@@ -1,0 +1,661 @@
+- generic [ref=f26e5]:
+  - complementary [ref=f26e6]
+  - link "Skip to content" [ref=f26e7] [cursor=pointer]:
+    - /url: "#main-content"
+  - banner [ref=f26e8]:
+    - generic [ref=f26e13]:
+      - button "Main navigation menu" [ref=f26e15] [cursor=pointer]:
+        - img "Three lines" [ref=f26e16]
+      - link [ref=f26e19] [cursor=pointer]:
+        - /url: /feed?pl=JTdCJTIyYWRkcmVzcyUyMiUzQSUyMjgyMTQlMjBQcmluY2V0b24lMjBTcXVhcmUlMjBCbHZkJTIwRSUyMiUyQyUyMnJlZmVyZW5jZSUyMiUzQSUyMjcxNjU1Mjc4LTZhMDAtYjYwNy0zYzQ4LTA2ODBkMzEzNTk0MyUyMiUyQyUyMnJlZmVyZW5jZVR5cGUlMjIlM0ElMjJ1YmVyX3BsYWNlcyUyMiUyQyUyMmxhdGl0dWRlJTIyJTNBMzAuMjE4MTU4NyUyQyUyMmxvbmdpdHVkZSUyMiUzQS04MS41NjEzMDI5JTdE
+        - img "Uber Eats Home" [ref=f26e20]
+      - generic [ref=f26e21]:
+        - link "Deliver to 8214 Princeton Square Blvd E" [ref=f26e26] [cursor=pointer]:
+          - /url: /store/mcdonalds-8590-baymeadows-rds/8MbNMNpxQfqq7BzUTlh7_A?diningMode=DELIVERY&mod=deliveryDetails&modctx=%7B%22locationManagerOrigin%22%3A%22feed%22%2C%22storeUuid%22%3A%22f0c6cd30-da71-41fa-aaec-1cd44e587bfc%22%2C%22isSchedulable%22%3Atrue%7D&next=%2Fstore%2Fmcdonalds-8590-baymeadows-rds%2F8MbNMNpxQfqq7BzUTlh7_A%3FdiningMode%3DDELIVERY%26pl%3DJTdCJTIyYWRkcmVzcyUyMiUzQSUyMjgyMTQlMjBQcmluY2V0b24lMjBTcXVhcmUlMjBCbHZkJTIwRSUyMiUyQyUyMnJlZmVyZW5jZSUyMiUzQSUyMjcxNjU1Mjc4LTZhMDAtYjYwNy0zYzQ4LTA2ODBkMzEzNTk0MyUyMiUyQyUyMnJlZmVyZW5jZVR5cGUlMjIlM0ElMjJ1YmVyX3BsYWNlcyUyMiUyQyUyMmxhdGl0dWRlJTIyJTNBMzAuMjE4MTU4NyUyQyUyMmxvbmdpdHVkZSUyMiUzQS04MS41NjEzMDI5JTdE&pl=JTdCJTIyYWRkcmVzcyUyMiUzQSUyMjgyMTQlMjBQcmluY2V0b24lMjBTcXVhcmUlMjBCbHZkJTIwRSUyMiUyQyUyMnJlZmVyZW5jZSUyMiUzQSUyMjcxNjU1Mjc4LTZhMDAtYjYwNy0zYzQ4LTA2ODBkMzEzNTk0MyUyMiUyQyUyMnJlZmVyZW5jZVR5cGUlMjIlM0ElMjJ1YmVyX3BsYWNlcyUyMiUyQyUyMmxhdGl0dWRlJTIyJTNBMzAuMjE4MTU4NyUyQyUyMmxvbmdpdHVkZSUyMiUzQS04MS41NjEzMDI5JTdE&ps=1
+          - generic [ref=f26e29]: 8214 Princeton Square Blvd E
+          - generic [ref=f26e30]: •
+          - generic [ref=f26e31]: Now
+        - search "Search Uber Eats" [ref=f26e35]:
+          - combobox "Search Uber Eats" [ref=f26e41]
+      - generic [ref=f26e43]:
+        - button "0 carts" [ref=f26e47] [cursor=pointer]:
+          - generic [ref=f26e48]:
+            - img "Carts" [ref=f26e49]
+            - generic [ref=f26e51]: "0"
+        - generic [ref=f26e53]:
+          - link "Log in" [ref=f26e54] [cursor=pointer]:
+            - /url: https://auth.uber.com/v2/?next_url=https%3A%2F%2Fwww.ubereats.com%2Flogin-redirect%2F%3Fcampaign%3Dstore_signin_universal_link%26marketing_vistor_id%3D33cdaf79-f4de-4c13-976e-918fadc6b7cf%26redirect%3D%252Fstore%252Fmcdonalds-8590-baymeadows-rds%252F8MbNMNpxQfqq7BzUTlh7_A%253FdiningMode%253DDELIVERY%2526pl%253DJTdCJTIyYWRkcmVzcyUyMiUzQSUyMjgyMTQlMjBQcmluY2V0b24lMjBTcXVhcmUlMjBCbHZkJTIwRSUyMiUyQyUyMnJlZmVyZW5jZSUyMiUzQSUyMjcxNjU1Mjc4LTZhMDAtYjYwNy0zYzQ4LTA2ODBkMzEzNTk0MyUyMiUyQyUyMnJlZmVyZW5jZVR5cGUlMjIlM0ElMjJ1YmVyX3BsYWNlcyUyMiUyQyUyMmxhdGl0dWRlJTIyJTNBMzAuMjE4MTU4NyUyQyUyMmxvbmdpdHVkZSUyMiUzQS04MS41NjEzMDI5JTdE%26guest_mode%3Dfalse%26app_clip%3Dfalse%26source_cta%3Dundefined%26source_flow%3Dundefined&localeCode=en-US&state=1787768369382_g0iwqqfp10b&x-uber-did=44a1c748-3101-4389-b251-c2f43ef17e98
+          - link "Sign up" [ref=f26e55] [cursor=pointer]:
+            - /url: https://auth.uber.com/v2/?next_url=https%3A%2F%2Fwww.ubereats.com%2Flogin-redirect%2F%3Fcampaign%3Dstore_signin_universal_link%26marketing_vistor_id%3D33cdaf79-f4de-4c13-976e-918fadc6b7cf%26redirect%3D%252Fstore%252Fmcdonalds-8590-baymeadows-rds%252F8MbNMNpxQfqq7BzUTlh7_A%253FdiningMode%253DDELIVERY%2526pl%253DJTdCJTIyYWRkcmVzcyUyMiUzQSUyMjgyMTQlMjBQcmluY2V0b24lMjBTcXVhcmUlMjBCbHZkJTIwRSUyMiUyQyUyMnJlZmVyZW5jZSUyMiUzQSUyMjcxNjU1Mjc4LTZhMDAtYjYwNy0zYzQ4LTA2ODBkMzEzNTk0MyUyMiUyQyUyMnJlZmVyZW5jZVR5cGUlMjIlM0ElMjJ1YmVyX3BsYWNlcyUyMiUyQyUyMmxhdGl0dWRlJTIyJTNBMzAuMjE4MTU4NyUyQyUyMmxvbmdpdHVkZSUyMiUzQS04MS41NjEzMDI5JTdE%26guest_mode%3Dfalse%26app_clip%3Dfalse%26source_cta%3Dundefined%26source_flow%3Dundefined&localeCode=en-US&state=1787768369382_qjl3ht8knan&x-uber-did=44a1c748-3101-4389-b251-c2f43ef17e98
+  - main [ref=f26e56]:
+    - generic [ref=f26e57]:
+      - generic [ref=f26e58]:
+        - generic [ref=f26e60]:
+          - generic [ref=f26e61]:
+            - generic [ref=f26e66]:
+              - heading "McDonald's® (8590 BAYMEADOWS RD)" [level=1] [ref=f26e67]
+              - generic [ref=f26e68]:
+                - paragraph [ref=f26e69]:
+                  - generic [ref=f26e70]: "4.3"
+                  - generic [ref=f26e74]: (2,000+)
+                  - generic [ref=f26e75]: •
+                  - generic [ref=f26e76]: American
+                  - generic [ref=f26e77]: •
+                  - generic [ref=f26e78]: Burgers
+                  - generic [ref=f26e79]: •
+                  - generic [ref=f26e80]: Fast Food
+                  - generic [ref=f26e81]: •
+                  - generic [ref=f26e82]: $
+                - paragraph [ref=f26e83]:
+                  - generic [ref=f26e84]: 8590 Baymeadows Rd, JACKSONVILLE, FL 32256
+                - generic [ref=f26e85]:
+                  - text: This spot is one of the most popular places in all of Jacksonvill...
+                  - generic "Show more" [ref=f26e86] [cursor=pointer]: More
+                - button "Store info" [ref=f26e87] [cursor=pointer]
+            - generic [ref=f26e89]:
+              - button "Lunch 10:30 AM – 4:59 PM" [ref=f26e91]:
+                - generic [ref=f26e92]: Lunch
+                - paragraph [ref=f26e93]: 10:30 AM – 4:59 PM
+              - navigation [ref=f26e94]:
+                - list [ref=f26e95]:
+                  - listitem [ref=f26e96]:
+                    - link "Featured items" [ref=f26e97] [cursor=pointer]:
+                      - /url: 0379a62a-1156-4ddb-a09a-7e1dc45d5dfb
+                  - listitem [ref=f26e99]:
+                    - link "Most Popular" [ref=f26e100] [cursor=pointer]:
+                      - /url: 17a0c31f-fa62-5f28-86b9-9cb963a3a6b4
+                  - listitem [ref=f26e102]:
+                    - 'link "NEW: McCafé®" [ref=f26e103] [cursor=pointer]':
+                      - /url: f5e4ed75-cc91-51f1-904a-7026dd9e4d20
+                  - listitem [ref=f26e105]:
+                    - link "Extra Value Meals" [ref=f26e106] [cursor=pointer]:
+                      - /url: 55563e9f-a600-574f-8c1e-1b9dae159ac7
+                  - listitem [ref=f26e108]:
+                    - link "Burgers" [ref=f26e109] [cursor=pointer]:
+                      - /url: 971c71e5-6eee-541b-8609-0532307888ef
+                  - listitem [ref=f26e111]:
+                    - link "Chicken" [ref=f26e112] [cursor=pointer]:
+                      - /url: fa69cb06-7a7d-5c22-9d56-4da30ebb37a7
+                  - listitem [ref=f26e114]:
+                    - link "Fish" [ref=f26e115] [cursor=pointer]:
+                      - /url: 8297b582-7726-54e2-817a-875a60cab530
+                  - listitem [ref=f26e117]:
+                    - link "Protein Picks" [ref=f26e118] [cursor=pointer]:
+                      - /url: d77cc889-9bd0-503d-b8d1-6346328f96d8
+                  - listitem [ref=f26e120]:
+                    - link "Fries" [ref=f26e121] [cursor=pointer]:
+                      - /url: dac92cd4-83e2-501a-a8ca-24a3ce849b2c
+                  - listitem [ref=f26e123]:
+                    - link "Happy Meal" [ref=f26e124] [cursor=pointer]:
+                      - /url: 1a571689-94f4-50d4-9668-17b00f837171
+                  - listitem [ref=f26e126]:
+                    - link "Drinks" [ref=f26e127] [cursor=pointer]:
+                      - /url: bd1c533a-8d91-51c7-b2f5-4c66614c047d
+                  - listitem [ref=f26e129]:
+                    - link "Sweets & Treats" [ref=f26e130] [cursor=pointer]:
+                      - /url: c571ad14-76d5-5873-a4ab-3cec216a750b
+                  - listitem [ref=f26e132]:
+                    - link "McCafé®" [ref=f26e133] [cursor=pointer]:
+                      - /url: b819f5ea-fbb4-55ed-8e5f-c437f58b6635
+                  - listitem [ref=f26e135]:
+                    - link "Shareables" [ref=f26e136] [cursor=pointer]:
+                      - /url: 500f4971-3a6e-5a96-a0d9-68585a340d8e
+                  - listitem [ref=f26e138]:
+                    - link "Condiments" [ref=f26e139] [cursor=pointer]:
+                      - /url: fa25a3ab-02d0-5bbd-8827-b0cd2fa9e22b
+                  - listitem [ref=f26e141]:
+                    - link "Sides & More" [ref=f26e142] [cursor=pointer]:
+                      - /url: 627f40bb-4847-52b3-aabd-7178986f4cb6
+                  - listitem [ref=f26e144]:
+                    - link "Individual Items" [ref=f26e145] [cursor=pointer]:
+                      - /url: 02aeba8a-685b-589b-9f2e-7b08a6e4b0da
+          - generic [ref=f26e147]:
+            - generic [ref=f26e148]:
+              - generic [ref=f26e149]:
+                - img "McDonald's® (8590 BAYMEADOWS RD)" [ref=f26e150]
+                - img "McDonald's® (8590 BAYMEADOWS RD)" [ref=f26e152]
+              - button "View more options" [ref=f26e155] [cursor=pointer]:
+                - img "Three dots horizontal" [ref=f26e156]
+            - generic [ref=f26e159]:
+              - generic [ref=f26e162]:
+                - img "Search" [ref=f26e164]
+                - textbox "Search in McDonald's® (8590 BAYMEADOWS RD)" [ref=f26e167]
+              - generic [ref=f26e169]:
+                - generic [ref=f26e172]:
+                  - radio "Delivery" [checked] [ref=f26e176] [cursor=pointer]
+                  - radio "Pickup" [ref=f26e181] [cursor=pointer]
+                - generic [ref=f26e187]:
+                  - generic [ref=f26e189]:
+                    - paragraph [ref=f26e191]: $0 delivery fee (new users)
+                    - paragraph [ref=f26e195] [cursor=pointer]: Other fees
+                  - generic [ref=f26e205]:
+                    - paragraph [ref=f26e206]: 12 min
+                    - paragraph [ref=f26e207] [cursor=pointer]: Earliest arrival
+              - list [ref=f26e214]:
+                - listitem [ref=f26e215]:
+                  - generic [ref=f26e216]:
+                    - heading "Featured items" [level=3] [ref=f26e219]
+                    - generic [ref=f26e222]:
+                      - button "Previous" [disabled] [ref=f26e223]
+                      - button "Next" [ref=f26e227] [cursor=pointer]
+                  - generic [ref=f26e230]:
+                    - list [ref=f26e231]:
+                      - list [ref=f26e232]:
+                        - listitem [ref=f26e233]:
+                          - link "#1 most liked Quick Add 6 pc. Chicken McNuggets® Happy Meal® $7.49 • 430 - 530 Cal." [ref=f26e235] [cursor=pointer]:
+                            - /url: /store/mcdonalds-8590-baymeadows-rds/8MbNMNpxQfqq7BzUTlh7_A?diningMode=DELIVERY&mod=quickView&modctx=%257B%2522storeUuid%2522%253A%2522f0c6cd30-da71-41fa-aaec-1cd44e587bfc%2522%252C%2522sectionUuid%2522%253A%25223a35a629-fbad-5799-9a93-eaa1f42a1963%2522%252C%2522subsectionUuid%2522%253A%25220379a62a-1156-4ddb-a09a-7e1dc45d5dfb%2522%252C%2522itemUuid%2522%253A%252263c7ddb0-1b32-5c18-a7d5-e8e30571e3fe%2522%252C%2522showSeeDetailsCTA%2522%253Atrue%257D&pl=JTdCJTIyYWRkcmVzcyUyMiUzQSUyMjgyMTQlMjBQcmluY2V0b24lMjBTcXVhcmUlMjBCbHZkJTIwRSUyMiUyQyUyMnJlZmVyZW5jZSUyMiUzQSUyMjcxNjU1Mjc4LTZhMDAtYjYwNy0zYzQ4LTA2ODBkMzEzNTk0MyUyMiUyQyUyMnJlZmVyZW5jZVR5cGUlMjIlM0ElMjJ1YmVyX3BsYWNlcyUyMiUyQyUyMmxhdGl0dWRlJTIyJTNBMzAuMjE4MTU4NyUyQyUyMmxvbmdpdHVkZSUyMiUzQS04MS41NjEzMDI5JTdE&ps=1
+                            - generic [ref=f26e236]:
+                              - generic [ref=f26e237]:
+                                - generic [ref=f26e238]: "#1 most liked"
+                                - button "Quick Add" [ref=f26e250]:
+                                  - img "Plus small" [ref=f26e251]
+                              - generic [ref=f26e254]:
+                                - generic [ref=f26e255]: 6 pc. Chicken McNuggets® Happy Meal®
+                                - generic [ref=f26e257]: $7.49 • 430 - 530 Cal.
+                        - listitem [ref=f26e259]:
+                          - link "#2 most liked Quick Add 10 pc. Chicken McNuggets® $7.69 • 410 Cal." [ref=f26e261] [cursor=pointer]:
+                            - /url: /store/mcdonalds-8590-baymeadows-rds/8MbNMNpxQfqq7BzUTlh7_A?diningMode=DELIVERY&mod=quickView&modctx=%257B%2522storeUuid%2522%253A%2522f0c6cd30-da71-41fa-aaec-1cd44e587bfc%2522%252C%2522sectionUuid%2522%253A%25223a35a629-fbad-5799-9a93-eaa1f42a1963%2522%252C%2522subsectionUuid%2522%253A%25220379a62a-1156-4ddb-a09a-7e1dc45d5dfb%2522%252C%2522itemUuid%2522%253A%2522c08f0176-bd30-5793-a58a-ddef2202a17a%2522%252C%2522showSeeDetailsCTA%2522%253Atrue%257D&pl=JTdCJTIyYWRkcmVzcyUyMiUzQSUyMjgyMTQlMjBQcmluY2V0b24lMjBTcXVhcmUlMjBCbHZkJTIwRSUyMiUyQyUyMnJlZmVyZW5jZSUyMiUzQSUyMjcxNjU1Mjc4LTZhMDAtYjYwNy0zYzQ4LTA2ODBkMzEzNTk0MyUyMiUyQyUyMnJlZmVyZW5jZVR5cGUlMjIlM0ElMjJ1YmVyX3BsYWNlcyUyMiUyQyUyMmxhdGl0dWRlJTIyJTNBMzAuMjE4MTU4NyUyQyUyMmxvbmdpdHVkZSUyMiUzQS04MS41NjEzMDI5JTdE&ps=1
+                            - generic [ref=f26e262]:
+                              - generic [ref=f26e263]:
+                                - generic [ref=f26e264]: "#2 most liked"
+                                - button "Quick Add" [ref=f26e276]:
+                                  - img "Plus small" [ref=f26e277]
+                              - generic [ref=f26e280]:
+                                - generic [ref=f26e281]: 10 pc. Chicken McNuggets®
+                                - generic [ref=f26e283]: $7.69 • 410 Cal.
+                        - listitem [ref=f26e285]:
+                          - link "#3 most liked Quick Add Hamburger Happy Meal® $5.69 • 380 - 510 Cal." [ref=f26e287] [cursor=pointer]:
+                            - /url: /store/mcdonalds-8590-baymeadows-rds/8MbNMNpxQfqq7BzUTlh7_A?diningMode=DELIVERY&mod=quickView&modctx=%257B%2522storeUuid%2522%253A%2522f0c6cd30-da71-41fa-aaec-1cd44e587bfc%2522%252C%2522sectionUuid%2522%253A%25223a35a629-fbad-5799-9a93-eaa1f42a1963%2522%252C%2522subsectionUuid%2522%253A%25220379a62a-1156-4ddb-a09a-7e1dc45d5dfb%2522%252C%2522itemUuid%2522%253A%2522d2cf3511-e001-5930-ac4f-4c9f35b67094%2522%252C%2522showSeeDetailsCTA%2522%253Atrue%257D&pl=JTdCJTIyYWRkcmVzcyUyMiUzQSUyMjgyMTQlMjBQcmluY2V0b24lMjBTcXVhcmUlMjBCbHZkJTIwRSUyMiUyQyUyMnJlZmVyZW5jZSUyMiUzQSUyMjcxNjU1Mjc4LTZhMDAtYjYwNy0zYzQ4LTA2ODBkMzEzNTk0MyUyMiUyQyUyMnJlZmVyZW5jZVR5cGUlMjIlM0ElMjJ1YmVyX3BsYWNlcyUyMiUyQyUyMmxhdGl0dWRlJTIyJTNBMzAuMjE4MTU4NyUyQyUyMmxvbmdpdHVkZSUyMiUzQS04MS41NjEzMDI5JTdE&ps=1
+                            - generic [ref=f26e288]:
+                              - generic [ref=f26e289]:
+                                - generic [ref=f26e290]: "#3 most liked"
+                                - button "Quick Add" [ref=f26e302]:
+                                  - img "Plus small" [ref=f26e303]
+                              - generic [ref=f26e306]:
+                                - generic [ref=f26e307]: Hamburger Happy Meal®
+                                - generic [ref=f26e309]: $5.69 • 380 - 510 Cal.
+                        - listitem [ref=f26e311]:
+                          - link "Quick Add Double Cheeseburger $4.89 • 440 Cal." [ref=f26e313] [cursor=pointer]:
+                            - /url: /store/mcdonalds-8590-baymeadows-rds/8MbNMNpxQfqq7BzUTlh7_A?diningMode=DELIVERY&mod=quickView&modctx=%257B%2522storeUuid%2522%253A%2522f0c6cd30-da71-41fa-aaec-1cd44e587bfc%2522%252C%2522sectionUuid%2522%253A%25223a35a629-fbad-5799-9a93-eaa1f42a1963%2522%252C%2522subsectionUuid%2522%253A%25220379a62a-1156-4ddb-a09a-7e1dc45d5dfb%2522%252C%2522itemUuid%2522%253A%25226fe7bb49-49e5-5c1a-8399-30ede0617a6a%2522%252C%2522showSeeDetailsCTA%2522%253Atrue%257D&pl=JTdCJTIyYWRkcmVzcyUyMiUzQSUyMjgyMTQlMjBQcmluY2V0b24lMjBTcXVhcmUlMjBCbHZkJTIwRSUyMiUyQyUyMnJlZmVyZW5jZSUyMiUzQSUyMjcxNjU1Mjc4LTZhMDAtYjYwNy0zYzQ4LTA2ODBkMzEzNTk0MyUyMiUyQyUyMnJlZmVyZW5jZVR5cGUlMjIlM0ElMjJ1YmVyX3BsYWNlcyUyMiUyQyUyMmxhdGl0dWRlJTIyJTNBMzAuMjE4MTU4NyUyQyUyMmxvbmdpdHVkZSUyMiUzQS04MS41NjEzMDI5JTdE&ps=1
+                            - generic [ref=f26e314]:
+                              - button "Quick Add" [ref=f26e324]:
+                                - img "Plus small" [ref=f26e325]
+                              - generic [ref=f26e328]:
+                                - generic [ref=f26e329]: Double Cheeseburger
+                                - generic [ref=f26e331]: $4.89 • 440 Cal.
+                    - list [ref=f26e333]:
+                      - list [ref=f26e334]:
+                        - listitem [ref=f26e335]:
+                          - link "Quick Add 40 pc. Chicken McNuggets® & 2 Large Fries $25.19 • 2610 Cal." [ref=f26e337] [cursor=pointer]:
+                            - /url: /store/mcdonalds-8590-baymeadows-rds/8MbNMNpxQfqq7BzUTlh7_A?diningMode=DELIVERY&mod=quickView&modctx=%257B%2522storeUuid%2522%253A%2522f0c6cd30-da71-41fa-aaec-1cd44e587bfc%2522%252C%2522sectionUuid%2522%253A%25223a35a629-fbad-5799-9a93-eaa1f42a1963%2522%252C%2522subsectionUuid%2522%253A%25220379a62a-1156-4ddb-a09a-7e1dc45d5dfb%2522%252C%2522itemUuid%2522%253A%2522d23849cb-6b58-564d-925b-c3933fd4a3ed%2522%252C%2522showSeeDetailsCTA%2522%253Atrue%257D&pl=JTdCJTIyYWRkcmVzcyUyMiUzQSUyMjgyMTQlMjBQcmluY2V0b24lMjBTcXVhcmUlMjBCbHZkJTIwRSUyMiUyQyUyMnJlZmVyZW5jZSUyMiUzQSUyMjcxNjU1Mjc4LTZhMDAtYjYwNy0zYzQ4LTA2ODBkMzEzNTk0MyUyMiUyQyUyMnJlZmVyZW5jZVR5cGUlMjIlM0ElMjJ1YmVyX3BsYWNlcyUyMiUyQyUyMmxhdGl0dWRlJTIyJTNBMzAuMjE4MTU4NyUyQyUyMmxvbmdpdHVkZSUyMiUzQS04MS41NjEzMDI5JTdE&ps=1
+                            - generic [ref=f26e338]:
+                              - button "Quick Add" [ref=f26e348]:
+                                - img "Plus small" [ref=f26e349]
+                              - generic [ref=f26e352]:
+                                - generic [ref=f26e353]: 40 pc. Chicken McNuggets® & 2 Large Fries
+                                - generic [ref=f26e355]: $25.19 • 2610 Cal.
+                        - listitem [ref=f26e357]:
+                          - link "Quick Add Medium Caramel Frappé $6.39 • 490 Cal." [ref=f26e359] [cursor=pointer]:
+                            - /url: /store/mcdonalds-8590-baymeadows-rds/8MbNMNpxQfqq7BzUTlh7_A?diningMode=DELIVERY&mod=quickView&modctx=%257B%2522storeUuid%2522%253A%2522f0c6cd30-da71-41fa-aaec-1cd44e587bfc%2522%252C%2522sectionUuid%2522%253A%25223a35a629-fbad-5799-9a93-eaa1f42a1963%2522%252C%2522subsectionUuid%2522%253A%25220379a62a-1156-4ddb-a09a-7e1dc45d5dfb%2522%252C%2522itemUuid%2522%253A%2522f936252c-8ac6-5183-bf06-c9de577f442c%2522%252C%2522showSeeDetailsCTA%2522%253Atrue%257D&pl=JTdCJTIyYWRkcmVzcyUyMiUzQSUyMjgyMTQlMjBQcmluY2V0b24lMjBTcXVhcmUlMjBCbHZkJTIwRSUyMiUyQyUyMnJlZmVyZW5jZSUyMiUzQSUyMjcxNjU1Mjc4LTZhMDAtYjYwNy0zYzQ4LTA2ODBkMzEzNTk0MyUyMiUyQyUyMnJlZmVyZW5jZVR5cGUlMjIlM0ElMjJ1YmVyX3BsYWNlcyUyMiUyQyUyMmxhdGl0dWRlJTIyJTNBMzAuMjE4MTU4NyUyQyUyMmxvbmdpdHVkZSUyMiUzQS04MS41NjEzMDI5JTdE&ps=1
+                            - generic [ref=f26e360]:
+                              - button "Quick Add" [ref=f26e370]:
+                                - img "Plus small" [ref=f26e371]
+                              - generic [ref=f26e374]:
+                                - generic [ref=f26e375]: Medium Caramel Frappé
+                                - generic [ref=f26e377]: $6.39 • 490 Cal.
+                        - listitem [ref=f26e379]:
+                          - link "Quick Add Medium French Fries $4.49 • 320 Cal." [ref=f26e381] [cursor=pointer]:
+                            - /url: /store/mcdonalds-8590-baymeadows-rds/8MbNMNpxQfqq7BzUTlh7_A?diningMode=DELIVERY&mod=quickView&modctx=%257B%2522storeUuid%2522%253A%2522f0c6cd30-da71-41fa-aaec-1cd44e587bfc%2522%252C%2522sectionUuid%2522%253A%25223a35a629-fbad-5799-9a93-eaa1f42a1963%2522%252C%2522subsectionUuid%2522%253A%25220379a62a-1156-4ddb-a09a-7e1dc45d5dfb%2522%252C%2522itemUuid%2522%253A%252265b81841-d679-5db5-a90f-ec176009a007%2522%252C%2522showSeeDetailsCTA%2522%253Atrue%257D&pl=JTdCJTIyYWRkcmVzcyUyMiUzQSUyMjgyMTQlMjBQcmluY2V0b24lMjBTcXVhcmUlMjBCbHZkJTIwRSUyMiUyQyUyMnJlZmVyZW5jZSUyMiUzQSUyMjcxNjU1Mjc4LTZhMDAtYjYwNy0zYzQ4LTA2ODBkMzEzNTk0MyUyMiUyQyUyMnJlZmVyZW5jZVR5cGUlMjIlM0ElMjJ1YmVyX3BsYWNlcyUyMiUyQyUyMmxhdGl0dWRlJTIyJTNBMzAuMjE4MTU4NyUyQyUyMmxvbmdpdHVkZSUyMiUzQS04MS41NjEzMDI5JTdE&ps=1
+                            - generic [ref=f26e382]:
+                              - button "Quick Add" [ref=f26e392]:
+                                - img "Plus small" [ref=f26e393]
+                              - generic [ref=f26e396]:
+                                - generic [ref=f26e397]: Medium French Fries
+                                - generic [ref=f26e399]: $4.49 • 320 Cal.
+                        - listitem [ref=f26e401]:
+                          - link "Quick Add 2 Cheeseburger Meal $11.39 • 920 - 1160 Cal." [ref=f26e403] [cursor=pointer]:
+                            - /url: /store/mcdonalds-8590-baymeadows-rds/8MbNMNpxQfqq7BzUTlh7_A?diningMode=DELIVERY&mod=quickView&modctx=%257B%2522storeUuid%2522%253A%2522f0c6cd30-da71-41fa-aaec-1cd44e587bfc%2522%252C%2522sectionUuid%2522%253A%25223a35a629-fbad-5799-9a93-eaa1f42a1963%2522%252C%2522subsectionUuid%2522%253A%25220379a62a-1156-4ddb-a09a-7e1dc45d5dfb%2522%252C%2522itemUuid%2522%253A%25225f48d904-c509-5cef-9fe1-42956ed1d50b%2522%252C%2522showSeeDetailsCTA%2522%253Atrue%257D&pl=JTdCJTIyYWRkcmVzcyUyMiUzQSUyMjgyMTQlMjBQcmluY2V0b24lMjBTcXVhcmUlMjBCbHZkJTIwRSUyMiUyQyUyMnJlZmVyZW5jZSUyMiUzQSUyMjcxNjU1Mjc4LTZhMDAtYjYwNy0zYzQ4LTA2ODBkMzEzNTk0MyUyMiUyQyUyMnJlZmVyZW5jZVR5cGUlMjIlM0ElMjJ1YmVyX3BsYWNlcyUyMiUyQyUyMmxhdGl0dWRlJTIyJTNBMzAuMjE4MTU4NyUyQyUyMmxvbmdpdHVkZSUyMiUzQS04MS41NjEzMDI5JTdE&ps=1
+                            - generic [ref=f26e404]:
+                              - button "Quick Add" [ref=f26e414]:
+                                - img "Plus small" [ref=f26e415]
+                              - generic [ref=f26e418]:
+                                - generic [ref=f26e419]: 2 Cheeseburger Meal
+                                - generic [ref=f26e421]: $11.39 • 920 - 1160 Cal.
+                - listitem [ref=f26e423]:
+                  - generic [ref=f26e424]:
+                    - generic [ref=f26e425]: Rating and reviews
+                    - button "See more" [ref=f26e426] [cursor=pointer]
+                  - generic [ref=f26e430]:
+                    - article [ref=f26e431]:
+                      - heading "4.3" [level=1] [ref=f26e432]
+                      - generic [ref=f26e433]:
+                        - img "Star" [ref=f26e434]
+                        - img "Star" [ref=f26e436]
+                        - img "Star" [ref=f26e438]
+                        - img "Star" [ref=f26e440]
+                        - img "Star outline" [ref=f26e442]
+                      - paragraph [ref=f26e444]: 2000+ Ratings
+                    - generic [ref=f26e446]:
+                      - article [ref=f26e448]:
+                        - paragraph [ref=f26e449]: "\"Fries were nice and salty, burgers were perfectly made to order,ketchup was in the bag and my shake still frozen! Very happy 😊\""
+                        - generic [ref=f26e450]:
+                          - generic [ref=f26e451]:
+                            - img "Star" [ref=f26e452]
+                            - img "Star" [ref=f26e454]
+                            - img "Star" [ref=f26e456]
+                            - img "Star" [ref=f26e458]
+                            - img "Star" [ref=f26e460]
+                          - generic [ref=f26e462]: •
+                          - generic [ref=f26e463]: Shelley S.
+                          - generic [ref=f26e464]: •
+                          - generic [ref=f26e465]: 12/11/25
+                      - article [ref=f26e467]:
+                        - paragraph [ref=f26e468]: "\"Amazing customer service. Kept me informed of my order. \""
+                        - generic [ref=f26e469]:
+                          - generic [ref=f26e470]:
+                            - img "Star" [ref=f26e471]
+                            - img "Star" [ref=f26e473]
+                            - img "Star" [ref=f26e475]
+                            - img "Star" [ref=f26e477]
+                            - img "Star" [ref=f26e479]
+                          - generic [ref=f26e481]: •
+                          - generic [ref=f26e482]: Telisa K.
+                          - generic [ref=f26e483]: •
+                          - generic [ref=f26e484]: 08/05/26
+                      - article [ref=f26e486]:
+                        - paragraph [ref=f26e487]: "\"Absolutely amazing thank you so so much. \""
+                        - generic [ref=f26e488]:
+                          - generic [ref=f26e489]:
+                            - img "Star" [ref=f26e490]
+                            - img "Star" [ref=f26e492]
+                            - img "Star" [ref=f26e494]
+                            - img "Star" [ref=f26e496]
+                            - img "Star" [ref=f26e498]
+                          - generic [ref=f26e500]: •
+                          - generic [ref=f26e501]: ALEXIS K.
+                          - generic [ref=f26e502]: •
+                          - generic [ref=f26e503]: 08/06/26
+                - listitem [ref=f26e504]:
+                  - generic [ref=f26e505]:
+                    - heading "Most Popular" [level=3] [ref=f26e510]
+                    - generic [ref=f26e512]:
+                      - list [ref=f26e514]:
+                        - listitem [ref=f26e515]:
+                          - link "Big Mac® Meal $11.39 • 910 - 1150 Cal. Quick Add" [ref=f26e517] [cursor=pointer]:
+                            - /url: /store/mcdonalds-8590-baymeadows-rds/8MbNMNpxQfqq7BzUTlh7_A?diningMode=DELIVERY&mod=quickView&modctx=%257B%2522storeUuid%2522%253A%2522f0c6cd30-da71-41fa-aaec-1cd44e587bfc%2522%252C%2522sectionUuid%2522%253A%25223a35a629-fbad-5799-9a93-eaa1f42a1963%2522%252C%2522subsectionUuid%2522%253A%252217a0c31f-fa62-5f28-86b9-9cb963a3a6b4%2522%252C%2522itemUuid%2522%253A%2522921bda56-016b-5612-aa21-6421928b0417%2522%252C%2522showSeeDetailsCTA%2522%253Atrue%257D&pl=JTdCJTIyYWRkcmVzcyUyMiUzQSUyMjgyMTQlMjBQcmluY2V0b24lMjBTcXVhcmUlMjBCbHZkJTIwRSUyMiUyQyUyMnJlZmVyZW5jZSUyMiUzQSUyMjcxNjU1Mjc4LTZhMDAtYjYwNy0zYzQ4LTA2ODBkMzEzNTk0MyUyMiUyQyUyMnJlZmVyZW5jZVR5cGUlMjIlM0ElMjJ1YmVyX3BsYWNlcyUyMiUyQyUyMmxhdGl0dWRlJTIyJTNBMzAuMjE4MTU4NyUyQyUyMmxvbmdpdHVkZSUyMiUzQS04MS41NjEzMDI5JTdE&ps=1
+                            - generic [ref=f26e518]:
+                              - generic [ref=f26e520]:
+                                - generic [ref=f26e521]: Big Mac® Meal
+                                - generic [ref=f26e522]:
+                                  - generic [ref=f26e523]: $11.39
+                                  - generic [ref=f26e524]: •
+                                  - generic [ref=f26e525]: 910 - 1150 Cal.
+                              - button "Quick Add" [ref=f26e534]:
+                                - img "Plus small" [ref=f26e535]
+                        - listitem [ref=f26e537]:
+                          - link "Double Quarter Pounder® with Cheese Meal $14.49 • 1060 - 1300 Cal. Quick Add" [ref=f26e539] [cursor=pointer]:
+                            - /url: /store/mcdonalds-8590-baymeadows-rds/8MbNMNpxQfqq7BzUTlh7_A?diningMode=DELIVERY&mod=quickView&modctx=%257B%2522storeUuid%2522%253A%2522f0c6cd30-da71-41fa-aaec-1cd44e587bfc%2522%252C%2522sectionUuid%2522%253A%25223a35a629-fbad-5799-9a93-eaa1f42a1963%2522%252C%2522subsectionUuid%2522%253A%252217a0c31f-fa62-5f28-86b9-9cb963a3a6b4%2522%252C%2522itemUuid%2522%253A%2522820b77a7-a272-560c-b23f-9d63a665f3e6%2522%252C%2522showSeeDetailsCTA%2522%253Atrue%257D&pl=JTdCJTIyYWRkcmVzcyUyMiUzQSUyMjgyMTQlMjBQcmluY2V0b24lMjBTcXVhcmUlMjBCbHZkJTIwRSUyMiUyQyUyMnJlZmVyZW5jZSUyMiUzQSUyMjcxNjU1Mjc4LTZhMDAtYjYwNy0zYzQ4LTA2ODBkMzEzNTk0MyUyMiUyQyUyMnJlZmVyZW5jZVR5cGUlMjIlM0ElMjJ1YmVyX3BsYWNlcyUyMiUyQyUyMmxhdGl0dWRlJTIyJTNBMzAuMjE4MTU4NyUyQyUyMmxvbmdpdHVkZSUyMiUzQS04MS41NjEzMDI5JTdE&ps=1
+                            - generic [ref=f26e540]:
+                              - generic [ref=f26e542]:
+                                - generic [ref=f26e543]: Double Quarter Pounder® with Cheese Meal
+                                - generic [ref=f26e544]:
+                                  - generic [ref=f26e545]: $14.49
+                                  - generic [ref=f26e546]: •
+                                  - generic [ref=f26e547]: 1060 - 1300 Cal.
+                              - button "Quick Add" [ref=f26e556]:
+                                - img "Plus small" [ref=f26e557]
+                      - list [ref=f26e560]:
+                        - listitem [ref=f26e561]:
+                          - link "20 pc. Chicken McNuggets® $13.29 • 830 Cal. Quick Add" [ref=f26e563] [cursor=pointer]:
+                            - /url: /store/mcdonalds-8590-baymeadows-rds/8MbNMNpxQfqq7BzUTlh7_A?diningMode=DELIVERY&mod=quickView&modctx=%257B%2522storeUuid%2522%253A%2522f0c6cd30-da71-41fa-aaec-1cd44e587bfc%2522%252C%2522sectionUuid%2522%253A%25223a35a629-fbad-5799-9a93-eaa1f42a1963%2522%252C%2522subsectionUuid%2522%253A%252217a0c31f-fa62-5f28-86b9-9cb963a3a6b4%2522%252C%2522itemUuid%2522%253A%2522ae9c427e-e565-5026-b2eb-32398a021c77%2522%252C%2522showSeeDetailsCTA%2522%253Atrue%257D&pl=JTdCJTIyYWRkcmVzcyUyMiUzQSUyMjgyMTQlMjBQcmluY2V0b24lMjBTcXVhcmUlMjBCbHZkJTIwRSUyMiUyQyUyMnJlZmVyZW5jZSUyMiUzQSUyMjcxNjU1Mjc4LTZhMDAtYjYwNy0zYzQ4LTA2ODBkMzEzNTk0MyUyMiUyQyUyMnJlZmVyZW5jZVR5cGUlMjIlM0ElMjJ1YmVyX3BsYWNlcyUyMiUyQyUyMmxhdGl0dWRlJTIyJTNBMzAuMjE4MTU4NyUyQyUyMmxvbmdpdHVkZSUyMiUzQS04MS41NjEzMDI5JTdE&ps=1
+                            - generic [ref=f26e564]:
+                              - generic [ref=f26e566]:
+                                - generic [ref=f26e567]: 20 pc. Chicken McNuggets®
+                                - generic [ref=f26e568]:
+                                  - generic [ref=f26e569]: $13.29
+                                  - generic [ref=f26e570]: •
+                                  - generic [ref=f26e571]: 830 Cal.
+                              - button "Quick Add" [ref=f26e580]:
+                                - img "Plus small" [ref=f26e581]
+                        - listitem [ref=f26e583]:
+                          - link "10 pc. Chicken McNuggets® Meal $11.69 • 740 - 980 Cal. Quick Add" [ref=f26e585] [cursor=pointer]:
+                            - /url: /store/mcdonalds-8590-baymeadows-rds/8MbNMNpxQfqq7BzUTlh7_A?diningMode=DELIVERY&mod=quickView&modctx=%257B%2522storeUuid%2522%253A%2522f0c6cd30-da71-41fa-aaec-1cd44e587bfc%2522%252C%2522sectionUuid%2522%253A%25223a35a629-fbad-5799-9a93-eaa1f42a1963%2522%252C%2522subsectionUuid%2522%253A%252217a0c31f-fa62-5f28-86b9-9cb963a3a6b4%2522%252C%2522itemUuid%2522%253A%25223ad11035-9588-50d8-9fb6-6fe7461af240%2522%252C%2522showSeeDetailsCTA%2522%253Atrue%257D&pl=JTdCJTIyYWRkcmVzcyUyMiUzQSUyMjgyMTQlMjBQcmluY2V0b24lMjBTcXVhcmUlMjBCbHZkJTIwRSUyMiUyQyUyMnJlZmVyZW5jZSUyMiUzQSUyMjcxNjU1Mjc4LTZhMDAtYjYwNy0zYzQ4LTA2ODBkMzEzNTk0MyUyMiUyQyUyMnJlZmVyZW5jZVR5cGUlMjIlM0ElMjJ1YmVyX3BsYWNlcyUyMiUyQyUyMmxhdGl0dWRlJTIyJTNBMzAuMjE4MTU4NyUyQyUyMmxvbmdpdHVkZSUyMiUzQS04MS41NjEzMDI5JTdE&ps=1
+                            - generic [ref=f26e586]:
+                              - generic [ref=f26e588]:
+                                - generic [ref=f26e589]: 10 pc. Chicken McNuggets® Meal
+                                - generic [ref=f26e590]:
+                                  - generic [ref=f26e591]: $11.69
+                                  - generic [ref=f26e592]: •
+                                  - generic [ref=f26e593]: 740 - 980 Cal.
+                              - button "Quick Add" [ref=f26e602]:
+                                - img "Plus small" [ref=f26e603]
+                      - list [ref=f26e606]:
+                        - listitem [ref=f26e607]:
+                          - link "McCrispy™ $6.19 • 470 Cal. Quick Add" [ref=f26e609] [cursor=pointer]:
+                            - /url: /store/mcdonalds-8590-baymeadows-rds/8MbNMNpxQfqq7BzUTlh7_A?diningMode=DELIVERY&mod=quickView&modctx=%257B%2522storeUuid%2522%253A%2522f0c6cd30-da71-41fa-aaec-1cd44e587bfc%2522%252C%2522sectionUuid%2522%253A%25223a35a629-fbad-5799-9a93-eaa1f42a1963%2522%252C%2522subsectionUuid%2522%253A%252217a0c31f-fa62-5f28-86b9-9cb963a3a6b4%2522%252C%2522itemUuid%2522%253A%2522d7f957f7-488c-54f3-b703-ad40ac25d66c%2522%252C%2522showSeeDetailsCTA%2522%253Atrue%257D&pl=JTdCJTIyYWRkcmVzcyUyMiUzQSUyMjgyMTQlMjBQcmluY2V0b24lMjBTcXVhcmUlMjBCbHZkJTIwRSUyMiUyQyUyMnJlZmVyZW5jZSUyMiUzQSUyMjcxNjU1Mjc4LTZhMDAtYjYwNy0zYzQ4LTA2ODBkMzEzNTk0MyUyMiUyQyUyMnJlZmVyZW5jZVR5cGUlMjIlM0ElMjJ1YmVyX3BsYWNlcyUyMiUyQyUyMmxhdGl0dWRlJTIyJTNBMzAuMjE4MTU4NyUyQyUyMmxvbmdpdHVkZSUyMiUzQS04MS41NjEzMDI5JTdE&ps=1
+                            - generic [ref=f26e610]:
+                              - generic [ref=f26e612]:
+                                - generic [ref=f26e613]: McCrispy™
+                                - generic [ref=f26e614]:
+                                  - generic [ref=f26e615]: $6.19
+                                  - generic [ref=f26e616]: •
+                                  - generic [ref=f26e617]: 470 Cal.
+                              - button "Quick Add" [ref=f26e626]:
+                                - img "Plus small" [ref=f26e627]
+                        - listitem [ref=f26e629]:
+                          - link "Medium French Fries $4.49 • 320 Cal. Quick Add" [ref=f26e631] [cursor=pointer]:
+                            - /url: /store/mcdonalds-8590-baymeadows-rds/8MbNMNpxQfqq7BzUTlh7_A?diningMode=DELIVERY&mod=quickView&modctx=%257B%2522storeUuid%2522%253A%2522f0c6cd30-da71-41fa-aaec-1cd44e587bfc%2522%252C%2522sectionUuid%2522%253A%25223a35a629-fbad-5799-9a93-eaa1f42a1963%2522%252C%2522subsectionUuid%2522%253A%252217a0c31f-fa62-5f28-86b9-9cb963a3a6b4%2522%252C%2522itemUuid%2522%253A%252265b81841-d679-5db5-a90f-ec176009a007%2522%252C%2522showSeeDetailsCTA%2522%253Atrue%257D&pl=JTdCJTIyYWRkcmVzcyUyMiUzQSUyMjgyMTQlMjBQcmluY2V0b24lMjBTcXVhcmUlMjBCbHZkJTIwRSUyMiUyQyUyMnJlZmVyZW5jZSUyMiUzQSUyMjcxNjU1Mjc4LTZhMDAtYjYwNy0zYzQ4LTA2ODBkMzEzNTk0MyUyMiUyQyUyMnJlZmVyZW5jZVR5cGUlMjIlM0ElMjJ1YmVyX3BsYWNlcyUyMiUyQyUyMmxhdGl0dWRlJTIyJTNBMzAuMjE4MTU4NyUyQyUyMmxvbmdpdHVkZSUyMiUzQS04MS41NjEzMDI5JTdE&ps=1
+                            - generic [ref=f26e632]:
+                              - generic [ref=f26e634]:
+                                - generic [ref=f26e635]: Medium French Fries
+                                - generic [ref=f26e636]:
+                                  - generic [ref=f26e637]: $4.49
+                                  - generic [ref=f26e638]: •
+                                  - generic [ref=f26e639]: 320 Cal.
+                              - button "Quick Add" [ref=f26e648]:
+                                - img "Plus small" [ref=f26e649]
+                - listitem [ref=f26e651]:
+                  - 'heading "NEW: McCafé®" [level=3] [ref=f26e657]'
+                - listitem [ref=f26e660]:
+                  - heading "Extra Value Meals" [level=3] [ref=f26e666]
+                - listitem [ref=f26e669]:
+                  - heading "Burgers" [level=3] [ref=f26e675]
+                - listitem [ref=f26e678]:
+                  - heading "Chicken" [level=3] [ref=f26e684]
+                - listitem [ref=f26e687]:
+                  - heading "Fish" [level=3] [ref=f26e693]
+                - listitem [ref=f26e696]:
+                  - heading "Protein Picks" [level=3] [ref=f26e702]
+                - listitem [ref=f26e705]:
+                  - heading "Fries" [level=3] [ref=f26e711]
+                - listitem [ref=f26e714]:
+                  - heading "Happy Meal" [level=3] [ref=f26e720]
+                - listitem [ref=f26e723]:
+                  - heading "Drinks" [level=3] [ref=f26e729]
+                - listitem [ref=f26e732]:
+                  - heading "Sweets & Treats" [level=3] [ref=f26e738]
+                - listitem [ref=f26e741]:
+                  - heading "McCafé®" [level=3] [ref=f26e747]
+                - listitem [ref=f26e750]:
+                  - heading "Shareables" [level=3] [ref=f26e756]
+                - listitem [ref=f26e759]:
+                  - heading "Condiments" [level=3] [ref=f26e765]
+                - listitem [ref=f26e768]:
+                  - heading "Sides & More" [level=3] [ref=f26e774]
+                - listitem [ref=f26e777]:
+                  - heading "Individual Items" [level=3] [ref=f26e783]
+                - listitem [ref=f26e786]:
+                  - generic [ref=f26e788]:
+                    - generic [ref=f26e790]:
+                      - generic [ref=f26e791]: Rating and reviews
+                      - generic [ref=f26e792]:
+                        - img "Star" [ref=f26e794]
+                        - paragraph [ref=f26e796]: "4.3"
+                        - generic [ref=f26e797]: •
+                        - paragraph [ref=f26e798]:
+                          - text: 2000+ Ratings
+                          - generic [ref=f26e799]: •
+                        - paragraph [ref=f26e800]: 29 Reviews
+                    - generic [ref=f26e801]:
+                      - article [ref=f26e803]:
+                        - generic [ref=f26e805]:
+                          - generic [ref=f26e806]: Mary P.
+                          - generic [ref=f26e807]:
+                            - generic [ref=f26e808]:
+                              - img "Star" [ref=f26e809]
+                              - img "Star" [ref=f26e811]
+                              - img "Star" [ref=f26e813]
+                              - img "Star" [ref=f26e815]
+                              - img "Star" [ref=f26e817]
+                            - generic [ref=f26e819]: •
+                            - text: 10/29/22
+                        - paragraph [ref=f26e821]: Great!
+                      - article [ref=f26e823]:
+                        - generic [ref=f26e825]:
+                          - generic [ref=f26e826]: Kaitlyn W.
+                          - generic [ref=f26e827]:
+                            - generic [ref=f26e828]:
+                              - img "Star" [ref=f26e829]
+                              - img "Star" [ref=f26e831]
+                              - img "Star" [ref=f26e833]
+                              - img "Star" [ref=f26e835]
+                              - img "Star" [ref=f26e837]
+                            - generic [ref=f26e839]: •
+                            - text: 02/20/23
+                        - paragraph [ref=f26e841]: order was fresh and correct. thank you.
+                      - article [ref=f26e843]:
+                        - generic [ref=f26e845]:
+                          - generic [ref=f26e846]: ELAINE D.
+                          - generic [ref=f26e847]:
+                            - generic [ref=f26e848]:
+                              - img "Star" [ref=f26e849]
+                              - img "Star" [ref=f26e851]
+                              - img "Star" [ref=f26e853]
+                              - img "Star" [ref=f26e855]
+                              - img "Star" [ref=f26e857]
+                            - generic [ref=f26e859]: •
+                            - text: 04/11/23
+                        - paragraph [ref=f26e861]: great price
+                    - generic [ref=f26e862]:
+                      - article [ref=f26e864]:
+                        - generic [ref=f26e866]:
+                          - generic [ref=f26e867]: Cameron B.
+                          - generic [ref=f26e868]:
+                            - generic [ref=f26e869]:
+                              - img "Star" [ref=f26e870]
+                              - img "Star" [ref=f26e872]
+                              - img "Star" [ref=f26e874]
+                              - img "Star" [ref=f26e876]
+                              - img "Star" [ref=f26e878]
+                            - generic [ref=f26e880]: •
+                            - text: 11/17/22
+                        - paragraph [ref=f26e882]: Very friendly and fast ❤️❤️🙂
+                      - article [ref=f26e884]:
+                        - generic [ref=f26e886]:
+                          - generic [ref=f26e887]: Lameshia A.
+                          - generic [ref=f26e888]:
+                            - generic [ref=f26e889]:
+                              - img "Star" [ref=f26e890]
+                              - img "Star" [ref=f26e892]
+                              - img "Star" [ref=f26e894]
+                              - img "Star" [ref=f26e896]
+                              - img "Star" [ref=f26e898]
+                            - generic [ref=f26e900]: •
+                            - text: 04/06/23
+                        - paragraph [ref=f26e902]: My kids like it
+                      - article [ref=f26e904]:
+                        - generic [ref=f26e906]:
+                          - generic [ref=f26e907]: Alicia G.
+                          - generic [ref=f26e908]:
+                            - generic [ref=f26e909]:
+                              - img "Star" [ref=f26e910]
+                              - img "Star" [ref=f26e912]
+                              - img "Star" [ref=f26e914]
+                              - img "Star" [ref=f26e916]
+                              - img "Star" [ref=f26e918]
+                            - generic [ref=f26e920]: •
+                            - text: 04/28/23
+                        - paragraph [ref=f26e922]: was delivered hot and fresh
+                    - button "Show more" [ref=f26e925] [cursor=pointer]
+        - generic [ref=f26e930]:
+          - heading "Frequently asked questions" [level=2] [ref=f26e931]
+          - list [ref=f26e932]:
+            - listitem [ref=f26e933]:
+              - button [ref=f26e934] [cursor=pointer]:
+                - heading "Can I order McDonald's® (8590 BAYMEADOWS RD) delivery in Jacksonville with Uber Eats?" [level=3] [ref=f26e936]
+                - img "Chevron down small" [ref=f26e938]
+            - listitem [ref=f26e940]:
+              - button [ref=f26e941] [cursor=pointer]:
+                - heading "Is McDonald's® (8590 BAYMEADOWS RD) delivery available near me?" [level=3] [ref=f26e943]
+                - img "Chevron down small" [ref=f26e945]
+            - listitem [ref=f26e947]:
+              - button [ref=f26e948] [cursor=pointer]:
+                - heading "How do I order McDonald's® (8590 BAYMEADOWS RD) delivery online in Jacksonville?" [level=3] [ref=f26e950]
+                - img "Chevron down small" [ref=f26e952]
+            - listitem [ref=f26e954]:
+              - button [ref=f26e955] [cursor=pointer]:
+                - heading "Where can I find McDonald's® (8590 BAYMEADOWS RD) online menu prices?" [level=3] [ref=f26e957]
+                - img "Chevron down small" [ref=f26e959]
+            - listitem [ref=f26e961]:
+              - button [ref=f26e962] [cursor=pointer]:
+                - heading "How do I get free delivery on my McDonald's® (8590 BAYMEADOWS RD) order?" [level=3] [ref=f26e964]
+                - img "Chevron down small" [ref=f26e966]
+            - listitem [ref=f26e968]:
+              - button [ref=f26e969] [cursor=pointer]:
+                - heading "How do I pay for my McDonald's® (8590 BAYMEADOWS RD) order?" [level=3] [ref=f26e971]
+                - img "Chevron down small" [ref=f26e973]
+            - listitem [ref=f26e975]:
+              - button [ref=f26e976] [cursor=pointer]:
+                - heading "What’s the best thing to order for McDonald's® (8590 BAYMEADOWS RD) delivery in Jacksonville?" [level=3] [ref=f26e978]
+                - img "Chevron down small" [ref=f26e980]
+            - listitem [ref=f26e982]:
+              - button [ref=f26e983] [cursor=pointer]:
+                - heading "Is breakfast available at McDonald’s?" [level=3] [ref=f26e985]
+                - img "Chevron down small" [ref=f26e987]
+            - listitem [ref=f26e989]:
+              - button [ref=f26e990] [cursor=pointer]:
+                - heading "Is McDonald’s halal?" [level=3] [ref=f26e992]
+                - img "Chevron down small" [ref=f26e994]
+            - listitem [ref=f26e996]:
+              - button [ref=f26e997] [cursor=pointer]:
+                - heading "Does McDonald’s serve gluten free food?" [level=3] [ref=f26e999]
+                - img "Chevron down small" [ref=f26e1001]
+            - listitem [ref=f26e1003]:
+              - button [ref=f26e1004] [cursor=pointer]:
+                - heading "Does McDonald’s serve vegetarian items?" [level=3] [ref=f26e1006]
+                - img "Chevron down small" [ref=f26e1008]
+            - listitem [ref=f26e1010]:
+              - button [ref=f26e1011] [cursor=pointer]:
+                - heading "Does McDonald’s serve vegan items?" [level=3] [ref=f26e1013]
+                - img "Chevron down small" [ref=f26e1015]
+            - listitem [ref=f26e1017]:
+              - button [ref=f26e1018] [cursor=pointer]:
+                - heading "What’s in a McDonald’s® Big Mac®?" [level=3] [ref=f26e1020]
+                - img "Chevron down small" [ref=f26e1022]
+            - listitem [ref=f26e1024]:
+              - button [ref=f26e1025] [cursor=pointer]:
+                - heading "Does McDonald’s® offer any special sauces for their burgers?" [level=3] [ref=f26e1027]
+                - img "Chevron down small" [ref=f26e1029]
+            - listitem [ref=f26e1031]:
+              - button [ref=f26e1032] [cursor=pointer]:
+                - heading "What are the options for a McDonald’s® Happy Meal®?" [level=3] [ref=f26e1034]
+                - img "Chevron down small" [ref=f26e1036]
+            - listitem [ref=f26e1038]:
+              - button [ref=f26e1039] [cursor=pointer]:
+                - heading "What is included in the McDonald’s® Dinner Box?" [level=3] [ref=f26e1041]
+                - img "Chevron down small" [ref=f26e1043]
+            - listitem [ref=f26e1045]:
+              - button [ref=f26e1046] [cursor=pointer]:
+                - heading "What are the options for McDonald’s® salads?" [level=3] [ref=f26e1048]
+                - img "Chevron down small" [ref=f26e1050]
+            - listitem [ref=f26e1052]:
+              - button [ref=f26e1053] [cursor=pointer]:
+                - heading "What are the available dipping sauces at McDonald’s®?" [level=3] [ref=f26e1055]
+                - img "Chevron down small" [ref=f26e1057]
+            - listitem [ref=f26e1059]:
+              - button [ref=f26e1060] [cursor=pointer]:
+                - heading "What are the options for McDonald’s® desserts?" [level=3] [ref=f26e1062]
+                - img "Chevron down small" [ref=f26e1064]
+      - navigation "Breadcrumbs navigation" [ref=f26e1068]:
+        - list [ref=f26e1069]:
+          - listitem [ref=f26e1070]:
+            - link "United States" [ref=f26e1071] [cursor=pointer]:
+              - /url: /
+          - listitem [ref=f26e1075]:
+            - link "Florida" [ref=f26e1076] [cursor=pointer]:
+              - /url: /region/fl
+          - listitem [ref=f26e1080]:
+            - link "Jacksonville" [ref=f26e1081] [cursor=pointer]:
+              - /url: /city/jacksonville-fl
+          - listitem [ref=f26e1085]:
+            - link "Craven" [ref=f26e1086] [cursor=pointer]:
+              - /url: /neighborhood/craven-jacksonville-fl
+          - listitem [ref=f26e1090]: McDonald's® (8590 BAYMEADOWS RD)
+      - generic [ref=f26e1093]:
+        - text: 2,000 calories a day is used for general nutrition advice, but calorie needs vary. Additional nutrition information available upon request.
+        - link "Click here" [ref=f26e1094] [cursor=pointer]:
+          - /url: https://www.mcdonalds.com/us/en-us/about-our-food/nutrition-calculator.html
+        - text: .
+  - contentinfo [ref=f26e1095]:
+    - generic [ref=f26e1096]:
+      - generic [ref=f26e1097]:
+        - generic [ref=f26e1098]:
+          - img "Uber Eats" [ref=f26e1099]
+          - generic [ref=f26e1100]:
+            - link [ref=f26e1101] [cursor=pointer]:
+              - /url: https://apps.apple.com/us/app/uber-eats-food-delivery/id1058959277
+              - img "Download on the App Store" [ref=f26e1102]
+            - link [ref=f26e1103] [cursor=pointer]:
+              - /url: https://play.google.com/store/apps/details?id=com.ubercab.eats
+              - img "Get it on Google Play" [ref=f26e1104]
+        - list [ref=f26e1106]:
+          - listitem [ref=f26e1107]:
+            - link "Get Help" [ref=f26e1108] [cursor=pointer]:
+              - /url: //help.uber.com/ubereats
+          - listitem [ref=f26e1109]:
+            - link "Buy gift cards" [ref=f26e1110] [cursor=pointer]:
+              - /url: //uber.com/gift-cards/
+          - listitem [ref=f26e1111]:
+            - link "Add your restaurant" [ref=f26e1112] [cursor=pointer]:
+              - /url: //merchants.ubereats.com/s/signup/
+          - listitem [ref=f26e1113]:
+            - link "Sign up to deliver" [ref=f26e1114] [cursor=pointer]:
+              - /url: //www.uber.com/deliver/
+          - listitem [ref=f26e1115]:
+            - link "Create a business account" [ref=f26e1116] [cursor=pointer]:
+              - /url: //www.uber.com/business/eats
+          - listitem [ref=f26e1117]:
+            - link "Promotions" [ref=f26e1118] [cursor=pointer]:
+              - /url: /promo
+        - list [ref=f26e1120]:
+          - listitem [ref=f26e1121]:
+            - link "Restaurants near me" [ref=f26e1122] [cursor=pointer]:
+              - /url: /near-me
+          - listitem [ref=f26e1123]:
+            - link "View all cities" [ref=f26e1124] [cursor=pointer]:
+              - /url: /location
+          - listitem [ref=f26e1125]:
+            - link "View all countries" [ref=f26e1126] [cursor=pointer]:
+              - /url: /location#all-countries
+          - listitem [ref=f26e1127]:
+            - link "Pickup near me" [ref=f26e1128] [cursor=pointer]:
+              - /url: /pickup/near-me
+          - listitem [ref=f26e1129]:
+            - link "About Uber Eats" [ref=f26e1130] [cursor=pointer]:
+              - /url: //about.ubereats.com
+          - listitem [ref=f26e1131]:
+            - link "Shop groceries" [ref=f26e1132] [cursor=pointer]:
+              - /url: /shopping
+          - listitem [ref=f26e1133]:
+            - link [ref=f26e1134] [cursor=pointer]:
+              - /url: /store/mcdonalds-8590-baymeadows-rds/8MbNMNpxQfqq7BzUTlh7_A?diningMode=DELIVERY&mod=selectLanguage&pl=JTdCJTIyYWRkcmVzcyUyMiUzQSUyMjgyMTQlMjBQcmluY2V0b24lMjBTcXVhcmUlMjBCbHZkJTIwRSUyMiUyQyUyMnJlZmVyZW5jZSUyMiUzQSUyMjcxNjU1Mjc4LTZhMDAtYjYwNy0zYzQ4LTA2ODBkMzEzNTk0MyUyMiUyQyUyMnJlZmVyZW5jZVR5cGUlMjIlM0ElMjJ1YmVyX3BsYWNlcyUyMiUyQyUyMmxhdGl0dWRlJTIyJTNBMzAuMjE4MTU4NyUyQyUyMmxvbmdpdHVkZSUyMiUzQS04MS41NjEzMDI5JTdE&ps=1
+              - img "Select a language" [ref=f26e1135]
+              - text: English
+      - separator [ref=f26e1138]
+      - generic [ref=f26e1139]:
+        - generic [ref=f26e1141]:
+          - link "Facebook" [ref=f26e1142] [cursor=pointer]:
+            - /url: //www.facebook.com/ubereats
+          - link "Twitter" [ref=f26e1147] [cursor=pointer]:
+            - /url: //www.twitter.com/ubereats
+          - link "Instagram" [ref=f26e1152] [cursor=pointer]:
+            - /url: //www.instagram.com/ubereats
+        - generic [ref=f26e1158]:
+          - link "Privacy Policy" [ref=f26e1159] [cursor=pointer]:
+            - /url: //www.uber.com/legal/privacy/users/
+          - link "Terms" [ref=f26e1161] [cursor=pointer]:
+            - /url: //www.uber.com/terms
+          - link "Pricing" [ref=f26e1163] [cursor=pointer]:
+            - /url: //help.uber.com/ubereats/article/uber-eats-pricing?nodeId=2adbed88-9822-4690-9529-3061c4821755
+          - link "Do not sell or share my personal information" [ref=f26e1165] [cursor=pointer]:
+            - /url: //privacy.uber.com/privacy/california/
+      - generic [ref=f26e1168]:
+        - generic [ref=f26e1169]:
+          - text: This site is protected by reCAPTCHA and the Google
+          - link "Privacy Policy" [ref=f26e1170] [cursor=pointer]:
+            - /url: //policies.google.com/privacy
+          - text: and
+          - link "Terms of Service" [ref=f26e1171] [cursor=pointer]:
+            - /url: //policies.google.com/terms
+          - text: apply.
+        - generic [ref=f26e1173]: © 2026 Uber Technologies Inc.

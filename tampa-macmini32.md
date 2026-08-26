@@ -1,0 +1,149 @@
+- generic [active] [ref=f227e1]:
+  - generic [ref=f227e2]:
+    - banner [ref=f227e3]:
+      - generic [ref=f227e4]:
+        - link " CL" [ref=f227e5] [cursor=pointer]:
+          - /url: https://www.craigslist.org/area/tampa
+          - generic [ref=f227e6]: 
+          - generic [ref=f227e7]: CL
+        - generic [ref=f227e8] [cursor=pointer]:
+          - button "tampa bay" [ref=f227e10]
+          - generic [ref=f227e12]: 
+        - generic [ref=f227e13] [cursor=pointer]:
+          - button "all tampa bay" [ref=f227e15]
+          - generic [ref=f227e17]: 
+        - generic [ref=f227e18] [cursor=pointer]:
+          - button "for sale (all)" [ref=f227e20]
+          - generic [ref=f227e22]: 
+        - generic [ref=f227e23] [cursor=pointer]:
+          - button "all" [ref=f227e25]
+          - generic [ref=f227e27]: 
+      - generic [ref=f227e29]:
+        - text: ⭐ 
+        - link "✍ post" [ref=f227e30] [cursor=pointer]:
+          - /url: https://www.craigslist.org/post/tpa
+          - generic [ref=f227e31]:
+            - generic [ref=f227e32]: ✍
+            - generic [ref=f227e33]: post
+        - link "👤 acct" [ref=f227e34] [cursor=pointer]:
+          - /url: https://www.craigslist.org/account
+          - generic [ref=f227e35]:
+            - generic [ref=f227e36]: 👤
+            - generic [ref=f227e37]: acct
+    - main [ref=f227e38]:
+      - generic:
+        - generic [ref=f227e39]:
+          - generic [ref=f227e41]:
+            - generic [ref=f227e42]: 
+            - textbox "search for sale" [ref=f227e44]: mac mini 32gb
+          - button "" [ref=f227e45] [cursor=pointer]
+          - button "" [ref=f227e47] [cursor=pointer]
+        - generic [ref=f227e49]:
+          - generic [ref=f227e50]:
+            - heading "for sale" [level=1] [ref=f227e52] [cursor=pointer]
+            - button "" [ref=f227e53] [cursor=pointer]
+          - generic [ref=f227e105]:
+            - list [ref=f227e106]:
+              - generic [ref=f227e107]:
+                - button "all" [ref=f227e108] [cursor=pointer]
+                - button "owner" [ref=f227e110] [cursor=pointer]
+                - button "dealer" [ref=f227e112] [cursor=pointer]
+            - generic [ref=f227e114]:
+              - generic [ref=f227e115] [cursor=pointer]:
+                - checkbox "search titles only" [ref=f227e116]
+                - text: search titles only
+              - generic [ref=f227e117] [cursor=pointer]:
+                - checkbox "has image" [ref=f227e118]
+                - text: has image
+              - generic [ref=f227e119] [cursor=pointer]:
+                - checkbox "posted today" [ref=f227e120]
+                - text: posted today
+              - generic [ref=f227e121] [cursor=pointer]:
+                - checkbox "hide duplicates" [ref=f227e122]
+                - text: hide duplicates
+            - generic [ref=f227e123]:
+              - generic [ref=f227e124]: miles from location
+              - generic [ref=f227e125]:
+                - textbox "miles" [ref=f227e126]
+                - textbox "from zip" [ref=f227e127]
+                - generic [ref=f227e128] [cursor=pointer]: 
+              - button "use map..." [ref=f227e129] [cursor=pointer]
+            - generic [ref=f227e131]:
+              - generic [ref=f227e132]: price
+              - generic [ref=f227e133] [cursor=pointer]:
+                - checkbox "free" [ref=f227e134]
+                - text: free
+              - generic [ref=f227e140]:
+                - text: $
+                - textbox "min" [ref=f227e141]
+                - text: – $
+                - textbox "max" [ref=f227e142]
+            - button " language of posting" [ref=f227e144] [cursor=pointer]:
+              - generic [ref=f227e145]: 
+              - generic [ref=f227e146]: language of posting
+          - text: 
+          - generic [ref=f227e147]:
+            - button "reset" [ref=f227e148] [cursor=pointer]
+            - button "apply" [ref=f227e150] [cursor=pointer]
+          - generic [ref=f227e56]:
+            - link "safety tips" [ref=f227e57] [cursor=pointer]:
+              - /url: https://www.craigslist.org/about/help/safety
+            - link "prohibited items" [ref=f227e59] [cursor=pointer]:
+              - /url: https://www.craigslist.org/about/prohibited
+            - link "product recalls" [ref=f227e61] [cursor=pointer]:
+              - /url: https://www.craigslist.org/about/recalled_items
+            - link "avoiding scams" [ref=f227e63] [cursor=pointer]:
+              - /url: https://www.craigslist.org/about/help/safety/scams
+      - generic [ref=f227e65]:
+        - generic [ref=f227e66]:
+          - generic [ref=f227e67]:
+            - generic [ref=f227e68]:
+              - button "" [ref=f227e69] [cursor=pointer]
+              - button "" [ref=f227e71] [cursor=pointer]
+              - text: 
+              - button "" [ref=f227e73] [cursor=pointer]
+              - button "" [ref=f227e75] [cursor=pointer]
+            - text: 
+            - generic [ref=f227e77] [cursor=pointer]:
+              - button "relevance" [ref=f227e152]
+              - generic [ref=f227e81]: 
+            - generic [ref=f227e153]:
+              - generic [ref=f227e154]:
+                - button "price" [ref=f227e155] [cursor=pointer]
+                - button "sold by" [ref=f227e157] [cursor=pointer]
+              - text:  
+          - generic [ref=f227e82]:  
+        - text:  
+        - generic [ref=f227e84]:
+          - generic [ref=f227e160]:
+            - paragraph [ref=f227e161]: no results found 🤔
+            - paragraph [ref=f227e162]: "please try the following:"
+            - list [ref=f227e163]:
+              - listitem [ref=f227e164]:
+                - button "search a wider area" [ref=f227e165] [cursor=pointer]
+              - listitem [ref=f227e167]:
+                - button "reset filters" [ref=f227e168] [cursor=pointer]
+              - listitem [ref=f227e170]:
+                - button "save this search" [ref=f227e171] [cursor=pointer]
+                - text: to be notified when new postings are available
+          - generic [ref=f227e85]: ⭐ 
+          - generic [ref=f227e87]:
+            - generic [ref=f227e88]:
+              - link "help" [ref=f227e89] [cursor=pointer]:
+                - /url: https://www.craigslist.org/about/help
+              - link "safety" [ref=f227e91] [cursor=pointer]:
+                - /url: https://www.craigslist.org/about/help/safety
+              - link "privacy" [ref=f227e93] [cursor=pointer]:
+                - /url: https://www.craigslist.org/about/privacy.policy
+              - link "terms" [ref=f227e95] [cursor=pointer]:
+                - /url: https://www.craigslist.org/about/terms.of.use
+              - generic [ref=f227e97]:
+                - link "about" [ref=f227e98] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/about
+                - link "app" [ref=f227e100] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/about/craigslist_app
+                - link "sitemap" [ref=f227e102] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/sitemap/area/tampa
+            - generic [ref=f227e104]: © 2026 craigslist
+        - text:        
+  - text:      

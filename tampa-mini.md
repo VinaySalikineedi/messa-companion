@@ -1,0 +1,960 @@
+- generic [active] [ref=f248e1]:
+  - generic [ref=f248e2]:
+    - banner [ref=f248e3]:
+      - generic [ref=f248e4]:
+        - link " CL" [ref=f248e5] [cursor=pointer]:
+          - /url: https://www.craigslist.org/area/tampa
+          - generic [ref=f248e6]: 
+          - generic [ref=f248e7]: CL
+        - generic [ref=f248e8] [cursor=pointer]:
+          - button "tampa bay" [ref=f248e10]
+          - generic [ref=f248e12]: 
+        - generic [ref=f248e13] [cursor=pointer]:
+          - button "all tampa bay" [ref=f248e15]
+          - generic [ref=f248e17]: 
+        - generic [ref=f248e18] [cursor=pointer]:
+          - button "for sale (all)" [ref=f248e20]
+          - generic [ref=f248e22]: 
+        - generic [ref=f248e23] [cursor=pointer]:
+          - button "all" [ref=f248e25]
+          - generic [ref=f248e27]: 
+      - generic [ref=f248e29]:
+        - text: ⭐ 
+        - link "✍ post" [ref=f248e30] [cursor=pointer]:
+          - /url: https://www.craigslist.org/post/tpa
+          - generic [ref=f248e31]:
+            - generic [ref=f248e32]: ✍
+            - generic [ref=f248e33]: post
+        - link "👤 acct" [ref=f248e34] [cursor=pointer]:
+          - /url: https://www.craigslist.org/account
+          - generic [ref=f248e35]:
+            - generic [ref=f248e36]: 👤
+            - generic [ref=f248e37]: acct
+    - main [ref=f248e38]:
+      - generic:
+        - generic [ref=f248e39]:
+          - generic [ref=f248e41]:
+            - generic [ref=f248e42]: 
+            - textbox "search for sale" [ref=f248e44]: mac mini
+          - button "" [ref=f248e45] [cursor=pointer]
+          - button "" [ref=f248e47] [cursor=pointer]
+        - generic [ref=f248e49]:
+          - generic [ref=f248e50]:
+            - heading "for sale" [level=1] [ref=f248e52] [cursor=pointer]
+            - button "" [ref=f248e53] [cursor=pointer]
+          - generic [ref=f248e105]:
+            - generic [ref=f248e108]:
+              - list [ref=f248e109]:
+                - list [ref=f248e111]:
+                  - listitem [ref=f248e112]:
+                    - link "computers" [ref=f248e113] [cursor=pointer]:
+                      - /url: https://www.craigslist.org/search/area/tampa?cat=sya&query=mac%20mini#search=2~gallery~0
+                    - generic [ref=f248e115]: "3"
+                    - checkbox [checked] [ref=f248e116] [cursor=pointer]
+                  - listitem [ref=f248e117]:
+                    - link "electronics" [ref=f248e118] [cursor=pointer]:
+                      - /url: https://www.craigslist.org/search/area/tampa?cat=ela&query=mac%20mini#search=2~gallery~0
+                    - generic [ref=f248e120]: "2"
+                    - checkbox [checked] [ref=f248e121] [cursor=pointer]
+              - generic [ref=f248e122]:
+                - button "check all" [ref=f248e123]
+                - button "uncheck all" [ref=f248e125] [cursor=pointer]
+            - list [ref=f248e127]:
+              - generic [ref=f248e128]:
+                - button "all" [ref=f248e129] [cursor=pointer]
+                - button "owner" [ref=f248e131] [cursor=pointer]
+                - button "dealer" [ref=f248e133] [cursor=pointer]
+            - generic [ref=f248e135]:
+              - generic [ref=f248e136] [cursor=pointer]:
+                - checkbox "search titles only" [ref=f248e137]
+                - text: search titles only
+              - generic [ref=f248e138] [cursor=pointer]:
+                - checkbox "has image" [ref=f248e139]
+                - text: has image
+              - generic [ref=f248e140] [cursor=pointer]:
+                - checkbox "posted today" [ref=f248e141]
+                - text: posted today
+              - generic [ref=f248e142] [cursor=pointer]:
+                - checkbox "hide duplicates" [ref=f248e143]
+                - text: hide duplicates
+            - generic [ref=f248e144]:
+              - generic [ref=f248e145]: miles from location
+              - generic [ref=f248e146]:
+                - textbox "miles" [ref=f248e147]
+                - textbox "from zip" [ref=f248e148]
+                - generic [ref=f248e149] [cursor=pointer]: 
+              - button "use map..." [ref=f248e150] [cursor=pointer]
+            - generic [ref=f248e152]:
+              - generic [ref=f248e153]: price
+              - generic [ref=f248e154] [cursor=pointer]:
+                - checkbox "free" [ref=f248e155]
+                - text: free
+              - generic [ref=f248e161]:
+                - text: $
+                - textbox "min" [ref=f248e162]
+                - text: – $
+                - textbox "max" [ref=f248e163]
+            - generic [ref=f248e164]:
+              - generic [ref=f248e165]: make and model
+              - textbox [ref=f248e168]
+            - button " condition" [ref=f248e170] [cursor=pointer]:
+              - generic [ref=f248e171]: 
+              - generic [ref=f248e172]: condition
+            - generic [ref=f248e173]:
+              - generic [ref=f248e174] [cursor=pointer]:
+                - checkbox "delivery available" [ref=f248e175]
+                - text: delivery available
+              - generic [ref=f248e176] [cursor=pointer]:
+                - checkbox "cryptocurrency ok" [ref=f248e177]
+                - text: cryptocurrency ok
+            - button " language of posting" [ref=f248e179] [cursor=pointer]:
+              - generic [ref=f248e180]: 
+              - generic [ref=f248e181]: language of posting
+          - text: 
+          - generic [ref=f248e182]:
+            - button "reset" [ref=f248e183] [cursor=pointer]
+            - button "apply" [ref=f248e185] [cursor=pointer]
+          - generic [ref=f248e56]:
+            - link "safety tips" [ref=f248e57] [cursor=pointer]:
+              - /url: https://www.craigslist.org/about/help/safety
+            - link "prohibited items" [ref=f248e59] [cursor=pointer]:
+              - /url: https://www.craigslist.org/about/prohibited
+            - link "product recalls" [ref=f248e61] [cursor=pointer]:
+              - /url: https://www.craigslist.org/about/recalled_items
+            - link "avoiding scams" [ref=f248e63] [cursor=pointer]:
+              - /url: https://www.craigslist.org/about/help/safety/scams
+      - generic [ref=f248e65]:
+        - generic [ref=f248e66]:
+          - generic [ref=f248e67]:
+            - generic [ref=f248e68]:
+              - button "" [ref=f248e69] [cursor=pointer]
+              - button "" [ref=f248e71] [cursor=pointer]
+              - text: 
+              - button "" [ref=f248e73] [cursor=pointer]
+              - button "" [ref=f248e75] [cursor=pointer]
+            - text: 
+            - generic [ref=f248e77] [cursor=pointer]:
+              - button "relevance" [ref=f248e187]
+              - generic [ref=f248e81]: 
+            - generic [ref=f248e188]:
+              - generic [ref=f248e189]:
+                - button "price" [ref=f248e190] [cursor=pointer]
+                - button "condition" [ref=f248e192] [cursor=pointer]
+                - button "sold by" [ref=f248e194] [cursor=pointer]
+              - text:  
+          - generic [ref=f248e82]:
+            - text:  
+            - generic [ref=f248e196]: 1 - 10 of 32
+        - text:  
+        - generic [ref=f248e84]:
+          - text: 🤔
+          - generic [ref=f248e85]: ⭐ 
+          - generic [ref=f248e197]:
+            - generic "Mac Mini M1 8-Core CPU, 8-Core GPU, 2TB SSD, 16GB RAM, 1gb Ethernet" [ref=f248e198]:
+              - generic [ref=f248e199]:
+                - generic [ref=f248e200]:
+                  - link [ref=f248e202] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/zephyrhills-mac-mini-m1-core-cpu-core/7cFhRFgPu4Rbuuq8Vp7LBw
+                    - generic [ref=f248e204]:
+                      - generic [ref=f248e205]:
+                        - text: 
+                        - img "Mac Mini M1 8-Core CPU, 8-Core GPU, 2TB SSD, 16GB RAM, 1gb Ethernet 1" [ref=f248e206]
+                      - generic [ref=f248e208]:
+                        - text: 
+                        - img "Mac Mini M1 8-Core CPU, 8-Core GPU, 2TB SSD, 16GB RAM, 1gb Ethernet 1" [ref=f248e209]
+                    - text:  
+                  - generic [ref=f248e211]:
+                    - generic [ref=f248e212]: •
+                    - generic [ref=f248e213]: •
+                - link "Mac Mini M1 8-Core CPU, 8-Core GPU, 2TB SSD, 16GB RAM, 1gb Ethernet" [ref=f248e214] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/zephyrhills-mac-mini-m1-core-cpu-core/7cFhRFgPu4Rbuuq8Vp7LBw
+                - generic [ref=f248e215]:
+                  - button "" [ref=f248e216] [cursor=pointer]
+                  - generic [ref=f248e218]:
+                    - generic [ref=f248e219]: 8/22
+                    - generic [ref=f248e220]: •
+                    - generic [ref=f248e221]: Zephyrhills
+                  - button "" [ref=f248e222] [cursor=pointer]
+                - generic [ref=f248e224]: $1,200
+            - generic "Mac Mini M1 8-Core CPU, 8-Core GPU, 2TB SSD, 16GB RAM, 1gb Ethernet" [ref=f248e225]:
+              - generic [ref=f248e226]:
+                - generic [ref=f248e227]:
+                  - link [ref=f248e229] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/zephyrhills-mac-mini-m1-core-cpu-core/rNw2dokDxLmPLoWi2djDJn
+                    - generic [ref=f248e231]:
+                      - generic [ref=f248e232]:
+                        - text: 
+                        - img "Mac Mini M1 8-Core CPU, 8-Core GPU, 2TB SSD, 16GB RAM, 1gb Ethernet 1" [ref=f248e233]
+                      - generic [ref=f248e235]:
+                        - text: 
+                        - img "Mac Mini M1 8-Core CPU, 8-Core GPU, 2TB SSD, 16GB RAM, 1gb Ethernet 1" [ref=f248e236]
+                    - text:  
+                  - generic [ref=f248e238]:
+                    - generic [ref=f248e239]: •
+                    - generic [ref=f248e240]: •
+                - link "Mac Mini M1 8-Core CPU, 8-Core GPU, 2TB SSD, 16GB RAM, 1gb Ethernet" [ref=f248e241] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/zephyrhills-mac-mini-m1-core-cpu-core/rNw2dokDxLmPLoWi2djDJn
+                - generic [ref=f248e242]:
+                  - button "" [ref=f248e243] [cursor=pointer]
+                  - generic [ref=f248e245]:
+                    - generic [ref=f248e246]: 8/22
+                    - generic [ref=f248e247]: •
+                    - generic [ref=f248e248]: pasco co
+                  - button "" [ref=f248e249] [cursor=pointer]
+                - generic [ref=f248e251]: $1,350
+            - generic "Dell U2723QE UltraSharp 27\" 4K USB-C Hub Monitor" [ref=f248e252]:
+              - generic [ref=f248e253]:
+                - generic [ref=f248e254]:
+                  - link [ref=f248e256] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/zephyrhills-dell-u2723qe-ultrasharp-27/2zes2pbEF6P7FpBYfLqLcu
+                    - generic [ref=f248e259]:
+                      - text: 
+                      - img "Dell U2723QE UltraSharp 27\" 4K USB-C Hub Monitor 1" [ref=f248e260]
+                    - text:  
+                  - generic [ref=f248e265]:
+                    - generic [ref=f248e266]: •
+                    - generic [ref=f248e267]: •
+                    - generic [ref=f248e268]: •
+                    - generic [ref=f248e269]: •
+                    - generic [ref=f248e270]: •
+                - link "Dell U2723QE UltraSharp 27\" 4K USB-C Hub Monitor" [ref=f248e271] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/zephyrhills-dell-u2723qe-ultrasharp-27/2zes2pbEF6P7FpBYfLqLcu
+                - generic [ref=f248e272]:
+                  - button "" [ref=f248e273] [cursor=pointer]
+                  - generic [ref=f248e275]:
+                    - generic [ref=f248e276]: 8/22
+                    - generic [ref=f248e277]: •
+                    - generic [ref=f248e278]: Zephyrhills
+                  - button "" [ref=f248e279] [cursor=pointer]
+                - generic [ref=f248e281]: $425
+            - generic "iMac (Retina 5K, 27-inch)" [ref=f248e282]:
+              - generic [ref=f248e283]:
+                - generic [ref=f248e284]:
+                  - link [ref=f248e286] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/tampa-imac-retina-5k-27-inch/qUqy7srNqbXP5wxjikfQ14
+                    - generic [ref=f248e289]:
+                      - text: 
+                      - img "iMac (Retina 5K, 27-inch) 1" [ref=f248e290]
+                    - text:  
+                  - generic [ref=f248e302]:
+                    - generic [ref=f248e303]: •
+                    - generic [ref=f248e304]: •
+                    - generic [ref=f248e305]: •
+                    - generic [ref=f248e306]: •
+                    - generic [ref=f248e307]: •
+                    - generic [ref=f248e308]: •
+                    - generic [ref=f248e309]: •
+                    - generic [ref=f248e310]: •
+                    - generic [ref=f248e311]: •
+                    - generic [ref=f248e312]: •
+                    - generic [ref=f248e313]: •
+                    - generic [ref=f248e314]: •
+                - link "iMac (Retina 5K, 27-inch)" [ref=f248e315] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/tampa-imac-retina-5k-27-inch/qUqy7srNqbXP5wxjikfQ14
+                - generic [ref=f248e316]:
+                  - button "" [ref=f248e317] [cursor=pointer]
+                  - generic [ref=f248e319]:
+                    - generic [ref=f248e320]: 8/19
+                    - generic [ref=f248e321]: •
+                    - generic [ref=f248e322]: N TPA/Lutz
+                  - button "" [ref=f248e323] [cursor=pointer]
+                - generic [ref=f248e325]: $185
+            - generic "Ultra slim 14-inch FHD 1080p portable laptop screen extender" [ref=f248e326]:
+              - generic [ref=f248e327]:
+                - generic [ref=f248e328]:
+                  - link [ref=f248e330] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/tampa-ultra-slim-14-inch-fhd-1080p/pkFsPS7pSsmS2R2HgPZPRK
+                    - generic [ref=f248e333]:
+                      - text: 
+                      - img "Ultra slim 14-inch FHD 1080p portable laptop screen extender 1" [ref=f248e334]
+                    - text:  
+                  - generic [ref=f248e340]:
+                    - generic [ref=f248e341]: •
+                    - generic [ref=f248e342]: •
+                    - generic [ref=f248e343]: •
+                    - generic [ref=f248e344]: •
+                    - generic [ref=f248e345]: •
+                    - generic [ref=f248e346]: •
+                - link "Ultra slim 14-inch FHD 1080p portable laptop screen extender" [ref=f248e347] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/tampa-ultra-slim-14-inch-fhd-1080p/pkFsPS7pSsmS2R2HgPZPRK
+                - generic [ref=f248e348]:
+                  - button "" [ref=f248e349] [cursor=pointer]
+                  - generic [ref=f248e351]:
+                    - generic [ref=f248e352]: 8/19
+                    - generic [ref=f248e353]: •
+                    - generic [ref=f248e354]: Tampa / Seminole Heights
+                  - button "" [ref=f248e355] [cursor=pointer]
+                - generic [ref=f248e357]: $70
+            - generic [ref=f248e358]:
+              - text: more from nearby areas (sorted by distance)
+              - button "search a wider area" [ref=f248e359] [cursor=pointer]
+            - generic "OTR Tires for Skid Steer, Telehandler, Backhoe, and More | Best Prices" [ref=f248e361]:
+              - generic [ref=f248e362]:
+                - generic [ref=f248e363]:
+                  - link [ref=f248e365] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/balm-otr-tires-for-skid-steer/133C7JHhJWRnGPrpS47H3P
+                    - generic [ref=f248e368]:
+                      - text: 
+                      - img "OTR Tires for Skid Steer, Telehandler, Backhoe, and More | Best Prices 1" [ref=f248e369]
+                    - text:  
+                  - generic [ref=f248e376]:
+                    - generic [ref=f248e377]: •
+                    - generic [ref=f248e378]: •
+                    - generic [ref=f248e379]: •
+                    - generic [ref=f248e380]: •
+                    - generic [ref=f248e381]: •
+                    - generic [ref=f248e382]: •
+                    - generic [ref=f248e383]: •
+                - link "OTR Tires for Skid Steer, Telehandler, Backhoe, and More | Best Prices" [ref=f248e384] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/balm-otr-tires-for-skid-steer/133C7JHhJWRnGPrpS47H3P
+                - generic [ref=f248e385]:
+                  - button "" [ref=f248e386] [cursor=pointer]
+                  - generic [ref=f248e388]:
+                    - generic [ref=f248e389]: 8/14
+                    - generic [ref=f248e390]: •
+                    - generic [ref=f248e391]: Monster Tires
+                  - button "" [ref=f248e392] [cursor=pointer]
+                - generic [ref=f248e394]: $799
+            - generic "Cat 336 Excavator Thumb LOW HOURS! NO DEF" [ref=f248e395]:
+              - generic [ref=f248e396]:
+                - generic [ref=f248e397]:
+                  - link [ref=f248e399] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/balm-cat-336-excavator-thumb-low-hours/34ajcTdwdmHHQsHwwcdYJC
+                    - img "Cat 336 Excavator Thumb LOW HOURS! NO DEF 1" [ref=f248e400]
+                  - generic [ref=f248e401]: •
+                - link "Cat 336 Excavator Thumb LOW HOURS! NO DEF" [ref=f248e403] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/balm-cat-336-excavator-thumb-low-hours/34ajcTdwdmHHQsHwwcdYJC
+                - generic [ref=f248e404]:
+                  - button "" [ref=f248e405] [cursor=pointer]
+                  - generic [ref=f248e407]:
+                    - generic [ref=f248e408]: 8/16
+                    - generic [ref=f248e409]: •
+                    - generic [ref=f248e410]: hillsborough co
+                  - button "" [ref=f248e411] [cursor=pointer]
+                - generic [ref=f248e413]: $79,500
+            - generic "2020 Next Gen Cat 308" [ref=f248e414]:
+              - generic [ref=f248e415]:
+                - generic [ref=f248e416]:
+                  - link [ref=f248e418] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/seminole-2020-next-gen-cat-308/pMZwvVXXXUPL8Af6K9QC3M
+                    - generic [ref=f248e421]:
+                      - text: 
+                      - img "2020 Next Gen Cat 308 1" [ref=f248e422]
+                    - text:  
+                  - generic [ref=f248e436]:
+                    - generic [ref=f248e437]: •
+                    - generic [ref=f248e438]: •
+                    - generic [ref=f248e439]: •
+                    - generic [ref=f248e440]: •
+                    - generic [ref=f248e441]: •
+                    - generic [ref=f248e442]: •
+                    - generic [ref=f248e443]: •
+                    - generic [ref=f248e444]: •
+                    - generic [ref=f248e445]: •
+                    - generic [ref=f248e446]: •
+                    - generic [ref=f248e447]: •
+                    - generic [ref=f248e448]: •
+                    - generic [ref=f248e449]: •
+                    - generic [ref=f248e450]: •
+                - link "2020 Next Gen Cat 308" [ref=f248e451] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/seminole-2020-next-gen-cat-308/pMZwvVXXXUPL8Af6K9QC3M
+                - generic [ref=f248e452]:
+                  - button "" [ref=f248e453] [cursor=pointer]
+                  - generic [ref=f248e455]:
+                    - generic [ref=f248e456]: 7/27
+                    - generic [ref=f248e457]: •
+                    - generic [ref=f248e458]: pinellas co
+                  - button "" [ref=f248e459] [cursor=pointer]
+                - generic [ref=f248e461]: $1
+            - generic "Mac mini M4 16gb - 512 SSD - Includes Apple Warranty" [ref=f248e462]:
+              - generic [ref=f248e463]:
+                - generic [ref=f248e464]:
+                  - link [ref=f248e466] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/sarasota-mac-mini-m4-16gb-ssd-includes/8pcsfC55r3UQiV7xA5rPLM
+                    - generic [ref=f248e469]:
+                      - text: 
+                      - img "Mac mini M4 16gb - 512 SSD - Includes Apple Warranty 1" [ref=f248e470]
+                    - text:  
+                  - generic [ref=f248e473]:
+                    - generic [ref=f248e474]: •
+                    - generic [ref=f248e475]: •
+                    - generic [ref=f248e476]: •
+                - link "Mac mini M4 16gb - 512 SSD - Includes Apple Warranty" [ref=f248e477] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/sarasota-mac-mini-m4-16gb-ssd-includes/8pcsfC55r3UQiV7xA5rPLM
+                - generic [ref=f248e478]:
+                  - button "" [ref=f248e479] [cursor=pointer]
+                  - generic [ref=f248e481]:
+                    - generic [ref=f248e482]: 8/19
+                    - generic [ref=f248e483]: •
+                    - generic [ref=f248e484]: Sarasota
+                  - button "" [ref=f248e485] [cursor=pointer]
+                - generic [ref=f248e487]: $899
+            - generic "2020 Next Gen Cat 308" [ref=f248e488]:
+              - generic [ref=f248e489]:
+                - generic [ref=f248e490]:
+                  - link [ref=f248e492] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/sarasota-2020-next-gen-cat-308/bUPYbLo9QDoQnDLB6XeJsF
+                    - generic [ref=f248e495]:
+                      - text: 
+                      - img "2020 Next Gen Cat 308 1" [ref=f248e496]
+                    - text:  
+                  - generic [ref=f248e510]:
+                    - generic [ref=f248e511]: •
+                    - generic [ref=f248e512]: •
+                    - generic [ref=f248e513]: •
+                    - generic [ref=f248e514]: •
+                    - generic [ref=f248e515]: •
+                    - generic [ref=f248e516]: •
+                    - generic [ref=f248e517]: •
+                    - generic [ref=f248e518]: •
+                    - generic [ref=f248e519]: •
+                    - generic [ref=f248e520]: •
+                    - generic [ref=f248e521]: •
+                    - generic [ref=f248e522]: •
+                    - generic [ref=f248e523]: •
+                    - generic [ref=f248e524]: •
+                - link "2020 Next Gen Cat 308" [ref=f248e525] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/sarasota-2020-next-gen-cat-308/bUPYbLo9QDoQnDLB6XeJsF
+                - generic [ref=f248e526]:
+                  - button "" [ref=f248e527] [cursor=pointer]
+                  - generic [ref=f248e529]: 7/27
+                  - button "" [ref=f248e531] [cursor=pointer]
+                - generic [ref=f248e533]: $1
+            - generic "Avid MTRX with Added 16 x 8 I/O, HDX Expansion, SPQ Cards" [ref=f248e534]:
+              - generic [ref=f248e535]:
+                - generic [ref=f248e536]:
+                  - link [ref=f248e538] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/clarcona-avid-mtrx-with-added-16-8-o/7UTg2dmmqGRp7hzxoxPmyi
+                    - text:  
+                  - generic [ref=f248e539]:
+                    - generic [ref=f248e540]: •
+                    - generic [ref=f248e541]: •
+                    - generic [ref=f248e542]: •
+                    - generic [ref=f248e543]: •
+                    - generic [ref=f248e544]: •
+                    - generic [ref=f248e545]: •
+                - link "Avid MTRX with Added 16 x 8 I/O, HDX Expansion, SPQ Cards" [ref=f248e546] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/clarcona-avid-mtrx-with-added-16-8-o/7UTg2dmmqGRp7hzxoxPmyi
+                - generic [ref=f248e547]:
+                  - button "" [ref=f248e548] [cursor=pointer]
+                  - generic [ref=f248e550]: 7/29
+                  - button "" [ref=f248e552] [cursor=pointer]
+                - generic [ref=f248e554]: $5,200
+            - generic "Rare Apple Magic Mouse, Battery Powered, A1296 MB829LL/A iMac Mac Mini" [ref=f248e555]:
+              - generic [ref=f248e556]:
+                - generic [ref=f248e557]:
+                  - link [ref=f248e559] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/port-charlotte-rare-apple-magic-mouse/8bTfB7BFaPmn3LWYHiTmkP
+                    - text:  
+                  - generic [ref=f248e560]:
+                    - generic [ref=f248e561]: •
+                    - generic [ref=f248e562]: •
+                    - generic [ref=f248e563]: •
+                    - generic [ref=f248e564]: •
+                    - generic [ref=f248e565]: •
+                - link "Rare Apple Magic Mouse, Battery Powered, A1296 MB829LL/A iMac Mac Mini" [ref=f248e566] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/port-charlotte-rare-apple-magic-mouse/8bTfB7BFaPmn3LWYHiTmkP
+                - generic [ref=f248e567]:
+                  - button "" [ref=f248e568] [cursor=pointer]
+                  - generic [ref=f248e570]:
+                    - generic [ref=f248e571]: 8/22
+                    - generic [ref=f248e572]: •
+                    - generic [ref=f248e573]: Port Charlotte
+                  - button "" [ref=f248e574] [cursor=pointer]
+                - generic [ref=f248e576]: $40
+            - generic "Multi-Condo Sale - 8AM - 12PM LOTS OF GOODS" [ref=f248e577]:
+              - generic [ref=f248e578]:
+                - generic [ref=f248e579]:
+                  - link [ref=f248e581] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/orlando-multi-condo-sale-8am-12pm-lots/kaxNwHwA5cuTCSzjW9Ef3q
+                    - text:  
+                  - generic [ref=f248e582]:
+                    - generic [ref=f248e583]: •
+                    - generic [ref=f248e584]: •
+                    - generic [ref=f248e585]: •
+                    - generic [ref=f248e586]: •
+                    - generic [ref=f248e587]: •
+                    - generic [ref=f248e588]: •
+                    - generic [ref=f248e589]: •
+                    - generic [ref=f248e590]: •
+                    - generic [ref=f248e591]: •
+                - link "Multi-Condo Sale - 8AM - 12PM LOTS OF GOODS" [ref=f248e592] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/orlando-multi-condo-sale-8am-12pm-lots/kaxNwHwA5cuTCSzjW9Ef3q
+                - generic [ref=f248e593]:
+                  - button "" [ref=f248e594] [cursor=pointer]
+                  - generic [ref=f248e596]:
+                    - text: 8/22
+                    - generic [ref=f248e597]: •
+                    - generic [ref=f248e598]: South downtown Orlando
+                  - button "" [ref=f248e599] [cursor=pointer]
+            - generic "Mac mini" [ref=f248e601]:
+              - generic [ref=f248e602]:
+                - generic [ref=f248e603]:
+                  - link [ref=f248e605] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/orlando-mac-mini/dydtUcTmqW3ze3owzhKtUN
+                    - text:  
+                  - generic [ref=f248e606]:
+                    - generic [ref=f248e607]: •
+                    - generic [ref=f248e608]: •
+                - link "Mac mini" [ref=f248e609] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/orlando-mac-mini/dydtUcTmqW3ze3owzhKtUN
+                - generic [ref=f248e610]:
+                  - button "" [ref=f248e611] [cursor=pointer]
+                  - generic [ref=f248e613]:
+                    - generic [ref=f248e614]: 7/17
+                    - generic [ref=f248e615]: •
+                    - generic [ref=f248e616]: Orlando
+                  - button "" [ref=f248e617] [cursor=pointer]
+                - generic [ref=f248e619]: $550
+            - generic "QUEEN MATTRESS SET. QUEEN BED. FULL, TWIN, BEDS. BED FRAMES." [ref=f248e620]:
+              - generic [ref=f248e621]:
+                - generic [ref=f248e622]:
+                  - link [ref=f248e624] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/queen-mattress-set-queen-bed-full-twin/2TLDeZSKovq8hMihhFAVXc
+                    - img "QUEEN MATTRESS SET. QUEEN BED. FULL, TWIN, BEDS. BED FRAMES. 1" [ref=f248e625]
+                  - generic [ref=f248e626]: •
+                - link "QUEEN MATTRESS SET. QUEEN BED. FULL, TWIN, BEDS. BED FRAMES." [ref=f248e628] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/queen-mattress-set-queen-bed-full-twin/2TLDeZSKovq8hMihhFAVXc
+                - generic [ref=f248e629]:
+                  - button "" [ref=f248e630] [cursor=pointer]
+                  - generic [ref=f248e632]:
+                    - generic [ref=f248e633]: 7/31
+                    - generic [ref=f248e634]: •
+                    - generic [ref=f248e635]: Orlando, Florida
+                  - button "" [ref=f248e636] [cursor=pointer]
+                - generic [ref=f248e638]: $100
+            - generic "BOXSPRINGS, BOX SPRING ONLY, QUEEN, FULL, TWIN, NEW" [ref=f248e639]:
+              - generic [ref=f248e640]:
+                - generic [ref=f248e641]:
+                  - link [ref=f248e643] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/orlando-boxsprings-box-spring-only/bm38cZdbwPNc9r3ni3B2VS
+                    - img "BOXSPRINGS, BOX SPRING ONLY, QUEEN, FULL, TWIN, NEW 1" [ref=f248e644]
+                  - generic [ref=f248e645]: •
+                - link "BOXSPRINGS, BOX SPRING ONLY, QUEEN, FULL, TWIN, NEW" [ref=f248e647] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/orlando-boxsprings-box-spring-only/bm38cZdbwPNc9r3ni3B2VS
+                - generic [ref=f248e648]:
+                  - button "" [ref=f248e649] [cursor=pointer]
+                  - generic [ref=f248e651]:
+                    - generic [ref=f248e652]: 7/31
+                    - generic [ref=f248e653]: •
+                    - generic [ref=f248e654]: Orlando, Florida
+                  - button "" [ref=f248e655] [cursor=pointer]
+                - generic [ref=f248e657]: $70
+            - generic "22' Insignia small TV and remote" [ref=f248e658]:
+              - generic [ref=f248e659]:
+                - generic [ref=f248e660]:
+                  - link [ref=f248e662] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/orlando-22-insignia-small-tv-and-remote/bRU6Y77Tew93N3HxJKbppk
+                    - text:  
+                  - generic [ref=f248e663]:
+                    - generic [ref=f248e664]: •
+                    - generic [ref=f248e665]: •
+                    - generic [ref=f248e666]: •
+                    - generic [ref=f248e667]: •
+                    - generic [ref=f248e668]: •
+                - link "22' Insignia small TV and remote" [ref=f248e669] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/orlando-22-insignia-small-tv-and-remote/bRU6Y77Tew93N3HxJKbppk
+                - generic [ref=f248e670]:
+                  - button "" [ref=f248e671] [cursor=pointer]
+                  - generic [ref=f248e673]:
+                    - generic [ref=f248e674]: 4h ago
+                    - generic [ref=f248e675]: •
+                    - generic [ref=f248e676]: ORLANDO
+                  - button "" [ref=f248e677] [cursor=pointer]
+                - generic [ref=f248e679]: $40
+            - generic "2020 Next Gen Cat 308" [ref=f248e680]:
+              - generic [ref=f248e681]:
+                - generic [ref=f248e682]:
+                  - link [ref=f248e684] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/winter-park-2020-next-gen-cat-308/uDBqM8gmBNDYDM4J2CocQ6
+                    - text:  
+                  - generic [ref=f248e685]:
+                    - generic [ref=f248e686]: •
+                    - generic [ref=f248e687]: •
+                    - generic [ref=f248e688]: •
+                    - generic [ref=f248e689]: •
+                    - generic [ref=f248e690]: •
+                    - generic [ref=f248e691]: •
+                    - generic [ref=f248e692]: •
+                    - generic [ref=f248e693]: •
+                    - generic [ref=f248e694]: •
+                    - generic [ref=f248e695]: •
+                    - generic [ref=f248e696]: •
+                    - generic [ref=f248e697]: •
+                    - generic [ref=f248e698]: •
+                    - generic [ref=f248e699]: •
+                - link "2020 Next Gen Cat 308" [ref=f248e700] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/winter-park-2020-next-gen-cat-308/uDBqM8gmBNDYDM4J2CocQ6
+                - generic [ref=f248e701]:
+                  - button "" [ref=f248e702] [cursor=pointer]
+                  - generic [ref=f248e704]: 7/27
+                  - button "" [ref=f248e706] [cursor=pointer]
+                - generic [ref=f248e708]: $1
+            - generic "OEM Apple Power Supply MagSafe MagSafe 2 USB-C Chargers REDUCED!" [ref=f248e709]:
+              - generic [ref=f248e710]:
+                - generic [ref=f248e711]:
+                  - link [ref=f248e713] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/lake-mary-oem-apple-power-supply/9ToFVrJr6JLnjs3Zc6Ybbf
+                    - text:  
+                  - generic [ref=f248e714]:
+                    - generic [ref=f248e715]: •
+                    - generic [ref=f248e716]: •
+                - link "OEM Apple Power Supply MagSafe MagSafe 2 USB-C Chargers REDUCED!" [ref=f248e717] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/lake-mary-oem-apple-power-supply/9ToFVrJr6JLnjs3Zc6Ybbf
+                - generic [ref=f248e718]:
+                  - button "" [ref=f248e719] [cursor=pointer]
+                  - generic [ref=f248e721]:
+                    - generic [ref=f248e722]: 8/21
+                    - generic [ref=f248e723]: •
+                    - generic [ref=f248e724]: Lake Mary
+                  - button "" [ref=f248e725] [cursor=pointer]
+            - generic "2020 Next Gen Cat 308" [ref=f248e727]:
+              - generic [ref=f248e728]:
+                - generic [ref=f248e729]:
+                  - link [ref=f248e731] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/merritt-island-2020-next-gen-cat-308/uAw9PDP3HJMAH6nYZPpwML
+                    - text:  
+                  - generic [ref=f248e732]:
+                    - generic [ref=f248e733]: •
+                    - generic [ref=f248e734]: •
+                    - generic [ref=f248e735]: •
+                    - generic [ref=f248e736]: •
+                    - generic [ref=f248e737]: •
+                    - generic [ref=f248e738]: •
+                    - generic [ref=f248e739]: •
+                    - generic [ref=f248e740]: •
+                    - generic [ref=f248e741]: •
+                    - generic [ref=f248e742]: •
+                    - generic [ref=f248e743]: •
+                    - generic [ref=f248e744]: •
+                    - generic [ref=f248e745]: •
+                    - generic [ref=f248e746]: •
+                - link "2020 Next Gen Cat 308" [ref=f248e747] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/merritt-island-2020-next-gen-cat-308/uAw9PDP3HJMAH6nYZPpwML
+                - generic [ref=f248e748]:
+                  - button "" [ref=f248e749] [cursor=pointer]
+                  - generic [ref=f248e751]: 7/27
+                  - button "" [ref=f248e753] [cursor=pointer]
+                - generic [ref=f248e755]: $1
+            - 'generic "NEW IN BOX: Mini Handheld Backlit Keyboard Mouse Touchpad Multi Media" [ref=f248e756]':
+              - generic [ref=f248e757]:
+                - generic [ref=f248e758]:
+                  - link [ref=f248e760] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/melbourne-new-in-box-mini-handheld/u8bMM1kJwZ4Wd1gitp4JpT
+                    - text:  
+                  - generic [ref=f248e761]:
+                    - generic [ref=f248e762]: •
+                    - generic [ref=f248e763]: •
+                    - generic [ref=f248e764]: •
+                    - generic [ref=f248e765]: •
+                    - generic [ref=f248e766]: •
+                    - generic [ref=f248e767]: •
+                    - generic [ref=f248e768]: •
+                    - generic [ref=f248e769]: •
+                    - generic [ref=f248e770]: •
+                    - generic [ref=f248e771]: •
+                    - generic [ref=f248e772]: •
+                - 'link "NEW IN BOX: Mini Handheld Backlit Keyboard Mouse Touchpad Multi Media" [ref=f248e773] [cursor=pointer]':
+                  - /url: https://www.craigslist.org/view/d/melbourne-new-in-box-mini-handheld/u8bMM1kJwZ4Wd1gitp4JpT
+                - generic [ref=f248e774]:
+                  - button "" [ref=f248e775] [cursor=pointer]
+                  - generic [ref=f248e777]: 8/25
+                  - button "" [ref=f248e779] [cursor=pointer]
+                - generic [ref=f248e781]: $10
+            - generic "Apple Mac mini M4 Pro 24GB RAM 512GB SSD + AppleCare+ + Accessories" [ref=f248e782]:
+              - generic [ref=f248e783]:
+                - generic [ref=f248e784]:
+                  - link [ref=f248e786] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/naples-apple-mac-mini-m4-pro-24gb-ram/tvLzUYzUaFzNLp2aAuUT3t
+                    - text:  
+                  - generic [ref=f248e787]:
+                    - generic [ref=f248e788]: •
+                    - generic [ref=f248e789]: •
+                    - generic [ref=f248e790]: •
+                    - generic [ref=f248e791]: •
+                    - generic [ref=f248e792]: •
+                    - generic [ref=f248e793]: •
+                    - generic [ref=f248e794]: •
+                    - generic [ref=f248e795]: •
+                    - generic [ref=f248e796]: •
+                    - generic [ref=f248e797]: •
+                    - generic [ref=f248e798]: •
+                - link "Apple Mac mini M4 Pro 24GB RAM 512GB SSD + AppleCare+ + Accessories" [ref=f248e799] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/naples-apple-mac-mini-m4-pro-24gb-ram/tvLzUYzUaFzNLp2aAuUT3t
+                - generic [ref=f248e800]:
+                  - button "" [ref=f248e801] [cursor=pointer]
+                  - generic [ref=f248e803]:
+                    - generic [ref=f248e804]: 7/28
+                    - generic [ref=f248e805]: •
+                    - generic [ref=f248e806]: Naples
+                  - button "" [ref=f248e807] [cursor=pointer]
+                - generic [ref=f248e809]: $1,300
+            - generic "Mac Desktop" [ref=f248e810]:
+              - generic [ref=f248e811]:
+                - generic [ref=f248e812]:
+                  - link [ref=f248e814] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/saint-augustine-mac-desktop/mhEASJx73yewd8Ld4Lq6zk
+                    - text:  
+                  - generic [ref=f248e815]:
+                    - generic [ref=f248e816]: •
+                    - generic [ref=f248e817]: •
+                - link "Mac Desktop" [ref=f248e818] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/saint-augustine-mac-desktop/mhEASJx73yewd8Ld4Lq6zk
+                - generic [ref=f248e819]:
+                  - button "" [ref=f248e820] [cursor=pointer]
+                  - generic [ref=f248e822]:
+                    - generic [ref=f248e823]: 7/21
+                    - generic [ref=f248e824]: •
+                    - generic [ref=f248e825]: Saint Augustine
+                  - button "" [ref=f248e826] [cursor=pointer]
+                - generic [ref=f248e828]: $275
+            - generic "2020 Next Gen Cat 308" [ref=f248e829]:
+              - generic [ref=f248e830]:
+                - generic [ref=f248e831]:
+                  - link [ref=f248e833] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/fernandina-beach-2020-next-gen-cat-308/5WegcuiFVHz6cgb2w1aknX
+                    - text:  
+                  - generic [ref=f248e834]:
+                    - generic [ref=f248e835]: •
+                    - generic [ref=f248e836]: •
+                    - generic [ref=f248e837]: •
+                    - generic [ref=f248e838]: •
+                    - generic [ref=f248e839]: •
+                    - generic [ref=f248e840]: •
+                    - generic [ref=f248e841]: •
+                    - generic [ref=f248e842]: •
+                    - generic [ref=f248e843]: •
+                    - generic [ref=f248e844]: •
+                    - generic [ref=f248e845]: •
+                    - generic [ref=f248e846]: •
+                    - generic [ref=f248e847]: •
+                    - generic [ref=f248e848]: •
+                - link "2020 Next Gen Cat 308" [ref=f248e849] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/fernandina-beach-2020-next-gen-cat-308/5WegcuiFVHz6cgb2w1aknX
+                - generic [ref=f248e850]:
+                  - button "" [ref=f248e851] [cursor=pointer]
+                  - generic [ref=f248e853]: 7/27
+                  - button "" [ref=f248e855] [cursor=pointer]
+                - generic [ref=f248e857]: $1
+            - generic "OTR Tires for Skid Steer, Telehandler, Backhoe, and More | Best Prices" [ref=f248e858]:
+              - generic [ref=f248e859]:
+                - generic [ref=f248e860]:
+                  - link [ref=f248e862] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/fernandina-beach-otr-tires-for-skid/qyzgMXxAqzaqYW1udEc5eM
+                    - text:  
+                  - generic [ref=f248e863]:
+                    - generic [ref=f248e864]: •
+                    - generic [ref=f248e865]: •
+                    - generic [ref=f248e866]: •
+                    - generic [ref=f248e867]: •
+                    - generic [ref=f248e868]: •
+                    - generic [ref=f248e869]: •
+                    - generic [ref=f248e870]: •
+                - link "OTR Tires for Skid Steer, Telehandler, Backhoe, and More | Best Prices" [ref=f248e871] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/fernandina-beach-otr-tires-for-skid/qyzgMXxAqzaqYW1udEc5eM
+                - generic [ref=f248e872]:
+                  - button "" [ref=f248e873] [cursor=pointer]
+                  - generic [ref=f248e875]:
+                    - generic [ref=f248e876]: 8/14
+                    - generic [ref=f248e877]: •
+                    - generic [ref=f248e878]: Monster Tires
+                  - button "" [ref=f248e879] [cursor=pointer]
+                - generic [ref=f248e881]: $799
+            - generic "Cat 336 Excavator Thumb LOW HOURS! NO DEF" [ref=f248e882]:
+              - generic [ref=f248e883]:
+                - generic [ref=f248e884]:
+                  - link [ref=f248e886] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/fernandina-beach-cat-336-excavator/eR7qh6v23KEbhWS2j1BtgW
+                    - img "Cat 336 Excavator Thumb LOW HOURS! NO DEF 1" [ref=f248e887]
+                  - generic [ref=f248e888]: •
+                - link "Cat 336 Excavator Thumb LOW HOURS! NO DEF" [ref=f248e890] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/fernandina-beach-cat-336-excavator/eR7qh6v23KEbhWS2j1BtgW
+                - generic [ref=f248e891]:
+                  - button "" [ref=f248e892] [cursor=pointer]
+                  - generic [ref=f248e894]: 8/16
+                  - button "" [ref=f248e896] [cursor=pointer]
+                - generic [ref=f248e898]: $79,500
+            - generic "2020 Next Gen Cat 308" [ref=f248e899]:
+              - generic [ref=f248e900]:
+                - generic [ref=f248e901]:
+                  - link [ref=f248e903] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/miami-2020-next-gen-cat-308/i4QyGXk8oRugB6ZND9Xkzn
+                    - text:  
+                  - generic [ref=f248e904]:
+                    - generic [ref=f248e905]: •
+                    - generic [ref=f248e906]: •
+                    - generic [ref=f248e907]: •
+                    - generic [ref=f248e908]: •
+                    - generic [ref=f248e909]: •
+                    - generic [ref=f248e910]: •
+                    - generic [ref=f248e911]: •
+                    - generic [ref=f248e912]: •
+                    - generic [ref=f248e913]: •
+                    - generic [ref=f248e914]: •
+                    - generic [ref=f248e915]: •
+                    - generic [ref=f248e916]: •
+                    - generic [ref=f248e917]: •
+                    - generic [ref=f248e918]: •
+                - link "2020 Next Gen Cat 308" [ref=f248e919] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/miami-2020-next-gen-cat-308/i4QyGXk8oRugB6ZND9Xkzn
+                - generic [ref=f248e920]:
+                  - button "" [ref=f248e921] [cursor=pointer]
+                  - generic [ref=f248e923]:
+                    - generic [ref=f248e924]: 7/27
+                    - generic [ref=f248e925]: •
+                    - generic [ref=f248e926]: miami / dade county
+                  - button "" [ref=f248e927] [cursor=pointer]
+                - generic [ref=f248e929]: $1
+            - generic "OTR Tires for Skid Steer, Telehandler, Backhoe, and More | Best Prices" [ref=f248e930]:
+              - generic [ref=f248e931]:
+                - generic [ref=f248e932]:
+                  - link [ref=f248e934] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/miami-otr-tires-for-skid-steer/exgRQket86yU2QUPeistYj
+                    - text:  
+                  - generic [ref=f248e935]:
+                    - generic [ref=f248e936]: •
+                    - generic [ref=f248e937]: •
+                    - generic [ref=f248e938]: •
+                    - generic [ref=f248e939]: •
+                    - generic [ref=f248e940]: •
+                    - generic [ref=f248e941]: •
+                    - generic [ref=f248e942]: •
+                - link "OTR Tires for Skid Steer, Telehandler, Backhoe, and More | Best Prices" [ref=f248e943] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/miami-otr-tires-for-skid-steer/exgRQket86yU2QUPeistYj
+                - generic [ref=f248e944]:
+                  - button "" [ref=f248e945] [cursor=pointer]
+                  - generic [ref=f248e947]:
+                    - generic [ref=f248e948]: 8/14
+                    - generic [ref=f248e949]: •
+                    - generic [ref=f248e950]: Monster Tires
+                  - button "" [ref=f248e951] [cursor=pointer]
+                - generic [ref=f248e953]: $799
+            - generic "Cat 336 Excavator Thumb LOW HOURS! NO DEF" [ref=f248e954]:
+              - generic [ref=f248e955]:
+                - generic [ref=f248e956]:
+                  - link [ref=f248e958] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/miami-cat-336-excavator-thumb-low-hours/39ZTPHLvHEVkPfGS6z2rNc
+                    - img "Cat 336 Excavator Thumb LOW HOURS! NO DEF 1" [ref=f248e959]
+                  - generic [ref=f248e960]: •
+                - link "Cat 336 Excavator Thumb LOW HOURS! NO DEF" [ref=f248e962] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/miami-cat-336-excavator-thumb-low-hours/39ZTPHLvHEVkPfGS6z2rNc
+                - generic [ref=f248e963]:
+                  - button "" [ref=f248e964] [cursor=pointer]
+                  - generic [ref=f248e966]:
+                    - generic [ref=f248e967]: 8/16
+                    - generic [ref=f248e968]: •
+                    - generic [ref=f248e969]: miami / dade county
+                  - button "" [ref=f248e970] [cursor=pointer]
+                - generic [ref=f248e972]: $79,500
+            - generic "Commercial Reach-In Freezer Refrigerator" [ref=f248e973]:
+              - generic [ref=f248e974]:
+                - generic [ref=f248e975]:
+                  - link [ref=f248e977] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/hollywood-commercial-reach-in-freezer/swKk8rA7bDneAoY8tvmgHv
+                    - text:  
+                  - generic [ref=f248e978]:
+                    - generic [ref=f248e979]: •
+                    - generic [ref=f248e980]: •
+                    - generic [ref=f248e981]: •
+                    - generic [ref=f248e982]: •
+                    - generic [ref=f248e983]: •
+                    - generic [ref=f248e984]: •
+                    - generic [ref=f248e985]: •
+                    - generic [ref=f248e986]: •
+                    - generic [ref=f248e987]: •
+                    - generic [ref=f248e988]: •
+                    - generic [ref=f248e989]: •
+                    - generic [ref=f248e990]: •
+                    - generic [ref=f248e991]: •
+                    - generic [ref=f248e992]: •
+                    - generic [ref=f248e993]: •
+                    - generic [ref=f248e994]: •
+                    - generic [ref=f248e995]: •
+                    - generic [ref=f248e996]: •
+                    - generic [ref=f248e997]: •
+                    - generic [ref=f248e998]: •
+                    - generic [ref=f248e999]: •
+                    - generic [ref=f248e1000]: •
+                    - generic [ref=f248e1001]: •
+                    - generic [ref=f248e1002]: •
+                - link "Commercial Reach-In Freezer Refrigerator" [ref=f248e1003] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/hollywood-commercial-reach-in-freezer/swKk8rA7bDneAoY8tvmgHv
+                - generic [ref=f248e1004]:
+                  - button "" [ref=f248e1005] [cursor=pointer]
+                  - generic [ref=f248e1007]:
+                    - generic [ref=f248e1008]: 8/14
+                    - generic [ref=f248e1009]: •
+                    - generic [ref=f248e1010]: 100% NEW
+                  - button "" [ref=f248e1011] [cursor=pointer]
+                - generic [ref=f248e1013]: $1,179
+            - generic "2020 Next Gen Cat 308" [ref=f248e1014]:
+              - generic [ref=f248e1015]:
+                - generic [ref=f248e1016]:
+                  - link [ref=f248e1018] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/tallahassee-2020-next-gen-cat-308/8idDSSaitRoJNfUZjxjuwj
+                    - text:  
+                  - generic [ref=f248e1019]:
+                    - generic [ref=f248e1020]: •
+                    - generic [ref=f248e1021]: •
+                    - generic [ref=f248e1022]: •
+                    - generic [ref=f248e1023]: •
+                    - generic [ref=f248e1024]: •
+                    - generic [ref=f248e1025]: •
+                    - generic [ref=f248e1026]: •
+                    - generic [ref=f248e1027]: •
+                    - generic [ref=f248e1028]: •
+                    - generic [ref=f248e1029]: •
+                    - generic [ref=f248e1030]: •
+                    - generic [ref=f248e1031]: •
+                    - generic [ref=f248e1032]: •
+                    - generic [ref=f248e1033]: •
+                - link "2020 Next Gen Cat 308" [ref=f248e1034] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/tallahassee-2020-next-gen-cat-308/8idDSSaitRoJNfUZjxjuwj
+                - generic [ref=f248e1035]:
+                  - button "" [ref=f248e1036] [cursor=pointer]
+                  - generic [ref=f248e1038]: 7/27
+                  - button "" [ref=f248e1040] [cursor=pointer]
+                - generic [ref=f248e1042]: $1
+            - generic "Apple Mac Mini M4 16GB / 256GB | Brand New Condition, Available Today" [ref=f248e1043]:
+              - generic [ref=f248e1044]:
+                - generic [ref=f248e1045]:
+                  - link [ref=f248e1047] [cursor=pointer]:
+                    - /url: https://www.craigslist.org/view/d/miami-apple-mac-mini-m4-16gb-256gb/2E1C7L5bUwWmZKxUgPv22a
+                    - text:  
+                  - generic [ref=f248e1048]:
+                    - generic [ref=f248e1049]: •
+                    - generic [ref=f248e1050]: •
+                    - generic [ref=f248e1051]: •
+                    - generic [ref=f248e1052]: •
+                    - generic [ref=f248e1053]: •
+                    - generic [ref=f248e1054]: •
+                - link "Apple Mac Mini M4 16GB / 256GB | Brand New Condition, Available Today" [ref=f248e1055] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/view/d/miami-apple-mac-mini-m4-16gb-256gb/2E1C7L5bUwWmZKxUgPv22a
+                - generic [ref=f248e1056]:
+                  - button "" [ref=f248e1057] [cursor=pointer]
+                  - generic [ref=f248e1059]:
+                    - generic [ref=f248e1060]: 8/22
+                    - generic [ref=f248e1061]: •
+                    - generic [ref=f248e1062]: Edgewater
+                  - button "" [ref=f248e1063] [cursor=pointer]
+                - generic [ref=f248e1065]: $955
+          - generic [ref=f248e87]:
+            - generic [ref=f248e88]:
+              - link "help" [ref=f248e89] [cursor=pointer]:
+                - /url: https://www.craigslist.org/about/help
+              - link "safety" [ref=f248e91] [cursor=pointer]:
+                - /url: https://www.craigslist.org/about/help/safety
+              - link "privacy" [ref=f248e93] [cursor=pointer]:
+                - /url: https://www.craigslist.org/about/privacy.policy
+              - link "terms" [ref=f248e95] [cursor=pointer]:
+                - /url: https://www.craigslist.org/about/terms.of.use
+              - generic [ref=f248e97]:
+                - link "about" [ref=f248e98] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/about
+                - link "app" [ref=f248e100] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/about/craigslist_app
+                - link "sitemap" [ref=f248e102] [cursor=pointer]:
+                  - /url: https://www.craigslist.org/sitemap/area/tampa
+            - generic [ref=f248e104]: © 2026 craigslist
+        - text:        
+  - text:      

@@ -1,0 +1,105 @@
+
+=== Browser Agent CLI ===
+Type your goal, or 'exit' to quit.
+
+You: Find me a used mac mini 32gb. I live in jacksonville so I want something closer to pick up and try different websites to find this. 
+!!! EXCEPTION !!!
+Traceback (most recent call last):
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/langchain_openai/chat_models/base.py", line 2179, in _agenerate
+    raw_response = await self.async_client.with_raw_response.create(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/openai/_legacy_response.py", line 386, in wrapped
+    return cast(LegacyAPIResponse[R], await func(*args, **kwargs))
+                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/openai/resources/chat/completions/completions.py", line 2907, in create
+    return await self._post(
+           ^^^^^^^^^^^^^^^^^
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/openai/_base_client.py", line 1995, in post
+    return await self.request(cast_to, opts, stream=stream, stream_cls=stream_cls)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/openai/_base_client.py", line 1780, in request
+    raise self._make_status_error_from_response(err.response) from None
+openai.BadRequestError: Error code: 400 - {'error': {'message': 'deepseek/deepseek-v4-flash-latest is not a valid model ID', 'code': 400}, 'user_id': 'user_3IEbjXfhJC8sSY0Yog1JIta75ob'}
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/Users/robocafedesktop/Documents/deepagent/agent.py", line 276, in main
+    session_messages, summary = await agentic_turn(agent, session_messages, user_input)
+                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/robocafedesktop/Documents/deepagent/agent.py", line 175, in agentic_turn
+    messages = await run_stream(agent, messages)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/robocafedesktop/Documents/deepagent/agent.py", line 121, in run_stream
+    async for chunk in agent.astream(
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/langgraph/pregel/main.py", line 3440, in astream
+    async for _ in runner.atick(
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/langgraph/pregel/_runner.py", line 396, in atick
+    await arun_with_retry(
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/langgraph/pregel/_retry.py", line 744, in arun_with_retry
+    return await task.proc.ainvoke(task.input, config)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/langgraph/_internal/_runnable.py", line 756, in ainvoke
+    input = await asyncio.create_task(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/langgraph/_internal/_runnable.py", line 522, in ainvoke
+    ret = await self.afunc(*args, **kwargs)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/langchain/agents/factory.py", line 1537, in amodel_node
+    result = await awrap_model_call_handler(request, _execute_model_async)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/langchain/agents/factory.py", line 430, in composed
+    outer_result = await outer(request, inner_handler)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/deepagents/middleware/filesystem.py", line 3151, in awrap_model_call
+    return await handler(request)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/langchain/agents/factory.py", line 420, in inner_handler
+    inner_result = await inner(req, handler)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/langchain/agents/factory.py", line 430, in composed
+    outer_result = await outer(request, inner_handler)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/deepagents/middleware/subagents.py", line 747, in awrap_model_call
+    return await handler(request)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/langchain/agents/factory.py", line 420, in inner_handler
+    inner_result = await inner(req, handler)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/langchain/agents/factory.py", line 430, in composed
+    outer_result = await outer(request, inner_handler)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/deepagents/middleware/summarization.py", line 1536, in awrap_model_call
+    return await handler(request.override(messages=truncated_messages))
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/langchain/agents/factory.py", line 420, in inner_handler
+    inner_result = await inner(req, handler)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/langchain_anthropic/middleware/prompt_caching.py", line 187, in awrap_model_call
+    return await handler(request)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/langchain/agents/factory.py", line 1505, in _execute_model_async
+    output = await model_.ainvoke(messages)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/langchain_core/runnables/base.py", line 6027, in ainvoke
+    return await self.bound.ainvoke(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/langchain_core/language_models/chat_models.py", line 500, in ainvoke
+    llm_result = await self.agenerate_prompt(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/langchain_core/language_models/chat_models.py", line 1877, in agenerate_prompt
+    return await self.agenerate(
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/langchain_core/language_models/chat_models.py", line 1835, in agenerate
+    raise exceptions[0]
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/langchain_core/language_models/chat_models.py", line 2168, in _agenerate_with_cache
+    result = await self._agenerate(
+             ^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/langchain_openai/chat_models/base.py", line 2184, in _agenerate
+    _handle_openai_bad_request(e)
+  File "/Users/robocafedesktop/Documents/deepagent/venv/lib/python3.12/site-packages/langchain_openai/chat_models/base.py", line 642, in _handle_openai_bad_request
+    raise OpenAIInvalidRequestError(
+langchain_openai.chat_models.base.OpenAIInvalidRequestError: Error code: 400 - {'error': {'message': 'deepseek/deepseek-v4-flash-latest is not a valid model ID', 'code': 400}, 'user_id': 'user_3IEbjXfhJC8sSY0Yog1JIta75ob'}
+During task with name 'model' and id 'dc9fbe5b-a4cf-52c4-e5ff-2b1eb51c2951'
+
+Session memory cleared. Goodbye.

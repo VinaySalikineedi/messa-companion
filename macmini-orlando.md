@@ -1,0 +1,417 @@
+- generic [active] [ref=e1]:
+  - region "Your privacy is our top priority!" [ref=e2]:
+    - generic [ref=e3]:
+      - button "Close" [ref=e4] [cursor=pointer]
+      - generic [ref=e5]:
+        - heading "Your privacy is our top priority!" [level=2] [ref=e6]
+        - generic [ref=e7]:
+          - paragraph [ref=e9]:
+            - text: We only use cookies and similar technologies to enhance your browsing experience, display personalized ads, and provide personalized content. By continuing to use our site, you consent to our use of cookies. Rest assured, you can opt-out at any time by clicking the link below.
+            - link "Cookie Policy" [ref=e10] [cursor=pointer]:
+              - /url: https://eshop.macsales.com/support/privacy-policy
+          - button "Do Not Share My Personal Information" [ref=e12] [cursor=pointer]
+  - generic [ref=e13]:
+    - button "Skip to main content"
+    - generic [ref=e17]:
+      - generic [ref=e19]:
+        - link "Free shipping available on orders $99 & up!" [ref=e21] [cursor=pointer]:
+          - /url: /shop/shipping
+        - link "Get out of this world deals delivered to your inbox!" [ref=e23] [cursor=pointer]:
+          - /url: /shop/macsales_newsletter
+          - text: Get out of this world deals delivered to your inbox!»
+        - link [ref=e25] [cursor=pointer]:
+          - /url: /about-us
+          - paragraph [ref=e26]: Celebrating 35 years of quality gear & expert support!
+        - link "Free shipping available on orders $99 & up!" [ref=e28] [cursor=pointer]:
+          - /url: /shop/shipping
+      - list [ref=e30]:
+        - listitem [ref=e31]:
+          - link [ref=e32] [cursor=pointer]:
+            - /url: /
+            - img "Business Icon" [ref=e34]
+            - text: For Business & More
+            - img "icon arrow" [ref=e37]
+        - listitem [ref=e38]:
+          - 'link "Region: US/Intl icon arrow" [ref=e39] [cursor=pointer]':
+            - /url: /
+            - text: "Region:"
+            - generic [ref=e41]: US/Intl
+            - img "icon arrow" [ref=e44]
+        - listitem [ref=e45]:
+          - link [ref=e46] [cursor=pointer]:
+            - /url: tel:1-800-275-4576
+            - img "Phone Icon" [ref=e47]
+            - text: 1-800-275-4576
+        - listitem [ref=e48]:
+          - 'link "Intl: 1-815-338-8685" [ref=e49] [cursor=pointer]':
+            - /url: tel:1-815-338-8685
+    - generic [ref=e50]:
+      - generic [ref=e53]:
+        - link "OWC" [ref=e55] [cursor=pointer]:
+          - /url: /
+          - img "MacSales.com Powered By OWC" [ref=e57]
+        - generic [ref=e58]:
+          - search [ref=e60]:
+            - group "Site Search" [ref=e61]:
+              - generic [ref=e63]:
+                - generic [ref=e64]: Search MacSales...
+                - textbox "Search MacSales..." [ref=e65]
+                - button "Search" [ref=e66] [cursor=pointer]
+          - navigation [ref=e69]:
+            - list [ref=e70]:
+              - listitem [ref=e71]:
+                - link "Blog" [ref=e72] [cursor=pointer]:
+                  - /url: /blog/
+              - listitem [ref=e76]:
+                - link "Support" [ref=e77] [cursor=pointer]:
+                  - /url: /Service/
+              - listitem [ref=e81]:
+                - link "Account" [ref=e82] [cursor=pointer]:
+                  - /url: /MyAccount/
+              - listitem [ref=e86]:
+                - link "0" [ref=e87] [cursor=pointer]:
+                  - /url: /cart/
+      - navigation "Main Navigation" [ref=e93]:
+        - list [ref=e94]:
+          - listitem [ref=e95] [cursor=pointer]:
+            - generic [ref=e96]: Shop All
+        - list [ref=e101]:
+          - listitem [ref=e102] [cursor=pointer]:
+            - link "Internal Drives" [ref=e103]:
+              - /url: /shop/internal_storage/hard_drives_and_SSD
+          - listitem [ref=e107] [cursor=pointer]:
+            - link "External Drives" [ref=e108]:
+              - /url: /shop/external-storage
+          - listitem [ref=e112] [cursor=pointer]:
+            - link "Apple & Macs" [ref=e113]:
+              - /url: /shop/Apple_Systems/Used/Macs_and_Tablets
+          - listitem [ref=e117] [cursor=pointer]:
+            - link "Docks & Connectivity" [ref=e118]:
+              - /url: /shop/docks
+          - listitem [ref=e122] [cursor=pointer]:
+            - link "Cards & Readers" [ref=e123]:
+              - /url: /shop/memory-cards/atlas
+          - listitem [ref=e127] [cursor=pointer]:
+            - link "Batteries" [ref=e128]:
+              - /url: /shop/Apple/Laptop/Batteries
+          - listitem [ref=e132] [cursor=pointer]:
+            - link "Software & Apps" [ref=e133]:
+              - /url: /shop/software
+          - listitem [ref=e137] [cursor=pointer]:
+            - link "Cables & Adapters" [ref=e138]:
+              - /url: /shop/accessories/cables
+          - listitem [ref=e142] [cursor=pointer]:
+            - link "Memory" [ref=e143]:
+              - /url: /shop/memory
+          - listitem [ref=e147] [cursor=pointer]:
+            - link "PCIe Expansion" [ref=e148]:
+              - /url: /shop/thunderbolt/thunderbolt-expansion
+          - listitem [ref=e152] [cursor=pointer]:
+            - link "Specials & Featured" [ref=e153]:
+              - /url: /shop/specials
+  - main [ref=e157]:
+    - generic [ref=e158]:
+      - img "OWC Memory" [ref=e159]
+      - navigation "Breadcrumb" [ref=e162]:
+        - list [ref=e164]:
+          - listitem [ref=e165]:
+            - link "Home" [ref=e166] [cursor=pointer]:
+              - /url: /
+          - text: »
+          - listitem [ref=e167]:
+            - link "New & Pre-Owned Macs" [ref=e168] [cursor=pointer]:
+              - /url: /shop/Apple_Systems/Used/Macs_and_Tablets
+          - text: »
+          - listitem [ref=e169]: Configure
+      - generic [ref=e170]:
+        - heading "New & Used Mac mini" [level=1] [ref=e171]
+        - paragraph [ref=e172]: The little machine that’s big on performance, your next Mac mini comes fully inspected, certified, and ready for work.
+    - generic [ref=e173]:
+      - list [ref=e175]:
+        - listitem [ref=e176]: 14-day 100% Money-Back Guarantee
+        - listitem [ref=e178]: FREE shipping within the contiguous 48 States
+        - listitem [ref=e180]: Warrantied and backed by OWC's expert support team
+        - listitem [ref=e182]: Add up to 2 years of extended service protection.
+      - list [ref=e188]:
+        - listitem [ref=e189]:
+          - link "Mac-to-School Flash Sale! Stay ahead of the class with doorbuster deals on select Macs. Shop the Savings" [ref=e191] [cursor=pointer]:
+            - /url: /search/?q=Back+to+School+Savings
+            - generic [ref=e192]:
+              - generic [ref=e193]:
+                - heading "Mac-to-School Flash Sale!" [level=2] [ref=e194]
+                - paragraph [ref=e196]: Stay ahead of the class with doorbuster deals on select Macs.
+              - generic [ref=e197]: Shop the Savings
+        - listitem [ref=e200]:
+          - link "Buy Any Mac. Get a Year of Extended Coverage On Us! Total peace of mind, powered by OWC Eclipse. US customers only. Browse Mac Lineup" [ref=e202] [cursor=pointer]:
+            - /url: /shop/Apple_Systems/Used/Macs_and_Tablets
+            - generic [ref=e203]:
+              - generic [ref=e204]:
+                - heading "Buy Any Mac. Get a Year of Extended Coverage On Us!" [level=2] [ref=e205]
+                - paragraph [ref=e207]: Total peace of mind, powered by OWC Eclipse. US customers only.
+              - generic [ref=e208]: Browse Mac Lineup
+      - heading "Select" [level=2] [ref=e211]
+      - tabpanel [ref=e212]:
+        - 'link "Apple Mac mini (M4 Series, Late 2024) (Current Model) Available with: 16GB Memory 256GB SSD Storage 10-Core Apple M4 Processor Apple Silicon M4 10-Core GPU 3 x Thunderbolt 4 Ports Built-in 802.11a/b/g/n/ac/ax Wi-Fi Built-in 10/100/1000BASE-T Gigabit Ethernet Supports up to macOS 26.x Tahoe (Current Version) From $929.00 Configure" [ref=e213] [cursor=pointer]':
+          - /url: https://eshop.macsales.com/configure-my-mac/apple-mac-mini-m4-apple-silicon-late-2024?sku=UAEK1HS3XXXXXXA
+          - generic [ref=e215]:
+            - heading "Apple Mac mini (M4 Series, Late 2024) (Current Model)" [level=3] [ref=e216]
+            - paragraph [ref=e217]: "Available with:"
+            - list [ref=e218]:
+              - listitem [ref=e219]: 16GB Memory
+              - listitem [ref=e220]: 256GB SSD Storage
+              - listitem [ref=e221]: 10-Core Apple M4 Processor
+              - listitem [ref=e222]: Apple Silicon M4 10-Core GPU
+              - listitem [ref=e223]: 3 x Thunderbolt 4 Ports
+              - listitem [ref=e224]: Built-in 802.11a/b/g/n/ac/ax Wi-Fi
+              - listitem [ref=e225]: Built-in 10/100/1000BASE-T Gigabit Ethernet
+              - listitem [ref=e226]: Supports up to macOS 26.x Tahoe (Current Version)
+            - paragraph [ref=e227]: From $929.00
+            - paragraph
+            - generic [ref=e228]: Configure
+        - 'link "Apple Mac mini (M2 Series, Early 2023) Available with: Memory up to 32GB Storage up to 1.0TB SSD Up to 12-Core Apple M2 Pro Processor Up to Apple Silicon M2 Pro 19-Core GPU 2 x Thunderbolt 4 Ports Built-in 802.11a/b/g/n/ac/ax Wi-Fi Built-in 10/100/1000BASE-T Gigabit Ethernet Supports up to macOS 26.x Tahoe (Current Version) From $599.00 Save up to $650.00 Configure" [ref=e229] [cursor=pointer]':
+          - /url: https://eshop.macsales.com/configure-my-mac/apple-mac-mini-apple-silicon-early-2023?sku=UAEJ1FS3XXXXXXA
+          - generic [ref=e231]:
+            - heading "Apple Mac mini (M2 Series, Early 2023)" [level=3] [ref=e232]
+            - paragraph [ref=e233]: "Available with:"
+            - list [ref=e234]:
+              - listitem [ref=e235]: Memory up to 32GB
+              - listitem [ref=e236]: Storage up to 1.0TB SSD
+              - listitem [ref=e237]: Up to 12-Core Apple M2 Pro Processor
+              - listitem [ref=e238]: Up to Apple Silicon M2 Pro 19-Core GPU
+              - listitem [ref=e239]: 2 x Thunderbolt 4 Ports
+              - listitem [ref=e240]: Built-in 802.11a/b/g/n/ac/ax Wi-Fi
+              - listitem [ref=e241]: Built-in 10/100/1000BASE-T Gigabit Ethernet
+              - listitem [ref=e242]: Supports up to macOS 26.x Tahoe (Current Version)
+            - paragraph [ref=e243]: From $599.00
+            - paragraph [ref=e244]: Save up to $650.00
+            - generic [ref=e245]: Configure
+        - 'link "Apple Mac mini (M1 Series, Late 2020) Available with: 16GB Memory 2.0TB SSD Storage 8-Core Apple M1 Processor Apple Silicon M1 8-Core GPU 2 x Thunderbolt 3 / USB 4 Ports Built-in 802.11a/b/g/n/ac Wi-Fi Built-in 10/100/1000BASE-T Gigabit Ethernet Supports up to macOS 26.x Tahoe (Current Version) From $849.00 Save up to $850.00 Configure" [ref=e246] [cursor=pointer]':
+          - /url: https://eshop.macsales.com/configure-my-mac/apple-mac-mini-apple-silicon-late-2020?sku=UAEI1HS7XXXXXXC
+          - generic [ref=e248]:
+            - heading "Apple Mac mini (M1 Series, Late 2020)" [level=3] [ref=e249]
+            - paragraph [ref=e250]: "Available with:"
+            - list [ref=e251]:
+              - listitem [ref=e252]: 16GB Memory
+              - listitem [ref=e253]: 2.0TB SSD Storage
+              - listitem [ref=e254]: 8-Core Apple M1 Processor
+              - listitem [ref=e255]: Apple Silicon M1 8-Core GPU
+              - listitem [ref=e256]: 2 x Thunderbolt 3 / USB 4 Ports
+              - listitem [ref=e257]: Built-in 802.11a/b/g/n/ac Wi-Fi
+              - listitem [ref=e258]: Built-in 10/100/1000BASE-T Gigabit Ethernet
+              - listitem [ref=e259]: Supports up to macOS 26.x Tahoe (Current Version)
+            - paragraph [ref=e260]: From $849.00
+            - paragraph [ref=e261]: Save up to $850.00
+            - generic [ref=e262]: Configure
+        - 'link "Apple Mac mini (Late 2018) Available with: Memory up to 64GB Storage up to 1.0TB SSD 3.2GHz 6-Core Intel Core i7 Processor Intel UHD Graphics 630 4 x Thunderbolt 3 Ports Built-in 802.11a/b/g/n/ac Wi-Fi Built-in 10/100/1000BASE-T Gigabit Ethernet Supports up to macOS 15.x Sequoia From $279.00 Save up to $1,970.00 Configure" [ref=e263] [cursor=pointer]':
+          - /url: https://eshop.macsales.com/configure-my-mac/apple-mac-mini-late-2018?sku=UAEH3HS2XXXXXXC
+          - generic [ref=e265]:
+            - heading "Apple Mac mini (Late 2018)" [level=3] [ref=e266]
+            - paragraph [ref=e267]: "Available with:"
+            - list [ref=e268]:
+              - listitem [ref=e269]: Memory up to 64GB
+              - listitem [ref=e270]: Storage up to 1.0TB SSD
+              - listitem [ref=e271]: 3.2GHz 6-Core Intel Core i7 Processor
+              - listitem [ref=e272]: Intel UHD Graphics 630
+              - listitem [ref=e273]: 4 x Thunderbolt 3 Ports
+              - listitem [ref=e274]: Built-in 802.11a/b/g/n/ac Wi-Fi
+              - listitem [ref=e275]: Built-in 10/100/1000BASE-T Gigabit Ethernet
+              - listitem [ref=e276]: Supports up to macOS 15.x Sequoia
+            - paragraph [ref=e277]: From $279.00
+            - paragraph [ref=e278]: Save up to $1,970.00
+            - generic [ref=e279]: Configure
+      - generic [ref=e280]:
+        - heading "New and Used Mac mini" [level=2] [ref=e281]
+        - paragraph [ref=e283]: Buying a used Mac mini from OWC is wise for anyone looking to save hundreds or even thousands of dollars on a small yet mighty desktop computer. We have various Mac mini models in gently used conditions ready for you to configure. Find one that best suits your needs!
+      - generic [ref=e284]:
+        - heading "Select New & Used Mac mini" [level=2] [ref=e285]
+        - paragraph [ref=e287]:
+          - text: From the latest model and dating back to Late 2009, selecting a used or refurbished Mac mini is a breeze. You can configure your next Mac mini to add more storage and memory or even upgrade the processor. For used Mac minis (2018), you can easily
+          - link "upgrade up to 64GB of memory" [ref=e288] [cursor=pointer]:
+            - /url: /shop/memory/owc/apple-mac-mini/2018
+          - text: . Does the thought of doing an upgrade yourself sound intimidating? Don’t worry. Our step-by-step installation videos will guide you through the process!
+      - generic [ref=e289]:
+        - heading "Is a Used Mac mini Worth Buying?" [level=2] [ref=e290]
+        - generic [ref=e291]:
+          - paragraph [ref=e292]: The short answer is yes, especially if you’re looking for a bargain on a used Mac desktop. Mac minis are versatile computers that can easily handle basic computing tasks, web browsing, and more.
+          - paragraph [ref=e293]: Their small form factor makes them suitable for any room, and most models have HDMI ports, so you can connect an HDTV or use the built-in Bluetooth to stream your favorite podcast or connect a pair of wireless headphones for watching Netflix, YouTube, and more. Also, many of our used Mac mini models have Thunderbolt ports to connect an array of high-speed devices.
+          - paragraph [ref=e294]: You can also use a Mac mini as a home entertainment center. Connect a keyboard, mouse, HDTV, and speakers to watch videos and movies, listen to music, play video games, and more!
+          - paragraph [ref=e295]: Are you a professional on the go? You can take a Mac mini with you everywhere. It can be a great alternative to a laptop, especially for creative professionals that collaborate with clients outside of their working environment. You can enjoy the performance features of a desktop computer with the bonus of added mobility!
+      - generic [ref=e296]:
+        - 'heading "Buying Used from OWC: Never Risky, Always Rewarding" [level=2] [ref=e297]'
+        - generic [ref=e298]:
+          - paragraph [ref=e299]:
+            - text: Your peace of mind is important to us. Every used Mac mini comes with a
+            - strong [ref=e300]:
+              - strong [ref=e301]: hassle-free 30-day return policy
+            - text: . If you change your mind, send it back — no questions asked.
+          - paragraph [ref=e302]:
+            - text: Another key difference between buying a new, refurbished, or used from OWC is our full lineup of upgrades tailor-made for Mac mini. From lifetime guaranteed
+            - link "OWC Memory" [ref=e303] [cursor=pointer]:
+              - /url: /shop/mac-mini
+            - text: to
+            - link "SSDs" [ref=e304] [cursor=pointer]:
+              - /url: /shop/ssd/owc/mac-mini
+            - text: and
+            - link "internal drive upgrades" [ref=e305] [cursor=pointer]:
+              - /url: /shop/internal_storage/hard_drives_and_SSD
+            - text: ","
+            - link "cables" [ref=e306] [cursor=pointer]:
+              - /url: /shop/accessories/cables
+            - text: ","
+            - link "keyboards & mice" [ref=e307] [cursor=pointer]:
+              - /url: /shop/accessories/keyboards-mice
+            - text: ","
+            - link "audio" [ref=e308] [cursor=pointer]:
+              - /url: /shop/audio
+            - text: ", and more, we have you covered with essentials that improve performance and keep your machine going strong. Plus, we’re known for a wide variety of"
+            - link "docks" [ref=e309] [cursor=pointer]:
+              - /url: /shop/docks
+            - text: ","
+            - link "drives" [ref=e310] [cursor=pointer]:
+              - /url: /shop/storage
+            - text: ", and"
+            - link "software solutions" [ref=e311] [cursor=pointer]:
+              - /url: /shop/software
+            - text: designed to improve your Mac experience.
+          - paragraph [ref=e312]:
+            - text: For over 30 years, we’ve earned your trust with the
+            - link "best Mac upgrades" [ref=e313] [cursor=pointer]:
+              - /url: /
+            - text: and exceptional service. When you buy a new or used Mac mini from OWC, you gain access to our award-winning support team for everything from troubleshooting through advanced setup. Reach out today — our team is happy to help.
+      - generic [ref=e314]:
+        - heading "Returns, Support & Upgrades" [level=2] [ref=e315]
+        - generic [ref=e316]:
+          - paragraph [ref=e317]:
+            - text: Your peace of mind is important to us. Every used Mac mini comes with a
+            - strong [ref=e318]: 14-day money-back guarantee
+            - text: . If you change your mind, send it back — no questions asked.
+          - paragraph [ref=e319]:
+            - text: Another key difference between buying a new, refurbished, or used from OWC is our full lineup of upgrades tailor-made for Mac mini. From lifetime guaranteed
+            - link "OWC Memory" [ref=e320] [cursor=pointer]:
+              - /url: /shop/mac-mini
+            - text: to
+            - link "SSDs" [ref=e321] [cursor=pointer]:
+              - /url: /shop/ssd/owc/mac-mini
+            - text: and
+            - link "internal drive upgrades" [ref=e322] [cursor=pointer]:
+              - /url: /shop/internal_storage/hard_drives_and_SSD
+            - text: ","
+            - link "cables" [ref=e323] [cursor=pointer]:
+              - /url: /shop/accessories/cables
+            - text: ","
+            - link "keyboards & mice" [ref=e324] [cursor=pointer]:
+              - /url: /shop/accessories/keyboards-mice
+            - text: ","
+            - link "audio" [ref=e325] [cursor=pointer]:
+              - /url: /shop/audio
+            - text: ", and more, we have you covered with essentials that improve performance and keep your machine going strong. Plus, we’re known for a wide variety of"
+            - link "docks" [ref=e326] [cursor=pointer]:
+              - /url: /shop/docks
+            - text: ","
+            - link "drives" [ref=e327] [cursor=pointer]:
+              - /url: /shop/storage
+            - text: ", and"
+            - link "software solutions" [ref=e328] [cursor=pointer]:
+              - /url: /shop/software
+            - text: designed to improve your Mac experience.
+          - paragraph [ref=e329]:
+            - text: For over 30 years, we’ve earned your trust with the
+            - link "best Mac upgrades" [ref=e330] [cursor=pointer]:
+              - /url: /
+            - text: and exceptional service. When you buy a new or used Mac mini from OWC, you gain access to our award-winning support team for everything from troubleshooting through advanced setup. Reach out today — our team is happy to help.
+  - contentinfo [ref=e331]:
+    - generic [ref=e333]:
+      - link "OWC" [ref=e335] [cursor=pointer]:
+        - /url: /
+      - generic [ref=e338]:
+        - generic [ref=e339]: Helpful Links
+        - list [ref=e340]:
+          - listitem [ref=e341]:
+            - link "About Us" [ref=e342] [cursor=pointer]:
+              - /url: /about-us
+          - listitem [ref=e343]:
+            - link "DIY Install Videos" [ref=e344] [cursor=pointer]:
+              - /url: /installvideos
+          - listitem [ref=e345]:
+            - link "Join our Affiliate Network" [ref=e346] [cursor=pointer]:
+              - /url: /affiliate-program
+          - listitem [ref=e347]:
+            - link "Where to Buy" [ref=e348] [cursor=pointer]:
+              - /url: https://www.owc.com/partners/where-to-buy/
+          - listitem [ref=e349]:
+            - link "Accessibility Statement" [ref=e350] [cursor=pointer]:
+              - /url: /accessibility-statement
+          - listitem [ref=e351]:
+            - link "Sustainability is Good Business" [ref=e352] [cursor=pointer]:
+              - /url: /thinkgreen/
+          - listitem [ref=e353]:
+            - link "Join the OWC Team" [ref=e354] [cursor=pointer]:
+              - /url: /Service/careers/
+          - listitem [ref=e355]:
+            - link "Media+Newsroom" [ref=e356] [cursor=pointer]:
+              - /url: /NewsRoom/
+          - listitem [ref=e357]:
+            - link "Privacy Promise" [ref=e358] [cursor=pointer]:
+              - /url: /support/privacy-policy
+          - listitem [ref=e359]:
+            - link "MacSales.com for Business" [ref=e360] [cursor=pointer]:
+              - /url: /business
+      - generic [ref=e362]:
+        - generic [ref=e363]: Join the OWC Newsletter
+        - paragraph [ref=e365]: Join hundreds-of-thousands of tech enthusiasts across the planet and gain access to specials, clearance, and holiday savings on the OWC upgrades, drives, and docks everyone loves.
+        - group "Newsletter Subscription" [ref=e367]:
+          - generic [ref=e369]:
+            - generic [ref=e370]:
+              - generic [ref=e371]: email address
+              - textbox "email address" [ref=e372]
+            - button "Subscribe" [ref=e373] [cursor=pointer]
+        - list [ref=e374]:
+          - listitem [ref=e375]:
+            - link "facebook new window link" [ref=e376] [cursor=pointer]:
+              - /url: https://www.facebook.com/PoweredbyOWC/
+          - listitem [ref=e379]:
+            - link "instagram new window link" [ref=e380] [cursor=pointer]:
+              - /url: https://www.instagram.com/poweredbyOWC/
+          - listitem [ref=e383]:
+            - link "youtube new window link" [ref=e384] [cursor=pointer]:
+              - /url: https://www.youtube.com/user/OWCmacsales
+          - listitem [ref=e387]:
+            - link "x new window link" [ref=e388] [cursor=pointer]:
+              - /url: https://x.com/PoweredbyOWC
+          - listitem [ref=e391]:
+            - link "linkedin new window link" [ref=e392] [cursor=pointer]:
+              - /url: https://www.linkedin.com/company/other-world-computing/
+          - listitem [ref=e393]:
+            - link "pinterest new window link" [ref=e394] [cursor=pointer]:
+              - /url: https://www.pinterest.com/owcmacsales/
+    - list [ref=e401]:
+      - listitem [ref=e402]:
+        - img "bizrate" [ref=e403]
+      - listitem [ref=e404]:
+        - img "better business bureau" [ref=e405]
+    - generic [ref=e407]:
+      - generic [ref=e408]:
+        - text: © 2000-2026 Other World Computing, Inc., All Rights Reserved.
+        - link "Site Terms" [ref=e410] [cursor=pointer]:
+          - /url: /support/site-terms
+        - generic [ref=e411]:
+          - text: "Guest ID: 213470753"
+          - link "Your Privacy Choices" [ref=e412] [cursor=pointer]:
+            - /url: javascript:void(0)
+      - link "Accepted payment methods" [ref=e413] [cursor=pointer]:
+        - /url: /support/terms-and-conditions-of-sale#s4
+        - list [ref=e414]:
+          - listitem [ref=e415]
+          - listitem [ref=e416]
+          - listitem [ref=e417]
+          - listitem [ref=e418]
+          - listitem [ref=e419]
+          - listitem [ref=e420]
+          - listitem [ref=e421]
+          - listitem [ref=e422]
+  - generic [ref=e424]:
+    - button [ref=e425] [cursor=pointer]:
+      - paragraph [ref=e429]:
+        - strong [ref=e431]: 6000MB/s PortableGiveaway
+    - button "Close teaser" [ref=e433] [cursor=pointer]
+  - button "Hello, have a question? Let’s chat." [ref=e437] [cursor=pointer]
