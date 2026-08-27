@@ -177,12 +177,11 @@ def _build_system_prompt(user: config.UserContext) -> str:
     live_view_str = ""
     if user.live_view_share_url:
         live_view_str = (
-            f" Specifically for deepsearch: every single time you delegate to it, include "
-            f"this exact link in that same acknowledgment so the user can watch the browser "
-            f"live -- {user.live_view_share_url} -- e.g. \"Checking that now, watch it live "
-            f"here: {user.live_view_share_url}\". It's always the same link for this user, "
-            f"so it's fine (expected, even) to send it again on every deepsearch delegation, "
-            f"not just the first."
+            " Specifically for deepsearch: your acknowledgment before delegating to it can "
+            "just be a short, natural line about what you're checking -- don't try to write "
+            "out a URL yourself. The system automatically appends the user's live-view link "
+            "to that same message right before it's sent, every single time, so you never "
+            "need to type, remember, or repeat the link -- just say what you're about to do."
         )
 
     return (

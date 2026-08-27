@@ -142,6 +142,22 @@ sendblue add-contact +1YOURNUMBER   # verify yourself as a contact first
   as a second text once the delegation finishes -- matching how a person
   actually texts, and the reason live-view links (or any other "starting
   this now" message) actually reach your phone in time to be useful.
+- **The live-view link is attached in code now, not written by the model.**
+  The fix above still wasn't enough on its own -- a real run showed the
+  model trailing off mid-sentence ("I'll look for gaming desks around $150
+  -- checking a") right as it fired the deepsearch tool call, before ever
+  reaching the link. That's not a streaming bug (`stream_mode="updates"`
+  only ever hands back complete messages, never partial tokens) -- it was
+  genuinely the entire, final `content` the model chose to generate before
+  switching into tool-call mode. Trusting a model to reliably finish a
+  sentence *and* reproduce a URL correctly, every time, right before a tool
+  call, isn't reliable enough for something that should always be there.
+  Messa is no longer asked to write the link into her own text at all;
+  `run_turn` now reports whenever a message carries a deepsearch delegation
+  (even one with no acknowledgment text at all), and `run_message` appends
+  "Watch it live: `<link>`" to whatever she said -- or sends it as its own
+  short message if she said nothing -- guaranteed correct and complete
+  every time, independent of the model's phrasing.
 
 Reminders/cron jobs still just log "this would fire" (see
 `messa/background.py`, unchanged this round) rather than proactively

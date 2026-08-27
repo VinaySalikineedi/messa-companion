@@ -56,19 +56,28 @@ async def run_turn(agent, messages: list[dict], on_ai_message=None) -> list[dict
     runs -- see messa/console.py's module docstring for why that's more
     reliable here than parsing nested LangGraph subgraph stream events.
 
-    on_ai_message: optional async callback(text: str), awaited inline for
-    *every* AI message with content the moment it's produced -- not just
-    the turn's final one. The CLI doesn't need this (the terminal already
-    shows every one live via console.agent_say below, which always runs
-    regardless of this callback); it exists for run_message/the Sendblue
-    webhook path, so an acknowledgment like "Checking that now, watch it
-    live here: <link>" sent before a deepsearch delegation actually reaches
-    the user's phone as its own text the moment Messa says it, instead of
-    only ever showing up in the server log while just the turn's last
-    message gets texted (see run_message's docstring for the bug this
-    fixes). Awaited inline (not fire-and-forget) so the ack is confirmed
-    sent to Sendblue before the graph moves on to the possibly-long-running
-    delegation that follows it.
+    on_ai_message: optional async callback(text: str, delegating_to: str | None),
+    awaited inline for every AI message *or* delegation the moment it's
+    produced -- not just the turn's final message. The CLI doesn't need
+    this (the terminal already shows everything live via console.agent_say/
+    console.delegation below, which always run regardless of this
+    callback); it exists for run_message/the Sendblue webhook path, so an
+    acknowledgment before a subagent delegation actually reaches the user's
+    phone as its own text the moment Messa says it, instead of only ever
+    showing up in the server log while just the turn's last message gets
+    texted (see run_message's docstring for the bug this fixes). Awaited
+    inline (not fire-and-forget) so the ack is confirmed sent to Sendblue
+    before the graph moves on to the possibly-long-running delegation that
+    follows it.
+
+    `delegating_to` is the subagent_type ("deepsearch", etc.) if this exact
+    message also carries a `task` tool call, else None -- fired even when
+    `text` is empty (the model went straight to the tool call with no
+    acknowledgment at all), because run_message needs to know about a
+    deepsearch delegation regardless of whether the model said anything,
+    to attach the live-view link itself rather than trusting the model to
+    write a correct, complete URL into its own free-form text (see
+    run_message's docstring for why that trust turned out to be misplaced).
     """
     final_messages = list(messages)
     async for chunk in agent.astream(
@@ -82,17 +91,20 @@ async def run_turn(agent, messages: list[dict], on_ai_message=None) -> list[dict
             for m in update.get("messages", []):
                 content = getattr(m, "content", "")
                 tool_calls = getattr(m, "tool_calls", None) or []
+                delegating_to = None
                 for tc in tool_calls:
                     if tc.get("name") == "task":
                         args = tc.get("args", {})
-                        console.delegation(
-                            "messa", args.get("subagent_type", "?"), args.get("description", "")
-                        )
-                if content and getattr(m, "type", None) == "ai":
-                    text = content if isinstance(content, str) else str(content)
-                    console.agent_say("messa", text)
+                        subagent_type = args.get("subagent_type", "?")
+                        console.delegation("messa", subagent_type, args.get("description", ""))
+                        delegating_to = subagent_type
+                is_ai = getattr(m, "type", None) == "ai"
+                text = (content if isinstance(content, str) else str(content)) if content else ""
+                if is_ai and (text or delegating_to):
+                    if text:
+                        console.agent_say("messa", text)
                     if on_ai_message:
-                        await on_ai_message(text)
+                        await on_ai_message(text, delegating_to)
                 final_messages.append(m)
     return final_messages
 
@@ -122,20 +134,38 @@ async def run_message(user: config.UserContext, agent, text: str, send=None) -> 
     send: optional async callable(text: str) -> None. When given, it's
     invoked immediately for *every* AI message Messa produces this turn, in
     order -- not just the last one. Without this, a pre-delegation
-    acknowledgment like "Checking that now, watch it live here: <link>"
-    would only ever get logged to the console (via run_turn's own tracing),
-    never actually reach the user: the caller used to send only whatever
-    this function returned, which is exclusively the turn's *final* AI
-    message -- so over SMS, Messa's live-view link (sent as part of the
-    acknowledgment right before delegating to deepsearch) was silently
-    dropped, and only her post-research summary ever arrived as a text.
-    server.py passes Sendblue's send_message here so each of Messa's
-    utterances goes out as its own SMS the moment she says it, matching how
-    a person actually texts rather than batching everything into one
-    message at the end of a possibly multi-minute browsing task. Each sent
-    message is persisted to message_history as it goes out (not just the
-    final one), so this turn's own interim texts are correctly present in
-    the next turn's conversation history too."""
+    acknowledgment would only ever get logged to the console (via
+    run_turn's own tracing), never actually reach the user: the caller used
+    to send only whatever this function returned, which is exclusively the
+    turn's *final* AI message -- so over SMS, Messa's live-view link (meant
+    to go out as part of the acknowledgment right before delegating to
+    deepsearch) was silently dropped, and only her post-research summary
+    ever arrived as a text. server.py passes Sendblue's send_message here
+    so each of Messa's utterances goes out as its own SMS the moment she
+    says it, matching how a person actually texts rather than batching
+    everything into one message at the end of a possibly multi-minute
+    browsing task. Each sent message is persisted to message_history as it
+    goes out (not just the final one), so this turn's own interim texts are
+    correctly present in the next turn's conversation history too.
+
+    The live-view link itself is attached here in code, not by the model:
+    an earlier version had the system prompt tell Messa to write the exact
+    URL into her own acknowledgment sentence, which mostly worked but
+    failed exactly the way free-text LLM output eventually always does --
+    a real run trailed off mid-sentence ("checking a") right as the model
+    fired its tool call, before ever reaching the link. stream_mode
+    "updates" only ever hands back complete messages, never partial
+    tokens, so that wasn't a streaming/truncation bug in this code -- it
+    was genuinely the full, final `content` the model chose to generate for
+    that turn. Trusting a model to reliably finish a sentence *and*
+    reproduce a URL correctly, every single time, right before it switches
+    into tool-call mode, isn't reliable enough for something that's
+    supposed to always be there. So the model is no longer asked to write
+    the link at all (see agents/registry.py) -- run_turn instead tells us
+    whenever a message carries a deepsearch delegation (`delegating_to`,
+    fired even when the model said nothing at all), and the link is
+    appended deterministically below, guaranteed correct and complete
+    regardless of what the model's own text looks like."""
     recent = await db.get_recent_messages(user.user_id, limit=20)
     history = [{"role": r["role"], "content": r["content"]} for r in recent]
     history.append({"role": "user", "content": text})
@@ -143,7 +173,13 @@ async def run_message(user: config.UserContext, agent, text: str, send=None) -> 
 
     sent_texts: list[str] = []
 
-    async def _on_ai_message(msg_text: str) -> None:
+    async def _on_ai_message(msg_text: str, delegating_to: str | None = None) -> None:
+        share_url = user.live_view_share_url
+        if delegating_to == "deepsearch" and share_url and share_url not in msg_text:
+            link_line = f"Watch it live: {share_url}"
+            msg_text = f"{msg_text.rstrip()} {link_line}" if msg_text.strip() else link_line
+        if not msg_text:
+            return  # nothing to say and no link to attach -- e.g. a silent, non-deepsearch delegation
         sent_texts.append(msg_text)
         await db.append_message(user.user_id, "assistant", msg_text, channel=user.channel)
         if send:
