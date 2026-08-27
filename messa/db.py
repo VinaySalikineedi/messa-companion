@@ -24,7 +24,26 @@ _pool: Optional[asyncpg.Pool] = None
 async def get_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
-        _pool = await asyncpg.create_pool(config.DATABASE_URL, min_size=1, max_size=5)
+        # statement_cache_size=0: your DATABASE_URL points at Neon's pooled
+        # endpoint (the "-pooler" host), which is PgBouncer in transaction-
+        # pooling mode -- a single asyncpg "connection" can be multiplexed
+        # across different physical Postgres backends between queries.
+        # asyncpg's default behavior is to server-side-prepare and cache
+        # each unique query per connection; with PgBouncer in the middle
+        # (and especially right after a migration's DDL changes a table's
+        # schema underneath an already-open connection), that cached plan
+        # can point at a backend/catalog state that no longer matches,
+        # which is exactly the "cached statement plan is invalid due to a
+        # database schema or configuration change" error you hit. This is
+        # a well-known asyncpg+PgBouncer incompatibility (Neon's own docs
+        # recommend the same fix) -- disabling the cache costs a small
+        # amount of per-query overhead in exchange for never hitting this
+        # again, which matters a lot here since this project's whole
+        # migration philosophy is additive ALTER TABLEs run against the
+        # live database while the app keeps running.
+        _pool = await asyncpg.create_pool(
+            config.DATABASE_URL, min_size=1, max_size=5, statement_cache_size=0,
+        )
     return _pool
 
 
@@ -316,19 +335,40 @@ _column_cache: dict[tuple[str, str], bool] = {}
 
 
 async def _has_column(conn: asyncpg.Connection, table: str, column: str) -> bool:
+    """True is cached forever (an additive migration never removes a
+    column, so that answer can't go stale); False is deliberately NEVER
+    cached, and re-checked on every call instead.
+
+    This asymmetry matters: this whole codebase's migration philosophy is
+    "ship the code, run the migration against the live Neon DB separately"
+    -- meaning there's a real window where the running process's first
+    call here happens *before* you've run that turn's migration. The
+    original version cached whatever it saw first, including False,
+    forever, in a plain in-memory dict with no invalidation -- so a check
+    that ran once before migrations/006_live_view.sql landed would keep
+    reporting "column doesn't exist" for the rest of that process's
+    lifetime even seconds after the migration actually succeeded. That's
+    exactly what caused live-view links to never generate and every
+    /live/<token>/status lookup to 404 even for a token that genuinely
+    existed in the users table -- the app's own belief about the schema
+    was stuck in the past until the next restart. Re-checking on every
+    False is one cheap information_schema query in the (should be brief)
+    window before a migration has run, and free forever after."""
     key = (table, column)
-    if key not in _column_cache:
-        exists = await conn.fetchval(
-            """
-            SELECT EXISTS (
-                SELECT 1 FROM information_schema.columns
-                WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2
-            )
-            """,
-            table, column,
+    if _column_cache.get(key):
+        return True
+    exists = await conn.fetchval(
+        """
+        SELECT EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2
         )
-        _column_cache[key] = bool(exists)
-    return _column_cache[key]
+        """,
+        table, column,
+    )
+    if exists:
+        _column_cache[key] = True
+    return bool(exists)
 
 
 # ---------------------------------------------------------------------------

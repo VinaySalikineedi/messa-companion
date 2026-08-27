@@ -399,6 +399,42 @@ Needs `migrations/006_live_view.sql` (adds `users.live_share_token`,
 no-op-safe like every other migration here; without it, deepsearch still
 works exactly as before, Messa just never has a link to mention).
 
+### Two reliability bugs this feature's testing surfaced (fixed, affect every migration)
+
+Rolling out migration 006 against your live Neon DB while the Space kept
+running exposed two real bugs in `db.py` -- not specific to this feature,
+they'd have bitten *any* future migration the same way:
+
+- **A stale-schema cache that never healed.** `_has_column`/`_has_table`
+  (what every additive migration's "has this been applied yet?" check
+  goes through) cached whatever answer they got *first* -- including
+  "column doesn't exist" -- in a plain in-memory dict with no expiry. If
+  your Space's process made its first check before you'd run that turn's
+  migration against Neon (very possible, since the two happen as separate
+  steps), it would keep insisting the column was missing forever, even
+  seconds after the migration actually succeeded -- only a full restart
+  would make it notice. This is exactly why your live-view link never
+  generated and why a token that genuinely existed in `users` still 404'd
+  at `/status`. Fixed: `True` is still cached forever (a column that
+  exists can't stop existing), but `False` is never cached -- it's
+  cheap to re-check, and it self-heals the instant the migration runs, no
+  restart required.
+- **"cached statement plan is invalid due to a database schema or
+  configuration change"** -- the turn-failure you saw in the logs. Your
+  `DATABASE_URL` points at Neon's pooled endpoint (the `-pooler` host),
+  which is PgBouncer in transaction-pooling mode: a single asyncpg
+  connection can get routed to a different physical Postgres backend
+  between queries, and asyncpg's default server-side statement caching
+  doesn't survive that combined with live DDL (exactly what running a
+  migration against the same DB a running process is using does). This is
+  a known asyncpg+PgBouncer incompatibility -- Neon's own docs recommend
+  the same fix Neon suggests: `get_pool()` now passes
+  `statement_cache_size=0` to `asyncpg.create_pool`.
+
+If you're still seeing either symptom after pulling this update, a Space
+restart clears both a stale connection pool and this process's in-memory
+cache in one shot -- but going forward neither should require one.
+
 ## Changes from your second round of testing
 
 - **Renamed browser_agent -> deepsearch.** Same subagent, new name
