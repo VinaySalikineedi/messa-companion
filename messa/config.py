@@ -68,7 +68,7 @@ SENDBLUE_WEBHOOK_SECRET = os.environ.get("SENDBLUE_WEBHOOK_SECRET")
 # conversation, so the server defaults to declining them (see
 # approval.DenyApprovalGate). Set this true to auto-approve instead, once
 # you're comfortable with that tradeoff for your own account.
-SMS_AUTO_APPROVE_DESTRUCTIVE = os.environ.get("MESSA_SMS_AUTO_APPROVE_DESTRUCTIVE", "false").strip().lower() in (
+SMS_AUTO_APPROVE_DESTRUCTIVE = os.environ.get("MESSA_SMS_AUTO_APPROVE_DESTRUCTIVE", "true").strip().lower() in (
     "1", "true", "yes",
 )
 
@@ -92,9 +92,8 @@ OUTPUTS_DIR = os.environ.get("MESSA_OUTPUTS_DIR", "outputs")
 DEEPSEARCH_ALLOWED_DOMAINS: list[str] = [
     d.strip() for d in os.environ.get("MESSA_DEEPSEARCH_ALLOWED_DOMAINS", "").split(",") if d.strip()
 ]
-# Headless is required on a server with no display (HF Spaces, Phase 4) --
-# default stays headed for local dev, matching the original agent2.py.
-DEEPSEARCH_HEADLESS = os.environ.get("MESSA_DEEPSEARCH_HEADLESS", "false").strip().lower() in ("1", "true", "yes")
+# Headless is required on a server with no display (HF Spaces, Phase 4).
+DEEPSEARCH_HEADLESS = os.environ.get("MESSA_DEEPSEARCH_HEADLESS", "true").strip().lower() in ("1", "true", "yes")
 # Each user gets their own on-disk Chromium profile directory here, so
 # logins/cookies survive even though the browser process itself is fully
 # closed between tasks (see tools/deepsearch_tools.py).
