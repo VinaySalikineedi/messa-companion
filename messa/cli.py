@@ -48,13 +48,27 @@ async def _load_user_context(channel: str = "cli") -> config.UserContext:
     return await load_user_context(config.DEFAULT_CLI_PHONE, config.DEFAULT_CLI_NAME, channel)
 
 
-async def run_turn(agent, messages: list[dict]) -> list[dict]:
+async def run_turn(agent, messages: list[dict], on_ai_message=None) -> list[dict]:
     """Stream one agent turn, printing Messa's own thoughts and delegations.
 
     Per-tool call/result tracing (including everything a subagent does) is
     printed synchronously by the trace_tool wrapper as each tool actually
     runs -- see messa/console.py's module docstring for why that's more
     reliable here than parsing nested LangGraph subgraph stream events.
+
+    on_ai_message: optional async callback(text: str), awaited inline for
+    *every* AI message with content the moment it's produced -- not just
+    the turn's final one. The CLI doesn't need this (the terminal already
+    shows every one live via console.agent_say below, which always runs
+    regardless of this callback); it exists for run_message/the Sendblue
+    webhook path, so an acknowledgment like "Checking that now, watch it
+    live here: <link>" sent before a deepsearch delegation actually reaches
+    the user's phone as its own text the moment Messa says it, instead of
+    only ever showing up in the server log while just the turn's last
+    message gets texted (see run_message's docstring for the bug this
+    fixes). Awaited inline (not fire-and-forget) so the ack is confirmed
+    sent to Sendblue before the graph moves on to the possibly-long-running
+    delegation that follows it.
     """
     final_messages = list(messages)
     async for chunk in agent.astream(
@@ -75,7 +89,10 @@ async def run_turn(agent, messages: list[dict]) -> list[dict]:
                             "messa", args.get("subagent_type", "?"), args.get("description", "")
                         )
                 if content and getattr(m, "type", None) == "ai":
-                    console.agent_say("messa", content if isinstance(content, str) else str(content))
+                    text = content if isinstance(content, str) else str(content)
+                    console.agent_say("messa", text)
+                    if on_ai_message:
+                        await on_ai_message(text)
                 final_messages.append(m)
     return final_messages
 
@@ -90,9 +107,9 @@ def last_ai_text(messages: list) -> str:
     return ""
 
 
-async def run_message(user: config.UserContext, agent, text: str) -> str:
+async def run_message(user: config.UserContext, agent, text: str, send=None) -> str:
     """One full, stateless turn for `user`: loads recent DB history for
-    context, runs it, persists both sides, returns the reply text.
+    context, runs it, persists both sides, returns the final reply text.
 
     This is what the Sendblue webhook server uses -- each inbound webhook
     is its own HTTP request with no long-lived process holding conversation
@@ -100,18 +117,47 @@ async def run_message(user: config.UserContext, agent, text: str) -> str:
     in-memory `history` list (plus a local session_store transcript) across
     the whole run. Loading from db.get_recent_messages() here means both
     paths ultimately draw on the same durable history, they just do it
-    differently."""
+    differently.
+
+    send: optional async callable(text: str) -> None. When given, it's
+    invoked immediately for *every* AI message Messa produces this turn, in
+    order -- not just the last one. Without this, a pre-delegation
+    acknowledgment like "Checking that now, watch it live here: <link>"
+    would only ever get logged to the console (via run_turn's own tracing),
+    never actually reach the user: the caller used to send only whatever
+    this function returned, which is exclusively the turn's *final* AI
+    message -- so over SMS, Messa's live-view link (sent as part of the
+    acknowledgment right before delegating to deepsearch) was silently
+    dropped, and only her post-research summary ever arrived as a text.
+    server.py passes Sendblue's send_message here so each of Messa's
+    utterances goes out as its own SMS the moment she says it, matching how
+    a person actually texts rather than batching everything into one
+    message at the end of a possibly multi-minute browsing task. Each sent
+    message is persisted to message_history as it goes out (not just the
+    final one), so this turn's own interim texts are correctly present in
+    the next turn's conversation history too."""
     recent = await db.get_recent_messages(user.user_id, limit=20)
     history = [{"role": r["role"], "content": r["content"]} for r in recent]
     history.append({"role": "user", "content": text})
     await db.append_message(user.user_id, "user", text, channel=user.channel)
 
-    final = await run_turn(agent, history)
+    sent_texts: list[str] = []
 
-    reply = last_ai_text(final)
-    if reply:
-        await db.append_message(user.user_id, "assistant", reply, channel=user.channel)
-    return reply
+    async def _on_ai_message(msg_text: str) -> None:
+        sent_texts.append(msg_text)
+        await db.append_message(user.user_id, "assistant", msg_text, channel=user.channel)
+        if send:
+            await send(msg_text)
+
+    final = await run_turn(agent, history, on_ai_message=_on_ai_message)
+
+    if sent_texts:
+        return sent_texts[-1]
+
+    # _on_ai_message above never fired at all -- the turn produced zero
+    # AI-with-content messages (rare, but possible). Nothing to persist or
+    # send either; last_ai_text(final) will also be "" here.
+    return last_ai_text(final)
 
 
 async def main_async(session_id: str) -> None:

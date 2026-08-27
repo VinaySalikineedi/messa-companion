@@ -123,25 +123,43 @@ async def _process_inbound(from_number: str, content: str, channel: str) -> None
     except SendblueError as e:
         console.system(f"Sendblue: typing indicator failed (non-fatal): {e}")
 
+    async def _send(text: str) -> None:
+        """Passed into cli.run_message as its `send` callback -- called
+        immediately for every AI message Messa produces this turn, not
+        just the last one. This is what actually fixes the missing
+        live-view link: Messa's pre-delegation acknowledgment ("Checking
+        that now, watch it live here: <link>") used to only ever be logged
+        server-side, since the old code waited for the whole turn
+        (including a possibly multi-minute deepsearch run) to finish and
+        texted only its final message. Now each of her utterances goes out
+        as its own SMS the moment she says it -- matching how a person
+        actually texts, and meaning the live link arrives *before* the
+        browsing starts, when it's actually useful."""
+        try:
+            await sendblue.send_message(from_number, text)
+        except SendblueError as e:
+            console.system(f"Sendblue: failed to deliver a message to {from_number}: {e}")
+            return
+        # Re-arm the typing indicator after each text -- Sendblue's own
+        # indicator doesn't persist across a real outbound message, and if
+        # more work follows (e.g. Messa just delegated to deepsearch), the
+        # user should see "typing..." again while that runs rather than
+        # nothing until the next text arrives.
+        try:
+            await sendblue.send_typing_indicator(from_number)
+        except SendblueError:
+            pass
+
     try:
         user = await cli.load_user_context(from_number, name=None, channel=channel)
         agent = await build_orchestrator(user, _approval_gate())
-        reply = await cli.run_message(user, agent, content)
+        await cli.run_message(user, agent, content, send=_send)
     except Exception as e:  # noqa: BLE001 - a webhook background task must never raise unseen
         console.system(f"Sendblue: turn failed for {from_number}: {e}")
-        reply = (
+        await _send(
             "Sorry, something went wrong on my end handling that -- mind trying again "
             "in a moment?"
         )
-
-    if not reply:
-        return
-
-    try:
-        await sendblue.send_message(from_number, reply)
-    except SendblueError as e:
-        console.system(f"Sendblue: failed to deliver reply to {from_number}: {e}")
-        return
 
     try:
         await sendblue.mark_read(from_number)

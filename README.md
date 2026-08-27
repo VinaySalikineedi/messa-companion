@@ -129,8 +129,19 @@ sendblue add-contact +1YOURNUMBER   # verify yourself as a contact first
 - **Users are created/resolved by phone number.** Same `save_profile_info`
   onboarding flow as the CLI, just triggered by whoever's texting in
   instead of `MESSA_CLI_USER_PHONE`.
-
-### Known Phase 2 limitation
+- **Every one of Messa's messages gets texted, not just the turn's last
+  one.** Found via your own report that the live-view link never arrived:
+  the pre-delegation acknowledgment ("Checking that now, watch it live
+  here: <link>") was being generated and logged correctly, but the old
+  code waited for the *entire* turn -- including a possibly multi-minute
+  deepsearch run -- to finish, then texted only its final AI message.
+  `cli.run_turn`/`run_message` now take an `on_ai_message`/`send` callback
+  that fires immediately for each AI message as it's produced, so an
+  acknowledgment goes out as its own SMS the moment Messa says it (and the
+  typing indicator re-arms after it), with the eventual summary following
+  as a second text once the delegation finishes -- matching how a person
+  actually texts, and the reason live-view links (or any other "starting
+  this now" message) actually reach your phone in time to be useful.
 
 Reminders/cron jobs still just log "this would fire" (see
 `messa/background.py`, unchanged this round) rather than proactively
