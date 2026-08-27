@@ -43,9 +43,12 @@ server-generated-but-ultimately-model-influenced text can inject anything.
 """
 from __future__ import annotations
 
+import os
+
 # "The variable you can change" (see module docstring): pick which skin
 # renders by default when a live link is opened with no ?style= override.
-LIVE_VIEW_STYLE = "polished"  # "polished" | "terminal"
+# Reads MESSA_LIVE_VIEW_STYLE / LIVE_VIEW_STYLE environment variable if set.
+LIVE_VIEW_STYLE = os.environ.get("MESSA_LIVE_VIEW_STYLE", os.environ.get("LIVE_VIEW_STYLE", "terminal")).strip().lower()  # "polished" | "terminal"
 
 _VALID_STYLES = ("polished", "terminal")
 
@@ -61,8 +64,8 @@ BROWSER_VIEWPORT_HEIGHT = 800
 
 def render_live_view_page(token: str, style: str | None = None) -> str:
     resolved_style = style if style in _VALID_STYLES else LIVE_VIEW_STYLE
-    return f"""<!doctype html>
-<html lang="en" data-style="{resolved_style}">
+    html = """<!doctype html>
+<html lang="en" data-style="__RESOLVED_STYLE__">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -413,9 +416,9 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
   <footer>textmessa.com &middot; this link is permanent, bookmark it</footer>
 
 <script>
-(function () {{
-  var TOKEN = "{token}";
-  var VIDEO_RATIO = {BROWSER_VIEWPORT_WIDTH} / {BROWSER_VIEWPORT_HEIGHT};
+(function () {
+  var TOKEN = "__TOKEN__";
+  var VIDEO_RATIO = __VIEWPORT_WIDTH__ / __VIEWPORT_HEIGHT__;
   var MIN_LOG_HEIGHT = 90;   // px always left for the chain-of-thought log,
                               // even on a short window, so the video never
                               // squeezes it away entirely
@@ -579,8 +582,14 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
   }}
 
   poll();
-}})();
+})();
 </script>
 </body>
 </html>
 """
+    return (
+        html.replace("__RESOLVED_STYLE__", resolved_style)
+        .replace("__TOKEN__", token)
+        .replace("__VIEWPORT_WIDTH__", str(BROWSER_VIEWPORT_WIDTH))
+        .replace("__VIEWPORT_HEIGHT__", str(BROWSER_VIEWPORT_HEIGHT))
+    )

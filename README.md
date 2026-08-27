@@ -754,6 +754,73 @@ This is separate from (and doesn't fix) the empty-promise bug above --
 this only matters once a delegation actually happens -- but it's a real
 gap your question surfaced, so it's fixed alongside it.
 
+### The empty-promise bug is now caught structurally, not just steered away
+
+Even on the stronger orchestrator model, you hit the same failure again:
+"Checking both now -- distance from Jax Beach to the Medtronic spot in
+Jacksonville, and today's top 3 news. Give me a few." went out, and
+nothing ever followed -- same shape as the bug above, just a different
+instance of it. That's expected, not a regression: the section above was
+explicit that a system-prompt fix "makes the failure less likely... but
+it can't *guarantee* a model never does this again -- it's steering model
+behavior, not fixing a deterministic bug." This is that prediction coming
+true, not the fix failing.
+
+You also asked whether we're bloating Messa with too many tokens, and
+whether trimming history or gating it behind a relevance check would
+help. I measured it rather than guessing: the fixed system prompt plus
+the `task` tool's subagent descriptions plus Messa's own tools come to
+roughly 2,000 tokens on every single turn, regardless of history length.
+20 short SMS-length history messages added maybe another 600-800 tokens
+on top of that -- so a typical turn is somewhere around 3,000-3,500
+tokens total. That's nowhere near context-limit territory for the model
+in use, and well short of where "lost in the middle" effects typically
+start showing up. So: probably not what caused this. I trimmed history
+from 20 to 12 messages anyway (`cli.py`'s `run_message`) since it's free
+and can only reduce how much an older, unrelated exchange competes for
+the model's attention -- but I'd be misleading you if I said it's likely
+to fix this specific failure, so don't expect it to. I'd also recommend
+against the "relevance check" idea: it means running a whole extra model
+call before *every* message just to decide what to include, which adds
+real cost and latency to every single turn to solve a token count that
+isn't actually large -- worse trade, not better.
+
+What I did add is a deterministic backstop, because relying on the prompt
+alone clearly isn't enough by itself. `cli.py`'s `run_turn` now watches
+its own turn as it streams: if the *entire* turn makes zero tool calls
+and the final text matches the same acknowledgment phrasing the system
+prompt tells Messa to use right before a delegation ("checking...",
+"give me a few", "one moment", "on it," etc.), that's a strong signal a
+call was promised and dropped -- so it replays the same messages plus one
+corrective nudge ("your previous reply didn't include the tool call it
+described...") and retries exactly once. The original acknowledgment may
+already have gone out over SMS before this check runs, which is fine --
+it was true when Messa said it, just unfinished; the retry's job is
+making sure the actual delegation (and eventually a real answer) follows
+it, instead of leaving the request silently dropped like you saw. Bounded
+to one retry via an internal `_allow_retry` flag on the recursive call,
+so a model that drops the ball twice in a row doesn't loop forever -- it
+gives up gracefully and still delivers whatever text the model produced
+the second time.
+
+Verified with two tests against the real `create_deep_agent` stack (not a
+hand-rolled fake): one where the retry's nudge succeeds (a fake model
+that drops the tool call on the first call, then includes it after seeing
+the nudge -- confirms the delegation actually fires and a real answer
+reaches the user this time) and one where it doesn't (a fake model that
+never attaches a tool call, proving the retry gives up after exactly one
+attempt rather than hanging). Also re-ran all four of the earlier
+live-link/empty-promise tests to confirm this didn't change any of the
+still-correct, no-retry-needed behavior they cover.
+
+Same honesty caveat as before, though: the stall-detection regex is a
+heuristic matched against the acknowledgment phrasing the prompt asks
+for, not a guarantee it catches every possible phrasing a model might
+use to describe a dropped delegation. It directly catches the exact
+pattern from both real reports so far. If a future instance says
+something a genuinely different way and slips past it, that's the next
+phrase to add to `_STALL_PATTERN` in `cli.py`.
+
 ## Changes from your second round of testing
 
 - **Renamed browser_agent -> deepsearch.** Same subagent, new name

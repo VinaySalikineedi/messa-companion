@@ -7,12 +7,33 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 import sys
 import traceback
+
+from langchain_core.messages import HumanMessage
 
 from . import background, config, console, db, session_store
 from .agents.registry import build_orchestrator
 from .approval import CLIApprovalGate
+
+# Heuristic backstop for the "empty promise" failure mode (see run_turn's
+# docstring): the system prompt explicitly tells Messa to open with a short
+# acknowledgment like "Checking flights now..." or "Give me a few" right
+# before a task-tool call, in the SAME response. When the model produces
+# that acknowledgment but drops the tool call, the phrasing it used is
+# almost always drawn from that exact instruction -- so a reply that (a)
+# matches this and (b) made zero tool calls all turn is a strong signal
+# something was promised but never actually started, not a case of "the
+# reply legitimately needed no tool call." False positives here just cost
+# one extra model call, which is cheap next to leaving the user's actual
+# request silently dropped.
+_STALL_PATTERN = re.compile(
+    r"\b(checking|looking into|give (?:you |me )?(?:a|one) (?:moment|sec|second|few|minute)s?|"
+    r"hold on|one (?:moment|sec|second)|i'?ll (?:check|look|find)|let me (?:check|look|find)|"
+    r"\bon it\b|sending (?:this|that|it) (?:to|over|back)|working on it)\b",
+    re.IGNORECASE,
+)
 
 
 async def load_user_context(
@@ -48,7 +69,9 @@ async def _load_user_context(channel: str = "cli") -> config.UserContext:
     return await load_user_context(config.DEFAULT_CLI_PHONE, config.DEFAULT_CLI_NAME, channel)
 
 
-async def run_turn(agent, messages: list[dict], on_ai_message=None) -> list[dict]:
+async def run_turn(
+    agent, messages: list[dict], on_ai_message=None, _allow_retry: bool = True
+) -> list[dict]:
     """Stream one agent turn, printing Messa's own thoughts and delegations.
 
     Per-tool call/result tracing (including everything a subagent does) is
@@ -78,8 +101,27 @@ async def run_turn(agent, messages: list[dict], on_ai_message=None) -> list[dict
     to attach the live-view link itself rather than trusting the model to
     write a correct, complete URL into its own free-form text (see
     run_message's docstring for why that trust turned out to be misplaced).
-    """
+
+    The "empty promise" failure and its retry: LangChain's ReAct agent loop
+    ends a turn the instant an AI message carries zero tool_calls -- there
+    is no next turn where the model gets to actually make a call it just
+    described in text (e.g. "Checking both now... give me a few"). The
+    system prompt tells Messa not to do this, but that's a probabilistic
+    steer, not a guarantee, and it does still happen. Rather than rely on
+    the prompt alone, this also catches it structurally: if the WHOLE turn
+    made zero tool calls and the final text matches `_STALL_PATTERN` (the
+    exact acknowledgment phrasing the prompt asks Messa to use right before
+    a delegation), that's a strong signal a call was promised and dropped
+    -- so this replays the same messages plus one nudge and retries
+    exactly once (`_allow_retry=False` on the recursive call prevents a
+    loop). The original (broken) acknowledgment may have already reached
+    the user via `on_ai_message` before this check runs, which is fine --
+    it was a true statement of intent, just unfinished; the retry's job is
+    making sure the actual delegation (and eventually a real answer)
+    follows it instead of leaving the user's request silently dropped."""
     final_messages = list(messages)
+    any_tool_call = False
+    last_text = ""
     async for chunk in agent.astream(
         {"messages": messages},
         config={"recursion_limit": config.RECURSION_LIMIT},
@@ -91,6 +133,8 @@ async def run_turn(agent, messages: list[dict], on_ai_message=None) -> list[dict
             for m in update.get("messages", []):
                 content = getattr(m, "content", "")
                 tool_calls = getattr(m, "tool_calls", None) or []
+                if tool_calls:
+                    any_tool_call = True
                 delegating_to = None
                 for tc in tool_calls:
                     if tc.get("name") == "task":
@@ -103,9 +147,28 @@ async def run_turn(agent, messages: list[dict], on_ai_message=None) -> list[dict
                 if is_ai and (text or delegating_to):
                     if text:
                         console.agent_say("messa", text)
+                        last_text = text
                     if on_ai_message:
                         await on_ai_message(text, delegating_to)
                 final_messages.append(m)
+
+    if _allow_retry and not any_tool_call and last_text and _STALL_PATTERN.search(last_text):
+        console.system(
+            "Messa: this reply looked like a dropped delegation (acknowledgment with no "
+            "tool call all turn) -- retrying once with a nudge."
+        )
+        nudge = HumanMessage(
+            content=(
+                "(auto-nudge, not from the user: your previous reply didn't include the "
+                "tool call it described. If you intended to delegate to a subagent just "
+                "now, call it in this response. If you'd already fully answered the "
+                "request, ignore this.)"
+            )
+        )
+        return await run_turn(
+            agent, final_messages + [nudge], on_ai_message=on_ai_message, _allow_retry=False
+        )
+
     return final_messages
 
 
@@ -166,7 +229,17 @@ async def run_message(user: config.UserContext, agent, text: str, send=None) -> 
     fired even when the model said nothing at all), and the link is
     appended deterministically below, guaranteed correct and complete
     regardless of what the model's own text looks like."""
-    recent = await db.get_recent_messages(user.user_id, limit=20)
+    # 12 rather than 20: measured against the real system prompt + tool
+    # schemas (~2,000 tokens fixed, every turn, regardless of history), 20
+    # short SMS-length messages only added another ~600-800 tokens -- not
+    # actually "bloat" in the sense of pushing near a context limit or deep
+    # into "lost in the middle" territory. Trimmed anyway since it's free
+    # (fewer, more recent messages can only reduce the chance of an older,
+    # unrelated exchange distracting a turn) and costs nothing to try, but
+    # this alone isn't expected to fix dropped-delegation replies -- that's
+    # a structural model-behavior issue (see run_turn's retry logic above),
+    # not a context-size one.
+    recent = await db.get_recent_messages(user.user_id, limit=12)
     history = [{"role": r["role"], "content": r["content"]} for r in recent]
     history.append({"role": "user", "content": text})
     await db.append_message(user.user_id, "user", text, channel=user.channel)
