@@ -121,7 +121,7 @@ DEEPSEARCH_ALLOWED_DOMAINS: list[str] = [
 # the orchestrator's own RECURSION_LIMIT -- deep research tasks legitimately
 # need many steps, and hitting this cap is expected/handled (the session is
 # saved and can be resumed) rather than an error condition.
-DEEPSEARCH_MAX_STEPS = int(os.environ.get("MESSA_DEEPSEARCH_MAX_STEPS", "40"))
+DEEPSEARCH_MAX_STEPS = int(os.environ.get("MESSA_DEEPSEARCH_MAX_STEPS", "100"))
 
 # All server-side "now" comparisons (due reminders/cron) use tz-aware UTC
 # datetimes explicitly (datetime.now(timezone.utc)) rather than naive
