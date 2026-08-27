@@ -29,13 +29,13 @@ from typing import Any
 from deepagents import GeneralPurposeSubagentProfile, HarnessProfile, create_deep_agent, register_harness_profile
 from langchain_core.tools import BaseTool, tool
 
-from .. import config, db
+from .. import config, db, timeutil
 from ..approval import ApprovalGate, CLIApprovalGate
 from ..tools.deepsearch_tools import build_deepsearch_subagent
 from ..tools.common import trace_all
 from ..tools.document_tools import DOCUMENT_SYSTEM_PROMPT, build_document_tools
 from ..tools.email_tools import EMAIL_SYSTEM_PROMPT, build_email_tools
-from ..tools.executive_tools import EXECUTIVE_SYSTEM_PROMPT, build_executive_tools
+from ..tools.executive_tools import build_executive_subagent
 from ..tools.routines_tools import ROUTINES_SYSTEM_PROMPT, build_routines_tools
 
 ORCHESTRATOR_LABEL = "messa"
@@ -104,9 +104,23 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
     async def save_profile_info(field: str, value: str) -> str:
         """Save one onboarding field the user just told you: field is 'name', 'email',
         or 'city'. For the optional email step, pass value='skip' if the user doesn't
-        want to share one. This also advances onboarding to the next question."""
+        want to share one. This also advances onboarding to the next question. Also use
+        this any time the user corrects their location later (not just during onboarding)
+        -- it re-resolves their timezone from whatever they give you."""
         row = await db.save_profile_field(uid, field, value)
-        return f"Saved {field}. Onboarding is now at: {row['onboarding_step']}."
+        msg = f"Saved {field}. Onboarding is now at: {row['onboarding_step']}."
+        if field == "city" and value and value.strip().lower() != "skip":
+            if row.get("timezone_confirmed"):
+                msg += f" Resolved timezone: {row['timezone']}."
+            else:
+                msg += (
+                    f" Could NOT confidently determine a single timezone from '{value}' alone "
+                    "(it matches places in more than one timezone, or couldn't be resolved at "
+                    "all) -- ask the user for their zip code, or their city AND state/country, "
+                    "so scheduling, reminders, and anything else time-sensitive land at the "
+                    "correct local time. Do not schedule anything time-sensitive off a guess."
+                )
+        return msg
 
     @tool
     async def list_deepsearch_sessions(status: str | None = None) -> str:
@@ -142,9 +156,14 @@ _ONBOARDING_PROMPTS = {
         "they give you, or save_profile_info('email', 'skip') if they'd rather not share it."
     ),
     "awaiting_location": (
-        "You still need the user's general location (city is enough) so results like "
-        "weather/local search/timezone-aware scheduling are accurate. Ask casually, then "
-        "call save_profile_info('city', ...)."
+        "You still need the user's location so results like weather/local search -- and, "
+        "critically, timezone-correct scheduling/reminders -- are accurate. Ask for their "
+        "city AND state/country, or a zip code if they're in the US, not just a bare city "
+        "name: a name alone can be genuinely ambiguous (there's a Jacksonville in Florida, "
+        "one in North Carolina, one in Illinois -- all different timezones). Then call "
+        "save_profile_info('city', ...) with whatever they give you; if the tool result "
+        "says the timezone couldn't be confidently resolved, ask a follow-up for a zip "
+        "code or a more specific city+state before treating it as settled."
     ),
 }
 
@@ -158,6 +177,14 @@ def _build_system_prompt(user: config.UserContext) -> str:
     if user.city:
         known.append(f"city: {user.city}")
     known_str = ("Known about this user so far -- " + ", ".join(known) + ".\n\n") if known else ""
+
+    # Neither Messa's nor any subagent's system prompt used to state the
+    # actual current date/time or the user's timezone at all -- meaning the
+    # model had zero deterministic anchor for "what time is it right now"
+    # when interpreting anything relative ("tomorrow", "in an hour"). This
+    # is that anchor. See timeutil.current_context_str's docstring for why
+    # it also calls out an unconfirmed default timezone explicitly.
+    time_str = timeutil.current_context_str(user.timezone, user.timezone_confirmed) + "\n\n"
 
     onboarding_str = ""
     if not user.onboarding_complete:
@@ -191,6 +218,7 @@ def _build_system_prompt(user: config.UserContext) -> str:
         "reminders, notes, contacts, calendar), email_agent (the user's own inbox), "
         "document_agent (generates PDFs), routines_agent (recurring automations).\n\n"
         f"{known_str}"
+        f"{time_str}"
         f"{onboarding_str}"
         f"{channel_str}"
         "Responsiveness: delegating to a subagent can take a little while. Before calling "
@@ -233,12 +261,16 @@ def _build_system_prompt(user: config.UserContext) -> str:
         "session id when the new ask is genuinely a fresh, unrelated task. Use "
         "list_deepsearch_sessions if you need to check on or remind yourself of past "
         "research before starting something that might duplicate it.\n\n"
-        "Confirmation flow: executive_assistant and routines_agent can only PROPOSE "
-        "creating/updating/deleting things -- they report back a pending id. You must "
-        "relay that proposal to the user in plain language and get an explicit yes before "
-        "calling confirm_pending_action; call reject_pending_action if they decline or the "
-        "details need to change. Never call confirm_pending_action without the user having "
-        "just said yes to that specific thing.\n\n"
+        "Confirmation flow: only SCHEDULING requires your confirmation -- executive_assistant's "
+        "calendar-event tools and routines_agent's new-recurring-job tool only PROPOSE the "
+        "change and report back a pending id. You must relay that proposal to the user in plain "
+        "language and get an explicit yes before calling confirm_pending_action; call "
+        "reject_pending_action if they decline or the details need to change. Never call "
+        "confirm_pending_action without the user having just said yes to that specific thing. "
+        "Everything else executive_assistant does -- creating/updating/deleting a task or "
+        "reminder, saving a note, adding/removing a contact -- happens immediately with no "
+        "proposal step; when it tells you one of those is done, it's already done, just relay "
+        "it, don't ask for confirmation that was never needed.\n\n"
         "Use track_project when a request looks like it'll span multiple turns or tasks "
         "(e.g. planning a trip, redesigning something), so related work stays grouped.\n\n"
         "Be concise -- responses may be read as a text message. Don't restate a subagent's "
@@ -265,16 +297,7 @@ async def build_orchestrator(
 
     subagents = [
         build_deepsearch_subagent(user, subagent_model, approval_gate),
-        {
-            "name": "executive_assistant",
-            "description": (
-                "Manages tasks, reminders, notes, contacts, and calendar events. Use for "
-                "anything about the user's to-dos, schedule, or personal notes/contacts."
-            ),
-            "system_prompt": EXECUTIVE_SYSTEM_PROMPT,
-            "tools": build_executive_tools(user),
-            "model": subagent_model,
-        },
+        build_executive_subagent(user, subagent_model),
         {
             "name": "email_agent",
             "description": (

@@ -30,19 +30,24 @@ config.py for the tradeoff and how to opt out of the safe default.
 """
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, Header, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from . import cli, config, console, db, live_activity
+from . import background, cli, config, console, db, live_activity
 from .agents.registry import build_orchestrator
 from .approval import AutoApproveGate, DenyApprovalGate
 from .channels import sendblue
 from .channels.sendblue import SendblueError
 from .live_view_page import render_live_view_page
+from .tools.routines_tools import compute_next_run
 
 app = FastAPI(title="Messa Sendblue webhook")
+
+# Populated by `_startup` below, cancelled by `_shutdown`.
+_bg_tasks: list[asyncio.Task] = []
 
 # iMessage/SMS both map to the same subagent behavior today; the distinction
 # is only surfaced to Messa's system prompt as the channel string in case a
@@ -189,6 +194,71 @@ async def _process_inbound(from_number: str, content: str, channel: str) -> None
         pass  # cosmetic only
 
 
+async def _production_reminder_loop() -> None:
+    """The real counterpart to background.py's CLI-only preview poller
+    (which only ever printed to a local terminal, and was never wired into
+    this server at all -- so due reminders were being scheduled correctly
+    in the DB but never actually reaching a real user's phone in
+    production). This one actually delivers via Sendblue, and only marks a
+    reminder sent once delivery succeeds -- a Sendblue failure leaves it
+    pending so the next poll retries it instead of silently losing it."""
+    while True:
+        try:
+            due = await db.get_due_reminders_for_delivery()
+            for r in due:
+                try:
+                    await sendblue.send_message(r["phone_number"], f"Reminder: {r['message']}")
+                except SendblueError as e:
+                    console.system(f"[reminder delivery failed] user={r['user_id']} reminder=#{r['id']}: {e}")
+                    continue
+                await db.mark_reminder_sent(r["id"])
+        except Exception as e:  # noqa: BLE001 - a background loop must never die silently mid-process
+            console.system(f"[reminder poller error] {e}")
+        await asyncio.sleep(background.POLL_INTERVAL_SECONDS)
+
+
+async def _production_cron_loop() -> None:
+    """The real counterpart to background.py's CLI-only cron preview (which
+    only ever printed "would run now"). This re-invokes Messa for real with
+    the job's saved prompt_or_task, using the same load_user_context/
+    build_orchestrator/run_message path a live inbound text would use, and
+    delivers whatever Messa produces via Sendblue -- so a recurring
+    automation (a daily briefing, a weekly check-in) actually happens
+    instead of only ever being provably schedulable."""
+    while True:
+        try:
+            due = await db.get_due_cron_jobs_for_delivery()
+            for job in due:
+                phone = job["phone_number"]
+                try:
+                    user = await cli.load_user_context(phone, channel="sms")
+                    agent = await build_orchestrator(user, _approval_gate())
+
+                    async def _cron_send(text: str, _phone: str = phone) -> None:
+                        await sendblue.send_message(_phone, text)
+
+                    await cli.run_message(user, agent, job["prompt_or_task"], send=_cron_send)
+                except Exception as e:  # noqa: BLE001
+                    console.system(f"[cron delivery failed] job=#{job['id']}: {e}")
+                next_run = compute_next_run(job["cron_expression"], job["user_timezone"])
+                await db.reschedule_cron_job(job["id"], next_run)
+        except Exception as e:  # noqa: BLE001
+            console.system(f"[cron poller error] {e}")
+        await asyncio.sleep(background.POLL_INTERVAL_SECONDS)
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    global _bg_tasks
+    _bg_tasks = [
+        asyncio.create_task(_production_reminder_loop()),
+        asyncio.create_task(_production_cron_loop()),
+    ]
+    console.system("Started production reminder/cron delivery pollers.")
+
+
 @app.on_event("shutdown")
 async def _shutdown() -> None:
+    for t in _bg_tasks:
+        t.cancel()
     await db.close_pool()

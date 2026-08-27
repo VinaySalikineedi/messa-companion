@@ -16,7 +16,7 @@ from typing import Any, Optional
 
 import asyncpg
 
-from . import config
+from . import config, timeutil
 
 _pool: Optional[asyncpg.Pool] = None
 
@@ -62,50 +62,24 @@ def _rows(rs: list[asyncpg.Record]) -> list[dict[str, Any]]:
     return [dict(r) for r in rs]
 
 
-def _parse_dt(value: Any) -> datetime | None:
+def _parse_dt(value: Any, user_tz: str | None = None) -> datetime | None:
     """asyncpg needs real datetime objects for timestamptz columns -- it won't
     parse ISO strings itself (unlike psycopg2). Tool-proposed payloads carry
-    ISO-8601 strings (that's what the LLM produces and what JSON can store),
-    so every applier that touches a timestamptz column runs values through
-    this first."""
-    if value is None or isinstance(value, datetime):
-        return value
-    text = str(value).strip()
-    if not text:
-        return None
-    if text.endswith("Z"):
-        text = text[:-1] + "+00:00"
-    try:
-        dt = datetime.fromisoformat(text)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except ValueError:
-        pass
+    ISO-8601-ish strings (that's what the LLM produces and what JSON can
+    store), so every applier that touches a timestamptz column runs values
+    through this first.
 
-    # Relative/human date parsing fallback
-    now = datetime.now(timezone.utc)
-    lower = text.lower()
-    if lower == "today":
-        return now
-    elif lower == "tomorrow":
-        return now + timedelta(days=1)
-
-    try:
-        from dateutil import parser
-        base = now
-        if "tomorrow" in lower:
-            base = now + timedelta(days=1)
-            text_clean = lower.replace("tomorrow", "").replace("noon", "12:00 PM").strip()
-            dt = parser.parse(text_clean, default=base) if text_clean else base
-        else:
-            text_clean = lower.replace("today", "").replace("noon", "12:00 PM").strip()
-            dt = parser.parse(text_clean, default=base)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except Exception:
-        raise ValueError(f"Could not parse datetime string: {value!r}")
+    This is now a thin wrapper over timeutil.to_local_aware: when a caller
+    knows the user's timezone (every real caller in this file does, via a
+    "user_timezone" key in the payload -- see the tasks/reminders/calendar
+    sections below), a value with no explicit UTC offset is interpreted as
+    that user's LOCAL time, not UTC. This is the write-side fix for the
+    "the LLM works in UTC" bug: a naive "3pm tomorrow" from the model used
+    to be silently stored as 3pm UTC regardless of where the user actually
+    lives. `user_tz` defaults to UTC only for the rare internal caller that
+    doesn't have a real user timezone to hand (there should be none left
+    after this change, but this keeps old behavior rather than raising)."""
+    return timeutil.to_local_aware(value, user_tz or "UTC")
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +124,47 @@ async def get_or_create_user(
             _initial_onboarding_step(name),
         )
         return dict(row)
+
+
+async def update_user_timezone(user_id: int, timezone_name: str, confirmed: bool = True) -> dict[str, Any] | None:
+    """Overwrite a user's stored timezone -- the one place, other than
+    account creation, that users.timezone is ever written. `confirmed`
+    tracks whether this came from an actually-resolved city/zip (see
+    timeutil.resolve_timezone) as opposed to still being the
+    config.DEFAULT_TIMEZONE placeholder. Additive/no-op-safe: if
+    migrations/007_timezone_confirmed.sql hasn't been applied yet, still
+    updates the timezone itself, just without the confirmed flag."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if await _has_column(conn, "users", "timezone_confirmed"):
+            row = await conn.fetchrow(
+                "UPDATE users SET timezone = $2, timezone_confirmed = $3 WHERE id = $1 RETURNING *",
+                user_id, timezone_name, confirmed,
+            )
+        else:
+            row = await conn.fetchrow(
+                "UPDATE users SET timezone = $2 WHERE id = $1 RETURNING *",
+                user_id, timezone_name,
+            )
+        return dict(row) if row else None
+
+
+async def ensure_timezone_resolved(user_row: dict[str, Any]) -> dict[str, Any]:
+    """One-time backfill / catch-up, called on every user-context load (see
+    cli.load_user_context): if this user has a city on file but their
+    timezone was never actually confirmed against it -- an account created
+    before this feature existed, or an earlier resolution attempt that
+    failed or was never tried -- try resolving it again now. No-ops (and
+    returns user_row unchanged) once timezone_confirmed is true, or if
+    there's no city to resolve from yet, so this is cheap for the common
+    case and only does real work for the accounts that actually need it."""
+    if user_row.get("timezone_confirmed") or not user_row.get("city"):
+        return user_row
+    resolution = await timeutil.resolve_timezone(user_row["city"])
+    if resolution is None:
+        return user_row
+    updated = await update_user_timezone(user_row["id"], resolution.timezone, confirmed=resolution.confident)
+    return updated or user_row
 
 
 async def get_browserbase_context_id(user_id: int) -> str | None:
@@ -274,6 +289,15 @@ async def save_profile_field(user_id: int, field: str, value: str) -> dict[str, 
 
     `value` may be the literal string 'skip' for the optional email step --
     that still advances onboarding without writing anything to the column.
+
+    For `field == "city"`, this also resolves and stores the user's real
+    timezone (via timeutil.resolve_timezone) instead of leaving it on
+    whatever config.DEFAULT_TIMEZONE was written at account creation -- the
+    root fix for a user's stored timezone never actually reflecting where
+    they live. The returned dict's `timezone_confirmed` tells the caller
+    (agents/registry.py's save_profile_info tool) whether that resolution
+    was unambiguous; when it's False, the caller should ask the user for a
+    zip code or "city, state" instead of trusting a guess.
     """
     if field not in ("name", "email", "city"):
         raise ValueError(f"Unknown profile field: {field}")
@@ -293,7 +317,14 @@ async def save_profile_field(user_id: int, field: str, value: str) -> dict[str, 
             next_step = ONBOARDING_STEPS[ONBOARDING_STEPS.index(step_for_field) + 1]
             await conn.execute("UPDATE users SET onboarding_step = $2 WHERE id = $1", user_id, next_step)
             row = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
-        return dict(row)
+
+    if field == "city" and value and value.strip().lower() != "skip":
+        resolution = await timeutil.resolve_timezone(value.strip())
+        if resolution is not None:
+            updated = await update_user_timezone(user_id, resolution.timezone, confirmed=resolution.confident)
+            if updated:
+                row = updated
+    return dict(row)
 
 
 # ---------------------------------------------------------------------------
@@ -377,7 +408,12 @@ async def _has_column(conn: asyncpg.Connection, table: str, column: str) -> bool
 
 
 # ---------------------------------------------------------------------------
-# Tasks (reads are direct; writes are gated -- see pending_actions below)
+# Tasks -- direct reads AND writes. Per explicit product decision, only
+# SCHEDULING (calendar events, see below) requires confirmation; tasks are
+# low-stakes and trivially reversible with a follow-up message, so they
+# write immediately. `due_date`, when given, must already be a tz-aware
+# datetime -- callers (tools/executive_tools.py) resolve it via
+# timeutil.to_local_aware(raw, user.timezone) before calling these.
 # ---------------------------------------------------------------------------
 
 async def list_tasks(user_id: int, status: str | None = None) -> list[dict[str, Any]]:
@@ -396,48 +432,62 @@ async def list_tasks(user_id: int, status: str | None = None) -> list[dict[str, 
         return _rows(rows)
 
 
-async def _insert_task(conn: asyncpg.Connection, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
-    row = await conn.fetchrow(
-        """
-        INSERT INTO tasks (user_id, title, description, due_date, priority)
-        VALUES ($1, $2, $3, $4, COALESCE($5::task_priority, 'medium'))
-        RETURNING *
-        """,
-        user_id,
-        payload["title"],
-        payload.get("description"),
-        _parse_dt(payload.get("due_date")),
-        payload.get("priority"),
-    )
-    return dict(row)
+async def create_task(
+    user_id: int,
+    title: str,
+    description: str | None = None,
+    due_date: datetime | None = None,
+    priority: str | None = None,
+) -> dict[str, Any]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO tasks (user_id, title, description, due_date, priority)
+            VALUES ($1, $2, $3, $4, COALESCE($5::task_priority, 'medium'))
+            RETURNING *
+            """,
+            user_id, title, description, due_date, priority,
+        )
+        return dict(row)
 
 
-async def _update_task(conn: asyncpg.Connection, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
-    row = await conn.fetchrow(
-        """
-        UPDATE tasks SET
-            title = COALESCE($3, title),
-            description = COALESCE($4, description),
-            due_date = COALESCE($5, due_date),
-            status = COALESCE($6::task_status, status),
-            priority = COALESCE($7::task_priority, priority),
-            updated_at = NOW()
-        WHERE id = $1 AND user_id = $2
-        RETURNING *
-        """,
-        payload["task_id"], user_id,
-        payload.get("title"), payload.get("description"), _parse_dt(payload.get("due_date")),
-        payload.get("status"), payload.get("priority"),
-    )
-    return dict(row) if row else {}
+async def update_task(
+    user_id: int,
+    task_id: int,
+    title: str | None = None,
+    description: str | None = None,
+    due_date: datetime | None = None,
+    status: str | None = None,
+    priority: str | None = None,
+) -> dict[str, Any]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE tasks SET
+                title = COALESCE($3, title),
+                description = COALESCE($4, description),
+                due_date = COALESCE($5, due_date),
+                status = COALESCE($6::task_status, status),
+                priority = COALESCE($7::task_priority, priority),
+                updated_at = NOW()
+            WHERE id = $1 AND user_id = $2
+            RETURNING *
+            """,
+            task_id, user_id, title, description, due_date, status, priority,
+        )
+        return dict(row) if row else {}
 
 
-async def _delete_task(conn: asyncpg.Connection, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
-    row = await conn.fetchrow(
-        "DELETE FROM tasks WHERE id = $1 AND user_id = $2 RETURNING id",
-        payload["task_id"], user_id,
-    )
-    return dict(row) if row else {}
+async def delete_task(user_id: int, task_id: int) -> dict[str, Any]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "DELETE FROM tasks WHERE id = $1 AND user_id = $2 RETURNING id",
+            task_id, user_id,
+        )
+        return dict(row) if row else {}
 
 
 # ---------------------------------------------------------------------------
@@ -465,33 +515,56 @@ async def get_due_reminders(now: datetime | None = None) -> list[dict[str, Any]]
         return _rows(rows)
 
 
+async def get_due_reminders_for_delivery(now: datetime | None = None) -> list[dict[str, Any]]:
+    """Same as get_due_reminders, but joined with users for the phone_number
+    a production sender needs -- used by server.py's real (Sendblue-backed)
+    reminder poller, as opposed to the CLI's local console-only preview."""
+    now = now or datetime.now(timezone.utc)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT r.*, u.phone_number, u.timezone AS user_timezone
+            FROM reminders r JOIN users u ON u.id = r.user_id
+            WHERE r.status = 'pending' AND r.trigger_time <= $1
+            """,
+            now,
+        )
+        return _rows(rows)
+
+
 async def mark_reminder_sent(reminder_id: int) -> None:
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute("UPDATE reminders SET status = 'sent' WHERE id = $1", reminder_id)
 
 
-async def _insert_reminder(conn: asyncpg.Connection, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
-    row = await conn.fetchrow(
-        """
-        INSERT INTO reminders (user_id, trigger_time, message, status, checkin_for_task_id)
-        VALUES ($1, $2, $3, COALESCE($4::reminder_status, 'pending'::reminder_status), $5) RETURNING *
-        """,
-        user_id,
-        _parse_dt(payload["trigger_time"]),
-        payload["message"],
-        payload.get("status"),
-        payload.get("checkin_for_task_id"),
-    )
-    return dict(row)
+async def create_reminder(
+    user_id: int,
+    trigger_time: datetime,
+    message: str,
+    checkin_for_task_id: int | None = None,
+) -> dict[str, Any]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO reminders (user_id, trigger_time, message, status, checkin_for_task_id)
+            VALUES ($1, $2, $3, 'pending'::reminder_status, $4) RETURNING *
+            """,
+            user_id, trigger_time, message, checkin_for_task_id,
+        )
+        return dict(row)
 
 
-async def _cancel_reminder(conn: asyncpg.Connection, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
-    row = await conn.fetchrow(
-        "UPDATE reminders SET status = 'cancelled' WHERE id = $1 AND user_id = $2 RETURNING id",
-        payload["reminder_id"], user_id,
-    )
-    return dict(row) if row else {}
+async def cancel_reminder(user_id: int, reminder_id: int) -> dict[str, Any]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "UPDATE reminders SET status = 'cancelled' WHERE id = $1 AND user_id = $2 RETURNING id",
+            reminder_id, user_id,
+        )
+        return dict(row) if row else {}
 
 
 # ---------------------------------------------------------------------------
@@ -516,18 +589,21 @@ async def list_calendar_events(user_id: int, upcoming_only: bool = True) -> list
 
 
 async def _insert_calendar_event(conn: asyncpg.Connection, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    user_tz = payload.get("user_timezone")
     row = await conn.fetchrow(
         """
         INSERT INTO calendar_events (user_id, title, start_time, end_time, location, notes)
         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *
         """,
-        user_id, payload["title"], _parse_dt(payload["start_time"]), _parse_dt(payload["end_time"]),
+        user_id, payload["title"],
+        _parse_dt(payload["start_time"], user_tz), _parse_dt(payload["end_time"], user_tz),
         payload.get("location"), payload.get("notes"),
     )
     return dict(row)
 
 
 async def _update_calendar_event(conn: asyncpg.Connection, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    user_tz = payload.get("user_timezone")
     row = await conn.fetchrow(
         """
         UPDATE calendar_events SET
@@ -541,8 +617,8 @@ async def _update_calendar_event(conn: asyncpg.Connection, user_id: int, payload
         WHERE id = $1 AND user_id = $2
         RETURNING *
         """,
-        payload["event_id"], user_id, payload.get("title"), _parse_dt(payload.get("start_time")),
-        _parse_dt(payload.get("end_time")), payload.get("location"), payload.get("notes"), payload.get("status"),
+        payload["event_id"], user_id, payload.get("title"), _parse_dt(payload.get("start_time"), user_tz),
+        _parse_dt(payload.get("end_time"), user_tz), payload.get("location"), payload.get("notes"), payload.get("status"),
     )
     return dict(row) if row else {}
 
@@ -556,7 +632,8 @@ async def _delete_calendar_event(conn: asyncpg.Connection, user_id: int, payload
 
 
 # ---------------------------------------------------------------------------
-# Notes (create is direct/ungated; delete is gated -- matches action_type enum)
+# Notes -- fully direct/ungated (creating AND deleting a note is low-stakes
+# and immediately reversible, so neither goes through pending_actions).
 # ---------------------------------------------------------------------------
 
 async def create_note(user_id: int, content: str, tags: str | None = None) -> dict[str, Any]:
@@ -579,16 +656,20 @@ async def list_notes(user_id: int, limit: int = 20) -> list[dict[str, Any]]:
         return _rows(rows)
 
 
-async def _delete_note(conn: asyncpg.Connection, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
-    row = await conn.fetchrow(
-        "DELETE FROM notes WHERE id = $1 AND user_id = $2 RETURNING id",
-        payload["note_id"], user_id,
-    )
-    return dict(row) if row else {}
+async def delete_note(user_id: int, note_id: int) -> dict[str, Any]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "DELETE FROM notes WHERE id = $1 AND user_id = $2 RETURNING id",
+            note_id, user_id,
+        )
+        return dict(row) if row else {}
 
 
 # ---------------------------------------------------------------------------
-# People / contacts (ungated -- not in the action_type enum)
+# People / contacts -- fully direct/ungated, including delete (previously
+# missing entirely: contacts could be created/updated via upsert_person but
+# never removed at all).
 # ---------------------------------------------------------------------------
 
 async def upsert_person(
@@ -619,6 +700,16 @@ async def list_people(user_id: int) -> list[dict[str, Any]]:
         return _rows(rows)
 
 
+async def delete_person(user_id: int, name: str) -> dict[str, Any]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "DELETE FROM people WHERE user_id = $1 AND name = $2 RETURNING id, name",
+            user_id, name,
+        )
+        return dict(row) if row else {}
+
+
 # ---------------------------------------------------------------------------
 # Cron jobs (create is gated via pending_actions; pause/cancel are direct)
 # ---------------------------------------------------------------------------
@@ -638,6 +729,23 @@ async def get_due_cron_jobs(now: datetime | None = None) -> list[dict[str, Any]]
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT * FROM cron_jobs WHERE status = 'active' AND next_run_at <= $1", now
+        )
+        return _rows(rows)
+
+
+async def get_due_cron_jobs_for_delivery(now: datetime | None = None) -> list[dict[str, Any]]:
+    """Same as get_due_cron_jobs, but joined with users for the phone_number
+    a production re-invocation needs -- used by server.py's real poller."""
+    now = now or datetime.now(timezone.utc)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT c.*, u.phone_number
+            FROM cron_jobs c JOIN users u ON u.id = c.user_id
+            WHERE c.status = 'active' AND c.next_run_at <= $1
+            """,
+            now,
         )
         return _rows(rows)
 
@@ -662,13 +770,16 @@ async def set_cron_job_status(user_id: int, cron_id: int, status: str) -> dict[s
 
 
 async def _insert_cron_job(conn: asyncpg.Connection, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    # payload["next_run_at"] is already a tz-aware datetime by the time it
+    # gets here (tools/routines_tools.py computes it via compute_next_run,
+    # which is timezone-aware end to end) -- no string parsing needed.
     row = await conn.fetchrow(
         """
         INSERT INTO cron_jobs (user_id, prompt_or_task, cron_expression, user_timezone, next_run_at)
         VALUES ($1, $2, $3, $4, $5) RETURNING *
         """,
         user_id, payload["prompt_or_task"], payload["cron_expression"],
-        payload.get("user_timezone", config.DEFAULT_TIMEZONE), _parse_dt(payload["next_run_at"]),
+        payload.get("user_timezone", config.DEFAULT_TIMEZONE), payload["next_run_at"],
     )
     return dict(row)
 
@@ -676,22 +787,19 @@ async def _insert_cron_job(conn: asyncpg.Connection, user_id: int, payload: dict
 # ---------------------------------------------------------------------------
 # Pending actions -- the confirm-before-write gate.
 #
-# The DB's action_type enum defines exactly which mutations require
-# confirmation: create/update/delete task, create reminder/cancel reminder,
-# create/update/delete calendar event, delete note, create recurring cron.
-# Anything not in that enum (reads, notes creation, contacts) writes directly.
+# Per explicit product decision, only SCHEDULING requires confirmation now:
+# create/update/delete calendar event, and creating a new recurring
+# automation (routines_agent's cron jobs -- also a scheduling action).
+# Tasks, reminders, notes, and contacts all write directly (see their
+# sections above) since they're low-stakes and trivially reversible with a
+# follow-up message -- an earlier version of this gate also covered those,
+# which added confirmation friction the product decision explicitly removed.
 # ---------------------------------------------------------------------------
 
 _APPLIERS = {
-    "create_task": _insert_task,
-    "update_task": _update_task,
-    "delete_task": _delete_task,
-    "create_reminder": _insert_reminder,
-    "cancel_reminder": _cancel_reminder,
     "create_calendar_event": _insert_calendar_event,
     "update_calendar_event": _update_calendar_event,
     "delete_calendar_event": _delete_calendar_event,
-    "delete_note": _delete_note,
     "create_recurring_cron": _insert_cron_job,
 }
 

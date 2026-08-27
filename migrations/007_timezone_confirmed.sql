@@ -1,0 +1,22 @@
+-- Additive migration: track whether a user's timezone has actually been
+-- resolved from something real (their city/zip, via timeutil.resolve_timezone)
+-- as opposed to still sitting on the hardcoded MESSA_DEFAULT_TIMEZONE that
+-- get_or_create_user() writes for every brand-new row. Before this column
+-- existed there was no way to tell those two cases apart in the database --
+-- a user whose city geocoded ambiguously (e.g. a bare "Jacksonville" with no
+-- state, which real-world testing showed spans three different US
+-- timezones) looked identical to one whose timezone was never even
+-- attempted. That distinction now drives two things: (1) executive_assistant's
+-- system prompt tells the model to ask for a zip/city+state before
+-- scheduling anything time-sensitive while this is false, and (2)
+-- db.ensure_timezone_resolved() retries resolution on load for any existing
+-- user who has a city on file but was never confirmed (a one-time backfill
+-- path for accounts created before this feature existed).
+--
+-- Defaults to FALSE for both new and existing rows -- correct for new rows
+-- (nothing has been resolved yet at creation time) and safe for existing
+-- rows (their stored timezone was never actually derived from anything the
+-- user told us, so treating it as "unconfirmed" is the honest state, not a
+-- regression).
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS timezone_confirmed BOOLEAN NOT NULL DEFAULT FALSE;

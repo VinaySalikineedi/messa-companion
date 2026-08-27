@@ -16,6 +16,13 @@ reportlab>=4.4.10
 # Routines agent (cron scheduling math)
 croniter>=6.2.4
 
+# Executive assistant (messa/timeutil.py): relative-date parsing fallback
+# ("tomorrow at 3pm") and timezone resolution. Was already an indirect/
+# transitive dependency before (db.py's old _parse_dt lazily imported it),
+# but timeutil.py now imports it eagerly at module level, so it's listed
+# explicitly rather than relying on something else pulling it in.
+python-dateutil>=2.9.0
+
 # Email agent (Composio) -- optional until COMPOSIO_API_KEY is set, but
 # import-guarded so the app runs without it. Install when you're ready to
 # wire up email:

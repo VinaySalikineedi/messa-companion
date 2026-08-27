@@ -62,7 +62,7 @@ def _require(name: str) -> str:
 # pinning the dated snapshot (`deepseek/deepseek-v4-pro-0813`) via
 # MESSA_MODEL, no code change needed either way.
 OPENROUTER_API_KEY = _require("OPENROUTER_API_KEY")
-ORCHESTRATOR_MODEL_NAME = os.environ.get("MESSA_MODEL", "deepseek/deepseek-v4-pro-0813")
+ORCHESTRATOR_MODEL_NAME = os.environ.get("MESSA_MODEL", "~deepseek/deepseek-v4-pro")
 SUBAGENT_MODEL_NAME = os.environ.get("MESSA_SUBAGENT_MODEL", "~deepseek/deepseek-v4-flash-latest")
 
 # Backward-compatible alias: kept in case anything (or you) still refers to
@@ -166,6 +166,14 @@ DEEPSEARCH_ALLOWED_DOMAINS: list[str] = [
 # saved and can be resumed) rather than an error condition.
 DEEPSEARCH_MAX_STEPS = int(os.environ.get("MESSA_DEEPSEARCH_MAX_STEPS", "100"))
 
+# Step budget for executive_assistant (tasks/reminders/notes/contacts/
+# calendar), deliberately small and separate from DEEPSEARCH_MAX_STEPS --
+# see tools/executive_tools.py's build_executive_subagent docstring. This
+# role is a handful of direct DB calls plus at most one deterministic
+# quality-check retry, not an open-ended research loop, so a large step
+# budget would only let a confused run wander instead of failing fast.
+EXECUTIVE_RECURSION_LIMIT = int(os.environ.get("MESSA_EXECUTIVE_RECURSION_LIMIT", "14"))
+
 # All server-side "now" comparisons (due reminders/cron) use tz-aware UTC
 # datetimes explicitly (datetime.now(timezone.utc)) rather than naive
 # datetime.now(), so this holds regardless of what timezone the host
@@ -189,6 +197,12 @@ class UserContext:
     email: str | None = None
     city: str | None = None
     timezone: str = DEFAULT_TIMEZONE
+    # Whether `timezone` was actually derived from something the user told
+    # us (their city/zip, via timeutil.resolve_timezone) as opposed to
+    # still being the hardcoded DEFAULT_TIMEZONE placeholder. False means
+    # "don't fully trust this for scheduling yet" -- see
+    # timeutil.current_context_str and executive_tools.py's system prompt.
+    timezone_confirmed: bool = False
     onboarding_step: str = "complete"
     channel: str = "cli"
     extra: dict = field(default_factory=dict)

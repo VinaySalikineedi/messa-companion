@@ -1,11 +1,17 @@
-"""Local background pollers for the CLI (Phase 1 preview of Phase 2's real scheduler).
+"""Local background pollers for the CLI -- a console-only PREVIEW, not real
+delivery. For actual production delivery (real SMS/iMessage via Sendblue,
+and real re-invocation of Messa for due cron jobs), see
+server.py's `_production_reminder_loop` / `_production_cron_loop`, started
+from that app's startup event. This module is only ever started from
+cli.main_async, and is intentionally never wired into server.py -- the CLI
+has no Sendblue number to send to, and a console print is exactly the
+right amount of feedback for local interactive testing.
 
 Two asyncio tasks run alongside the REPL:
   * due reminders -> printed as a proactive Messa line, marked sent.
   * due cron jobs -> printed as "this would fire now", rescheduled to their
-    next occurrence. Not actually re-invoking the agent yet -- Phase 2's
-    always-on backend does that; this just proves the scheduling math and
-    DB plumbing work end-to-end before that exists.
+    next occurrence. Not actually re-invoking the agent here -- that's what
+    server.py's production loop does for real, over a real channel.
 
 Both are best-effort: any DB/other error is logged and the loop keeps going
 rather than taking down the CLI.

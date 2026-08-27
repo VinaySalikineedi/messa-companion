@@ -843,6 +843,210 @@ delegations in one turn (the original Chipotle+Subway shape) and confirms
 exactly one link across both acknowledgments, alongside all five previous
 tests re-run to confirm nothing else changed.
 
+## Executive assistant rebuild: approval scope, timezone correctness, a small-loop quality check
+
+You asked for an audit of every executive_assistant tool (reminders,
+scheduling, tasks, contacts) plus three specific changes: approval required
+only for scheduling (tasks and reminders should NOT need approval -- you
+corrected this mid-conversation from an earlier draft that also gated
+tasks/reminders, so double-check this matches what you meant); heavy
+attention to timezone correctness, using the city collected at onboarding
+to resolve it, and asking for a zip/city when that's not enough; and a
+rebuild of executive_assistant as something suited to personal-assistant
+work rather than deepsearch's ~100-step research loop -- "quality and
+proper checking within small loops" instead of a large recursion budget.
+
+### The timezone bug, precisely
+
+You reported: "the llm works in UTC and we show results to the user in
+whatever timezone they are, without proper setup there will be confusion."
+That's actually three separate, compounding bugs, all fixed together in
+the new `messa/timeutil.py`:
+
+1. **Write side.** `db._parse_dt` took a naive datetime string from the
+   model -- exactly what "3pm tomorrow" looks like once it's in a tool
+   call -- and silently assumed it was already UTC. A user in Pacific time
+   asking for "3pm" got it stored as 3pm UTC (7-8am Pacific), with nothing
+   anywhere flagging the mismatch. Fixed by `timeutil.to_local_aware`,
+   which every date/time-carrying tool in `executive_tools.py` now runs
+   input through before it reaches the database: a value with no explicit
+   UTC offset is interpreted as the *user's own* local time.
+2. **Read side.** `list_tasks`/`list_reminders`/`list_calendar_events` just
+   stringified whatever asyncpg returned for a `timestamptz` column (which
+   asyncpg normalizes to UTC) with no conversion and no zone label at all
+   -- so even a *correctly stored* time looked wrong once displayed. Fixed
+   by `timeutil.format_local`, used everywhere a stored date/time is shown
+   back to the user (e.g. "Aug 28, 2026 01:00 PM PDT" instead of a bare
+   UTC timestamp).
+3. **The timezone itself was never real.** `users.timezone` was written
+   once, at account creation, to a hardcoded default
+   (`MESSA_DEFAULT_TIMEZONE`) and never derived from the city onboarding
+   actually collects -- so even with (1) and (2) fixed, the timezone being
+   used could still just be wrong for that specific person. Fixed by
+   wiring real resolution into the onboarding flow: `save_profile_field`
+   ('city') now calls `timeutil.resolve_timezone(city)` and stores the
+   result, and a new `users.timezone_confirmed` column
+   (`migrations/007_timezone_confirmed.sql`) tracks whether that ever
+   actually succeeded, as opposed to still being the placeholder.
+
+No system prompt anywhere (Messa's or any subagent's) used to state the
+actual current date/time or the user's timezone at all -- the model had no
+deterministic anchor for "what time is it right now." `_build_system_prompt`
+in both `agents/registry.py` and `tools/executive_tools.py` now opens with
+`timeutil.current_context_str`, an explicit line like "Current date/time:
+Wednesday, August 27, 2026 02:15 PM EDT (timezone: America/New_York)" --
+and, when `timezone_confirmed` is false, an explicit instruction to ask
+for a city/zip before treating anything time-sensitive as settled.
+
+### Resolving a city (or zip) to a real timezone
+
+`timeutil.resolve_timezone` uses Open-Meteo's free, keyless geocoding API
+(`https://geocoding-api.open-meteo.com/v1/search`), which returns an IANA
+timezone directly for both city names and US zip codes -- no separate
+lat/lon lookup needed. Verified live by hand during development (three
+manual fetches, since this project's own dev sandbox restricts outbound
+network calls to a small package-registry allowlist and couldn't run the
+real HTTP call itself):
+
+- A bare `"Jacksonville"` (no state) returns results in **three different
+  US timezones** (FL/NC/IL) -- a real ambiguity hazard for a bare city
+  name.
+- A 5-digit US zip (`"32218"`) resolves to exactly one unambiguous result.
+- Even `"Jacksonville, FL"` included one low-population outlier (a police
+  heliport) tagged with a *different, wrong* timezone for that county.
+
+`resolve_timezone` handles this by preferring populated results and
+checking whether the highest-population candidates actually agree on
+timezone before calling the result "confident." When they don't agree (or
+nothing resolves at all), the caller is told so explicitly -- both
+`save_profile_info`'s tool result (which tells Messa to ask for a zip code
+or "city, state") and the onboarding prompt itself
+(`_ONBOARDING_PROMPTS["awaiting_location"]`, updated to ask for a state/zip
+up front rather than a bare city name) reflect this. An existing user
+created before this feature existed (or whose city never resolved) isn't
+stuck: `db.ensure_timezone_resolved`, called on every `load_user_context`,
+retries resolution against the city already on file until it succeeds,
+with no user action needed.
+
+**Honesty caveat:** the live Open-Meteo call itself could not be
+exercised end-to-end from this sandbox (see above) -- only the decision
+logic (population weighting, agreement checking) is covered by an
+automated test, against the exact response shapes recorded from the three
+manual fetches. Any normal deployment target (HuggingFace Spaces included)
+has unrestricted outbound HTTPS, so the real call is expected to work as
+designed; this is the one thing I genuinely could not verify myself before
+shipping it.
+
+### Approval scope, corrected: only scheduling
+
+Your first draft said approval should be required for "scheduling,
+reminders, tasks," with "others" (notes, contacts) going through
+unapproved. Partway through, you corrected that to: approval only for
+scheduling -- reminders and tasks should NOT need approval either. The
+final, shipped scope is the corrected one:
+
+| Action | Approval? |
+|---|---|
+| Calendar events (create/update/delete) -- "scheduling" | **Yes** -- `propose_*` -> `pending_actions` -> Messa confirms |
+| Recurring automations (routines_agent's cron jobs) | Yes -- same reasoning, a standing schedule is the same category of risk |
+| Tasks (create/update/delete) | No -- direct write |
+| Reminders (create/cancel) | No -- direct write |
+| Notes (create/delete) | No -- direct write (delete used to be gated; that's removed) |
+| Contacts (create/update/delete) | No -- direct write (**delete didn't exist at all before** -- see below) |
+
+The reasoning: tasks/reminders/notes/contacts are low-stakes and trivially
+reversible with one follow-up message ("cancel that reminder"); a calendar
+event is the one category where a mistaken write is more likely to
+visibly collide with a real commitment someone else can also see (a
+meeting, an appointment), so that's the one still kept behind an explicit
+human yes. `db.py`'s `_APPLIERS`/`GATED_ACTION_TYPES` now contains exactly
+`create_calendar_event`, `update_calendar_event`, `delete_calendar_event`,
+`create_recurring_cron` -- everything else that used to route through
+`pending_actions` (`create_task`, `update_task`, `delete_task`,
+`create_reminder`, `cancel_reminder`, `delete_note`) is now a plain direct
+function, and the old conn-taking `_insert_task`/`_update_task`/etc.
+appliers are gone rather than left dead in the file.
+
+While auditing "if I missed any, you still take care of it," I found
+**contacts had no delete at all** -- `upsert_contact` could create/update a
+person, but nothing could remove one. Added `db.delete_person` /
+`tools/executive_tools.py`'s `delete_contact` (matches by name, direct, no
+confirmation, consistent with the rest of the contacts surface).
+
+### executive_assistant rebuilt as a small-loop CompiledSubAgent, not a deepsearch clone
+
+Previously executive_assistant was one of the four plain declarative
+`SubAgent` dicts (name + system_prompt + tools), sharing deepagents'
+generic subagent path with no custom recursion limit -- meaning a confused
+run could, in principle, wander for as many steps as the orchestrator's
+own 100-step budget allows. That's the wrong shape for "create a task" or
+"set a reminder," which is a handful of direct DB calls, not an
+open-ended research loop.
+
+`tools/executive_tools.py`'s `build_executive_subagent` now mirrors
+deepsearch's `CompiledSubAgent` pattern (a hand-written `_run()` wrapping
+its own `create_agent(...)` call with an explicit `run_config`) instead,
+with two differences that are the actual point:
+
+1. **A small, dedicated recursion budget** -- `config.EXECUTIVE_RECURSION_LIMIT`
+   (default 14, overridable via `MESSA_EXECUTIVE_RECURSION_LIMIT`), not
+   `DEEPSEARCH_MAX_STEPS` (100). Enough for several tool calls plus a
+   summary; not enough for a runaway loop.
+2. **A deterministic, non-LLM quality check**, not a second unconditional
+   LLM "critic" call. `build_executive_tools` optionally threads a
+   `written` list through every date/time-writing tool; after the inner
+   agent finishes, `_past_due_issue` checks whether anything just written
+   landed more than 5 minutes in the *past* relative to the user's real
+   local now -- almost always a parsing/timezone mistake, not an
+   intentional backdated entry. If so, exactly one corrective nudge is
+   sent back into the *same* LangGraph thread (via the checkpointer, so
+   the model still has full context of what it just did) before the
+   delegation's reply goes back to Messa -- the same bounded
+   retry-once shape already proven for the orchestrator's own
+   dropped-delegation bug (see "The empty-promise bug" above), just
+   applied to a different failure mode.
+
+Verified against the real `langchain.agents.create_agent` + LangGraph
+stack (only the chat model and `db.py`'s reminder functions are faked): a
+fake model creates a reminder for a date years in the past, wrongly
+believes it's done, gets the auto-check nudge, and correctly cancels the
+stale reminder on the retry -- exactly 2 rounds (4 model calls total), not
+more, proving the retry is bounded to once. A separate test exercises
+`build_executive_tools` directly (no LLM) to confirm the read-side
+timezone display fix, the write-side interpretation fix, and that only
+`propose_create_calendar_event` (and its update/delete siblings) ever call
+`db.propose_action` while everything else calls a direct function.
+
+### Reminders and recurring jobs actually reach a real phone now
+
+While auditing "make sure reminders... are functioning as they should," I
+found a gap that wasn't explicitly asked about but falls squarely under
+that instruction: `messa/background.py`'s pollers (which check for due
+reminders/cron jobs) were only ever started from `cli.main_async` --
+**never from `messa/server.py`**, the actual production webhook app. In
+production, a due reminder was being correctly identified in the database
+and then... nothing happened with it. The CLI's poller only prints to a
+local terminal (`console.proactive`) and its cron loop only logged "would
+run now" without invoking Messa at all -- fine as a Phase 1 preview of the
+scheduling math, but not something that was ever going to deliver an SMS.
+
+`server.py` now starts two real pollers on FastAPI startup:
+`_production_reminder_loop` sends a due reminder via
+`sendblue.send_message` and only marks it sent once delivery actually
+succeeds (a Sendblue failure leaves it pending so the next poll retries
+rather than silently losing it); `_production_cron_loop` re-invokes Messa
+for real via the same `load_user_context`/`build_orchestrator`/
+`run_message` path a live inbound text uses, with the job's saved
+`prompt_or_task` as the message, and delivers whatever Messa produces back
+over Sendblue. `db.get_due_reminders_for_delivery` /
+`get_due_cron_jobs_for_delivery` are new query functions that join
+`users` for the `phone_number` a real send needs (the existing
+`get_due_reminders`/`get_due_cron_jobs` stay as-is for the CLI's
+console-only preview). `messa/background.py`'s docstring is updated to
+point at this as the real counterpart, and `routines_agent`'s system
+prompt/docstring no longer says a confirmed job "isn't actually executed
+yet" -- it is, now, in production.
+
 ## Changes from your second round of testing
 
 - **Renamed browser_agent -> deepsearch.** Same subagent, new name
@@ -970,22 +1174,29 @@ LangGraph's nested subgraph stream events.
 
 ## The confirm-before-write pattern
 
-Your schema's `action_type` enum (`create_task`, `update_task`,
-`delete_task`, `create_reminder`, `cancel_reminder`,
+**Updated scope (see "Executive assistant rebuild" above for the full
+story):** only SCHEDULING goes through `pending_actions` now --
 `create_calendar_event`, `update_calendar_event`, `delete_calendar_event`,
-`delete_note`, `create_recurring_cron`) is exactly the set of mutations
-that go through `pending_actions` instead of writing directly:
+and `create_recurring_cron`. Your schema's `action_type` enum originally
+also covered `create_task`/`update_task`/`delete_task`/`create_reminder`/
+`cancel_reminder`/`delete_note`, and an earlier round of this project gated
+all of those too -- that's been narrowed per your explicit correction
+("approval only for scheduling... reminders and tasks do not need
+approval"). `db.GATED_ACTION_TYPES` is the authoritative set; it's
+enforced in Python (`propose_action` raises on anything not in it), not by
+an actual Postgres enum constraint.
 
-1. `executive_assistant` / `routines_agent` call a `propose_*` tool ->
-   inserts into `pending_actions`, nothing changes yet.
+1. `executive_assistant` (calendar events) / `routines_agent` (new
+   recurring jobs) call a `propose_*` tool -> inserts into
+   `pending_actions`, nothing changes yet.
 2. Messa relays the proposal to you in the chat and waits for an explicit
    yes.
 3. You confirm -> Messa (only Messa -- subagents can't do this
    themselves) calls `confirm_pending_action`, which applies the change
    and writes an `audit_logs` row. A no calls `reject_pending_action`.
 
-Everything not in that enum (reads, creating a note, contacts) writes
-directly -- no round trip.
+Everything not in that set -- reads, tasks, reminders, notes, contacts --
+writes directly, no round trip.
 
 This is the same mechanism that will let Phase 2 confirm actions over
 SMS/email (a channel with no synchronous stdin), unlike deepsearch's
@@ -1026,12 +1237,21 @@ longer-lived history (see "Phase 3: watch the browser live" above), so
 `migrations/006_live_view.sql` adds `users.live_share_token`,
 `live_view_url`, `live_view_task`, and `live_view_started_at`.
 
-All six are additive/reversible and the app runs fine without them
+Finally, there was no way to tell "this user's timezone was actually
+resolved from something real" apart from "this is still the untouched
+default" (see "Executive assistant rebuild" above), so
+`migrations/007_timezone_confirmed.sql` adds `users.timezone_confirmed`
+(defaults `FALSE`).
+
+All seven are additive/reversible and the app runs fine without them
 (project tracking, email-saving, and session resumption just no-op;
 without migration 005, deepsearch still runs against Browserbase, it just
 can't remember your login between separate sessions or capture a live-view
 link; without migration 006, deepsearch works exactly the same, Messa just
-never has a link to mention).
+never has a link to mention; without migration 007, timezone resolution
+still runs and `users.timezone` still gets updated, it just can't persist
+the "was this actually confirmed" flag, so the system prompt's "ask for a
+zip code" nudge won't fire).
 
 ## Known Phase 1 limitations (by design -- later phases cover these)
 
@@ -1039,10 +1259,13 @@ never has a link to mention).
   a placeholder) -- goes through onboarding once, like any new user, then
   stays "known" for future CLI runs. Phase 2 resolves the user from the
   inbound channel instead of one fixed phone number.
-- Routines agent's cron jobs are created/scheduled but not actually
-  executed on a timer yet -- `messa/background.py` polls and prints what
-  *would* fire, proving the DB/scheduling math, but re-invoking Messa on
-  schedule needs Phase 2's always-on backend process.
+- ~~Routines agent's cron jobs are created/scheduled but not actually
+  executed on a timer yet~~ -- **fixed**: `server.py`'s
+  `_production_cron_loop` (started on FastAPI startup) actually
+  re-invokes Messa on schedule and delivers the reply over Sendblue now.
+  `messa/background.py`'s poller still only prints what *would* fire, but
+  that's intentional -- it's the CLI's console-only preview, not the
+  production path (see "Executive assistant rebuild" above).
 - Email agent's Composio integration is written against Composio's
   documented client API but **not tested against a live account** -- I
   didn't have a Composio API key while building this. Verify the action

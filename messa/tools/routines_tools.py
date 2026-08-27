@@ -6,12 +6,12 @@ cancelling an existing job is direct since the enum has no separate type
 for that (removing something already-approved is lower risk than creating
 new standing automation).
 
-Actually *running* a due cron job (i.e. re-invoking Messa with
-`prompt_or_task` on schedule) is Phase 2's job -- it needs a long-lived
-backend process, which the interactive CLI isn't. Phase 1 only wires up the
-CRUD + a local poller (see messa/background.py) that prints what *would*
-fire, so the concept is testable end-to-end before the real scheduler
-exists.
+Actually *running* a due cron job (re-invoking Messa with `prompt_or_task`
+on schedule) needs a long-lived backend process, which the interactive CLI
+isn't -- so messa/background.py's local poller only ever prints what
+*would* fire. server.py's `_production_cron_loop` is the real counterpart:
+running as part of the always-on webhook server, it actually re-invokes
+Messa and delivers the reply over Sendblue.
 """
 from __future__ import annotations
 
@@ -102,6 +102,7 @@ ROUTINES_SYSTEM_PROMPT = (
     "stages the job. Tell Messa what was proposed and its pending id so the user can confirm.\n"
     "- Pausing, resuming, or cancelling an existing job happens immediately, no confirmation "
     "needed.\n"
-    "- In Phase 1, confirmed jobs are stored and scheduled but not yet actually executed on a "
-    "background timer -- that ships in Phase 2. Be upfront about that if asked.\n"
+    "- Once confirmed, a job actually fires on schedule in production (the always-on webhook "
+    "server runs it and texts the result) -- it's not just stored for show. The interactive "
+    "CLI's own preview only prints what would fire, since it isn't a long-lived process.\n"
 )

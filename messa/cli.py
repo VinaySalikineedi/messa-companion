@@ -48,8 +48,16 @@ async def load_user_context(
 
     Shared by the CLI (fixed dev phone number) and the Sendblue webhook
     server (real inbound phone_number, one per sender) -- see run_message
-    below for the rest of what the server reuses from here."""
+    below for the rest of what the server reuses from here.
+
+    `db.ensure_timezone_resolved` runs on every call: a no-op the moment
+    timezone_confirmed is true (the common case, one cheap column check),
+    but for any user created before that feature existed -- or whose city
+    was saved before it resolved successfully -- this retries resolution
+    against the city already on file, so those accounts self-heal onto the
+    correct timezone without needing to re-answer onboarding."""
     user_row = await db.get_or_create_user(phone_number, name, config.DEFAULT_TIMEZONE)
+    user_row = await db.ensure_timezone_resolved(user_row)
     live_view_token = await db.get_or_create_live_share_token(user_row["id"])
     return config.UserContext(
         user_id=user_row["id"],
@@ -58,6 +66,7 @@ async def load_user_context(
         email=user_row.get("email"),
         city=user_row.get("city"),
         timezone=user_row["timezone"],
+        timezone_confirmed=bool(user_row.get("timezone_confirmed", False)),
         onboarding_step=user_row["onboarding_step"],
         channel=channel,
         live_view_token=live_view_token,
