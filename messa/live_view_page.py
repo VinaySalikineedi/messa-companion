@@ -45,7 +45,7 @@ from __future__ import annotations
 
 # "The variable you can change" (see module docstring): pick which skin
 # renders by default when a live link is opened with no ?style= override.
-LIVE_VIEW_STYLE = "polished"  # "polished" | "terminal"
+LIVE_VIEW_STYLE = "terminal"  # "polished" | "terminal"
 
 _VALID_STYLES = ("polished", "terminal")
 
