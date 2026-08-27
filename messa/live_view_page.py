@@ -43,12 +43,9 @@ server-generated-but-ultimately-model-influenced text can inject anything.
 """
 from __future__ import annotations
 
-import os
-
 # "The variable you can change" (see module docstring): pick which skin
 # renders by default when a live link is opened with no ?style= override.
-# Reads MESSA_LIVE_VIEW_STYLE / LIVE_VIEW_STYLE environment variable if set.
-LIVE_VIEW_STYLE = os.environ.get("MESSA_LIVE_VIEW_STYLE", os.environ.get("LIVE_VIEW_STYLE", "terminal")).strip().lower()  # "polished" | "terminal"
+LIVE_VIEW_STYLE = "terminal"  # "polished" | "terminal"
 
 _VALID_STYLES = ("polished", "terminal")
 
