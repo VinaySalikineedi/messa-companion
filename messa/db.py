@@ -51,12 +51,41 @@ def _parse_dt(value: Any) -> datetime | None:
     if value is None or isinstance(value, datetime):
         return value
     text = str(value).strip()
+    if not text:
+        return None
     if text.endswith("Z"):
         text = text[:-1] + "+00:00"
-    dt = datetime.fromisoformat(text)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
+    try:
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        pass
+
+    # Relative/human date parsing fallback
+    now = datetime.now(timezone.utc)
+    lower = text.lower()
+    if lower == "today":
+        return now
+    elif lower == "tomorrow":
+        return now + timedelta(days=1)
+
+    try:
+        from dateutil import parser
+        base = now
+        if "tomorrow" in lower:
+            base = now + timedelta(days=1)
+            text_clean = lower.replace("tomorrow", "").replace("noon", "12:00 PM").strip()
+            dt = parser.parse(text_clean, default=base) if text_clean else base
+        else:
+            text_clean = lower.replace("today", "").replace("noon", "12:00 PM").strip()
+            dt = parser.parse(text_clean, default=base)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        raise ValueError(f"Could not parse datetime string: {value!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -287,10 +316,14 @@ async def mark_reminder_sent(reminder_id: int) -> None:
 async def _insert_reminder(conn: asyncpg.Connection, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
     row = await conn.fetchrow(
         """
-        INSERT INTO reminders (user_id, trigger_time, message, checkin_for_task_id)
-        VALUES ($1, $2, $3, $4) RETURNING *
+        INSERT INTO reminders (user_id, trigger_time, message, status, checkin_for_task_id)
+        VALUES ($1, $2, $3, COALESCE($4::reminder_status, 'pending'::reminder_status), $5) RETURNING *
         """,
-        user_id, _parse_dt(payload["trigger_time"]), payload["message"], payload.get("checkin_for_task_id"),
+        user_id,
+        _parse_dt(payload["trigger_time"]),
+        payload["message"],
+        payload.get("status"),
+        payload.get("checkin_for_task_id"),
     )
     return dict(row)
 
