@@ -132,8 +132,9 @@ class BrowserToolProvider:
             args += ["--user-data-dir", _profile_dir(user_id)]
         if headless if headless is not None else config.DEEPSEARCH_HEADLESS:
             args.append("--headless")
+        import os
         self._client = MultiServerMCPClient({
-            "playwright": {"command": "npx", "args": args, "transport": "stdio"}
+            "playwright": {"command": "npx", "args": args, "transport": "stdio", "env": dict(os.environ)}
         })
         self._session_cm = None
         self._session = None
