@@ -150,17 +150,33 @@ class BrowserToolProvider:
         # this is what makes logins survive between tasks (and, unlike the
         # old --user-data-dir profile directory, survives an HF Space
         # restart too, since it isn't on the container's disk at all).
-        context_id = None
-        if self._user_id is not None:
-            context_id = await db.get_browserbase_context_id(self._user_id)
-            if not context_id:
-                context_id = await browserbase.create_context()
-                await db.save_browserbase_context_id(self._user_id, context_id)
+        # This whole method used to have no top-level error handling (same as
+        # the original local-Chromium version) -- fine when the only failure
+        # mode was "npx/chromium missing," which the guarded tool-call path
+        # below already logs clearly. Now that opening a browser means two
+        # network round trips to Browserbase before anything else runs (auth,
+        # quota, an expired/malformed key, HF's own egress to
+        # api.browserbase.com being blocked -- all plausible, all silent
+        # without this), a failure here needs its own clear, findable log
+        # line instead of surfacing as an unlabeled exception three layers
+        # up. Two separate try/excepts so the log line itself tells you
+        # whether it was Browserbase or the local MCP/CDP connection step
+        # that failed.
+        try:
+            context_id = None
+            if self._user_id is not None:
+                context_id = await db.get_browserbase_context_id(self._user_id)
+                if not context_id:
+                    context_id = await browserbase.create_context()
+                    await db.save_browserbase_context_id(self._user_id, context_id)
 
-        session = await browserbase.create_session(context_id)
-        self._bb_session_id = session["id"]
-        connect_url = session["connectUrl"]
-        console.system(f"Deepsearch: opened Browserbase session {self._bb_session_id}.")
+            session = await browserbase.create_session(context_id)
+            self._bb_session_id = session["id"]
+            connect_url = session["connectUrl"]
+            console.system(f"Deepsearch: opened Browserbase session {self._bb_session_id}.")
+        except Exception as e:  # noqa: BLE001
+            console.tool_error(LABEL, "browserbase_session_create", str(e))
+            raise
 
         # Best-effort: not having a live-view link yet shouldn't block the run.
         try:
@@ -168,25 +184,45 @@ class BrowserToolProvider:
         except BrowserbaseError as e:
             console.tool_error(LABEL, "browserbase_live_view", str(e))
 
-        # env=dict(os.environ): MCP's stdio transport does NOT inherit the
-        # parent process's environment by default (deliberately -- so an
-        # arbitrary MCP server doesn't automatically see your secrets).
-        # Without PATH/HOME passed through, the spawned npx subprocess can't
-        # even find node_modules/npx's own cache -- still needed here even
-        # though the browser itself is remote now.
-        self._client = MultiServerMCPClient({
-            "playwright": {
-                "command": "npx",
-                "args": ["@playwright/mcp@latest", "--cdp-endpoint", connect_url],
-                "transport": "stdio",
-                "env": dict(os.environ),
-            }
-        })
-        self._session_cm = self._client.session("playwright")
-        self._session = await self._session_cm.__aenter__()
-        raw_tools = await load_mcp_tools(self._session)
-        self.tools = [self._guard(t) for t in raw_tools]
-        console.system(f"Deepsearch: launched with {len(self.tools)} Playwright tools.")
+        try:
+            # env=dict(os.environ): MCP's stdio transport does NOT inherit the
+            # parent process's environment by default (deliberately -- so an
+            # arbitrary MCP server doesn't automatically see your secrets).
+            # Without PATH/HOME passed through, the spawned npx subprocess
+            # can't even find node_modules/npx's own cache -- still needed
+            # here even though the browser itself is remote now.
+            self._client = MultiServerMCPClient({
+                "playwright": {
+                    "command": "npx",
+                    "args": ["@playwright/mcp@latest", "--cdp-endpoint", connect_url],
+                    "transport": "stdio",
+                    "env": dict(os.environ),
+                }
+            })
+            self._session_cm = self._client.session("playwright")
+            self._session = await self._session_cm.__aenter__()
+            raw_tools = await load_mcp_tools(self._session)
+            self.tools = [self._guard(t) for t in raw_tools]
+            console.system(f"Deepsearch: launched with {len(self.tools)} Playwright tools.")
+        except Exception as e:  # noqa: BLE001
+            console.tool_error(LABEL, "browserbase_cdp_connect", str(e))
+            # __aexit__ is NOT called by `async with` when __aenter__ itself
+            # raises -- without this, a Browserbase session that was created
+            # just above but never got a working CDP connection would leak
+            # (left running until it idles out on Browserbase's side, rather
+            # than released immediately). Left unfixed, repeated failed
+            # attempts would each leak another session -- on the free plan's
+            # low concurrent-session cap, that alone could make every
+            # *subsequent* attempt fail at browserbase_session_create with a
+            # quota/limit error, which would look identical to this failure
+            # from the outside. Best-effort: we're already failing, a second
+            # error here shouldn't mask the first.
+            if self._bb_session_id is not None:
+                try:
+                    await browserbase.release_session(self._bb_session_id)
+                except Exception as release_err:  # noqa: BLE001
+                    console.tool_error(LABEL, "browserbase_release_after_failure", str(release_err))
+            raise
         return self
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
