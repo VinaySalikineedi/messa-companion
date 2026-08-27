@@ -821,6 +821,28 @@ pattern from both real reports so far. If a future instance says
 something a genuinely different way and slips past it, that's the next
 phrase to add to `_STALL_PATTERN` in `cli.py`.
 
+**Follow-up from testing this live:** you confirmed the retry itself
+works, but flagged that the live-view link came through twice in one
+exchange -- "first time I was fine but it happened twice and it was a
+little annoying." That's a direct consequence of two things being
+individually correct but not accounting for each other: `_on_ai_message`
+attaches the link to *every* deepsearch delegation's acknowledgment
+(deliberately -- see "Phase 3" above, added so a genuinely separate
+double-delegation, like the original Chipotle-cart-plus-Subway-order
+case, always gets the link on each part), and the retry above can itself
+produce a second acknowledgment moments after the first. Neither behavior
+was wrong on its own, but together they meant the exact same permanent
+link could go out twice within seconds of itself, which reads as spammy
+rather than helpful. Fixed with a `live_link_sent` flag scoped to one
+`run_message` call (i.e. one incoming text) -- the link is attached to
+whichever deepsearch delegation happens first in the turn, and suppressed
+on any later one, retry-triggered or a genuinely separate second ask
+alike. It's still there the moment a new incoming message starts a fresh
+turn. Verified with a test that fires two real, unrelated deepsearch
+delegations in one turn (the original Chipotle+Subway shape) and confirms
+exactly one link across both acknowledgments, alongside all five previous
+tests re-run to confirm nothing else changed.
+
 ## Changes from your second round of testing
 
 - **Renamed browser_agent -> deepsearch.** Same subagent, new name

@@ -245,13 +245,25 @@ async def run_message(user: config.UserContext, agent, text: str, send=None) -> 
     await db.append_message(user.user_id, "user", text, channel=user.channel)
 
     sent_texts: list[str] = []
+    # Once per incoming message, not once per delegation: a compound ask
+    # ("how far is X, also get me today's news") can legitimately produce
+    # more than one deepsearch delegation in the same exchange -- and now
+    # that run_turn can also retry a dropped delegation once (see its
+    # docstring), the *same* logical attempt can produce a second
+    # acknowledgment moments after the first. Either way, repeating the
+    # exact same permanent link twice in one exchange reads as spammy
+    # rather than helpful -- it's still right there in the first message.
+    # Reported directly: "it happened twice and was a little annoying."
+    live_link_sent = False
 
     async def _on_ai_message(msg_text: str, delegating_to: str | None = None) -> None:
+        nonlocal live_link_sent
         share_url = user.live_view_share_url
         if delegating_to == "deepsearch":
-            if share_url and share_url not in msg_text:
+            if share_url and not live_link_sent and share_url not in msg_text:
                 link_line = f"Watch it live: {share_url}"
                 msg_text = f"{msg_text.rstrip()} {link_line}" if msg_text.strip() else link_line
+                live_link_sent = True
             elif not share_url:
                 # Confirmed (by direct integration test against the real
                 # deepagents/create_deep_agent harness) that `delegating_to`
