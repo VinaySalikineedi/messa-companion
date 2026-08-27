@@ -30,30 +30,44 @@ _state: dict[int, dict] = {}
 
 def start(user_id: int, initial_description: str | None) -> None:
     """Called once when a deepsearch delegation's browser opens."""
-    _state[user_id] = {"description": initial_description or "Working on it...", "steps": []}
+    _state[user_id] = {"description": initial_description or "Working on it...", "steps": [], "closing": False}
 
 
 def set_description(user_id: int, text: str) -> None:
     """Updates the one-line "doing this right now" text shown above the video."""
-    entry = _state.setdefault(user_id, {"description": None, "steps": []})
+    entry = _state.setdefault(user_id, {"description": None, "steps": [], "closing": False})
     entry["description"] = text
 
 
 def add_step(user_id: int, text: str) -> None:
     """Appends one completed action to the chain-of-thought log below the video."""
-    entry = _state.setdefault(user_id, {"description": None, "steps": []})
+    entry = _state.setdefault(user_id, {"description": None, "steps": [], "closing": False})
     entry["steps"].append(text)
     if len(entry["steps"]) > MAX_STEPS:
         entry["steps"] = entry["steps"][-MAX_STEPS:]
 
 
+def set_closing(user_id: int) -> None:
+    """Called once the browser session is about to be released -- while the
+    DB still says a browser is live (tools/deepsearch_tools.py sets this
+    *before* leaving BrowserToolProvider's `async with` block, i.e. before
+    the Browserbase session is actually released) so the live-view page's
+    next poll can proactively swap to a "Compiling your results..." screen
+    instead of showing whatever Browserbase's own embedded debug page
+    renders the instant its CDP connection is torn down (a raw
+    "Debugging connection was closed" banner)."""
+    entry = _state.setdefault(user_id, {"description": None, "steps": [], "closing": False})
+    entry["closing"] = True
+
+
 def get(user_id: int) -> dict:
-    """Returns {"description": str|None, "steps": list[str]} -- never raises,
-    just gives back an empty log for a user with nothing currently tracked."""
+    """Returns {"description": str|None, "steps": list[str], "closing": bool}
+    -- never raises, just gives back an empty/not-closing log for a user with
+    nothing currently tracked."""
     entry = _state.get(user_id)
     if entry is None:
-        return {"description": None, "steps": []}
-    return {"description": entry["description"], "steps": list(entry["steps"])}
+        return {"description": None, "steps": [], "closing": False}
+    return {"description": entry["description"], "steps": list(entry["steps"]), "closing": bool(entry.get("closing"))}
 
 
 def clear(user_id: int) -> None:

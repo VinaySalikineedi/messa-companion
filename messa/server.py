@@ -83,11 +83,16 @@ async def live_view_status(token: str) -> JSONResponse:
     with active=false means "valid link, nothing running right now".
 
     When active, also attaches `description` (what deepsearch is doing
-    right now, one line) and `steps` (this task's chain-of-thought log so
-    far) from live_activity.py's in-memory per-user log -- both go back to
-    None/[] the instant `active` is false, regardless of whatever
-    live_activity still happens to hold, so a stale in-memory log can never
-    outlive what the DB says is actually running."""
+    right now, one line), `steps` (this task's chain-of-thought log so far),
+    and `closing` (true for the brief window between "the run finished" and
+    "the Browserbase session is actually released" -- see
+    tools/deepsearch_tools.py's `set_closing` call -- so the page can swap
+    to a clean "Compiling your results..." screen instead of showing
+    Browserbase's own CDP-disconnect banner) from live_activity.py's
+    in-memory per-user log. All three go back to None/[]/false the instant
+    `active` is false, regardless of whatever live_activity still happens to
+    hold, so a stale in-memory log can never outlive what the DB says is
+    actually running."""
     status = await db.get_live_status_by_token(token)
     if status is None:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -95,6 +100,7 @@ async def live_view_status(token: str) -> JSONResponse:
     activity = live_activity.get(user_id) if (status["active"] and user_id is not None) else None
     status["description"] = activity["description"] if activity else None
     status["steps"] = activity["steps"] if activity else []
+    status["closing"] = activity["closing"] if activity else False
     return JSONResponse(status)
 
 

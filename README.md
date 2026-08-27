@@ -548,6 +548,105 @@ of inferring it from the iframe URL alone. Verified with Playwright
 screenshots of a fresh page load against a canned idle response, in both
 skins, before and after the fix.
 
+### Five UI fixes to the live page (dead space, sizing, live indicator, closing screen)
+
+**Per your screenshots and request**, five changes to `live_view_page.py`
+(plus small supporting changes elsewhere):
+
+**1 & 2 -- the dead space below the video, and the card growing downward.**
+Both came from the same root cause: `.video-wrap` used to be
+`flex: 1 1 auto`, stretching to fill whatever space was left in the card
+regardless of the actual browser content's shape. Browserbase's embedded
+live-view page preserves its own aspect ratio and letterboxes rather than
+distorting to fill an arbitrarily-shaped container -- so a tall, oddly-
+shaped `.video-wrap` showed the real video plus a big blank strip below
+it. Two things needed fixing at once: the video needed to be exactly the
+right shape, and the card as a whole needed a height that never grows as
+`.log` (the chain-of-thought panel) accumulates lines.
+
+I pinned `channels/browserbase.py`'s `create_session` to a known,
+explicit `browserSettings.viewport` (1280x800 -- Browserbase's docs don't
+actually commit to a default, so rather than guess I gave it one), and
+added a `fitVideo()` function to the page's JS that measures the real
+space left in the card (its height, minus the description row, minus a
+guaranteed minimum for the log) and sets `.video-wrap`'s height in pixels
+to the largest box matching that 1280:800 ratio that still fits -- full
+card width whenever there's room (this is also what makes the browsing
+window itself noticeably bigger; I also raised the card's own
+`max-width` from 960px to 1320px and cut its outer padding), a bit
+shorter only on a short window, so the log never gets squeezed away
+entirely. `.log` changed from a `max-height: 34%` block that hid itself
+via `display: none` when empty (which just relocated the dead space
+rather than fixing it) to `flex: 1 1 auto` with real internal scrolling,
+so new lines scroll *inside* the card's fixed height instead of pushing
+it taller.
+
+While testing this at different window sizes I also found a genuine,
+separate flexbox bug: `main` (the row containing the card) didn't have
+`min-height: 0`, so flexbox refused to shrink it below its content's
+natural minimum size -- meaning a tall card could push the *entire
+document* taller than the browser's viewport instead of being contained,
+which is exactly the "bounding box extends downward" failure mode you
+flagged. Fixed by adding `min-height: 0` to `main`, `.stage`, and the
+card itself. Verified with Playwright screenshots across five window
+sizes (a normal 1440x900 desktop, a wide 1800x1100, a short 1440x680, and
+a narrow 390x844 mobile portrait -- the shape an iMessage in-app browser
+actually opens at) and confirmed via `document.documentElement.scrollHeight`
+that the page's total height exactly matches the viewport in every case,
+never taller.
+
+**3 -- the live indicator.** Replaced the single pulsing dot with a small
+solid core plus two staggered, outward-fading rings (a "radar ping," each
+ring delayed half a cycle behind the other so the effect reads as
+continuous rather than a single dot flashing on a timer), plus a "LIVE"
+text label that fades in next to it. Same treatment in both skins
+(square corners in "terminal," round in "polished"), same red -- the ask
+was for it to look higher-quality, not to change what it signals.
+
+**4 -- a visible cursor showing where deepsearch clicks.** I looked into
+this and didn't implement it, and want to be upfront about why rather
+than quietly skipping it. The live-view `<iframe>` embeds Browserbase's
+own hosted debug page, which is cross-origin -- this page's own JS can't
+reach inside it to draw an overlay. The technically real way to get a
+visible custom cursor would be to inject a small script into the actual
+pages deepsearch visits (via a second, independent CDP connection to the
+same Browserbase session, listening for the real `mousemove` events
+Playwright's clicks already generate, and drawing a synthetic cursor
+element that follows them) -- Chrome does support more than one CDP
+client attached to the same browser, so this isn't impossible. But it
+means a second client attaching to the exact browser session
+`@playwright/mcp` already owns and is actively driving for the real
+task, and I have no real Browserbase credentials in this sandbox to test
+whether that's actually safe or whether it interferes with deepsearch's
+own navigation/snapshot state. Given that deepsearch's actual ability to
+browse correctly is the thing that matters most here, I'd rather flag
+that risk and get your go-ahead than ship something unverified that
+could destabilize the one feature everything else depends on. Happy to
+build it if you want to accept that risk -- just say so.
+
+**5 -- the "Debugging connection was closed" error at the end of a run.**
+That error is Browserbase's own embedded page reacting to its CDP
+connection tearing down the instant the session is released -- not
+something this page's code produces, so suppressing it *inside* the
+iframe isn't an option (same cross-origin wall as above). Instead I made
+the backend warn the page a moment *before* that happens: 
+`tools/deepsearch_tools.py`'s `_run()` used to clear "a browser is live"
+state in the same `finally` block that's still holding the Browserbase
+session open; now it calls the new `live_activity.set_closing()` in that
+`finally` (while the DB still says a browser is live) and only clears
+everything *after* `BrowserToolProvider.__aexit__` has actually released
+the session. `server.py`'s `/live/<token>/status` route surfaces this as
+a new `closing` field, and the page's JS (`showClosing()`) swaps the
+iframe for a clean black screen reading "Compiling your results..." the
+moment it sees that flag -- before Browserbase's own disconnect banner
+would otherwise have a chance to render. The chain-of-thought log carries
+over into this screen (a `lastSteps` variable holds the most recent list)
+so it doesn't blank out right as the run wraps up. Verified with a small
+test server whose `/status` response changes over time (active for 5s,
+then `closing` for 5s, then idle) and confirmed via `page.evaluate` that
+the log's 3 prior lines were still showing once the page had switched to
+the "Compiling your results..." screen.
+
 ### A delegation Messa announces but never actually makes
 
 You reported a real conversation where Messa said "Sending back to

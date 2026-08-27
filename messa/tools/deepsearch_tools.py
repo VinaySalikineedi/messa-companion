@@ -457,13 +457,30 @@ def build_deepsearch_subagent(
                         final_messages = messages
                     final_messages = [*final_messages, AIMessage(content=f"(run errored: {e})")]
             finally:
-                # Mirrors the set_live_browser_active call above -- runs
-                # whether the agent finished cleanly, hit its step limit, or
-                # errored, so a user's live-view page never gets stuck
-                # showing "live" for a browser this delegation is done with.
+                # Signal "closing" *before* this `async with` block ends --
+                # the browser is still open and the DB still says a session
+                # is live (we haven't cleared it yet), but the live-view
+                # page's next poll can now proactively swap to a "Compiling
+                # your results..." screen instead of riding out whatever
+                # Browserbase's own embedded debug page renders the instant
+                # its CDP connection is torn down (a raw "Debugging
+                # connection was closed" banner) -- which happens moments
+                # from now, when `provider.__aexit__` below actually
+                # releases the Browserbase session.
                 if live_view_url:
-                    await db.clear_live_browser_active(user.user_id)
-                    live_activity.clear(user.user_id)
+                    live_activity.set_closing(user.user_id)
+
+        # BrowserToolProvider.__aexit__ has now released the Browserbase
+        # session -- only clear "a browser is live" state once that's
+        # actually true, mirroring the set_live_browser_active call above so
+        # it runs whether the agent finished cleanly, hit its step limit, or
+        # errored. Clearing this here (rather than in the finally above)
+        # keeps the "closing" signal up for the whole teardown window
+        # instead of flipping straight to idle before the front-end gets a
+        # chance to show the "closing" screen.
+        if live_view_url:
+            await db.clear_live_browser_active(user.user_id)
+            live_activity.clear(user.user_id)
 
         summary = _last_ai_text(final_messages)
 

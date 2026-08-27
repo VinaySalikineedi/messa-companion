@@ -54,16 +54,31 @@ async def create_context() -> str:
     return data["id"]
 
 
+# Pinned rather than left to Browserbase's own unconfigured default (which
+# its docs don't actually commit to a number for) -- live_view_page.py's
+# `.video-wrap` sizes itself to this exact aspect ratio, so the embedded
+# live-view iframe fills it edge-to-edge with no letterboxing/dead space
+# below the browser content. If you change this, update
+# live_view_page.py's BROWSER_VIEWPORT_WIDTH/HEIGHT to match.
+VIEWPORT_WIDTH = 1280
+VIEWPORT_HEIGHT = 800
+
+
 async def create_session(context_id: str | None) -> dict[str, Any]:
     """Start a browser session. With a context_id, cookies/logins persist
     back to that Context (persist: true) and are restored from it -- the
     direct replacement for the old local --user-data-dir profile directory,
     except this survives an HF Space restart since it isn't on the
     container's disk at all. Returns the full session dict; callers want
-    at least `id` and `connectUrl` (the CDP WebSocket URL)."""
-    body: dict[str, Any] = {}
+    at least `id` and `connectUrl` (the CDP WebSocket URL).
+
+    Pins `browserSettings.viewport` to VIEWPORT_WIDTH x VIEWPORT_HEIGHT --
+    see the comment above those constants for why."""
+    body: dict[str, Any] = {
+        "browserSettings": {"viewport": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT}},
+    }
     if context_id:
-        body["browserSettings"] = {"context": {"id": context_id, "persist": True}}
+        body["browserSettings"]["context"] = {"id": context_id, "persist": True}
     return await _request("POST", "/sessions", json=body)
 
 
