@@ -132,6 +132,30 @@ async def get_or_create_user(
         return dict(row)
 
 
+async def get_browserbase_context_id(user_id: int) -> str | None:
+    """One Browserbase Context per user, created once and reused forever --
+    see migrations/005_browserbase.sql. Additive/no-op-safe: returns None
+    if migration 005 hasn't been applied yet (deepsearch_tools.py then just
+    creates an unpersisted context for that one run)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_column(conn, "users", "browserbase_context_id"):
+            return None
+        return await conn.fetchval(
+            "SELECT browserbase_context_id FROM users WHERE id = $1", user_id
+        )
+
+
+async def save_browserbase_context_id(user_id: int, context_id: str) -> None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_column(conn, "users", "browserbase_context_id"):
+            return
+        await conn.execute(
+            "UPDATE users SET browserbase_context_id = $2 WHERE id = $1", user_id, context_id
+        )
+
+
 async def save_profile_field(user_id: int, field: str, value: str) -> dict[str, Any]:
     """Save one onboarding field (name/email/city) and advance onboarding_step.
 
@@ -711,22 +735,41 @@ async def get_deepsearch_session(user_id: int, session_id: int) -> dict[str, Any
 
 
 async def update_deepsearch_session(
-    session_id: int, messages_json: str, status: str, summary: str | None, steps_used: int
+    session_id: int,
+    messages_json: str,
+    status: str,
+    summary: str | None,
+    steps_used: int,
+    live_view_url: str | None = None,
 ) -> dict[str, Any] | None:
     pool = await get_pool()
     async with pool.acquire() as conn:
         if not await _has_table(conn, "deepsearch_sessions"):
             return None
-        row = await conn.fetchrow(
-            """
-            UPDATE deepsearch_sessions SET
-                messages = $2, status = $3::deepsearch_status, summary = $4,
-                steps_used = $5, updated_at = NOW()
-            WHERE id = $1
-            RETURNING *
-            """,
-            session_id, messages_json, status, summary, steps_used,
-        )
+        has_live_view = await _has_column(conn, "deepsearch_sessions", "live_view_url")
+        if has_live_view:
+            row = await conn.fetchrow(
+                """
+                UPDATE deepsearch_sessions SET
+                    messages = $2, status = $3::deepsearch_status, summary = $4,
+                    steps_used = $5, live_view_url = COALESCE($6, live_view_url), updated_at = NOW()
+                WHERE id = $1
+                RETURNING *
+                """,
+                session_id, messages_json, status, summary, steps_used, live_view_url,
+            )
+        else:
+            # Migration 005 not applied yet -- live_view_url silently dropped.
+            row = await conn.fetchrow(
+                """
+                UPDATE deepsearch_sessions SET
+                    messages = $2, status = $3::deepsearch_status, summary = $4,
+                    steps_used = $5, updated_at = NOW()
+                WHERE id = $1
+                RETURNING *
+                """,
+                session_id, messages_json, status, summary, steps_used,
+            )
         return dict(row) if row else None
 
 

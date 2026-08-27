@@ -48,10 +48,11 @@ SENDBLUE_NUMBER=...           # from `sendblue lines`
 # SENDBLUE_WEBHOOK_SECRET=... # optional, see step 3
 ```
 
-### 2. Point DATABASE_URL at real Neon, run all four migrations
+### 2. Point DATABASE_URL at real Neon, run all five migrations
 
 ```
 DATABASE_URL=postgresql+asyncpg://user:pass@ep-xxxx.neon.tech/dbname?sslmode=require
+BROWSERBASE_API_KEY=...      # required -- see "Browserbase" below
 ```
 
 (Verified asyncpg parses Neon's `sslmode=require` param with no extra code
@@ -61,6 +62,7 @@ DATABASE_URL=postgresql+asyncpg://user:pass@ep-xxxx.neon.tech/dbname?sslmode=req
 psql "$DATABASE_URL" -f migrations/002_projects_and_channel.sql
 psql "$DATABASE_URL" -f migrations/003_user_email.sql
 psql "$DATABASE_URL" -f migrations/004_deepsearch_sessions.sql
+psql "$DATABASE_URL" -f migrations/005_browserbase.sql
 ```
 
 ### 3. Run the server and register the webhook
@@ -181,15 +183,12 @@ change:
 ```
 OPENROUTER_API_KEY
 DATABASE_URL              # your real Neon connection string
+BROWSERBASE_API_KEY       # required -- deepsearch has no local-browser fallback, see "Browserbase" below
 SENDBLUE_API_KEY
 SENDBLUE_API_SECRET
 SENDBLUE_NUMBER
 SENDBLUE_WEBHOOK_SECRET   # if you set one, see Phase 2 step 3 above
 ```
-
-`MESSA_DEEPSEARCH_HEADLESS=true` is already baked into the Dockerfile as a
-build-time default (there's no display on a Space), so you don't need to
-set it yourself unless you want to override something.
 
 ### 3. Push
 
@@ -208,9 +207,10 @@ git push space main
 this folder's -- e.g. it still has Gradio's starter commit -- and you're
 sure you want this folder's content to win.)
 
-Watch the build in the Space's **Logs** tab. The Playwright/Chromium install
-step adds a few minutes the first time; after that, Docker layer caching
-makes rebuilds faster unless `requirements.txt` changed.
+Watch the build in the Space's **Logs** tab. It's a much lighter build now
+than earlier rounds -- no local Chromium download/install step, since
+deepsearch drives a remote Browserbase browser instead (see "Browserbase"
+below) -- so rebuilds are quick unless `requirements.txt` changed.
 
 ### 4. Point Sendblue at it
 
@@ -229,16 +229,78 @@ sendblue webhooks set-receive https://<your-username>-<your-space-name>.hf.space
   Sendblue's retry; every message after that is fast, since the container's
   already warm).
 - **The filesystem is ephemeral** -- wiped on every restart/redeploy unless
-  you attach paid persistent storage. Concretely: deepsearch's per-user
-  Chromium profile directories (the login persistence from round 1's
-  feedback) reset to logged-out on a restart, and local `sessions`/`outputs`
-  files (CLI-only, not used by the server) don't survive one either. Neon
+  you attach paid persistent storage. Concretely: local `sessions`/`outputs`
+  files (CLI-only, not used by the server) don't survive a restart. Neon
   itself is unaffected -- it's an external DB, not Space storage, so users/
-  tasks/reminders/deepsearch_sessions/message_history are all fine. If
-  losing deepsearch logins on restart becomes a real annoyance, the fix is
-  storing Playwright's exported `storage_state` in Postgres instead of on
-  disk (same pattern as deepsearch_sessions) and rehydrating it per
-  delegation -- happy to build that if/when it matters to you.
+  tasks/reminders/deepsearch_sessions/message_history are all fine. Nor is
+  deepsearch's login persistence affected anymore -- since the Browserbase
+  switch (see below) that's a Browserbase Context, not a directory on this
+  container's disk, so it survives restarts fine.
+
+## Browserbase
+
+Two rounds of testing hit the same wall from different angles: "Chrome
+isn't installed in the sandbox." Both times the root cause I found and
+fixed was real (MCP's stdio transport not passing through the parent
+environment; then a `--browser` flag that silently pointed at a totally
+different, uninstalled Chrome build) -- but you redeployed with both fixes
+in and it was still down. Rather than keep chasing a third HF-container-
+specific quirk, your call to switch to Browserbase was the right one: it
+runs the actual Chromium on its own infrastructure, and our container just
+drives it remotely over CDP (`@playwright/mcp@latest --cdp-endpoint
+<url>`). deepsearch's own architecture -- the LangChain agent, the full
+Playwright tool set, the domain allow-list, the destructive-action approval
+gate, the stale-snapshot guard -- is all completely unchanged; only *where*
+the browser physically runs is different. This also directly answers your
+question about whether Browserbase would get in the way of either
+requirement:
+
+- **Keeping your own fine-tuned agent driving the browser**: yes, fully
+  preserved. This deliberately does *not* use Browserbase's own
+  Stagehand/agent product -- `--cdp-endpoint` just hands your existing
+  `@playwright/mcp` tool-calling setup a remote browser to control, exactly
+  matching Browserbase's own guidance for "let your own agent drive it,
+  Browserbase is just the infrastructure layer" use cases.
+- **Interactive live browser streaming (Phase 3)**: yes, this is what
+  Browserbase's Live View is for. Every deepsearch run now captures a
+  `debuggerFullscreenUrl` (an iframe-embeddable link to watch that exact
+  session live) into `deepsearch_sessions.live_view_url` the moment it
+  opens the browser -- see `migrations/005_browserbase.sql` and
+  `messa/channels/browserbase.py`. It's not wired into any reply yet
+  (Messa doesn't text it to you), that's the Phase 3 work, but the data is
+  already there waiting for it.
+
+What changed concretely:
+
+- **Per-user login persistence moved from disk to Browserbase.** The old
+  `--user-data-dir deepsearch_profiles/user-<id>` directory is gone;
+  `users.browserbase_context_id` now holds one Browserbase Context per
+  user (created once via `db.get_browserbase_context_id`/
+  `save_browserbase_context_id`, reused on every later session). This is
+  strictly better than the old approach -- Contexts live indefinitely on
+  Browserbase's side, so they survive an HF Space restart, unlike the old
+  local directory.
+- **`BROWSERBASE_API_KEY` is now required** -- there's no local-Chromium
+  fallback anymore, deepsearch simply doesn't work without it. Get a free
+  key at browserbase.com; per their current docs no
+  `BROWSERBASE_PROJECT_ID` is needed anywhere, the API key alone resolves
+  the project.
+- **The Dockerfile is lighter.** No more `playwright install --with-deps
+  chromium` (a multi-minute build step) or `PLAYWRIGHT_BROWSERS_PATH`/
+  `MESSA_DEEPSEARCH_HEADLESS` plumbing for a browser that no longer runs in
+  this container. Node.js and the `@playwright/mcp` npx-cache warm-up are
+  still there -- that package is the MCP *client*, which still runs
+  locally and now just connects out to Browserbase over CDP instead of
+  launching a local process.
+- **Worth knowing about the free Browserbase plan** (per the setup doc you
+  saved): no Proxies, no Verified/auto-CAPTCHA-solving. Only matters if
+  deepsearch ever needs to get through a bot-protected or CAPTCHA-walled
+  site -- ordinary browsing/research is unaffected. Their Model Gateway's
+  $5 token cap is irrelevant here too, since Messa brings its own LLM via
+  OpenRouter rather than using Browserbase's.
+- Needs `migrations/005_browserbase.sql` (adds `users.browserbase_context_id`
+  and `deepsearch_sessions.live_view_url`, both additive/no-op-safe like
+  every other migration here).
 
 ## Changes from your second round of testing
 
@@ -298,12 +360,13 @@ sendblue webhooks set-receive https://<your-username>-<your-space-name>.hf.space
 - **Browser lifecycle.** deepsearch (then still called browser_agent) is no
   longer a long-lived Playwright session held open for the whole CLI
   process. It's a `CompiledSubAgent` (see `tools/deepsearch_tools.py`) that
-  launches `@playwright/mcp` fresh on each delegation and fully closes that
-  subprocess (killing the browser) once the subagent's task finishes -- so
-  an idle session doesn't hold a Chromium process open. Logins still
-  persist between separate tasks because each user gets their own on-disk
-  profile directory (`--user-data-dir deepsearch_profiles/user-<id>`)
-  rather than an in-memory one.
+  connects `@playwright/mcp` fresh to a new browser session on each
+  delegation and fully closes/releases it once the subagent's task
+  finishes -- so an idle session doesn't hold a browser open. Logins still
+  persist between separate tasks because each user gets their own
+  Browserbase Context rather than an unpersisted one-off session (see the
+  "Browserbase" section above for why this replaced an earlier on-disk
+  `--user-data-dir` approach).
 
 ## Setup
 
@@ -318,6 +381,7 @@ pip install -r requirements.txt
 ```
 OPENROUTER_API_KEY=...       # already set
 DATABASE_URL=...             # already set (Neon)
+BROWSERBASE_API_KEY=...      # required -- see "Browserbase" above
 # optional, for the email agent once you're ready:
 # COMPOSIO_API_KEY=...
 # COMPOSIO_EMAIL_CONNECTED_ACCOUNT_ID=...
@@ -325,14 +389,16 @@ DATABASE_URL=...             # already set (Neon)
 
 Run the additive migrations once (adds a lightweight `projects` table used
 to group related requests, a `channel` column on `message_history` for
-Phase 2's multiple channels, a `users.email` column for onboarding, and a
-`deepsearch_sessions` table for resumable research -- see "What I added
-beyond your schema" below). Paste each file into the Neon SQL editor, or:
+Phase 2's multiple channels, a `users.email` column for onboarding, a
+`deepsearch_sessions` table for resumable research, and the Browserbase
+columns -- see "What I added beyond your schema" below). Paste each file
+into the Neon SQL editor, or:
 
 ```bash
 psql "$DATABASE_URL" -f migrations/002_projects_and_channel.sql
 psql "$DATABASE_URL" -f migrations/003_user_email.sql
 psql "$DATABASE_URL" -f migrations/004_deepsearch_sessions.sql
+psql "$DATABASE_URL" -f migrations/005_browserbase.sql
 ```
 
 Everything else works without them -- `db.py` checks for the table/column
@@ -406,9 +472,16 @@ history, `summary`, `steps_used`, timestamps). `messages`/`summary` are
 schema already uses for `pending_actions.payload`/`audit_logs.payload`,
 rather than introducing JSONB as a second convention.
 
-All four are additive/reversible and the app runs fine without them
-(project tracking, email-saving, and session resumption just no-op --
-deepsearch still works, it just can't resume a cut-off run).
+There was also nowhere to store the per-user Browserbase Context id or a
+session's live-view link once deepsearch moved off local Chromium (see
+"Browserbase" above), so `migrations/005_browserbase.sql` adds
+`users.browserbase_context_id` and `deepsearch_sessions.live_view_url`.
+
+All five are additive/reversible and the app runs fine without them
+(project tracking, email-saving, and session resumption just no-op;
+without migration 005, deepsearch still runs against Browserbase, it just
+can't remember your login between separate sessions or capture a live-view
+link).
 
 ## Known Phase 1 limitations (by design -- later phases cover these)
 

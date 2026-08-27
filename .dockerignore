@@ -6,6 +6,5 @@ __pycache__/
 *.pyc
 sessions/
 outputs/
-deepsearch_profiles/
 .playwright-mcp/
 .DS_Store

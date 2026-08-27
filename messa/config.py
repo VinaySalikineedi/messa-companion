@@ -50,6 +50,16 @@ DATABASE_URL = _RAW_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://
 COMPOSIO_API_KEY = os.environ.get("COMPOSIO_API_KEY")  # optional until Phase 2 wiring
 COMPOSIO_EMAIL_ACCOUNT = os.environ.get("COMPOSIO_EMAIL_CONNECTED_ACCOUNT_ID")
 
+# ---- Browserbase (deepsearch's remote browser) ----
+# Two rounds of "Chrome isn't installed" on the HF Space -- each one a real,
+# fixable bug (MCP not passing through the environment; a --browser channel
+# mismatch), but both symptoms of the same underlying problem: running an
+# actual Chromium inside a constrained, ephemeral container. Browserbase
+# runs the browser on its own infrastructure instead; deepsearch just
+# drives it over CDP (see tools/deepsearch_tools.py). Required for
+# deepsearch to work at all now -- there's no local-Chromium fallback.
+BROWSERBASE_API_KEY = os.environ.get("BROWSERBASE_API_KEY")
+
 # ---- Sendblue (SMS/iMessage channel, Phase 2) ----
 # Left optional (unlike OPENROUTER_API_KEY/DATABASE_URL above) so the CLI
 # keeps working with no Sendblue account at all -- messa/server.py checks
@@ -92,12 +102,12 @@ OUTPUTS_DIR = os.environ.get("MESSA_OUTPUTS_DIR", "outputs")
 DEEPSEARCH_ALLOWED_DOMAINS: list[str] = [
     d.strip() for d in os.environ.get("MESSA_DEEPSEARCH_ALLOWED_DOMAINS", "").split(",") if d.strip()
 ]
-# Headless is required on a server with no display (HF Spaces, Phase 4).
-DEEPSEARCH_HEADLESS = os.environ.get("MESSA_DEEPSEARCH_HEADLESS", "true").strip().lower() in ("1", "true", "yes")
-# Each user gets their own on-disk Chromium profile directory here, so
-# logins/cookies survive even though the browser process itself is fully
-# closed between tasks (see tools/deepsearch_tools.py).
-DEEPSEARCH_PROFILES_ROOT = os.environ.get("MESSA_DEEPSEARCH_PROFILES_ROOT", "deepsearch_profiles")
+# No more DEEPSEARCH_HEADLESS / DEEPSEARCH_PROFILES_ROOT -- now that the
+# browser itself lives on Browserbase, not in our container, headless mode
+# and profile-directory persistence are Browserbase's problem (the latter
+# is now a per-user Browserbase Context instead, see db.py's
+# get_browserbase_context_id). Both settings are dead now that deepsearch
+# talks to a remote browser instead of launching a local one.
 # Step budget for a single deepsearch run (one delegation). Separate from
 # the orchestrator's own RECURSION_LIMIT -- deep research tasks legitimately
 # need many steps, and hitting this cap is expected/handled (the session is

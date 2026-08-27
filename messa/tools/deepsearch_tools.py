@@ -14,13 +14,24 @@ unchanged:
     a new snapshot is taken, since stale refs silently point at the wrong
     element.
 
+Browser location: the actual Chromium no longer runs inside our own
+container -- two rounds of "Chrome isn't installed" failures on the HF
+Space (see config.py's Browserbase comment) came from exactly that, so the
+browser now lives on Browserbase's infrastructure instead, and
+`@playwright/mcp` connects to it remotely over CDP (`--cdp-endpoint
+<connectUrl>`, see channels/browserbase.py) rather than launching a local
+process. Everything downstream of that -- the tool set, the LangChain
+agent, the guard layer below -- is completely unchanged; only *where* the
+browser physically runs is different.
+
 Lifecycle: `build_deepsearch_subagent()` returns a deepagents
-`CompiledSubAgent` whose runnable launches `@playwright/mcp` fresh on each
-delegation and fully closes that subprocess (killing the browser) once the
-subagent's task finishes -- so an idle Messa session isn't holding a
-Chromium process open. Logins still survive between tasks because each
-user gets a persistent on-disk profile directory (`--user-data-dir`, keyed
-by user id) rather than an in-memory (`--isolated`) one.
+`CompiledSubAgent` whose runnable connects `@playwright/mcp` fresh to a new
+Browserbase session on each delegation and fully closes/releases it once
+the subagent's task finishes -- so an idle Messa session isn't holding a
+browser session open (and racking up Browserbase usage). Logins still
+survive between tasks because each user gets a persistent Browserbase
+Context (created once, reused forever -- see db.get_browserbase_context_id)
+rather than an unpersisted one-off session.
 
 Resumability: the `task` tool's schema only carries free-text `description`
 + `subagent_type` (deepagents fixes this; there's no side channel for
@@ -41,7 +52,6 @@ from __future__ import annotations
 import json
 import os
 import re
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -57,6 +67,8 @@ from langgraph.errors import GraphRecursionError
 
 from .. import config, console, db
 from ..approval import ApprovalGate
+from ..channels import browserbase
+from ..channels.browserbase import BrowserbaseError
 from ..config import UserContext
 
 LABEL = "deepsearch"
@@ -86,12 +98,6 @@ def _domain_allowed(url: str) -> bool:
     return any(host == d or host.endswith("." + d) for d in config.DEEPSEARCH_ALLOWED_DOMAINS)
 
 
-def _profile_dir(user_id: int) -> str:
-    path = Path(config.DEEPSEARCH_PROFILES_ROOT) / f"user-{user_id}"
-    path.mkdir(parents=True, exist_ok=True)
-    return str(path.resolve())
-
-
 def _message_text(message: Any) -> str:
     content = getattr(message, "content", "")
     if isinstance(content, str):
@@ -112,55 +118,70 @@ def _last_ai_text(messages: list[Any]) -> str:
 
 
 class BrowserToolProvider:
-    """Owns one Playwright MCP subprocess for the duration of an `async with` block.
+    """Owns one Playwright MCP subprocess (connected to a remote Browserbase
+    session over CDP) for the duration of an `async with` block.
 
     Usage:
         async with BrowserToolProvider(approval_gate, user_id=1) as provider:
             tools = provider.tools
             ...use tools while the block is open...
-        # subprocess (and its browser) is fully closed here.
+            provider.live_view_url  # link to watch this session live, or None
+        # MCP subprocess is closed and the Browserbase session released here.
     """
 
     def __init__(
         self,
         approval_gate: ApprovalGate | None = None,
         user_id: int | None = None,
-        headless: bool | None = None,
     ):
         self._approval_gate = approval_gate
-        # Deliberately no --browser flag: passing "chromium" explicitly
-        # (tempting, given the Dockerfile only installs "chromium") actually
-        # makes this *worse* on current @playwright/mcp versions -- it maps
-        # to a separate "Chrome for Testing" build with its own install
-        # command (`install-browser chrome-for-testing`), not the Chromium
-        # `playwright install chromium` puts on disk. Confirmed by testing
-        # both ways: omitting --browser correctly finds and launches the
-        # Dockerfile's installed Chromium (including in --user-data-dir/
-        # persistent-context mode, matching deepsearch's actual usage);
-        # passing --browser chromium instead fails looking for an
-        # executable that was never installed.
-        args = ["@playwright/mcp@latest"]
-        if user_id is not None:
-            args += ["--user-data-dir", _profile_dir(user_id)]
-        if headless if headless is not None else config.DEEPSEARCH_HEADLESS:
-            args.append("--headless")
-        # env=dict(os.environ): MCP's stdio transport does NOT inherit the
-        # parent process's environment by default (deliberately -- so an
-        # arbitrary MCP server doesn't automatically see your secrets).
-        # Without this, the spawned npx subprocess has no PATH/HOME/
-        # PLAYWRIGHT_BROWSERS_PATH, so it can't find the Chromium the
-        # Dockerfile installed either -- this and the --browser flag above
-        # were BOTH needed, not just one or the other.
-        self._client = MultiServerMCPClient({
-            "playwright": {"command": "npx", "args": args, "transport": "stdio", "env": dict(os.environ)}
-        })
+        self._user_id = user_id
+        self._client: MultiServerMCPClient | None = None
         self._session_cm = None
         self._session = None
+        self._bb_session_id: str | None = None
+        self.live_view_url: str | None = None
         self.tools: list[BaseTool] = []
         # Shared mutable state referenced by the closures below.
         self._state = {"consecutive_errors": 0, "snapshot_fresh": False}
 
     async def __aenter__(self) -> "BrowserToolProvider":
+        # One Browserbase Context per user, created once and reused forever --
+        # this is what makes logins survive between tasks (and, unlike the
+        # old --user-data-dir profile directory, survives an HF Space
+        # restart too, since it isn't on the container's disk at all).
+        context_id = None
+        if self._user_id is not None:
+            context_id = await db.get_browserbase_context_id(self._user_id)
+            if not context_id:
+                context_id = await browserbase.create_context()
+                await db.save_browserbase_context_id(self._user_id, context_id)
+
+        session = await browserbase.create_session(context_id)
+        self._bb_session_id = session["id"]
+        connect_url = session["connectUrl"]
+        console.system(f"Deepsearch: opened Browserbase session {self._bb_session_id}.")
+
+        # Best-effort: not having a live-view link yet shouldn't block the run.
+        try:
+            self.live_view_url = await browserbase.get_live_view_url(self._bb_session_id)
+        except BrowserbaseError as e:
+            console.tool_error(LABEL, "browserbase_live_view", str(e))
+
+        # env=dict(os.environ): MCP's stdio transport does NOT inherit the
+        # parent process's environment by default (deliberately -- so an
+        # arbitrary MCP server doesn't automatically see your secrets).
+        # Without PATH/HOME passed through, the spawned npx subprocess can't
+        # even find node_modules/npx's own cache -- still needed here even
+        # though the browser itself is remote now.
+        self._client = MultiServerMCPClient({
+            "playwright": {
+                "command": "npx",
+                "args": ["@playwright/mcp@latest", "--cdp-endpoint", connect_url],
+                "transport": "stdio",
+                "env": dict(os.environ),
+            }
+        })
         self._session_cm = self._client.session("playwright")
         self._session = await self._session_cm.__aenter__()
         raw_tools = await load_mcp_tools(self._session)
@@ -171,6 +192,12 @@ class BrowserToolProvider:
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         if self._session_cm is not None:
             await self._session_cm.__aexit__(exc_type, exc, tb)
+        if self._bb_session_id is not None:
+            try:
+                await browserbase.release_session(self._bb_session_id)
+            except BrowserbaseError as e:
+                # Best-effort: the session will idle out on its own either way.
+                console.tool_error(LABEL, "browserbase_release", str(e))
         console.system("Deepsearch: browser closed.")
 
     def _guard(self, original: BaseTool) -> BaseTool:
@@ -293,7 +320,9 @@ def build_deepsearch_subagent(
             "recursion_limit": config.DEEPSEARCH_MAX_STEPS,
         }
 
+        live_view_url = None
         async with BrowserToolProvider(approval_gate, user_id=user.user_id) as provider:
+            live_view_url = provider.live_view_url
             inner_agent = create_agent(
                 model=model, tools=provider.tools, system_prompt=DEEPSEARCH_SYSTEM_PROMPT,
                 checkpointer=checkpointer,
@@ -329,6 +358,7 @@ def build_deepsearch_subagent(
                 status=status,
                 summary=summary,
                 steps_used=steps_so_far + len(final_messages),
+                live_view_url=live_view_url,
             )
             if status == "active":
                 header = (
