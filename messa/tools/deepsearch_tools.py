@@ -39,6 +39,7 @@ exactly where this one left off.
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -127,12 +128,29 @@ class BrowserToolProvider:
         headless: bool | None = None,
     ):
         self._approval_gate = approval_gate
+        # Deliberately no --browser flag: passing "chromium" explicitly
+        # (tempting, given the Dockerfile only installs "chromium") actually
+        # makes this *worse* on current @playwright/mcp versions -- it maps
+        # to a separate "Chrome for Testing" build with its own install
+        # command (`install-browser chrome-for-testing`), not the Chromium
+        # `playwright install chromium` puts on disk. Confirmed by testing
+        # both ways: omitting --browser correctly finds and launches the
+        # Dockerfile's installed Chromium (including in --user-data-dir/
+        # persistent-context mode, matching deepsearch's actual usage);
+        # passing --browser chromium instead fails looking for an
+        # executable that was never installed.
         args = ["@playwright/mcp@latest"]
         if user_id is not None:
             args += ["--user-data-dir", _profile_dir(user_id)]
         if headless if headless is not None else config.DEEPSEARCH_HEADLESS:
             args.append("--headless")
-        import os
+        # env=dict(os.environ): MCP's stdio transport does NOT inherit the
+        # parent process's environment by default (deliberately -- so an
+        # arbitrary MCP server doesn't automatically see your secrets).
+        # Without this, the spawned npx subprocess has no PATH/HOME/
+        # PLAYWRIGHT_BROWSERS_PATH, so it can't find the Chromium the
+        # Dockerfile installed either -- this and the --browser flag above
+        # were BOTH needed, not just one or the other.
         self._client = MultiServerMCPClient({
             "playwright": {"command": "npx", "args": args, "transport": "stdio", "env": dict(os.environ)}
         })
