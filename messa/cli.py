@@ -175,9 +175,38 @@ async def run_message(user: config.UserContext, agent, text: str, send=None) -> 
 
     async def _on_ai_message(msg_text: str, delegating_to: str | None = None) -> None:
         share_url = user.live_view_share_url
-        if delegating_to == "deepsearch" and share_url and share_url not in msg_text:
-            link_line = f"Watch it live: {share_url}"
-            msg_text = f"{msg_text.rstrip()} {link_line}" if msg_text.strip() else link_line
+        if delegating_to == "deepsearch":
+            if share_url and share_url not in msg_text:
+                link_line = f"Watch it live: {share_url}"
+                msg_text = f"{msg_text.rstrip()} {link_line}" if msg_text.strip() else link_line
+            elif not share_url:
+                # Confirmed (by direct integration test against the real
+                # deepagents/create_deep_agent harness) that `delegating_to`
+                # detection itself is reliable, in both the "model wrote an
+                # acknowledgment" and "model went straight to the tool call
+                # with zero text" cases -- so if a deepsearch delegation
+                # ever ships with no link again, it's one of exactly two
+                # things and this line says which: either migration 006
+                # hasn't run yet against this DB (live_view_token is None --
+                # get_or_create_live_share_token returns None whenever
+                # users.live_share_token doesn't exist yet) or it has run
+                # but something about token generation/lookup itself failed
+                # silently. Previously this was a completely silent no-op,
+                # which is exactly why the last two rounds of this bug took
+                # multiple back-and-forths to even localize.
+                console.system(
+                    f"Deepsearch delegation for user #{user.user_id} has no live-view link to "
+                    f"attach -- live_view_token={user.live_view_token!r}, "
+                    f"LIVE_VIEW_BASE_URL={config.LIVE_VIEW_BASE_URL!r}. "
+                    + (
+                        "live_view_token is None: migration 006_live_view.sql likely hasn't "
+                        "run against this DB yet (or get_or_create_live_share_token failed)."
+                        if not user.live_view_token
+                        else "LIVE_VIEW_BASE_URL is empty: set MESSA_LIVE_VIEW_BASE_URL."
+                        if not config.LIVE_VIEW_BASE_URL
+                        else "both look set -- check live_view_share_url's own logic."
+                    )
+                )
         if not msg_text:
             return  # nothing to say and no link to attach -- e.g. a silent, non-deepsearch delegation
         sent_texts.append(msg_text)

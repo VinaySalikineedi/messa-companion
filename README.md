@@ -366,10 +366,14 @@ message *every single time* she delegates to deepsearch (not just the
 first) -- e.g. "Checking that now, watch it live here: <link>" -- since
 it's always the same permanent link for that user, repeating it costs
 nothing and means you never have to go dig up an old text to find it.
-This lives in `agents/registry.py`'s system prompt, conditioned on
-`MESSA_LIVE_VIEW_BASE_URL` being set; leave it unset and Messa simply
-never mentions a link, so there's no risk of texting a broken one before
-you're ready.
+The link itself is attached in code (`cli.py`'s `run_message`), not written
+by the model -- see "Debugging the missing live link" below for why. It
+only shows up in a message when `user.live_view_share_url` resolves to a
+real URL, which needs both `LIVE_VIEW_BASE_URL` (now defaults to
+`https://live.textmessa.com`, no secret required) and a per-user
+`live_view_token` (needs migration 006 -- see below). Missing either one
+means Messa simply never mentions a link that turn, so there's no risk of
+texting a broken one.
 
 **Connecting textmessa.com:** Hugging Face Spaces supports custom domains,
 but only as a subdomain (not the bare apex) via a CNAME, and only on a
@@ -434,6 +438,64 @@ they'd have bitten *any* future migration the same way:
 If you're still seeing either symptom after pulling this update, a Space
 restart clears both a stale connection pool and this process's in-memory
 cache in one shot -- but going forward neither should require one.
+
+### Debugging the missing live link (this round)
+
+You reported deepsearch and the live-view page both working end to end,
+but the link itself still never arriving over SMS, and gave three specific
+hypotheses for where the chain breaks. Each was checked directly rather
+than guessed at:
+
+1. **"Tool call name detection gap"** (a `deepsearch`-named tool call
+   bypassing the `"task"`-name check `run_turn` looks for) -- ruled out by
+   reading the installed `deepagents` library's own source
+   (`middleware/subagents.py`'s `_build_task_tool`). Every subagent this
+   project defines (plain dict or `CompiledSubAgent`, which deepsearch is)
+   is invoked through one single, unconditionally-named `"task"` tool --
+   there's no code path in this version of deepagents that would ever
+   expose deepsearch as its own directly-named tool. This hypothesis isn't
+   possible given how `registry.py` builds the orchestrator.
+2. **The model going straight to the tool call with no acknowledgment
+   text** -- and the related concern that LangGraph might split a single
+   completion's text and tool call across separate stream events, which
+   would defeat `delegating_to` detection either way. Rather than reason
+   about this, I built a real integration test: a fake chat model wired
+   into the *actual* `create_deep_agent`/`build_orchestrator` (only the
+   model and Browserbase's session are faked; everything else -- the `task`
+   tool, LangGraph's `astream(stream_mode="updates")`, `cli.run_turn`,
+   `cli.run_message` -- is the real code), covering both a completion with
+   text+tool_call together and one with an empty acknowledgment and only a
+   tool_call. Both cases correctly produced a text with the live link
+   attached. So neither of these is happening in this codebase as it
+   stands.
+3. **`MESSA_LIVE_VIEW_BASE_URL` missing/misconfigured on the Space** --
+   this is the one hypothesis that *is* still a real possibility, and the
+   one I can't check from outside your deployed Space or your live Neon
+   DB. It's now partly moot (`LIVE_VIEW_BASE_URL` defaults to
+   `https://live.textmessa.com` even with no secret set at all), which
+   leaves the other half of `live_view_share_url`: a per-user
+   `live_view_token`, which is `None` until migration 006 has actually run
+   against the DB your Space is pointed at.
+
+Since (1) and (2) are now confirmed not to be the cause and (3) can't be
+checked from here, `run_message`'s `_on_ai_message` (in `cli.py`) now logs
+a clear, specific line the moment a deepsearch delegation has no link to
+attach, telling you exactly which half is missing:
+
+```
+Deepsearch delegation for user #<id> has no live-view link to attach --
+live_view_token=None, LIVE_VIEW_BASE_URL='https://live.textmessa.com'.
+live_view_token is None: migration 006_live_view.sql likely hasn't run
+against this DB yet (or get_or_create_live_share_token failed).
+```
+
+Previously this was a silent no-op -- exactly why this bug took several
+rounds just to localize. If the link is still missing on your next
+deepsearch delegation, check the Space's logs for this line: it tells you
+directly whether it's the token or the base URL, instead of another guess.
+If it says `live_view_token is None`, the fix is confirming migration 006
+has actually run against the same `DATABASE_URL` the deployed Space uses
+(not just your local `.env`'s database).
 
 ## Changes from your second round of testing
 

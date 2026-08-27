@@ -62,11 +62,15 @@ BROWSERBASE_API_KEY = os.environ.get("BROWSERBASE_API_KEY")
 
 # ---- Live view sharing (Phase 3) ----
 # Base URL for the public /live/<token> page (see server.py + db.py's
-# live_share_token functions) -- e.g. "https://live.textmessa.com" once
-# the custom domain is wired up, or your Space's own hf.space URL before
-# that. Left unset by default: UserContext.live_view_share_url returns
-# None when this is empty, and the system prompt skips mentioning a live
-# link at all rather than texting a broken one.
+# live_share_token functions). Defaults to the now-permanent custom domain
+# rather than an empty string -- an earlier version left this unset by
+# default specifically so a missing/misconfigured HF secret would silently
+# omit the live link rather than send a broken one, but that meant a
+# genuinely-missing MESSA_LIVE_VIEW_BASE_URL secret on the Space was
+# indistinguishable from "not ready yet," and cost a live-view link that
+# should have gone out. Since live.textmessa.com is stable now, hardcoding
+# it as the default is strictly better -- override via the env var only if
+# you ever need to point this at something else (e.g. a staging Space).
 LIVE_VIEW_BASE_URL = os.environ.get("MESSA_LIVE_VIEW_BASE_URL", "https://live.textmessa.com").rstrip("/")
 
 # ---- Sendblue (SMS/iMessage channel, Phase 2) ----
