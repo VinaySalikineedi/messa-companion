@@ -39,3 +39,19 @@ class AutoApproveGate:
 
     async def confirm(self, label: str, tool_name: str, args: dict[str, Any]) -> bool:
         return True
+
+
+class DenyApprovalGate:
+    """Always declines. The safe default for non-interactive channels (the
+    Sendblue webhook server) that have no synchronous stdin to block on --
+    CLIApprovalGate's `input()` would just hang forever there. Declining is
+    a safe default: most of what deepsearch/email_agent do isn't destructive
+    and still works fine; only clicks/typing/sends need this gate, and they
+    get a clear 'blocked' tool result back instead of hanging or silently
+    auto-proceeding. Opt into auto-approval instead (see server.py /
+    MESSA_SMS_AUTO_APPROVE_DESTRUCTIVE) only once you're comfortable with
+    that tradeoff."""
+
+    async def confirm(self, label: str, tool_name: str, args: dict[str, Any]) -> bool:
+        console.system(f"[{label}] wants to run '{tool_name}' -- auto-denied (no interactive approval channel).")
+        return False

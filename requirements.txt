@@ -31,3 +31,8 @@ croniter>=6.2.4
 # Browser agent tools are provided by the Playwright MCP server, which runs
 # via `npx @playwright/mcp@latest` (needs Node.js installed; npx will
 # fetch it on first run).
+
+# Phase 2: Sendblue webhook server
+fastapi>=0.121.0
+uvicorn[standard]>=0.38.0
+httpx>=0.28.1

@@ -63,11 +63,27 @@ def _parse_dt(value: Any) -> datetime | None:
 # Users
 # ---------------------------------------------------------------------------
 
+ONBOARDING_STEPS = ["awaiting_name", "awaiting_email", "awaiting_location", "complete"]
+
+
+def _initial_onboarding_step(name: str | None) -> str:
+    """Where a brand-new user's onboarding starts, given what we already know."""
+    return "awaiting_email" if name else "awaiting_name"
+
+
 async def get_or_create_user(
     phone_number: str,
     name: str | None = None,
     timezone_name: str = config.DEFAULT_TIMEZONE,
 ) -> dict[str, Any]:
+    """Look up (or create) the user for this phone number.
+
+    A new user starts at 'awaiting_name' (the schema's own default) unless a
+    name was already supplied -- Messa's system prompt uses onboarding_step
+    to decide whether/what to casually ask for at the start of the
+    conversation (see agents/registry.py). Existing users are returned as-is;
+    onboarding only runs once.
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM users WHERE phone_number = $1", phone_number)
@@ -75,14 +91,42 @@ async def get_or_create_user(
             return dict(row)
         row = await conn.fetchrow(
             """
-            INSERT INTO users (phone_number, name, timezone, onboarding_step, tier)
-            VALUES ($1, $2, $3, 'complete', 'free'::user_tier)
+            INSERT INTO users (phone_number, name, timezone, onboarding_step)
+            VALUES ($1, $2, $3, $4)
             RETURNING *
             """,
             phone_number,
             name,
             timezone_name,
+            _initial_onboarding_step(name),
         )
+        return dict(row)
+
+
+async def save_profile_field(user_id: int, field: str, value: str) -> dict[str, Any]:
+    """Save one onboarding field (name/email/city) and advance onboarding_step.
+
+    `value` may be the literal string 'skip' for the optional email step --
+    that still advances onboarding without writing anything to the column.
+    """
+    if field not in ("name", "email", "city"):
+        raise ValueError(f"Unknown profile field: {field}")
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if field == "email" and not await _has_column(conn, "users", "email"):
+            # Migration 003 not applied yet -- skip storing, still advance.
+            pass
+        elif value and value.strip().lower() != "skip":
+            await conn.execute(f"UPDATE users SET {field} = $2 WHERE id = $1", user_id, value.strip())
+
+        row = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
+        current_step = row["onboarding_step"]
+        step_for_field = {"name": "awaiting_name", "email": "awaiting_email", "city": "awaiting_location"}[field]
+        if current_step == step_for_field:
+            next_step = ONBOARDING_STEPS[ONBOARDING_STEPS.index(step_for_field) + 1]
+            await conn.execute("UPDATE users SET onboarding_step = $2 WHERE id = $1", user_id, next_step)
+            row = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
         return dict(row)
 
 
@@ -592,4 +636,82 @@ async def list_projects(user_id: int, status: str = "active") -> list[dict[str, 
             "SELECT * FROM projects WHERE user_id = $1 AND status = $2 ORDER BY updated_at DESC",
             user_id, status,
         )
+        return _rows(rows)
+
+
+# ---------------------------------------------------------------------------
+# Deepsearch sessions -- resumable research/browsing threads.
+#
+# Deliberately framework-agnostic here, same as the rest of this file:
+# `messages_json` is just a string this layer stores and returns as-is.
+# tools/deepsearch_tools.py is what knows it's a LangChain message list
+# (via messages_to_dict/messages_from_dict) -- db.py doesn't import
+# LangChain. Additive: no-ops (returns None/[]) if migration 004 hasn't
+# been applied yet, same pattern as the projects table.
+# ---------------------------------------------------------------------------
+
+async def create_deepsearch_session(user_id: int, title: str, messages_json: str = "[]") -> dict[str, Any] | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "deepsearch_sessions"):
+            return None
+        row = await conn.fetchrow(
+            """
+            INSERT INTO deepsearch_sessions (user_id, title, messages)
+            VALUES ($1, $2, $3) RETURNING *
+            """,
+            user_id, title[:255], messages_json,
+        )
+        return dict(row)
+
+
+async def get_deepsearch_session(user_id: int, session_id: int) -> dict[str, Any] | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "deepsearch_sessions"):
+            return None
+        row = await conn.fetchrow(
+            "SELECT * FROM deepsearch_sessions WHERE id = $1 AND user_id = $2",
+            session_id, user_id,
+        )
+        return dict(row) if row else None
+
+
+async def update_deepsearch_session(
+    session_id: int, messages_json: str, status: str, summary: str | None, steps_used: int
+) -> dict[str, Any] | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "deepsearch_sessions"):
+            return None
+        row = await conn.fetchrow(
+            """
+            UPDATE deepsearch_sessions SET
+                messages = $2, status = $3::deepsearch_status, summary = $4,
+                steps_used = $5, updated_at = NOW()
+            WHERE id = $1
+            RETURNING *
+            """,
+            session_id, messages_json, status, summary, steps_used,
+        )
+        return dict(row) if row else None
+
+
+async def list_deepsearch_sessions(user_id: int, status: str | None = None) -> list[dict[str, Any]]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "deepsearch_sessions"):
+            return []
+        if status:
+            rows = await conn.fetch(
+                "SELECT id, title, status, summary, steps_used, updated_at FROM deepsearch_sessions "
+                "WHERE user_id = $1 AND status = $2::deepsearch_status ORDER BY updated_at DESC LIMIT 20",
+                user_id, status,
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT id, title, status, summary, steps_used, updated_at FROM deepsearch_sessions "
+                "WHERE user_id = $1 ORDER BY updated_at DESC LIMIT 20",
+                user_id,
+            )
         return _rows(rows)

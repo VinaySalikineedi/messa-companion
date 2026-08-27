@@ -20,7 +20,7 @@ DIM = "\033[2m"
 BOLD = "\033[1m"
 COLORS = {
     "messa": "\033[95m",       # magenta
-    "browser_agent": "\033[94m",       # blue
+    "deepsearch": "\033[94m",       # blue
     "executive_assistant": "\033[92m", # green
     "email_agent": "\033[93m",         # yellow
     "document_agent": "\033[96m",      # cyan

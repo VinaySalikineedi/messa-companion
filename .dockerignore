@@ -1,10 +1,11 @@
 .env
-.DS_Store
+.git
+.gitignore
 venv/
-.playwright-mcp/
 __pycache__/
 *.pyc
 sessions/
 outputs/
 deepsearch_profiles/
-browser_profiles/
+.playwright-mcp/
+.DS_Store
