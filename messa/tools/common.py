@@ -1,0 +1,97 @@
+"""Shared tool-wrapping helper used by every subagent's tool module.
+
+Generalizes the `guard_tool` pattern from the original browser agent
+(agent2.py) so every tool in the harness -- not just browser tools -- gets:
+
+  * real-time console tracing (see messa/console.py for why this beats
+    trying to stream nested subagent events),
+  * consistent error handling (exceptions become a string the agent can
+    react to instead of crashing the whole run),
+  * optional human confirmation for actions marked destructive.
+
+Works for both plain @tool-decorated functions and StructuredTool instances
+(e.g. tools loaded from an MCP server).
+"""
+from __future__ import annotations
+
+import inspect
+from typing import Any, Callable, Sequence
+
+from langchain_core.tools import BaseTool, StructuredTool, tool as tool_decorator
+
+from .. import console
+from ..approval import ApprovalGate
+
+
+def trace_tool(
+    original: BaseTool,
+    label: str,
+    *,
+    destructive: bool = False,
+    approval_gate: ApprovalGate | None = None,
+) -> BaseTool:
+    """Wrap a tool with tracing, error handling, and optional confirmation."""
+
+    name = original.name
+    is_async_native = original.coroutine is not None
+
+    async def _invoke_original(*args: Any, **kwargs: Any) -> Any:
+        if is_async_native:
+            return await original.coroutine(*args, **kwargs)
+        result = original.func(*args, **kwargs)  # type: ignore[misc]
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+
+    async def guarded(*args: Any, **kwargs: Any) -> Any:
+        display_args = kwargs if kwargs else {"args": args}
+        console.tool_call(label, name, display_args)
+
+        if destructive:
+            gate = approval_gate or _NO_APPROVAL_GATE
+            allowed = await gate.confirm(label, name, display_args)
+            if not allowed:
+                msg = f"BLOCKED: user declined to run '{name}'."
+                console.tool_result(label, name, msg)
+                return msg
+
+        try:
+            result = await _invoke_original(*args, **kwargs)
+            console.tool_result(label, name, result)
+            return result
+        except Exception as e:  # noqa: BLE001 - tools must never crash the agent loop
+            console.tool_error(label, name, str(e))
+            return (
+                f"ERROR running '{name}': {e}. Do not retry with the exact same "
+                f"arguments -- try a different approach."
+            )
+
+    return StructuredTool.from_function(
+        name=original.name,
+        description=original.description,
+        args_schema=original.args_schema,
+        coroutine=guarded,
+    )
+
+
+class _NoApprovalGate:
+    async def confirm(self, label: str, tool_name: str, args: dict[str, Any]) -> bool:
+        console.system(f"No approval gate configured for destructive tool '{tool_name}' -- denying by default.")
+        return False
+
+
+_NO_APPROVAL_GATE = _NoApprovalGate()
+
+
+def trace_all(
+    tools: Sequence[BaseTool],
+    label: str,
+    *,
+    destructive_names: set[str] | None = None,
+    approval_gate: ApprovalGate | None = None,
+) -> list[BaseTool]:
+    destructive_names = destructive_names or set()
+    return [
+        trace_tool(t, label, destructive=t.name in destructive_names, approval_gate=approval_gate)
+        for t in tools
+    ]

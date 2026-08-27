@@ -4,3 +4,5 @@ venv/
 .playwright-mcp/
 __pycache__/
 *.pyc
+sessions/
+outputs/

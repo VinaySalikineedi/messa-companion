@@ -1,0 +1,33 @@
+# Core agent framework (same stack as the original browser agent, agent2.py)
+deepagents>=0.7.9
+langgraph>=1.2.11
+langchain>=1.3.17
+langchain-core>=1.6.0
+langchain-openai>=1.6.0
+langchain-mcp-adapters>=0.3.2
+python-dotenv>=1.2.2
+
+# Database (Neon Postgres)
+asyncpg>=0.31.0
+
+# Document agent
+reportlab>=4.4.10
+
+# Routines agent (cron scheduling math)
+croniter>=6.2.4
+
+# Email agent (Composio) -- optional until COMPOSIO_API_KEY is set, but
+# import-guarded so the app runs without it. Install when you're ready to
+# wire up email:
+#   pip install composio composio_langchain
+# NOTE: on some Linux systems with an old system setuptools, `composio`'s
+# `pysher` dependency can fail to build a wheel (setuptools/distutils
+# "install_layout" AttributeError). If that happens, install inside your
+# venv (you already have one) with a fresh pip/setuptools:
+#   pip install -U pip setuptools wheel && pip install composio composio_langchain
+# composio
+# composio_langchain
+
+# Browser agent tools are provided by the Playwright MCP server, which runs
+# via `npx @playwright/mcp@latest` (needs Node.js installed; npx will
+# fetch it on first run).
