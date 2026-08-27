@@ -244,7 +244,7 @@ async def get_live_status_by_token(token: str) -> dict[str, Any] | None:
         if not await _has_column(conn, "users", "live_share_token"):
             return None
         row = await conn.fetchrow(
-            "SELECT live_view_url, live_view_task, live_view_started_at, name "
+            "SELECT id, live_view_url, live_view_task, live_view_started_at, name "
             "FROM users WHERE live_share_token = $1",
             token,
         )
@@ -261,6 +261,11 @@ async def get_live_status_by_token(token: str) -> dict[str, Any] | None:
             "live_view_url": row["live_view_url"] if active else None,
             "task": row["live_view_task"] if active else None,
             "name": row["name"],
+            # Internal only -- server.py uses this to look up
+            # live_activity.py's in-memory description/chain-of-thought log
+            # for this user, then strips it before the JSON response goes
+            # out (a raw internal id has no business in a public payload).
+            "user_id": row["id"],
         }
 
 

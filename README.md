@@ -497,6 +497,57 @@ If it says `live_view_token is None`, the fix is confirming migration 006
 has actually run against the same `DATABASE_URL` the deployed Space uses
 (not just your local `.env`'s database).
 
+### The live page now shows what deepsearch is doing, not just the video
+
+**Per your request**, the live-view page is no longer just the raw
+Browserbase iframe. The video now sits inside one lifted card, with a
+one-line description of *what deepsearch is doing right now* above it
+(e.g. "Navigating to https://www.amazon.com/s?k=gaming+desk") and a
+scrolling chain-of-thought log below it, listing every action taken so
+far this task. Both are specific to the task currently running -- they
+reset to nothing the moment a new deepsearch delegation starts, and
+disappear (the page falls back to the idle state) the instant the browser
+closes, success or failure alike.
+
+This is genuinely live, not simulated: `messa/live_activity.py` is a
+small in-memory, per-user log that `tools/deepsearch_tools.py`'s guarded
+tool-call wrapper writes to on every single browser action (navigate,
+click, type, snapshot, etc. -- see `_describe_action` for how a raw tool
+call like `browser_navigate(url=...)` becomes "Navigating to ..."), and
+`server.py`'s `/live/<token>/status` route reads it back on every poll.
+It's deliberately not persisted to Postgres -- it only matters for the
+lifetime of one in-flight task, and already has the same natural
+clear-on-close point (a `try`/`finally` in `deepsearch_tools.py`) as
+`live_browser_active` does.
+
+**Two visual skins, your choice:**
+
+- `"polished"` -- soft gradient background, one lifted rounded card,
+  description and chain-of-thought both feel like part of a normal
+  consumer product.
+- `"terminal"` -- black background, monospace, a fake terminal titlebar,
+  `$ `-prefixed lines, a blinking cursor on the newest log line. Same
+  information, gritty/dev-tool mood.
+
+`live_view_page.py`'s `LIVE_VIEW_STYLE` constant at the top of the file
+is **the variable you can change** -- flip it between `"polished"` and
+`"terminal"` and redeploy to switch the default everyone sees. For
+comparing them side by side without redeploying at all, append
+`?style=polished` or `?style=terminal` to any live link -- that overrides
+the default for just that one page load and touches nothing stored.
+
+While building this I also found and fixed a real, pre-existing bug in
+the page's own polling JS: `showIdle()` only replaced the "Loading..."
+placeholder if a live URL had been shown *before* (`if (currentUrl !==
+null)`), which meant a link that had never once been active -- brand new,
+or opened before your first deepsearch run -- would sit on "Loading..."
+forever, since idle and "haven't rendered anything yet" both looked like
+`currentUrl === null` to that check. Fixed by tracking what's actually
+rendered (`shownState`: `"idle"` / `"invalid"` / `"active:<url>"`) instead
+of inferring it from the iframe URL alone. Verified with Playwright
+screenshots of a fresh page load against a canned idle response, in both
+skins, before and after the fix.
+
 ## Changes from your second round of testing
 
 - **Renamed browser_agent -> deepsearch.** Same subagent, new name

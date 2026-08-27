@@ -35,7 +35,7 @@ from typing import Any
 from fastapi import BackgroundTasks, FastAPI, Header, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
-from . import cli, config, console, db
+from . import cli, config, console, db, live_activity
 from .agents.registry import build_orchestrator
 from .approval import AutoApproveGate, DenyApprovalGate
 from .channels import sendblue
@@ -60,25 +60,41 @@ async def health() -> dict[str, str]:
 
 
 @app.get("/live/{token}")
-async def live_view_page(token: str) -> HTMLResponse:
+async def live_view_page(token: str, style: str | None = None) -> HTMLResponse:
     """Phase 3: the public page Messa's live-view link points at (see
     agents/registry.py). Always returns 200 with the page shell regardless
     of whether the token is valid -- the page's own JS calls the status
     route below to find out, and renders an "invalid link" state itself on
     a 404 from that. Keeping this route token-agnostic (no DB lookup here)
     means a bad/typo'd link still loads something sensible instantly
-    instead of a bare framework 404."""
-    return HTMLResponse(render_live_view_page(token))
+    instead of a bare framework 404.
+
+    `style`: optional `?style=polished` or `?style=terminal` query param --
+    overrides live_view_page.LIVE_VIEW_STYLE for just this one page load,
+    so you can compare both skins by editing the URL rather than redeploying
+    (see that module's docstring)."""
+    return HTMLResponse(render_live_view_page(token, style))
 
 
 @app.get("/live/{token}/status")
 async def live_view_status(token: str) -> JSONResponse:
     """Polled by the page above every few seconds. 404 means "no such
     link" (the page shows 'this link isn't valid' and stops polling); 200
-    with active=false means "valid link, nothing running right now"."""
+    with active=false means "valid link, nothing running right now".
+
+    When active, also attaches `description` (what deepsearch is doing
+    right now, one line) and `steps` (this task's chain-of-thought log so
+    far) from live_activity.py's in-memory per-user log -- both go back to
+    None/[] the instant `active` is false, regardless of whatever
+    live_activity still happens to hold, so a stale in-memory log can never
+    outlive what the DB says is actually running."""
     status = await db.get_live_status_by_token(token)
     if status is None:
         return JSONResponse({"error": "not found"}, status_code=404)
+    user_id = status.pop("user_id", None)
+    activity = live_activity.get(user_id) if (status["active"] and user_id is not None) else None
+    status["description"] = activity["description"] if activity else None
+    status["steps"] = activity["steps"] if activity else []
     return JSONResponse(status)
 
 

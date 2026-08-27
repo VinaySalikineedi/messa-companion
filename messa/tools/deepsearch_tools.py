@@ -65,7 +65,7 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.errors import GraphRecursionError
 
-from .. import config, console, db
+from .. import config, console, db, live_activity
 from ..approval import ApprovalGate
 from ..channels import browserbase
 from ..channels.browserbase import BrowserbaseError
@@ -86,6 +86,53 @@ SNAPSHOT_DEPENDENT_TOOLS = {
 }
 
 _SESSION_REF_RE = re.compile(r"session\s*#?\s*(\d+)", re.IGNORECASE)
+
+
+def _describe_action(name: str, args: dict[str, Any]) -> str:
+    """Turns a raw Playwright MCP tool call into one human-readable line for
+    the live-view page's description/chain-of-thought (see live_activity.py)
+    -- e.g. "Navigating to https://..." instead of "browser_navigate". Best
+    effort: an unrecognized tool name still gets a readable fallback rather
+    than failing or showing the raw snake_case name."""
+    kwargs = args if isinstance(args, dict) and "args" not in args else {}
+    if name == "browser_navigate":
+        url = kwargs.get("url")
+        return f"Navigating to {url}" if url else "Navigating"
+    if name == "browser_navigate_back":
+        return "Going back"
+    if name in ("browser_snapshot",):
+        return "Reading the page"
+    if name in ("browser_take_screenshot", "browser_screenshot"):
+        return "Taking a screenshot"
+    if name == "browser_click":
+        return "Clicking on the page"
+    if name == "browser_type":
+        text = kwargs.get("text")
+        return f'Typing "{text}"' if text else "Typing"
+    if name == "browser_press_key":
+        key = kwargs.get("key")
+        return f"Pressing {key}" if key else "Pressing a key"
+    if name == "browser_hover":
+        return "Hovering over an element"
+    if name == "browser_select_option":
+        return "Selecting an option"
+    if name in ("browser_wait_for", "browser_wait"):
+        return "Waiting for the page"
+    if name in ("browser_tab_new", "browser_new_tab"):
+        return "Opening a new tab"
+    if name in ("browser_tab_close", "browser_close"):
+        return "Closing a tab"
+    if name == "browser_drag":
+        return "Dragging an element"
+    if name == "browser_file_upload":
+        return "Uploading a file"
+    if name == "browser_evaluate":
+        return "Running a script on the page"
+    if name == "browser_handle_dialog":
+        return "Responding to a dialog"
+    if "scroll" in name:
+        return "Scrolling the page"
+    return name.replace("browser_", "").replace("_", " ").strip().capitalize() or "Working on it"
 
 
 def _domain_allowed(url: str) -> bool:
@@ -244,12 +291,17 @@ class BrowserToolProvider:
         async def guarded(*args: Any, **kwargs: Any) -> Any:
             display_args = kwargs if kwargs else {"args": args}
             console.tool_call(LABEL, name, display_args)
+            action_desc = _describe_action(name, display_args)
+            if self._user_id is not None:
+                live_activity.set_description(self._user_id, action_desc)
 
             if name == "browser_navigate":
                 url = kwargs.get("url") or (args[0] if args else None)
                 if url and not _domain_allowed(url):
                     msg = f"BLOCKED: '{url}' is not in the allowed domain list."
                     console.tool_result(LABEL, name, msg)
+                    if self._user_id is not None:
+                        live_activity.add_step(self._user_id, f"Blocked: {url} isn't an allowed domain")
                     return msg
                 state["snapshot_fresh"] = False
 
@@ -271,6 +323,8 @@ class BrowserToolProvider:
                 if not allowed:
                     msg = f"BLOCKED: user declined to run '{name}'."
                     console.tool_result(LABEL, name, msg)
+                    if self._user_id is not None:
+                        live_activity.add_step(self._user_id, f"Blocked: you declined \"{action_desc}\"")
                     return msg
                 state["snapshot_fresh"] = False
 
@@ -278,10 +332,14 @@ class BrowserToolProvider:
                 result = await original.coroutine(*args, **kwargs)
                 state["consecutive_errors"] = 0
                 console.tool_result(LABEL, name, result)
+                if self._user_id is not None:
+                    live_activity.add_step(self._user_id, action_desc)
                 return result
             except Exception as e:  # noqa: BLE001
                 state["consecutive_errors"] += 1
                 console.tool_error(LABEL, name, str(e))
+                if self._user_id is not None:
+                    live_activity.add_step(self._user_id, f"Error: {action_desc} failed ({e})")
                 return (
                     f"ERROR running '{name}': {e}. Do not retry with the exact same "
                     f"arguments. Take a fresh browser_snapshot, then try a different approach."
@@ -368,6 +426,10 @@ def build_deepsearch_subagent(
             live_view_url = provider.live_view_url
             if live_view_url:
                 await db.set_live_browser_active(user.user_id, live_view_url, task_title)
+                # Starts this task's chain-of-thought log (see live_activity.py)
+                # -- guarded() below fills it in as tool calls actually happen;
+                # cleared in the finally block regardless of how this run ends.
+                live_activity.start(user.user_id, task_title)
             try:
                 inner_agent = create_agent(
                     model=model, tools=provider.tools, system_prompt=DEEPSEARCH_SYSTEM_PROMPT,
@@ -401,6 +463,7 @@ def build_deepsearch_subagent(
                 # showing "live" for a browser this delegation is done with.
                 if live_view_url:
                     await db.clear_live_browser_active(user.user_id)
+                    live_activity.clear(user.user_id)
 
         summary = _last_ai_text(final_messages)
 
