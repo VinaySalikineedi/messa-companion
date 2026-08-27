@@ -4,6 +4,19 @@
 # README.md's frontmatter, this Dockerfile, and a push.
 FROM python:3.11-slim
 
+# Without this, Python fully block-buffers stdout whenever it isn't
+# attached to a real terminal -- which is exactly Docker's case. uvicorn's
+# own request logs go through the `logging` module (which flushes each
+# record), so those always showed up fine in the Space's Logs tab; but
+# every plain print() this project uses for tracing (console.py --
+# console.system/tool_error, the exact lines that show whether deepsearch
+# even attempted a Browserbase session, and why it failed if not) could
+# sit in an unflushed buffer indefinitely on a long-running server
+# process. Confirmed as a real gap, not a hypothetical: this is *the*
+# standard reason "print() debugging shows nothing in my container logs"
+# happens, and there was nothing forcing a flush here before now.
+ENV PYTHONUNBUFFERED=1
+
 # Non-root user + HOME/PATH -- required for HF Spaces' Dev Mode, and good
 # practice regardless (see huggingface.co/docs/hub/spaces-sdks-docker-first-demo).
 RUN useradd -m -u 1000 user
