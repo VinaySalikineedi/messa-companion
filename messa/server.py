@@ -59,6 +59,7 @@ async def health() -> dict[str, str]:
 
 
 @app.post("/webhook/sendblue")
+@app.post("/sms/sendblue/webhook")
 async def sendblue_webhook(
     request: Request,
     background_tasks: BackgroundTasks,
