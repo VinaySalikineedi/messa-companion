@@ -67,7 +67,7 @@ BROWSERBASE_API_KEY = os.environ.get("BROWSERBASE_API_KEY")
 # that. Left unset by default: UserContext.live_view_share_url returns
 # None when this is empty, and the system prompt skips mentioning a live
 # link at all rather than texting a broken one.
-LIVE_VIEW_BASE_URL = os.environ.get("MESSA_LIVE_VIEW_BASE_URL", "").rstrip("/")
+LIVE_VIEW_BASE_URL = os.environ.get("MESSA_LIVE_VIEW_BASE_URL", "https://live.textmessa.com").rstrip("/")
 
 # ---- Sendblue (SMS/iMessage channel, Phase 2) ----
 # Left optional (unlike OPENROUTER_API_KEY/DATABASE_URL above) so the CLI
