@@ -60,6 +60,15 @@ COMPOSIO_EMAIL_ACCOUNT = os.environ.get("COMPOSIO_EMAIL_CONNECTED_ACCOUNT_ID")
 # deepsearch to work at all now -- there's no local-Chromium fallback.
 BROWSERBASE_API_KEY = os.environ.get("BROWSERBASE_API_KEY")
 
+# ---- Live view sharing (Phase 3) ----
+# Base URL for the public /live/<token> page (see server.py + db.py's
+# live_share_token functions) -- e.g. "https://live.textmessa.com" once
+# the custom domain is wired up, or your Space's own hf.space URL before
+# that. Left unset by default: UserContext.live_view_share_url returns
+# None when this is empty, and the system prompt skips mentioning a live
+# link at all rather than texting a broken one.
+LIVE_VIEW_BASE_URL = os.environ.get("MESSA_LIVE_VIEW_BASE_URL", "").rstrip("/")
+
 # ---- Sendblue (SMS/iMessage channel, Phase 2) ----
 # Left optional (unlike OPENROUTER_API_KEY/DATABASE_URL above) so the CLI
 # keeps working with no Sendblue account at all -- messa/server.py checks
@@ -140,7 +149,18 @@ class UserContext:
     onboarding_step: str = "complete"
     channel: str = "cli"
     extra: dict = field(default_factory=dict)
+    live_view_token: str | None = None
 
     @property
     def onboarding_complete(self) -> bool:
         return self.onboarding_step == "complete"
+
+    @property
+    def live_view_share_url(self) -> str | None:
+        """The link Messa texts alongside every deepsearch delegation, or
+        None if either migration 006 hasn't run yet (no token) or
+        LIVE_VIEW_BASE_URL isn't configured yet -- either way, the system
+        prompt treats None as "don't mention a live link this turn"."""
+        if not self.live_view_token or not LIVE_VIEW_BASE_URL:
+            return None
+        return f"{LIVE_VIEW_BASE_URL}/live/{self.live_view_token}"

@@ -7,7 +7,7 @@ sdk: docker
 app_port: 7860
 ---
 
-# Messa -- multi-agent personal assistant (Phase 1 + Phase 2)
+# Messa -- multi-agent personal assistant (Phase 1 + Phase 2 + Phase 3)
 
 Messa is the orchestrator. She talks to you and delegates to five
 specialist subagents through deepagents' built-in `task` tool:
@@ -48,11 +48,12 @@ SENDBLUE_NUMBER=...           # from `sendblue lines`
 # SENDBLUE_WEBHOOK_SECRET=... # optional, see step 3
 ```
 
-### 2. Point DATABASE_URL at real Neon, run all five migrations
+### 2. Point DATABASE_URL at real Neon, run all six migrations
 
 ```
 DATABASE_URL=postgresql+asyncpg://user:pass@ep-xxxx.neon.tech/dbname?sslmode=require
 BROWSERBASE_API_KEY=...      # required -- see "Browserbase" below
+# MESSA_LIVE_VIEW_BASE_URL=... # optional -- see "Phase 3: watch the browser live" below
 ```
 
 (Verified asyncpg parses Neon's `sslmode=require` param with no extra code
@@ -63,6 +64,7 @@ psql "$DATABASE_URL" -f migrations/002_projects_and_channel.sql
 psql "$DATABASE_URL" -f migrations/003_user_email.sql
 psql "$DATABASE_URL" -f migrations/004_deepsearch_sessions.sql
 psql "$DATABASE_URL" -f migrations/005_browserbase.sql
+psql "$DATABASE_URL" -f migrations/006_live_view.sql
 ```
 
 ### 3. Run the server and register the webhook
@@ -184,6 +186,7 @@ change:
 OPENROUTER_API_KEY
 DATABASE_URL              # your real Neon connection string
 BROWSERBASE_API_KEY       # required -- deepsearch has no local-browser fallback, see "Browserbase" below
+MESSA_LIVE_VIEW_BASE_URL  # e.g. https://live.textmessa.com -- see "Phase 3: watch the browser live" below
 SENDBLUE_API_KEY
 SENDBLUE_API_SECRET
 SENDBLUE_NUMBER
@@ -266,9 +269,8 @@ requirement:
   `debuggerFullscreenUrl` (an iframe-embeddable link to watch that exact
   session live) into `deepsearch_sessions.live_view_url` the moment it
   opens the browser -- see `migrations/005_browserbase.sql` and
-  `messa/channels/browserbase.py`. It's not wired into any reply yet
-  (Messa doesn't text it to you), that's the Phase 3 work, but the data is
-  already there waiting for it.
+  `messa/channels/browserbase.py`. This is now fully wired into a reply --
+  see "Phase 3: watch the browser live" below.
 
 What changed concretely:
 
@@ -301,6 +303,74 @@ What changed concretely:
 - Needs `migrations/005_browserbase.sql` (adds `users.browserbase_context_id`
   and `deepsearch_sessions.live_view_url`, both additive/no-op-safe like
   every other migration here).
+
+## Phase 3: watch the browser live
+
+A permanent, shareable link per user that shows Browserbase's live view
+while deepsearch is browsing, and a calm "nothing happening right now"
+state otherwise -- no login, just the link, meant to be opened straight
+from the text Messa sends.
+
+**How it works:** `users.live_share_token` is a random, unguessable token
+generated once per user and reused forever (`db.get_or_create_live_share_token`).
+The link is `<MESSA_LIVE_VIEW_BASE_URL>/live/<token>`. Separately,
+`users.live_view_url`/`live_view_task`/`live_view_started_at` track whether
+a browser is open *right now* -- set the instant `BrowserToolProvider`
+opens a Browserbase session, cleared the instant that delegation is done
+with it, success or failure alike (a `try`/`finally` in
+`tools/deepsearch_tools.py`, so a crash mid-run can't leave the page stuck
+showing "live" forever -- there's also a 15-minute staleness cutoff as a
+second safety net for the one thing `finally` can't catch, the whole
+process getting killed). This is deliberately separate from
+`deepsearch_sessions`, which tracks completed/resumable run *history*, not
+"is something on screen this second" -- a session can sit there marked
+resumable for hours after its browser already closed.
+
+The page itself (`messa/live_view_page.py`, served by `messa/server.py` at
+`GET /live/<token>`) is a single self-contained HTML file with no build
+step -- it polls its own `GET /live/<token>/status` JSON endpoint every 4
+seconds and swaps between the idle state and Browserbase's iframe with no
+manual refresh. An unknown token still gets a 200 with the page shell (so
+a typo'd link doesn't just 404 blankly); the page's own JS is what shows
+"this link isn't valid" once its first status poll comes back 404.
+
+**Per your request**, Messa now includes this link in her acknowledgment
+message *every single time* she delegates to deepsearch (not just the
+first) -- e.g. "Checking that now, watch it live here: <link>" -- since
+it's always the same permanent link for that user, repeating it costs
+nothing and means you never have to go dig up an old text to find it.
+This lives in `agents/registry.py`'s system prompt, conditioned on
+`MESSA_LIVE_VIEW_BASE_URL` being set; leave it unset and Messa simply
+never mentions a link, so there's no risk of texting a broken one before
+you're ready.
+
+**Connecting textmessa.com:** Hugging Face Spaces supports custom domains,
+but only as a subdomain (not the bare apex) via a CNAME, and only on a
+**PRO** (or Team/Enterprise) account -- separate from the Space's own
+free/paid hardware tier. The Space also needs to be public or "protected,"
+not fully private, for a custom domain to attach at all.
+
+1. In your DNS provider, add `live` (or whatever subdomain you prefer) as
+   a **CNAME** pointing to `hf.space`. Don't leave any other record type
+   (A/AAAA) at that same label -- that's the most common reason a custom
+   domain gets stuck in "pending."
+2. In the Space's **Settings -> Custom Domain**, add `live.textmessa.com`.
+3. Wait for it to flip from "pending" to "ready" -- HF issues the TLS
+   certificate automatically once DNS resolves correctly, no cert work on
+   your end.
+4. Set `MESSA_LIVE_VIEW_BASE_URL=https://live.textmessa.com` as a Space
+   secret/variable (see "Add your secrets" above) and redeploy.
+
+Until that's done, you can still use the whole feature today with
+`MESSA_LIVE_VIEW_BASE_URL` set to your Space's own
+`https://<you>-<space>.hf.space` URL -- the page and the link both work
+identically either way, `live.textmessa.com` is just a nicer hostname on
+top of the same backend.
+
+Needs `migrations/006_live_view.sql` (adds `users.live_share_token`,
+`live_view_url`, `live_view_task`, `live_view_started_at` -- additive/
+no-op-safe like every other migration here; without it, deepsearch still
+works exactly as before, Messa just never has a link to mention).
 
 ## Changes from your second round of testing
 
@@ -382,6 +452,7 @@ pip install -r requirements.txt
 OPENROUTER_API_KEY=...       # already set
 DATABASE_URL=...             # already set (Neon)
 BROWSERBASE_API_KEY=...      # required -- see "Browserbase" above
+# MESSA_LIVE_VIEW_BASE_URL=... # optional -- see "Phase 3: watch the browser live" above
 # optional, for the email agent once you're ready:
 # COMPOSIO_API_KEY=...
 # COMPOSIO_EMAIL_CONNECTED_ACCOUNT_ID=...
@@ -390,15 +461,16 @@ BROWSERBASE_API_KEY=...      # required -- see "Browserbase" above
 Run the additive migrations once (adds a lightweight `projects` table used
 to group related requests, a `channel` column on `message_history` for
 Phase 2's multiple channels, a `users.email` column for onboarding, a
-`deepsearch_sessions` table for resumable research, and the Browserbase
-columns -- see "What I added beyond your schema" below). Paste each file
-into the Neon SQL editor, or:
+`deepsearch_sessions` table for resumable research, the Browserbase
+columns, and the live-view-link columns -- see "What I added beyond your
+schema" below). Paste each file into the Neon SQL editor, or:
 
 ```bash
 psql "$DATABASE_URL" -f migrations/002_projects_and_channel.sql
 psql "$DATABASE_URL" -f migrations/003_user_email.sql
 psql "$DATABASE_URL" -f migrations/004_deepsearch_sessions.sql
 psql "$DATABASE_URL" -f migrations/005_browserbase.sql
+psql "$DATABASE_URL" -f migrations/006_live_view.sql
 ```
 
 Everything else works without them -- `db.py` checks for the table/column
@@ -477,11 +549,18 @@ session's live-view link once deepsearch moved off local Chromium (see
 "Browserbase" above), so `migrations/005_browserbase.sql` adds
 `users.browserbase_context_id` and `deepsearch_sessions.live_view_url`.
 
-All five are additive/reversible and the app runs fine without them
+Finally, sharing a live view needed a permanent per-user link and a
+"is a browser open right now" flag distinct from `deepsearch_sessions`'
+longer-lived history (see "Phase 3: watch the browser live" above), so
+`migrations/006_live_view.sql` adds `users.live_share_token`,
+`live_view_url`, `live_view_task`, and `live_view_started_at`.
+
+All six are additive/reversible and the app runs fine without them
 (project tracking, email-saving, and session resumption just no-op;
 without migration 005, deepsearch still runs against Browserbase, it just
 can't remember your login between separate sessions or capture a live-view
-link).
+link; without migration 006, deepsearch works exactly the same, Messa just
+never has a link to mention).
 
 ## Known Phase 1 limitations (by design -- later phases cover these)
 

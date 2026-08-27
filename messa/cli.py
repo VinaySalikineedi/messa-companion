@@ -29,6 +29,7 @@ async def load_user_context(
     server (real inbound phone_number, one per sender) -- see run_message
     below for the rest of what the server reuses from here."""
     user_row = await db.get_or_create_user(phone_number, name, config.DEFAULT_TIMEZONE)
+    live_view_token = await db.get_or_create_live_share_token(user_row["id"])
     return config.UserContext(
         user_id=user_row["id"],
         phone_number=user_row["phone_number"],
@@ -38,6 +39,7 @@ async def load_user_context(
         timezone=user_row["timezone"],
         onboarding_step=user_row["onboarding_step"],
         channel=channel,
+        live_view_token=live_view_token,
     )
 
 

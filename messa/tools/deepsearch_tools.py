@@ -329,6 +329,7 @@ def build_deepsearch_subagent(
 
         if session_row:
             session_id = session_row["id"]
+            task_title = session_row["title"]
             try:
                 prior_messages = messages_from_dict(json.loads(session_row["messages"]))
             except Exception:
@@ -343,8 +344,8 @@ def build_deepsearch_subagent(
             console.system(f"Deepsearch: resuming session #{session_id} ({len(prior_messages)} prior messages).")
         else:
             messages = list(incoming)
-            title = (last_text.strip() or "Deepsearch task")[:255]
-            created = await db.create_deepsearch_session(user.user_id, title)
+            task_title = (last_text.strip() or "Deepsearch task")[:255]
+            created = await db.create_deepsearch_session(user.user_id, task_title)
             session_id = created["id"] if created else None
             steps_so_far = 0
             if session_id:
@@ -356,34 +357,50 @@ def build_deepsearch_subagent(
             "recursion_limit": config.DEEPSEARCH_MAX_STEPS,
         }
 
+        # live_view_url only gets set (and the "a browser is open right now"
+        # DB flag only gets flipped on) *after* BrowserToolProvider.__aenter__
+        # returns successfully -- so if opening the Browserbase session/CDP
+        # connection itself fails, there's nothing to clear here, and the
+        # try/finally below correctly never marks this user "live" for a
+        # browser that never actually opened.
         live_view_url = None
         async with BrowserToolProvider(approval_gate, user_id=user.user_id) as provider:
             live_view_url = provider.live_view_url
-            inner_agent = create_agent(
-                model=model, tools=provider.tools, system_prompt=DEEPSEARCH_SYSTEM_PROMPT,
-                checkpointer=checkpointer,
-            )
-            status = "completed"
+            if live_view_url:
+                await db.set_live_browser_active(user.user_id, live_view_url, task_title)
             try:
-                result = await inner_agent.ainvoke({"messages": messages}, config=run_config)
-                final_messages = result["messages"]
-            except GraphRecursionError:
-                status = "active"
-                state_snapshot = await inner_agent.aget_state(run_config)
-                final_messages = state_snapshot.values.get("messages", messages)
-                console.system(
-                    f"Deepsearch: hit its {config.DEEPSEARCH_MAX_STEPS}-step limit -- "
-                    f"saving progress to session #{session_id} for later."
+                inner_agent = create_agent(
+                    model=model, tools=provider.tools, system_prompt=DEEPSEARCH_SYSTEM_PROMPT,
+                    checkpointer=checkpointer,
                 )
-            except Exception as e:  # noqa: BLE001
-                status = "active"
-                console.tool_error(LABEL, "deepsearch", str(e))
+                status = "completed"
                 try:
+                    result = await inner_agent.ainvoke({"messages": messages}, config=run_config)
+                    final_messages = result["messages"]
+                except GraphRecursionError:
+                    status = "active"
                     state_snapshot = await inner_agent.aget_state(run_config)
                     final_messages = state_snapshot.values.get("messages", messages)
-                except Exception:
-                    final_messages = messages
-                final_messages = [*final_messages, AIMessage(content=f"(run errored: {e})")]
+                    console.system(
+                        f"Deepsearch: hit its {config.DEEPSEARCH_MAX_STEPS}-step limit -- "
+                        f"saving progress to session #{session_id} for later."
+                    )
+                except Exception as e:  # noqa: BLE001
+                    status = "active"
+                    console.tool_error(LABEL, "deepsearch", str(e))
+                    try:
+                        state_snapshot = await inner_agent.aget_state(run_config)
+                        final_messages = state_snapshot.values.get("messages", messages)
+                    except Exception:
+                        final_messages = messages
+                    final_messages = [*final_messages, AIMessage(content=f"(run errored: {e})")]
+            finally:
+                # Mirrors the set_live_browser_active call above -- runs
+                # whether the agent finished cleanly, hit its step limit, or
+                # errored, so a user's live-view page never gets stuck
+                # showing "live" for a browser this delegation is done with.
+                if live_view_url:
+                    await db.clear_live_browser_active(user.user_id)
 
         summary = _last_ai_text(final_messages)
 

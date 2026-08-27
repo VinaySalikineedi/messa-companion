@@ -33,13 +33,14 @@ from __future__ import annotations
 from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, Header, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from . import cli, config, console, db
 from .agents.registry import build_orchestrator
 from .approval import AutoApproveGate, DenyApprovalGate
 from .channels import sendblue
 from .channels.sendblue import SendblueError
+from .live_view_page import render_live_view_page
 
 app = FastAPI(title="Messa Sendblue webhook")
 
@@ -56,6 +57,29 @@ def _approval_gate():
 @app.get("/")
 async def health() -> dict[str, str]:
     return {"status": "ok", "service": "messa-sendblue-webhook"}
+
+
+@app.get("/live/{token}")
+async def live_view_page(token: str) -> HTMLResponse:
+    """Phase 3: the public page Messa's live-view link points at (see
+    agents/registry.py). Always returns 200 with the page shell regardless
+    of whether the token is valid -- the page's own JS calls the status
+    route below to find out, and renders an "invalid link" state itself on
+    a 404 from that. Keeping this route token-agnostic (no DB lookup here)
+    means a bad/typo'd link still loads something sensible instantly
+    instead of a bare framework 404."""
+    return HTMLResponse(render_live_view_page(token))
+
+
+@app.get("/live/{token}/status")
+async def live_view_status(token: str) -> JSONResponse:
+    """Polled by the page above every few seconds. 404 means "no such
+    link" (the page shows 'this link isn't valid' and stops polling); 200
+    with active=false means "valid link, nothing running right now"."""
+    status = await db.get_live_status_by_token(token)
+    if status is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse(status)
 
 
 @app.post("/webhook/sendblue")

@@ -174,6 +174,17 @@ def _build_system_prompt(user: config.UserContext) -> str:
             "the way a person texting would. Keep it as short as the answer allows.\n\n"
         )
 
+    live_view_str = ""
+    if user.live_view_share_url:
+        live_view_str = (
+            f" Specifically for deepsearch: every single time you delegate to it, include "
+            f"this exact link in that same acknowledgment so the user can watch the browser "
+            f"live -- {user.live_view_share_url} -- e.g. \"Checking that now, watch it live "
+            f"here: {user.live_view_share_url}\". It's always the same link for this user, "
+            f"so it's fine (expected, even) to send it again on every deepsearch delegation, "
+            f"not just the first."
+        )
+
     return (
         "You are Messa, a personal assistant reachable by text, email, and (soon) WhatsApp. "
         "You talk to the user directly and delegate specialized work to subagents via the "
@@ -186,7 +197,9 @@ def _build_system_prompt(user: config.UserContext) -> str:
         "Responsiveness: delegating to a subagent can take a little while. Before calling "
         "the task tool, send one short line acknowledging what you're about to do (e.g. "
         "\"Checking flights now...\") so the user isn't staring at silence -- don't just go "
-        "straight to a silent tool call.\n\n"
+        "straight to a silent tool call."
+        f"{live_view_str}"
+        "\n\n"
         "Live data means a fresh check, every time: if the user asks for anything that can "
         "change between messages -- a price, availability, a live status, today's weather -- "
         "and they're asking again (even just \"try again\" or \"is it back yet\"), delegate to "

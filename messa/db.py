@@ -10,6 +10,7 @@ and translate results into tool-call strings.
 from __future__ import annotations
 
 import json
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
@@ -154,6 +155,94 @@ async def save_browserbase_context_id(user_id: int, context_id: str) -> None:
         await conn.execute(
             "UPDATE users SET browserbase_context_id = $2 WHERE id = $1", user_id, context_id
         )
+
+
+# How long a live_view_started_at is trusted without being refreshed
+# before the share page treats the session as stale and shows idle anyway
+# -- a safety net for the one case the try/finally in deepsearch_tools.py
+# can't cover: the whole process getting killed (OOM, host restart) mid-
+# delegation, which would otherwise leave a user's page stuck showing
+# "live" forever for a browser that's long gone.
+LIVE_VIEW_STALE_AFTER = timedelta(minutes=15)
+
+
+async def get_or_create_live_share_token(user_id: int) -> str | None:
+    """Permanent, unguessable per-user link (see migrations/006_live_view.sql)
+    -- generated once, reused forever, so it only needs to be texted to the
+    user a single time even though Messa mentions it on every deepsearch
+    delegation. Additive-safe: returns None if migration 006 hasn't been
+    applied yet, so callers (the system prompt) just skip mentioning a link
+    rather than erroring or sending a dead one."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_column(conn, "users", "live_share_token"):
+            return None
+        existing = await conn.fetchval("SELECT live_share_token FROM users WHERE id = $1", user_id)
+        if existing:
+            return existing
+        token = secrets.token_urlsafe(24)
+        await conn.execute("UPDATE users SET live_share_token = $2 WHERE id = $1", user_id, token)
+        return token
+
+
+async def set_live_browser_active(user_id: int, live_view_url: str, task: str | None) -> None:
+    """Marks this user as having a browser open right now -- see
+    migrations/006_live_view.sql for why this is separate from
+    deepsearch_sessions. Additive/no-op-safe."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_column(conn, "users", "live_view_url"):
+            return
+        await conn.execute(
+            """
+            UPDATE users SET live_view_url = $2, live_view_task = $3, live_view_started_at = NOW()
+            WHERE id = $1
+            """,
+            user_id, live_view_url, task,
+        )
+
+
+async def clear_live_browser_active(user_id: int) -> None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_column(conn, "users", "live_view_url"):
+            return
+        await conn.execute(
+            "UPDATE users SET live_view_url = NULL, live_view_task = NULL, live_view_started_at = NULL "
+            "WHERE id = $1",
+            user_id,
+        )
+
+
+async def get_live_status_by_token(token: str) -> dict[str, Any] | None:
+    """Looks up a user by their live-share token for the public /live/<token>
+    page. Returns None for an unknown/bad token (the route renders a plain
+    404 for that -- distinct from a *valid* token with nothing running,
+    which returns {"active": False, ...} so a wrong link never quietly
+    looks like a normal idle state)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_column(conn, "users", "live_share_token"):
+            return None
+        row = await conn.fetchrow(
+            "SELECT live_view_url, live_view_task, live_view_started_at, name "
+            "FROM users WHERE live_share_token = $1",
+            token,
+        )
+        if not row:
+            return None
+        started_at = row["live_view_started_at"]
+        is_stale = (
+            started_at is not None
+            and datetime.now(timezone.utc) - started_at > LIVE_VIEW_STALE_AFTER
+        )
+        active = bool(row["live_view_url"]) and not is_stale
+        return {
+            "active": active,
+            "live_view_url": row["live_view_url"] if active else None,
+            "task": row["live_view_task"] if active else None,
+            "name": row["name"],
+        }
 
 
 async def save_profile_field(user_id: int, field: str, value: str) -> dict[str, Any]:
