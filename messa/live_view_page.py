@@ -64,8 +64,8 @@ BROWSER_VIEWPORT_HEIGHT = 800
 
 def render_live_view_page(token: str, style: str | None = None) -> str:
     resolved_style = style if style in _VALID_STYLES else LIVE_VIEW_STYLE
-    html = """<!doctype html>
-<html lang="en" data-style="__RESOLVED_STYLE__">
+    return f"""<!doctype html>
+<html lang="en" data-style="{resolved_style}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -416,9 +416,9 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
   <footer>textmessa.com &middot; this link is permanent, bookmark it</footer>
 
 <script>
-(function () {
-  var TOKEN = "__TOKEN__";
-  var VIDEO_RATIO = __VIEWPORT_WIDTH__ / __VIEWPORT_HEIGHT__;
+(function () {{
+  var TOKEN = "{token}";
+  var VIDEO_RATIO = {BROWSER_VIEWPORT_WIDTH} / {BROWSER_VIEWPORT_HEIGHT};
   var MIN_LOG_HEIGHT = 90;   // px always left for the chain-of-thought log,
                               // even on a short window, so the video never
                               // squeezes it away entirely
@@ -582,14 +582,8 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
   }}
 
   poll();
-})();
+}})();
 </script>
 </body>
 </html>
 """
-    return (
-        html.replace("__RESOLVED_STYLE__", resolved_style)
-        .replace("__TOKEN__", token)
-        .replace("__VIEWPORT_WIDTH__", str(BROWSER_VIEWPORT_WIDTH))
-        .replace("__VIEWPORT_HEIGHT__", str(BROWSER_VIEWPORT_HEIGHT))
-    )
