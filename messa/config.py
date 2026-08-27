@@ -24,14 +24,53 @@ def _require(name: str) -> str:
 
 
 # ---- LLM config ----
-# Main reasoning model used by the orchestrator and all subagents unless
-# a subagent overrides it. Swap the model string to change providers/cost.
+# Two separate models now, not one shared by everything:
+#
+# - ORCHESTRATOR_MODEL_NAME is Messa's own model -- the one that decides
+#   whether/when to delegate. This is specifically where the "empty
+#   promise" bug (agents/registry.py's "Critical:" paragraph, README's
+#   "A delegation Messa announces but never actually makes" section) bites:
+#   Messa narrating a delegation in text without actually including the
+#   tool call, which the framework treats as a normal, final reply and
+#   silently drops the delegation. That failure is about instruction-
+#   following/tool-calling discipline specifically, which is what a
+#   stronger ("pro"-tier) model buys you -- so per your call, Messa gets
+#   the pro model and everyone else stays on the cheaper/faster one.
+# - SUBAGENT_MODEL_NAME is used by every subagent: deepsearch (see
+#   agents/registry.py's build_orchestrator, which passes it into
+#   build_deepsearch_subagent) and the four dict-based subagents
+#   (executive_assistant, email_agent, document_agent, routines_agent),
+#   which each get `"model": subagent_model` in their spec -- deepagents'
+#   own SubAgent dict supports a per-subagent `model` override (see
+#   deepagents/middleware/subagents.py's SubAgent.model field); without
+#   it, a subagent silently inherits whatever model create_deep_agent's
+#   own `model=` argument was called with. Their jobs are narrower
+#   (execute one delegated task, not decide whether to delegate at all),
+#   so they're less prone to that specific failure mode, and running 5-6
+#   agents per turn on the pricier model would multiply cost for little
+#   extra reliability where it doesn't matter as much.
+#
+# The `~` prefix on the flash model string below isn't a documented
+# OpenRouter convention I could find -- it's just what was already proven
+# working in this project (every deepsearch run so far has gone through
+# it), so ORCHESTRATOR_MODEL_NAME's default mirrors the same prefix rather
+# than introducing an unverified deviation. I couldn't verify
+# "~deepseek/deepseek-v4-pro" against the real OpenRouter API myself (no
+# real credentials touch this sandbox, by design -- see this project's own
+# testing discipline), so if it 400s on your first real message, the
+# quickest fallback is dropping the tilde (`deepseek/deepseek-v4-pro`) or
+# pinning the dated snapshot (`deepseek/deepseek-v4-pro-0813`) via
+# MESSA_MODEL, no code change needed either way.
 OPENROUTER_API_KEY = _require("OPENROUTER_API_KEY")
-MAIN_MODEL_NAME = os.environ.get("MESSA_MODEL", "~deepseek/deepseek-v4-flash-latest")
-CRITIC_MODEL_NAME = os.environ.get("MESSA_CRITIC_MODEL", MAIN_MODEL_NAME)
+ORCHESTRATOR_MODEL_NAME = os.environ.get("MESSA_MODEL", "deepseek/deepseek-v4-pro-0813")
+SUBAGENT_MODEL_NAME = os.environ.get("MESSA_SUBAGENT_MODEL", "~deepseek/deepseek-v4-flash-latest")
+
+# Backward-compatible alias: kept in case anything (or you) still refers to
+# "the main model" -- always Messa's own orchestrator model.
+MAIN_MODEL_NAME = ORCHESTRATOR_MODEL_NAME
 
 
-def build_model(model_name: str = MAIN_MODEL_NAME) -> ChatOpenAI:
+def build_model(model_name: str = ORCHESTRATOR_MODEL_NAME) -> ChatOpenAI:
     """Build a ChatOpenAI client pointed at OpenRouter."""
     return ChatOpenAI(
         model=model_name,

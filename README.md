@@ -548,6 +548,113 @@ of inferring it from the iframe URL alone. Verified with Playwright
 screenshots of a fresh page load against a canned idle response, in both
 skins, before and after the fix.
 
+### A delegation Messa announces but never actually makes
+
+You reported a real conversation where Messa said "Sending back to
+deepsearch to update the cart..." and, separately, "Doing both now --
+updating the Chipotle cart... and building your Subway order..." -- and
+neither one ever actually happened. No new Browserbase session opened, no
+follow-up message ever arrived, nothing. The first delegation in that same
+conversation (the original Chipotle order) worked completely normally.
+
+This is architectural, not a bug in this project's code, and I confirmed
+it directly rather than guessing: `langchain`'s agent loop (which
+`create_deep_agent` builds on) ends a turn the instant the model produces
+a response with zero `tool_calls` -- that's `factory.py`'s own comment,
+"the classic exit condition for an agent loop." There is no next step
+where the model gets to "actually" make the call it just described in
+text. So when the model writes "sending this to deepsearch..." as pure
+acknowledgment text *without* also including the `task` tool call in that
+exact same response, the turn is over right there: the text still goes
+out over SMS (which is why you saw it), but the delegation it describes
+never happens, with nothing in the logs to flag it as a failure -- it
+looks exactly like a normal, successful "I'm working on it" message.
+
+I reproduced this exactly with a fake model forced to return
+acknowledgment-only text with no tool call, run through the real
+`create_deep_agent` stack (not a hand-rolled substitute): confirmed one
+model call, zero deepsearch calls, one text message sent -- matching what
+you saw down to "the message still arrives, the action just never
+happens."
+
+**The fix is a system-prompt change** (`agents/registry.py`), since this
+is fundamentally the model's behavior, not something `cli.py`/`run_turn`
+can detect or recover from after the fact (a response with no tool call
+carries no signal that a delegation was *supposed* to be there -- there's
+nothing to catch). The prompt now spells out, explicitly, that the
+acknowledgment and the tool call must be the same response, that there is
+no later turn to catch up in, and that multiple simultaneous asks (like
+your Chipotle-update-plus-Subway-order message) should become multiple
+`task` tool calls in one response rather than one now and one "later"
+that never comes.
+
+Worth being direct about the limits here: this makes the failure less
+likely by making the instruction impossible to misread, but it can't
+*guarantee* a model never does this again -- it's steering model behavior,
+not fixing a deterministic bug. If you keep seeing it after this change,
+the next lever worth pulling is `MESSA_MODEL`/`MESSA_CRITIC_MODEL`
+(`config.py`) -- the current default (`deepseek-v4-flash-latest`) is
+optimized for speed/cost, and a slower, more instruction-following model
+for the orchestrator specifically would likely drop this failure rate
+further, at the cost of a slower/pricier reply on every turn. Happy to
+help evaluate that tradeoff if it keeps happening -- didn't want to swap
+your model out from under you without asking first.
+
+### Messa runs on a stronger model now; every subagent stays on the fast one
+
+Per your call: Messa (the orchestrator) and every subagent used to share
+one model instance. Now there are two -- `config.ORCHESTRATOR_MODEL_NAME`
+(env: `MESSA_MODEL`, defaults to `~deepseek/deepseek-v4-pro`) for Messa
+only, and `config.SUBAGENT_MODEL_NAME` (env: `MESSA_SUBAGENT_MODEL`,
+defaults to the same `~deepseek/deepseek-v4-flash-latest` you were already
+running) for deepsearch and all four dict-based subagents
+(executive_assistant, email_agent, document_agent, routines_agent).
+
+Why split it this way rather than upgrading everything: the "empty
+promise" bug above is specifically about Messa's own instruction-following
+-- pairing an acknowledgment with its tool call, in one response, no
+second chances. That's exactly what a stronger model buys you. The
+subagents' job is narrower (execute the one task they were just handed),
+so they're less exposed to that specific failure, and putting all 5-6
+agents on the pricier model would multiply cost for not much reliability
+gain where it matters less. `deepagents`' own `SubAgent` spec supports a
+per-subagent `model` override (`registry.py` now sets `"model":
+subagent_model` on each of the four dict subagents, and passes
+`subagent_model` straight into `build_deepsearch_subagent`) -- this isn't
+a workaround, it's the framework's own supported mechanism for exactly
+this.
+
+One thing I couldn't verify from here: `deepseek/deepseek-v4-pro` is a
+real, current OpenRouter model (confirmed via their docs -- "designed for
+advanced reasoning, coding, and long-horizon agent workflows"), but I
+can't make a real OpenRouter API call from this sandbox to confirm the
+exact string resolves cleanly (no real credentials touch this environment,
+by design). If your first real message to Messa comes back with a model
+error, the fix is just changing `MESSA_MODEL` -- try
+`deepseek/deepseek-v4-pro` without the leading `~`, or the dated snapshot
+`deepseek/deepseek-v4-pro-0813` -- no code change needed either way.
+
+### Session continuation now covers "fix what you just did," not just "finish what you didn't"
+
+You asked about this directly: deepsearch's session-resume (`db.get_deepsearch_session`
++ the `_SESSION_REF_RE` "session #<id>" matching in `deepsearch_tools.py`)
+was never broken -- it already works for a *completed* session, not just
+an unfinished one, because the lookup doesn't filter by status. The gap
+was narrower: the system prompt only ever *told* Messa to use it for the
+unfinished case ("hit its step limit"). For your Chipotle order, she'd
+just finished a *completed* session, and the prompt gave her no nudge to
+reference it again when you asked her to swap the drink and add chips --
+so any follow-up delegation (had one actually fired) might have started
+totally fresh, without deepsearch knowing what cart it was supposed to be
+adjusting instead of building from nothing.
+
+The prompt now says explicitly: reference "session #<id>" any time a new
+ask continues, corrects, or adds to something deepsearch just did --
+finished or not -- and only skip it for a genuinely new, unrelated task.
+This is separate from (and doesn't fix) the empty-promise bug above --
+this only matters once a delegation actually happens -- but it's a real
+gap your question surfaced, so it's fixed alongside it.
+
 ## Changes from your second round of testing
 
 - **Renamed browser_agent -> deepsearch.** Same subagent, new name

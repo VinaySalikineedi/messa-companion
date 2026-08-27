@@ -199,6 +199,17 @@ def _build_system_prompt(user: config.UserContext) -> str:
         "straight to a silent tool call."
         f"{live_view_str}"
         "\n\n"
+        "Critical: that acknowledgment and the task tool call must be in the SAME response "
+        "-- there is no next turn where you get to actually make the call. If your reply "
+        "says something like \"sending this to deepsearch\" or \"doing both now\" but "
+        "doesn't also include the task tool call(s) right then, in that exact response, "
+        "nothing happens: the conversation just ends there. Not delayed, not queued -- "
+        "silently dropped, with no error shown to you or the user, and no later chance to "
+        "catch up on it. If one message needs more than one subagent action (two different "
+        "subagents, or the same one twice), include all of those task tool calls together "
+        "in that single response rather than describing one now and coming back for the "
+        "rest -- you only get one shot per response to actually act on what you just said "
+        "you'd do.\n\n"
         "Live data means a fresh check, every time: if the user asks for anything that can "
         "change between messages -- a price, availability, a live status, today's weather -- "
         "and they're asking again (even just \"try again\" or \"is it back yet\"), delegate to "
@@ -210,11 +221,18 @@ def _build_system_prompt(user: config.UserContext) -> str:
         "worse failure than a slow reply.\n\n"
         "Deepsearch sessions: a deepsearch reply always starts with "
         "'[deepsearch session #<id> -- completed]' or '...-- not finished, hit its step "
-        "limit'. When it's not finished and the task is still worth continuing, delegate "
-        "again with 'session #<id>' written in your description (e.g. \"session #12: also "
-        "check the return flights\") so it resumes with everything it already found instead "
-        "of starting over. Use list_deepsearch_sessions if you need to check on or remind "
-        "yourself of past research before starting something that might duplicate it.\n\n"
+        "limit'. Reference that same 'session #<id>' in your next delegation's description "
+        "any time the new ask is a continuation of that same task -- not only when it hit "
+        "its step limit, but just as much when the user wants to adjust, correct, or add to "
+        "something deepsearch just finished (e.g. \"session #12: change the drink to a "
+        "fountain Coke and add a bag of chips\" after it built a cart, or \"session #12: also "
+        "check the return flights\" after it hit its limit). Referencing the session id "
+        "replays everything deepsearch already did and found straight back into its context, "
+        "so it can build on the actual cart/page/result it left off at instead of guessing "
+        "from scratch or -- worse -- redoing the entire task over again. Only skip the "
+        "session id when the new ask is genuinely a fresh, unrelated task. Use "
+        "list_deepsearch_sessions if you need to check on or remind yourself of past "
+        "research before starting something that might duplicate it.\n\n"
         "Confirmation flow: executive_assistant and routines_agent can only PROPOSE "
         "creating/updating/deleting things -- they report back a pending id. You must "
         "relay that proposal to the user in plain language and get an explicit yes before "
@@ -232,12 +250,21 @@ async def build_orchestrator(
     user: config.UserContext,
     approval_gate: ApprovalGate | None = None,
     model: Any = None,
+    subagent_model: Any = None,
 ) -> Any:
+    """`model` is Messa's own orchestrator model (config.ORCHESTRATOR_MODEL_NAME
+    by default); `subagent_model` is what every subagent below uses instead
+    (config.SUBAGENT_MODEL_NAME by default) -- see config.py's comment for why
+    these are deliberately two different models now rather than one shared
+    instance. Both params exist mainly so tests can inject fakes for either
+    or both independently; real callers (cli.py, server.py) just omit them
+    and get the configured defaults."""
     approval_gate = approval_gate or CLIApprovalGate()
-    model = model or config.build_model()
+    model = model or config.build_model(config.ORCHESTRATOR_MODEL_NAME)
+    subagent_model = subagent_model or config.build_model(config.SUBAGENT_MODEL_NAME)
 
     subagents = [
-        build_deepsearch_subagent(user, model, approval_gate),
+        build_deepsearch_subagent(user, subagent_model, approval_gate),
         {
             "name": "executive_assistant",
             "description": (
@@ -246,6 +273,7 @@ async def build_orchestrator(
             ),
             "system_prompt": EXECUTIVE_SYSTEM_PROMPT,
             "tools": build_executive_tools(user),
+            "model": subagent_model,
         },
         {
             "name": "email_agent",
@@ -255,12 +283,14 @@ async def build_orchestrator(
             ),
             "system_prompt": EMAIL_SYSTEM_PROMPT,
             "tools": build_email_tools(user, approval_gate),
+            "model": subagent_model,
         },
         {
             "name": "document_agent",
             "description": "Generates polished PDF documents from structured content on request.",
             "system_prompt": DOCUMENT_SYSTEM_PROMPT,
             "tools": build_document_tools(),
+            "model": subagent_model,
         },
         {
             "name": "routines_agent",
@@ -270,6 +300,7 @@ async def build_orchestrator(
             ),
             "system_prompt": ROUTINES_SYSTEM_PROMPT,
             "tools": build_routines_tools(user),
+            "model": subagent_model,
         },
     ]
 
