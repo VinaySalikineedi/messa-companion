@@ -1,0 +1,11 @@
+{
+  "name": "messa-nodehelpers",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Node-side helpers for messa/tools/deepsearch_tools.py -- currently just cursor_driver.mjs (real human-cursor mouse movement via a second CDP connection). @playwright/mcp itself is deliberately NOT a dependency here -- it's still run ephemerally via `npx @playwright/mcp@latest` (see Dockerfile), unrelated to this package.",
+  "type": "module",
+  "dependencies": {
+    "human-cursor": "1.1.0",
+    "playwright": "1.55.0"
+  }
+}

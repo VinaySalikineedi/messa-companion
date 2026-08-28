@@ -6,5 +6,7 @@ __pycache__/
 *.pyc
 sessions/
 outputs/
-deepsearch_profiles/
+messa/node_modules/
 browser_profiles/
+deepsearch_profiles/
+

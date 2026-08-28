@@ -33,6 +33,31 @@ survive between tasks because each user gets a persistent Browserbase
 Context (created once, reused forever -- see db.get_browserbase_context_id)
 rather than an unpersisted one-off session.
 
+Multi-site delegation: the top-level BrowserToolProvider owns one Browserbase
+session and runs `@playwright/mcp` as a local HTTP server against it with
+`--shared-browser-context --isolated` (rather than the single stdio
+connection used before) -- this lets the `delegate_website_task` tool open
+brand-new, independent MCP client connections to that SAME server, each
+landing on its own isolated tab within the one Browserbase session, instead
+of opening (and paying for) a separate Browserbase session per site. Both
+flags matter: `--shared-browser-context` alone was NOT enough once a real
+`--cdp-endpoint` (an externally-owned browser, exactly how a Browserbase
+session is connected -- not a browser `@playwright/mcp` launches itself) is
+involved -- two connections raced onto the very same page until `--isolated`
+was added too (confirmed the hard way, see
+/tmp/test_multisite_delegation_live.py's history; the original
+/tmp/test_mcp_multitab.py POC didn't catch this because it let
+`@playwright/mcp` launch its own local browser rather than connecting to an
+externally-owned one). A model that calls
+`delegate_website_task` several times in one turn gets real concurrency for
+free from LangGraph's own tool-calling loop (see
+/tmp/test_agent_concurrency.py), bounded by
+`config.DEEPSEARCH_MAX_SUBAGENTS` via a shared `asyncio.Semaphore`. Each
+sub-worker is a full `BrowserToolProvider` in its own right (same guard
+layer, same `request_human_help`), just constructed with `server_url` set
+instead of creating its own session/process -- see that parameter's
+docstring on `__init__`.
+
 Resumability: the `task` tool's schema only carries free-text `description`
 + `subagent_type` (deepagents fixes this; there's no side channel for
 structured args), so Messa references a prior run by writing "session
@@ -53,6 +78,7 @@ import asyncio
 import json
 import os
 import re
+import uuid
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -128,6 +154,145 @@ _CURSOR_MOVE_FN = (
     "}"
 )
 
+# Real human-cursor (config.DEEPSEARCH_HUMAN_CURSOR_DRIVER): resolves the
+# SAME target element's bounding-box center as _CURSOR_MOVE_FN above, but
+# returns the coordinates instead of calling window.__messaCursor.moveTo()
+# itself -- the actual move happens over a SEPARATE CDP connection (see
+# CursorDriver below), not via this browser_evaluate call, so this only
+# ever needs to report WHERE to move, never perform the move.
+# Deliberately returns a single PACKED NUMBER, not an {x, y} object or a
+# string -- same reasoning as _page_fingerprint's own docstring: a
+# non-numeric browser_evaluate result gets JSON-quoted/repr-escaped in a
+# way that's proven fragile to parse back out reliably (see that method's
+# docstring for the exact failure mode this sidesteps). x is assumed under
+# 100000 CSS pixels, comfortably beyond any real viewport.
+_CURSOR_RESOLVE_XY_FN = (
+    "(element) => {"
+    "const rect = element.getBoundingClientRect();"
+    "const x = Math.max(0, Math.round(rect.left + rect.width / 2));"
+    "const y = Math.max(0, Math.round(rect.top + rect.height / 2));"
+    "return x * 100000 + y;"
+    "}"
+)
+
+_CURSOR_DRIVER_SCRIPT_PATH = Path(__file__).resolve().parent.parent / "nodehelpers" / "cursor_driver.mjs"
+
+
+class CursorDriver:
+    """Python-side client for messa/nodehelpers/cursor_driver.mjs -- ONE
+    persistent Node subprocess per deepsearch RUN (owned and started by the
+    top-level BrowserToolProvider, then handed to every delegate_website_task
+    sub-worker too -- see that method's own `cursor_driver=self._cursor_driver`
+    -- so a single Node process serves every tab in the run, not one per
+    tab), talking JSON Lines over stdin/stdout. See that file's own module
+    docstring for the full wire protocol and design rationale.
+
+    Every public method here is best-effort and never raises: a failure
+    talking to the driver process must never break or block the real
+    browser action it's decorating. Callers treat a False/None return as
+    "this one cursor move didn't happen," never as a reason to fail the
+    actual click/type/etc. it was decorating."""
+
+    def __init__(self) -> None:
+        self._proc: asyncio.subprocess.Process | None = None
+        self._next_id = 0
+        self._pending: dict[int, asyncio.Future] = {}
+        self._reader_task: asyncio.Task | None = None
+
+    async def start(self, cdp_url: str) -> bool:
+        """Spawns cursor_driver.mjs and connects it to the SAME CDP
+        endpoint @playwright/mcp itself is using (a second, independent
+        connection -- see the module docstring's "Multi-site delegation"
+        note above for why a second connection to the same browser is safe
+        at all, and /tmp/hc_poc/ for the original proof that a second CDP
+        connection can genuinely move the mouse on a page a different
+        process is driving). Returns False (never raises) on any failure --
+        the caller falls back to the DOM-only cursor for the whole run
+        rather than trying to partially recover."""
+        try:
+            self._proc = await asyncio.create_subprocess_exec(
+                "node", str(_CURSOR_DRIVER_SCRIPT_PATH),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+                env=dict(os.environ),
+            )
+            self._reader_task = asyncio.create_task(self._read_loop())
+            resp = await self._call("connect", timeout=15, cdpUrl=cdp_url)
+            ok = bool(resp and resp.get("ok"))
+            if not ok:
+                console.system(f"Deepsearch: cursor driver connect failed: {resp}")
+            return ok
+        except Exception as e:  # noqa: BLE001
+            console.system(f"Deepsearch: cursor driver failed to start (non-fatal, falling back to DOM cursor): {e}")
+            return False
+
+    async def _read_loop(self) -> None:
+        proc = self._proc
+        if proc is None or proc.stdout is None:
+            return
+        while True:
+            try:
+                line = await proc.stdout.readline()
+            except Exception:  # noqa: BLE001
+                return
+            if not line:
+                return
+            try:
+                msg = json.loads(line.decode())
+            except Exception:  # noqa: BLE001
+                continue
+            fut = self._pending.pop(msg.get("id"), None)
+            if fut is not None and not fut.done():
+                fut.set_result(msg)
+
+    async def _call(self, cmd: str, timeout: float = 10.0, **kwargs: Any) -> dict | None:
+        if self._proc is None or self._proc.stdin is None or self._proc.returncode is not None:
+            return None
+        self._next_id += 1
+        req_id = self._next_id
+        fut: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending[req_id] = fut
+        try:
+            payload = {"id": req_id, "cmd": cmd, **kwargs}
+            self._proc.stdin.write((json.dumps(payload) + "\n").encode())
+            await self._proc.stdin.drain()
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except Exception as e:  # noqa: BLE001
+            console.system(f"Deepsearch: cursor driver call '{cmd}' failed (non-fatal): {e}")
+            return None
+        finally:
+            self._pending.pop(req_id, None)
+
+    async def register_tab(self, marker: str) -> bool:
+        """Marker-based, NOT creation-order-based (see cursor_driver.mjs's
+        own findPageByMarker) -- confirmed the only reliable way to
+        correlate a tab across a second, independent CDP connection once
+        more than one tab can exist at once."""
+        resp = await self._call("registerTab", marker=marker, timeoutMs=8000)
+        return bool(resp and resp.get("ok"))
+
+    async def move(self, marker: str, x: int, y: int) -> bool:
+        resp = await self._call("move", marker=marker, x=x, y=y)
+        return bool(resp and resp.get("ok"))
+
+    async def unregister_tab(self, marker: str) -> None:
+        await self._call("unregisterTab", marker=marker, timeout=5)
+
+    async def shutdown(self) -> None:
+        if self._proc is None:
+            return
+        try:
+            await self._call("shutdown", timeout=5)
+        finally:
+            if self._proc.returncode is None:
+                try:
+                    await asyncio.wait_for(self._proc.wait(), timeout=3)
+                except asyncio.TimeoutError:
+                    self._proc.terminate()
+            if self._reader_task is not None:
+                self._reader_task.cancel()
+
 # "Reading" scroll animation on the live view (per explicit user request --
 # see config.DEEPSEARCH_READING_ANIMATION's comment and README's "Reading
 # animation" section for the full design rationale, including the
@@ -148,6 +313,60 @@ _CURSOR_MOVE_FN = (
 # call is still in flight.
 _READING_ANIMATION_START_FN = "() => window.__messaReader ? window.__messaReader.start(6) : undefined"
 _READING_ANIMATION_STOP_FN = "() => { if (window.__messaReader) window.__messaReader.stop(); }"
+
+# Human-in-the-loop pause (login wall/CAPTCHA/2FA) -- see request_human_help
+# below and README's "Human-in-the-loop pause" section for the full design.
+# @playwright/mcp's browser_evaluate wraps its result as
+# "### Result\n<value>\n### Ran Playwright code\n```js...```" (confirmed
+# empirically against a live local session, same as every other raw
+# browser_evaluate call in this file) -- a string result comes back
+# JSON-quoted (e.g. '"https://example.com/login"'), a bare value (a number,
+# an already-quote-free concatenation) doesn't. This helper undoes that so
+# request_human_help's page-fingerprint polling gets a plain string back
+# either way, not a JSON-quoted one it'd have to strip itself.
+# NOTE the doubled backslashes: `str()` of the raw tool result is a Python
+# repr of a tuple/list of dicts, so the *actual* newlines inside that
+# result's own text come through as the literal two-character sequence
+# backslash-n, not a real newline -- matching a real "\n" here would never
+# find anything. Same doubled-backslash pattern already proven against a
+# live session in this project's own /tmp/debug_reader.py and
+# /tmp/test_reading_animation_live.py.
+_EVALUATE_RESULT_RE = re.compile(r"### Result\\n(.*?)\\n### Ran", re.DOTALL)
+
+
+def _parse_evaluate_text(raw: Any) -> str | None:
+    text = str(raw)
+    m = _EVALUATE_RESULT_RE.search(text)
+    if not m:
+        return None
+    val = m.group(1).strip()
+    if val.startswith('"') and val.endswith('"'):
+        try:
+            return json.loads(val)
+        except Exception:  # noqa: BLE001
+            return val
+    return val
+
+
+# Deterministic backstop for human-help detection (per your answer: model-
+# driven first, this is only the safety net). Deliberately a short, generic
+# list -- this only needs to catch the OBVIOUS cases; anything subtler is
+# exactly what the model itself is there to recognize. Checked against the
+# text of the most recent successful browser_snapshot, not the live page
+# (no extra browser round trip needed for a check that fires on every
+# consecutive failure).
+_AUTH_WALL_KEYWORDS = (
+    "password", "verify you are human", "captcha", "two-factor", "2fa",
+    "one-time code", "one-time passcode", "enter the code", "security check",
+    "sign in to continue", "confirm your identity",
+)
+
+
+def _looks_like_auth_wall(snapshot_text: str | None) -> bool:
+    if not snapshot_text:
+        return False
+    lowered = snapshot_text.lower()
+    return any(kw in lowered for kw in _AUTH_WALL_KEYWORDS)
 
 
 def _target_values(name: str, kwargs: dict[str, Any]) -> list[str]:
@@ -261,9 +480,65 @@ class BrowserToolProvider:
         self,
         approval_gate: ApprovalGate | None = None,
         user_id: int | None = None,
+        deepsearch_session_id: int | None = None,
+        *,
+        server_url: str | None = None,
+        model: BaseChatModel | None = None,
+        cursor_driver: "CursorDriver | None" = None,
     ):
         self._approval_gate = approval_gate
         self._user_id = user_id
+        # For db.create_human_help_request -- lets a human-help request row
+        # be traced back to the deepsearch_sessions row it happened during.
+        # None is fine (session tracking is itself optional, see
+        # build_deepsearch_subagent's own "session tracking not enabled"
+        # fallback) -- the human-help flow still works without it.
+        self._deepsearch_session_id = deepsearch_session_id
+        # A short random id identifying this one browser tab, independent of
+        # deepsearch_session_id (which identifies the whole TASK, potentially
+        # across resumed runs) -- load-bearing now that multi-site
+        # delegation gives one deepsearch run several tabs at once, each
+        # needing its own identity for the human-cursor driver (stage 3) and
+        # for telling one tab's human-help request/live-activity entry apart
+        # from another's.
+        self._tab_id = f"tab-{uuid.uuid4().hex[:10]}"
+        # Multi-site delegation (see delegate_website_task below):
+        # server_url is None for the TOP-LEVEL provider -- it owns the
+        # Browserbase session and the @playwright/mcp HTTP server subprocess
+        # backing it, created below in __aenter__. When server_url IS given
+        # (only delegate_website_task constructs a provider this way), this
+        # is a SUB-WORKER: it connects a brand-new, independent MCP client
+        # to that ALREADY-RUNNING server instead of creating its own
+        # Browserbase session or spawning a second server process -- which
+        # is what makes several concurrent sub-workers cost one Browserbase
+        # session, not N (see /tmp/test_mcp_multitab.py's empirical
+        # confirmation that --shared-browser-context gives each separate
+        # client connection its own isolated tab). `model` is only needed by
+        # an owning provider (to run each sub-worker's own create_agent
+        # loop) but is threaded through to sub-workers too since they
+        # construct their OWN nested BrowserToolProvider today only via
+        # delegate_website_task, which is unreachable from a sub-worker's
+        # toolset (no recursive delegation, enforced by _owns_server below,
+        # not just by omission from the tool list).
+        self._server_url = server_url
+        self._owns_server = server_url is None
+        self._model = model
+        # Real human-cursor (Stage 3): None means "not using the real
+        # driver for this tab" -- either the feature is off
+        # (config.DEEPSEARCH_HUMAN_CURSOR_DRIVER), it failed to start (see
+        # CursorDriver.start's own fallback), or DEEPSEARCH_CURSOR_OVERLAY
+        # is off entirely (no arrow drawn at all, real or DOM-only). Set
+        # here for a sub-worker (handed down from the top-level provider
+        # that actually owns/started it); set in __aenter__ below for the
+        # owning/top-level provider itself, once it has a connect_url to
+        # start the driver against.
+        self._cursor_driver = cursor_driver
+        self._mcp_proc: asyncio.subprocess.Process | None = None
+        # Created only for an owning/top-level provider (see __aenter__) --
+        # shared across every delegate_website_task call made during this
+        # one deepsearch run, capping how many sub-worker tabs run at once
+        # regardless of how many times the model calls the tool in one turn.
+        self._subagent_semaphore: asyncio.Semaphore | None = None
         self._client: MultiServerMCPClient | None = None
         self._session_cm = None
         self._session = None
@@ -284,111 +559,252 @@ class BrowserToolProvider:
         # cleanup, and __aexit__'s final sweep on the way out.
         self._reading_task: asyncio.Task | None = None
         # Shared mutable state referenced by the closures below.
-        self._state = {"consecutive_errors": 0, "snapshot_fresh": False}
+        # last_snapshot_text: the most recent successful browser_snapshot's
+        # result, truncated -- read by the deterministic human-help backstop
+        # (_looks_like_auth_wall) so it doesn't need its own extra browser
+        # round trip on every consecutive failure just to check.
+        self._state = {"consecutive_errors": 0, "snapshot_fresh": False, "last_snapshot_text": None}
+
+    async def _spawn_mcp_http_server(self, connect_url: str) -> str:
+        """Owning provider only: launches @playwright/mcp as a local HTTP
+        server (--port 0 lets it pick a free port) with
+        --shared-browser-context, connected over CDP to the Browserbase
+        session at `connect_url`. Returns the server's own base URL, parsed
+        from its stdout -- confirmed empirically (see /tmp/test_mcp_multitab.py)
+        that it prints a "Listening on http://..." line once ready, the same
+        line this parses. --shared-browser-context is what lets
+        delegate_website_task open brand-new, independent MCP client
+        connections against this SAME server and each land on its own
+        isolated tab within the one Browserbase session, instead of each
+        sub-worker needing (and billing) its own session."""
+        mcp_args = [
+            "@playwright/mcp@latest", "--cdp-endpoint", connect_url,
+            "--port", "0", "--shared-browser-context",
+            # --isolated is REQUIRED here, not optional, when combined with
+            # --cdp-endpoint -- confirmed empirically (see
+            # /tmp/test_multisite_delegation_live.py's history and
+            # /tmp/probe_flags.py): without it, two separate client
+            # connections against a --cdp-endpoint-connected browser raced
+            # onto the SAME page (one connection's browser_navigate was
+            # literally "interrupted by another navigation" from the other
+            # connection), instead of each landing on its own isolated tab.
+            # /tmp/test_mcp_multitab.py's original POC didn't catch this
+            # because it launched its OWN local browser (no --cdp-endpoint)
+            # rather than connecting to an externally-owned one the way a
+            # real Browserbase session works -- --isolated is what makes
+            # the externally-owned-browser case behave the same way. Safe
+            # to always pass: each deepsearch run already gets a brand-new
+            # Browserbase session, so there's no persisted local profile to
+            # keep across runs regardless.
+            "--isolated",
+            # --image-responses omit: our subagent model
+            # (config.SUBAGENT_MODEL_NAME) isn't confirmed to
+            # accept image inputs, so a screenshot tool result
+            # would otherwise embed a base64 image the model
+            # can't actually use -- pure wasted tokens. This
+            # also means we're deliberately NOT enabling
+            # --caps=vision (the coordinate-click tools that
+            # capability adds are useless without a
+            # vision-capable model reading a screenshot first)
+            # -- revisit only once the subagent model is
+            # confirmed to support vision.
+            "--image-responses", "omit",
+            # See config.DEEPSEARCH_TIMEOUT_SETTLE_MS's comment
+            # for why this is turned down from the package's
+            # own 500ms default.
+            "--timeout-settle", str(config.DEEPSEARCH_TIMEOUT_SETTLE_MS),
+        ]
+        # Both cosmetic features (click/type cursor overlay, reading scroll
+        # animation) live in the same asset file and ride the same
+        # --init-script injection, but are independently toggled -- only
+        # skip injecting the script when BOTH are off. A server-wide flag
+        # (set once here, at the ONE process every tab -- top-level and
+        # every delegated sub-worker alike -- ultimately connects through),
+        # so every tab gets it automatically with no per-tab plumbing.
+        if config.DEEPSEARCH_CURSOR_OVERLAY or config.DEEPSEARCH_READING_ANIMATION:
+            mcp_args += ["--init-script", str(_CURSOR_OVERLAY_SCRIPT_PATH)]
+
+        # env=dict(os.environ): a spawned subprocess does NOT inherit the
+        # parent process's environment by default (deliberately -- so an
+        # arbitrary MCP server doesn't automatically see your secrets).
+        # Without PATH/HOME passed through, the spawned npx subprocess can't
+        # even find node_modules/npx's own cache -- still needed here even
+        # though the browser itself is remote now. asyncio.create_subprocess_exec
+        # (not subprocess.Popen) so reading its stdout below doesn't block
+        # the event loop -- other tool calls / the human-help poll loop
+        # elsewhere in this process need to keep running while we wait for
+        # this to come up.
+        self._mcp_proc = await asyncio.create_subprocess_exec(
+            "npx", *mcp_args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=dict(os.environ),
+        )
+        deadline = asyncio.get_event_loop().time() + 20
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                line = await asyncio.wait_for(self._mcp_proc.stdout.readline(), timeout=1.0)
+            except asyncio.TimeoutError:
+                if self._mcp_proc.returncode is not None:
+                    break
+                continue
+            if not line:
+                break
+            text = line.decode(errors="replace").strip()
+            if text:
+                console.system(f"Deepsearch: [playwright-mcp] {text}")
+            m = re.search(r"(http://\S+)", text)
+            if m:
+                return m.group(1)
+        raise RuntimeError(
+            "playwright-mcp HTTP server never printed a listening URL "
+            f"(exited with code {self._mcp_proc.returncode})"
+        )
 
     async def __aenter__(self) -> "BrowserToolProvider":
-        # One Browserbase Context per user, created once and reused forever --
-        # this is what makes logins survive between tasks (and, unlike the
-        # old --user-data-dir profile directory, survives an HF Space
-        # restart too, since it isn't on the container's disk at all).
-        # This whole method used to have no top-level error handling (same as
-        # the original local-Chromium version) -- fine when the only failure
-        # mode was "npx/chromium missing," which the guarded tool-call path
-        # below already logs clearly. Now that opening a browser means two
-        # network round trips to Browserbase before anything else runs (auth,
-        # quota, an expired/malformed key, HF's own egress to
-        # api.browserbase.com being blocked -- all plausible, all silent
-        # without this), a failure here needs its own clear, findable log
-        # line instead of surfacing as an unlabeled exception three layers
-        # up. Two separate try/excepts so the log line itself tells you
-        # whether it was Browserbase or the local MCP/CDP connection step
-        # that failed.
-        try:
-            context_id = None
-            if self._user_id is not None:
-                context_id = await db.get_browserbase_context_id(self._user_id)
-                if not context_id:
-                    context_id = await browserbase.create_context()
-                    await db.save_browserbase_context_id(self._user_id, context_id)
+        if self._owns_server:
+            # One Browserbase Context per user, created once and reused
+            # forever -- this is what makes logins survive between tasks
+            # (and, unlike the old --user-data-dir profile directory,
+            # survives an HF Space restart too, since it isn't on the
+            # container's disk at all).
+            # This whole method used to have no top-level error handling
+            # (same as the original local-Chromium version) -- fine when the
+            # only failure mode was "npx/chromium missing," which the
+            # guarded tool-call path below already logs clearly. Now that
+            # opening a browser means two network round trips to Browserbase
+            # before anything else runs (auth, quota, an expired/malformed
+            # key, HF's own egress to api.browserbase.com being blocked --
+            # all plausible, all silent without this), a failure here needs
+            # its own clear, findable log line instead of surfacing as an
+            # unlabeled exception three layers up. Two separate try/excepts
+            # so the log line itself tells you whether it was Browserbase or
+            # the local MCP/CDP connection step that failed.
+            try:
+                context_id = None
+                if self._user_id is not None:
+                    context_id = await db.get_browserbase_context_id(self._user_id)
+                    if not context_id:
+                        context_id = await browserbase.create_context()
+                        await db.save_browserbase_context_id(self._user_id, context_id)
 
-            session = await browserbase.create_session(context_id)
-            self._bb_session_id = session["id"]
-            connect_url = session["connectUrl"]
-            console.system(f"Deepsearch: opened Browserbase session {self._bb_session_id}.")
-        except Exception as e:  # noqa: BLE001
-            console.tool_error(LABEL, "browserbase_session_create", str(e))
-            raise
+                session = await browserbase.create_session(context_id)
+                self._bb_session_id = session["id"]
+                connect_url = session["connectUrl"]
+                console.system(f"Deepsearch: opened Browserbase session {self._bb_session_id}.")
+            except Exception as e:  # noqa: BLE001
+                console.tool_error(LABEL, "browserbase_session_create", str(e))
+                raise
 
-        # Best-effort: not having a live-view link yet shouldn't block the run.
-        try:
-            self.live_view_url = await browserbase.get_live_view_url(self._bb_session_id)
-        except BrowserbaseError as e:
-            console.tool_error(LABEL, "browserbase_live_view", str(e))
+            # Best-effort: not having a live-view link yet shouldn't block the run.
+            try:
+                self.live_view_url = await browserbase.get_live_view_url(self._bb_session_id)
+            except BrowserbaseError as e:
+                console.tool_error(LABEL, "browserbase_live_view", str(e))
+
+            try:
+                self._server_url = await self._spawn_mcp_http_server(connect_url)
+                self._subagent_semaphore = asyncio.Semaphore(config.DEEPSEARCH_MAX_SUBAGENTS)
+                # Real human-cursor (Stage 3): started once per RUN, here,
+                # not per tab -- every sub-worker (see _delegate_website_task)
+                # is handed THIS SAME instance rather than starting its own
+                # Node process. Best-effort and non-fatal: CursorDriver.start
+                # returns False (never raises) on any failure, at which
+                # point self._cursor_driver simply stays None and every tab
+                # for the rest of this run falls back to the DOM-only
+                # cursor -- deepsearch itself must never fail just because
+                # the cosmetic cursor upgrade didn't come up.
+                if config.DEEPSEARCH_CURSOR_OVERLAY and config.DEEPSEARCH_HUMAN_CURSOR_DRIVER:
+                    driver = CursorDriver()
+                    started = await driver.start(connect_url)
+                    self._cursor_driver = driver if started else None
+            except Exception as e:  # noqa: BLE001
+                console.tool_error(LABEL, "browserbase_cdp_connect", str(e))
+                # __aexit__ is NOT called by `async with` when __aenter__
+                # itself raises -- without this, a Browserbase session that
+                # was created just above but never got a working CDP
+                # connection would leak (left running until it idles out on
+                # Browserbase's side, rather than released immediately).
+                # Left unfixed, repeated failed attempts would each leak
+                # another session -- on the free plan's low concurrent-
+                # session cap, that alone could make every *subsequent*
+                # attempt fail at browserbase_session_create with a
+                # quota/limit error, which would look identical to this
+                # failure from the outside. Best-effort: we're already
+                # failing, a second error here shouldn't mask the first.
+                if self._mcp_proc is not None and self._mcp_proc.returncode is None:
+                    self._mcp_proc.terminate()
+                if self._bb_session_id is not None:
+                    try:
+                        await browserbase.release_session(self._bb_session_id)
+                    except Exception as release_err:  # noqa: BLE001
+                        console.tool_error(LABEL, "browserbase_release_after_failure", str(release_err))
+                raise
 
         try:
-            # env=dict(os.environ): MCP's stdio transport does NOT inherit the
-            # parent process's environment by default (deliberately -- so an
-            # arbitrary MCP server doesn't automatically see your secrets).
-            # Without PATH/HOME passed through, the spawned npx subprocess
-            # can't even find node_modules/npx's own cache -- still needed
-            # here even though the browser itself is remote now.
-            mcp_args = [
-                "@playwright/mcp@latest", "--cdp-endpoint", connect_url,
-                # --image-responses omit: our subagent model
-                # (config.SUBAGENT_MODEL_NAME) isn't confirmed to
-                # accept image inputs, so a screenshot tool result
-                # would otherwise embed a base64 image the model
-                # can't actually use -- pure wasted tokens. This
-                # also means we're deliberately NOT enabling
-                # --caps=vision (the coordinate-click tools that
-                # capability adds are useless without a
-                # vision-capable model reading a screenshot first)
-                # -- revisit only once the subagent model is
-                # confirmed to support vision.
-                "--image-responses", "omit",
-                # See config.DEEPSEARCH_TIMEOUT_SETTLE_MS's comment
-                # for why this is turned down from the package's
-                # own 500ms default.
-                "--timeout-settle", str(config.DEEPSEARCH_TIMEOUT_SETTLE_MS),
-            ]
-            # Both cosmetic features (click/type cursor overlay, reading
-            # scroll animation) live in the same asset file and ride the
-            # same --init-script injection, but are independently toggled --
-            # only skip injecting the script when BOTH are off.
-            if config.DEEPSEARCH_CURSOR_OVERLAY or config.DEEPSEARCH_READING_ANIMATION:
-                mcp_args += ["--init-script", str(_CURSOR_OVERLAY_SCRIPT_PATH)]
+            # Both the owning provider (connecting to the server it just
+            # spawned above) and a sub-worker (connecting to an
+            # already-running server passed in via server_url) land here the
+            # same way -- a brand-new, independent streamable-HTTP client
+            # connection, which is what gives each one its own isolated tab
+            # within the shared browser context (confirmed empirically, see
+            # /tmp/test_mcp_multitab.py).
             self._client = MultiServerMCPClient({
-                "playwright": {
-                    "command": "npx",
-                    "args": mcp_args,
-                    "transport": "stdio",
-                    "env": dict(os.environ),
-                }
+                "playwright": {"url": self._server_url, "transport": "streamable_http"}
             })
             self._session_cm = self._client.session("playwright")
             self._session = await self._session_cm.__aenter__()
             raw_tools = await load_mcp_tools(self._session)
             self._raw_tools_by_name = {t.name: t for t in raw_tools}
             self.tools = [self._guard(t) for t in raw_tools]
-            console.system(f"Deepsearch: launched with {len(self.tools)} Playwright tools.")
+            # request_human_help isn't a wrapped MCP tool -- it's our own
+            # Python method, added directly to the model-facing toolset
+            # (unlike _move_cursor_to/_start_reading_animation, which the
+            # model never calls itself). Given to BOTH the top-level
+            # provider and every sub-worker -- a login wall can turn up on
+            # any tab, not just the first one.
+            self.tools.append(StructuredTool.from_function(
+                coroutine=self._request_human_help,
+                name="request_human_help",
+                description=(self._request_human_help.__doc__ or "").strip(),
+            ))
+            # delegate_website_task is deliberately owning-provider-only --
+            # _owns_server is the actual enforcement (not just leaving it
+            # off a sub-worker's tool list), so there is no path to
+            # recursive delegation even if this method were ever called
+            # directly.
+            if self._owns_server:
+                self.tools.append(StructuredTool.from_function(
+                    coroutine=self._delegate_website_task,
+                    name="delegate_website_task",
+                    description=(self._delegate_website_task.__doc__ or "").strip(),
+                ))
+            console.system(
+                f"Deepsearch: launched with {len(self.tools)} tools "
+                f"({'top-level' if self._owns_server else 'sub-worker ' + self._tab_id})."
+            )
+            # Real human-cursor (Stage 3): register THIS tab (top-level or
+            # sub-worker alike -- every tab needs its own marker/cursor
+            # instance) with the shared driver, if one is running. Marker
+            # set via a raw, non-approval-gated browser_evaluate call, same
+            # pattern _move_cursor_to already uses -- this is our own
+            # cosmetic side effect, never something the model chose to do.
+            # Best-effort throughout: any failure here just means this
+            # tab's cursor movement silently falls back to the DOM-only
+            # path for the rest of the run (see _move_cursor_to), never a
+            # reason to fail tool setup.
+            if self._cursor_driver is not None:
+                await self._assert_cursor_marker()
         except Exception as e:  # noqa: BLE001
-            console.tool_error(LABEL, "browserbase_cdp_connect", str(e))
-            # __aexit__ is NOT called by `async with` when __aenter__ itself
-            # raises -- without this, a Browserbase session that was created
-            # just above but never got a working CDP connection would leak
-            # (left running until it idles out on Browserbase's side, rather
-            # than released immediately). Left unfixed, repeated failed
-            # attempts would each leak another session -- on the free plan's
-            # low concurrent-session cap, that alone could make every
-            # *subsequent* attempt fail at browserbase_session_create with a
-            # quota/limit error, which would look identical to this failure
-            # from the outside. Best-effort: we're already failing, a second
-            # error here shouldn't mask the first.
-            if self._bb_session_id is not None:
-                try:
-                    await browserbase.release_session(self._bb_session_id)
-                except Exception as release_err:  # noqa: BLE001
-                    console.tool_error(LABEL, "browserbase_release_after_failure", str(release_err))
+            console.tool_error(LABEL, "playwright_mcp_connect", str(e))
+            if self._owns_server:
+                if self._mcp_proc is not None and self._mcp_proc.returncode is None:
+                    self._mcp_proc.terminate()
+                if self._bb_session_id is not None:
+                    try:
+                        await browserbase.release_session(self._bb_session_id)
+                    except Exception as release_err:  # noqa: BLE001
+                        console.tool_error(LABEL, "browserbase_release_after_failure", str(release_err))
             raise
         return self
 
@@ -406,6 +822,35 @@ class BrowserToolProvider:
             self._reading_task.cancel()
         if self._session_cm is not None:
             await self._session_cm.__aexit__(exc_type, exc, tb)
+        if not self._owns_server:
+            # A sub-worker only closes its OWN client connection and (if a
+            # real cursor driver is running) its OWN registered tab -- the
+            # shared driver process, the shared server process, and the
+            # Browserbase session all belong to the top-level provider,
+            # which tears those down (below) once the whole deepsearch run
+            # ends, not when one delegated sub-worker's single-site task
+            # finishes.
+            if self._cursor_driver is not None:
+                try:
+                    await self._cursor_driver.unregister_tab(self._tab_id)
+                except Exception as e:  # noqa: BLE001 - cosmetic only
+                    console.system(f"Deepsearch: cursor tab unregister failed (non-fatal): {e}")
+            console.system(f"Deepsearch: sub-worker tab {self._tab_id} closed.")
+            return
+        if self._cursor_driver is not None:
+            try:
+                await self._cursor_driver.shutdown()
+            except Exception as e:  # noqa: BLE001 - cosmetic only
+                console.system(f"Deepsearch: cursor driver shutdown failed (non-fatal): {e}")
+        if self._mcp_proc is not None and self._mcp_proc.returncode is None:
+            try:
+                self._mcp_proc.terminate()
+                await asyncio.wait_for(self._mcp_proc.wait(), timeout=5)
+            except Exception:  # noqa: BLE001
+                try:
+                    self._mcp_proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
         if self._bb_session_id is not None:
             try:
                 await browserbase.release_session(self._bb_session_id)
@@ -413,6 +858,43 @@ class BrowserToolProvider:
                 # Best-effort: the session will idle out on its own either way.
                 console.tool_error(LABEL, "browserbase_release", str(e))
         console.system("Deepsearch: browser closed.")
+
+    async def _assert_cursor_marker(self) -> None:
+        """Sets this tab's window.name to self._tab_id (its own marker) and
+        (re-)registers it with the shared cursor driver, if one is running.
+        Called once in __aenter__ and again after every browser_navigate
+        (see guarded()) -- window.name can reset on a cross-origin
+        navigation in modern Chrome, and while the already-registered Page
+        object stays valid for `move` regardless (same tab, just possibly a
+        different window.name), re-asserting it here keeps the marker
+        genuinely accurate rather than silently stale. Best-effort: never
+        raises, never blocks/fails the real action it's running alongside."""
+        if self._cursor_driver is None:
+            return
+        evaluate_tool = self._raw_tools_by_name.get("browser_evaluate")
+        if evaluate_tool is None:
+            return
+        try:
+            # No `target=` -- this takes no element, it just needs to run in
+            # this tab's own page context (same no-target shape as
+            # _page_fingerprint's and the reading animation's own
+            # browser_evaluate calls). json.dumps to safely embed the
+            # marker string as a JS string literal, same reasoning as
+            # everywhere else in this file that builds a browser_evaluate
+            # function string with a dynamic value baked in.
+            await evaluate_tool.coroutine(
+                element="cursor marker",
+                function=f"() => {{ window.name = {json.dumps(self._tab_id)}; }}",
+            )
+        except Exception as e:  # noqa: BLE001 - cosmetic only, never surfaced to the model
+            console.system(f"Deepsearch: setting cursor marker failed (non-fatal): {e}")
+            return
+        try:
+            ok = await self._cursor_driver.register_tab(self._tab_id)
+            if not ok:
+                console.system(f"Deepsearch: cursor driver couldn't find tab {self._tab_id} (non-fatal).")
+        except Exception as e:  # noqa: BLE001 - cosmetic only, never surfaced to the model
+            console.system(f"Deepsearch: cursor tab registration failed (non-fatal): {e}")
 
     async def _move_cursor_to(self, element: str | None, target: str | None) -> None:
         """Best-effort, cosmetic-only: animate the injected SVG cursor (see
@@ -428,6 +910,30 @@ class BrowserToolProvider:
             return
         evaluate_tool = self._raw_tools_by_name.get("browser_evaluate")
         if evaluate_tool is None:
+            return
+        if self._cursor_driver is not None:
+            # Real human-cursor path: resolve the target's on-screen
+            # coordinates (same target the real action is about to use,
+            # same first step as the DOM-only path below), then move over
+            # the SEPARATE CDP connection instead of calling
+            # window.__messaCursor.moveTo() in-page -- cursor_overlay.js's
+            # own real mousemove/mousedown listeners pick up the resulting
+            # genuine browser events and move the drawn arrow to match (see
+            # that file's own comment).
+            try:
+                raw = await evaluate_tool.coroutine(
+                    element=element or "target element", target=target, function=_CURSOR_RESOLVE_XY_FN,
+                )
+                text = _parse_evaluate_text(raw)
+                if text is None:
+                    return
+                packed = int(text)
+                x, y = packed // 100000, packed % 100000
+                ok = await self._cursor_driver.move(self._tab_id, x, y)
+                if not ok:
+                    console.system("Deepsearch: real cursor move failed (non-fatal); arrow may lag this one action.")
+            except Exception as e:  # noqa: BLE001 - cosmetic only, never surfaced to the model
+                console.system(f"Deepsearch: real cursor move failed (non-fatal): {e}")
             return
         try:
             await evaluate_tool.coroutine(
@@ -488,6 +994,272 @@ class BrowserToolProvider:
         except Exception as e:  # noqa: BLE001 - cosmetic only, never surfaced to the model
             console.system(f"Deepsearch: reading animation stop failed (non-fatal): {e}")
 
+    # ------------------------------------------------------------------
+    # live_activity dispatch: a sub-worker (delegate_website_task) reports
+    # its own progress into live_activity's per-tab `tabs` dict instead of
+    # the flat top-level fields, so several concurrent sub-workers never
+    # race to clobber each other's (or the top-level's) description/steps/
+    # waiting_for_human -- see live_activity.py's own comment above its
+    # per-tab functions for the full rationale. The top-level provider
+    # keeps using the flat fields exactly as before multi-site delegation
+    # existed. guarded() and _request_human_help below call these instead
+    # of live_activity.* directly so neither has to branch on
+    # self._is_subworker itself.
+    # ------------------------------------------------------------------
+
+    def _live_set_description(self, text: str) -> None:
+        if self._user_id is None:
+            return
+        if self._owns_server:
+            live_activity.set_description(self._user_id, text)
+        else:
+            live_activity.set_tab_description(self._user_id, self._tab_id, text)
+
+    def _live_add_step(self, text: str) -> None:
+        if self._user_id is None:
+            return
+        if self._owns_server:
+            live_activity.add_step(self._user_id, text)
+        else:
+            live_activity.add_tab_step(self._user_id, self._tab_id, text)
+
+    def _live_set_waiting(self, reason: str) -> None:
+        if self._user_id is None:
+            return
+        if self._owns_server:
+            live_activity.set_waiting_for_human(self._user_id, reason)
+        else:
+            live_activity.set_tab_waiting_for_human(self._user_id, self._tab_id, reason)
+
+    def _live_clear_waiting(self) -> None:
+        if self._user_id is None:
+            return
+        if self._owns_server:
+            live_activity.clear_waiting_for_human(self._user_id)
+        else:
+            live_activity.clear_tab_waiting_for_human(self._user_id, self._tab_id)
+
+    async def _page_fingerprint(self) -> int | None:
+        """A cheap, no-side-effect check of "has anything changed" for
+        request_human_help's polling loop: the current URL plus the length
+        of every input field's value, joined into one string. Deliberately
+        NOT a full browser_snapshot (that's a much heavier call to run every
+        few seconds for up to several minutes) -- just enough to notice (a)
+        the page navigated (a login/verification usually redirects on
+        success) or (b) someone is actively typing into a field, without
+        reading the actual field contents. Returns None on any failure
+        (e.g. the tab isn't ready yet) rather than raising -- a missed poll
+        just means the next one tries again.
+
+        Deliberately returns a single PLAIN NUMBER, not a string: a string
+        result (even a boring one like a bare URL) gets JSON-quoted by
+        browser_evaluate, and if that string happens to contain both a
+        single and a double quote (a realistic URL usually doesn't, but the
+        "Ran Playwright code" example block wrapped around every
+        browser_evaluate result sometimes does), Python's own repr() of the
+        surrounding structure escapes it unpredictably -- confirmed the hard
+        way while building this (see /tmp/test_human_help.py's history).
+        Encoding "URL identity" as a bounded hash and "how much text is in
+        every input field" as a bounded length, packed into one integer,
+        sidesteps that whole class of parsing fragility -- a bare number's
+        str() is unambiguous no matter what it's nested inside."""
+        evaluate_tool = self._raw_tools_by_name.get("browser_evaluate")
+        if evaluate_tool is None:
+            return None
+        try:
+            raw = await evaluate_tool.coroutine(
+                element="human-help page check",
+                function=(
+                    "() => {"
+                    "let h = 0;"
+                    "for (let i = 0; i < document.URL.length; i++) {"
+                    "h = (h * 31 + document.URL.charCodeAt(i)) | 0;"
+                    "}"
+                    "h = Math.abs(h) % 1000000;"
+                    "const totalLen = Math.min(Array.from(document.querySelectorAll('input'))"
+                    ".reduce((a, el) => a + (el.value || '').length, 0), 999);"
+                    "return h * 1000 + totalLen;"
+                    "}"
+                ),
+            )
+            text = _parse_evaluate_text(raw)
+            return int(text) if text is not None else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _request_human_help(self, reason: str) -> str:
+        """Model-facing tool: call this when you recognize a login wall,
+        CAPTCHA, 2FA prompt, or similar block you cannot get past yourself.
+
+        Writes a durable request that a separate background process (not
+        this call) uses to text the user -- see db.create_human_help_request
+        and server.py's _production_deepsearch_pause_loop -- then waits,
+        polling this tab for real activity: gives up after
+        config.DEEPSEARCH_HUMAN_HELP_INITIAL_WAIT_SECONDS with no activity
+        at all; as long as fresh activity keeps appearing, extends the wait
+        in config.DEEPSEARCH_HUMAN_HELP_EXTEND_SECONDS increments, capped
+        regardless by config.DEEPSEARCH_HUMAN_HELP_MAX_TOTAL_SECONDS. A URL
+        change is treated as resolved (logins/verifications almost always
+        redirect on success). Never raises: returns a RESOLVED string with a
+        fresh snapshot on success, or a BLOCKED string to give up on --
+        continue with other independent work if there is any, otherwise
+        wrap up and report that this task needs the user's help."""
+        if self._user_id is None:
+            return "ERROR: request_human_help isn't available outside a real user session."
+
+        console.system(f"Deepsearch: requesting human help on tab {self._tab_id} -- {reason}")
+        request_row = await db.create_human_help_request(
+            self._user_id, self._deepsearch_session_id, self._tab_id, reason,
+        )
+        request_id = request_row["id"] if request_row else None
+        self._live_set_waiting(reason)
+
+        try:
+            start_fp = await self._page_fingerprint()
+            start_url_hash = (start_fp // 1000) if start_fp is not None else None
+            last_fp = start_fp
+            elapsed = 0
+            saw_any_activity = False
+            deadline = config.DEEPSEARCH_HUMAN_HELP_INITIAL_WAIT_SECONDS
+
+            while elapsed < config.DEEPSEARCH_HUMAN_HELP_MAX_TOTAL_SECONDS:
+                await asyncio.sleep(config.DEEPSEARCH_HUMAN_HELP_POLL_INTERVAL_SECONDS)
+                elapsed += config.DEEPSEARCH_HUMAN_HELP_POLL_INTERVAL_SECONDS
+
+                fp = await self._page_fingerprint()
+                current_url_hash = (fp // 1000) if fp is not None else None
+
+                if current_url_hash is not None and start_url_hash is not None and current_url_hash != start_url_hash:
+                    if request_id is not None:
+                        await db.resolve_human_help_request(request_id)
+                    console.system(f"Deepsearch: human help on tab {self._tab_id} resolved after {elapsed}s (URL changed).")
+                    snapshot_tool = self._raw_tools_by_name.get("browser_snapshot")
+                    snapshot = None
+                    if snapshot_tool is not None:
+                        try:
+                            snapshot = await snapshot_tool.coroutine()
+                            self._state["snapshot_fresh"] = True
+                        except Exception:  # noqa: BLE001
+                            snapshot = None
+                    return (
+                        "RESOLVED: the page changed -- you're likely past the login/verification "
+                        "now. Here is a fresh snapshot:\n\n"
+                        + (str(snapshot) if snapshot is not None else "(snapshot unavailable, take one now)")
+                    )
+
+                if fp is not None and fp != last_fp:
+                    saw_any_activity = True
+                    deadline = elapsed + config.DEEPSEARCH_HUMAN_HELP_EXTEND_SECONDS
+                last_fp = fp
+
+                if elapsed >= deadline:
+                    break
+
+            if request_id is not None:
+                await db.timeout_human_help_request(request_id)
+            console.system(
+                f"Deepsearch: human help on tab {self._tab_id} timed out after {elapsed}s "
+                f"(saw_any_activity={saw_any_activity})."
+            )
+            return (
+                "BLOCKED: no one finished the login/verification in time. If there is other "
+                "independent work left to do, move on to that now. Otherwise, wrap up and "
+                "report back honestly that this part needs the user's help."
+            )
+        finally:
+            # Always clear the waiting flag on the way out, whichever branch
+            # returned -- an early exception inside this method (a bug, an
+            # unexpected None somewhere) must never leave the live-view page
+            # stuck showing "waiting for you" past the point where this call
+            # actually stopped waiting.
+            self._live_clear_waiting()
+
+    async def _delegate_website_task(self, url: str, instructions: str) -> str:
+        """Model-facing tool: delegate independent work on ONE website to a
+        fresh sub-worker with its OWN browser tab, in the SAME shared
+        Browserbase session -- no new session, no extra billing unit (see
+        the module docstring's "Multi-site delegation" note and
+        /tmp/test_mcp_multitab.py, which confirmed a new MCP client
+        connection against a --shared-browser-context server always lands
+        on its own isolated tab, safely separate from every other
+        connection's).
+
+        Call this MULTIPLE TIMES IN THE SAME TURN for genuinely independent
+        multi-site work (e.g. "check the price on site A and on site B") --
+        LangGraph runs multiple tool calls from one AI turn concurrently, so
+        several delegate_website_task calls made together actually run in
+        parallel, not one after another (confirmed empirically, see
+        /tmp/test_agent_concurrency.py). Up to
+        config.DEEPSEARCH_MAX_SUBAGENTS sub-workers run at once; extra calls
+        beyond that simply wait for a free slot rather than erroring, so you
+        don't need to count concurrency yourself.
+
+        Do NOT use this for a single site, or for a step that depends on
+        another delegate_website_task call's result (e.g. "use the price
+        from site A to decide what to search for on site B") -- those need
+        to happen directly or one after another instead, since concurrent
+        sub-workers cannot see each other's progress until they've each
+        returned.
+
+        Returns the sub-worker's final summary, prefixed with the url it
+        worked on. A sub-worker that hits a login wall calls
+        request_human_help itself, on its own tab, exactly like the
+        top-level agent would."""
+        if not self._owns_server:
+            return "ERROR: delegate_website_task cannot be called from within a sub-worker (no recursive delegation)."
+        if self._model is None or self._server_url is None:
+            return "ERROR: delegate_website_task isn't available in this context."
+        if not _domain_allowed(url):
+            return f"BLOCKED: '{url}' is not in the allowed domain list."
+
+        assert self._subagent_semaphore is not None  # set alongside server_url in __aenter__
+        async with self._subagent_semaphore:
+            console.system(f"Deepsearch: delegating a sub-worker to {url}.")
+            try:
+                async with BrowserToolProvider(
+                    self._approval_gate, user_id=self._user_id,
+                    deepsearch_session_id=self._deepsearch_session_id,
+                    server_url=self._server_url, model=self._model,
+                    cursor_driver=self._cursor_driver,
+                ) as worker:
+                    if self._user_id is not None:
+                        live_activity.set_tab(self._user_id, worker._tab_id, url)
+                    try:
+                        sub_agent = create_agent(
+                            model=self._model, tools=worker.tools,
+                            system_prompt=_SUBAGENT_SYSTEM_PROMPT.format(url=url),
+                        )
+                        try:
+                            result = await asyncio.wait_for(
+                                sub_agent.ainvoke(
+                                    {"messages": [HumanMessage(
+                                        content=f"Navigate to {url}, then: {instructions}"
+                                    )]},
+                                    config={"recursion_limit": config.DEEPSEARCH_SUBAGENT_MAX_STEPS},
+                                ),
+                                timeout=config.DEEPSEARCH_MAX_SESSION_SECONDS,
+                            )
+                            summary = _last_ai_text(result["messages"])
+                        except GraphRecursionError:
+                            summary = "(hit its step limit before finishing -- partial progress only)"
+                        except asyncio.TimeoutError:
+                            summary = "(hit the overall session time limit before finishing)"
+                        except Exception as e:  # noqa: BLE001
+                            console.tool_error(LABEL, "delegate_website_task", str(e))
+                            summary = f"(errored: {e})"
+                    finally:
+                        if self._user_id is not None:
+                            live_activity.clear_tab(self._user_id, worker._tab_id)
+            except Exception as e:  # noqa: BLE001
+                # A failure opening the sub-worker's OWN tab/connection
+                # (distinct from a failure during its task, handled above) --
+                # still must never propagate as an unhandled exception into
+                # the top-level agent's tool-calling loop; report it as a
+                # normal (if unhappy) tool result instead.
+                console.tool_error(LABEL, "delegate_website_task", str(e))
+                return f"[{url}] ERROR: couldn't open a tab for this site: {e}"
+        return f"[{url}] {summary}"
+
     def _guard(self, original: BaseTool) -> BaseTool:
         name = original.name
         state = self._state
@@ -504,16 +1276,14 @@ class BrowserToolProvider:
             display_args = kwargs if kwargs else {"args": args}
             console.tool_call(LABEL, name, display_args)
             action_desc = _describe_action(name, display_args)
-            if self._user_id is not None:
-                live_activity.set_description(self._user_id, action_desc)
+            self._live_set_description(action_desc)
 
             if name == "browser_navigate":
                 url = kwargs.get("url") or (args[0] if args else None)
                 if url and not _domain_allowed(url):
                     msg = f"BLOCKED: '{url}' is not in the allowed domain list."
                     console.tool_result(LABEL, name, msg)
-                    if self._user_id is not None:
-                        live_activity.add_step(self._user_id, f"Blocked: {url} isn't an allowed domain")
+                    self._live_add_step(f"Blocked: {url} isn't an allowed domain")
                     return msg
                 state["snapshot_fresh"] = False
 
@@ -541,8 +1311,7 @@ class BrowserToolProvider:
                 if not allowed:
                     msg = f"BLOCKED: user declined to run '{name}'."
                     console.tool_result(LABEL, name, msg)
-                    if self._user_id is not None:
-                        live_activity.add_step(self._user_id, f"Blocked: you declined \"{action_desc}\"")
+                    self._live_add_step(f"Blocked: you declined \"{action_desc}\"")
                     return msg
                 state["snapshot_fresh"] = False
 
@@ -553,9 +1322,12 @@ class BrowserToolProvider:
                 result = await original.coroutine(*args, **kwargs)
                 state["consecutive_errors"] = 0
                 console.tool_result(LABEL, name, result)
-                if self._user_id is not None:
-                    live_activity.add_step(self._user_id, action_desc)
+                self._live_add_step(action_desc)
                 if name == "browser_snapshot":
+                    # Kept for the deterministic human-help backstop below
+                    # (_looks_like_auth_wall) -- truncated so a very large
+                    # page snapshot doesn't bloat this in-memory state.
+                    state["last_snapshot_text"] = str(result)[:4000]
                     # The agent is about to spend some think-time deciding
                     # its next move against this snapshot's content -- fill
                     # that dead time on the live view instead of leaving the
@@ -563,16 +1335,42 @@ class BrowserToolProvider:
                     # _start_reading_animation's own docstring for why this
                     # is never awaited here.
                     self._start_reading_animation()
+                if name == "browser_navigate" and self._cursor_driver is not None:
+                    # Fire-and-forget, same reasoning as _start_reading_animation
+                    # above: re-asserting the marker is a real MCP round trip
+                    # (a browser_evaluate call) and must never add latency to
+                    # the agent's own navigate call it's piggybacking on. The
+                    # already-registered Page object stays valid for `move`
+                    # regardless of whether window.name actually reset on
+                    # this particular navigation, so nothing here needs to
+                    # complete before the next real action can proceed.
+                    asyncio.create_task(self._assert_cursor_marker())
                 return result
             except Exception as e:  # noqa: BLE001
                 state["consecutive_errors"] += 1
                 console.tool_error(LABEL, name, str(e))
-                if self._user_id is not None:
-                    live_activity.add_step(self._user_id, f"Error: {action_desc} failed ({e})")
-                return (
+                self._live_add_step(f"Error: {action_desc} failed ({e})")
+                msg = (
                     f"ERROR running '{name}': {e}. Do not retry with the exact same "
                     f"arguments. Take a fresh browser_snapshot, then try a different approach."
                 )
+                # Deterministic backstop (per your answer: model-driven
+                # detection first, this is only the safety net): several
+                # consecutive failures on a page that looks like a login/
+                # verification wall is exactly the pattern of a model that
+                # doesn't realize it's stuck retrying something a human
+                # needs to do instead. Nudge it toward request_human_help
+                # rather than letting it keep retrying indefinitely -- same
+                # "one corrective nudge into the same graph thread" shape
+                # already proven for executive_assistant's own quality
+                # check, not a new mechanism.
+                if state["consecutive_errors"] >= 2 and _looks_like_auth_wall(state["last_snapshot_text"]):
+                    msg += (
+                        " This looks like it might be a login/verification page you can't get "
+                        "past on your own -- if so, call request_human_help with a short reason "
+                        "instead of retrying again."
+                    )
+                return msg
 
         return StructuredTool.from_function(
             name=original.name,
@@ -581,6 +1379,33 @@ class BrowserToolProvider:
             coroutine=guarded,
         )
 
+
+# A sub-worker's own system prompt (delegate_website_task) -- deliberately a
+# trimmed copy of DEEPSEARCH_SYSTEM_PROMPT below, not the same string reused
+# verbatim: a sub-worker is scoped to exactly ONE site handed to it by the
+# top-level agent, not an open-ended multi-site task, so it doesn't need
+# (and shouldn't be tempted to use) delegate_website_task or session-
+# resumption guidance that only make sense for the orchestrator.
+_SUBAGENT_SYSTEM_PROMPT = (
+    "You are a deepsearch sub-worker, delegated exactly ONE website to work on: {url}. You "
+    "have your OWN browser tab, separate from whoever delegated this to you and from any other "
+    "sub-worker running at the same time -- stay on this one site; you have no visibility into "
+    "what any other tab is doing.\n"
+    "- After navigating, always call browser_snapshot to read actual page content.\n"
+    "- Prefer browser_find or browser_snapshot's `depth` argument over a full snapshot when you "
+    "just need to confirm something worked, not the full page layout.\n"
+    "- browser_click/browser_type/browser_hover/browser_select_option/browser_drag accept "
+    "EITHER an element ref from the most recent snapshot ('e12') OR a stable selector directly "
+    "(e.g. 'role=button[name=\"Add to cart\"]', 'text=Submit', a CSS selector).\n"
+    "- Base every factual claim strictly on text that literally appears in snapshots.\n"
+    "- If a tool result starts with 'BLOCKED:' or 'ERROR', do not retry the exact same action; "
+    "take a fresh snapshot or try a different approach.\n"
+    "- If you hit a login wall, CAPTCHA, 2FA/one-time-code prompt, or any other verification "
+    "step that requires a real human, call request_human_help with a short reason instead of "
+    "guessing at credentials or retrying the same form repeatedly.\n"
+    "- When you're done, reply with a clear, complete summary of what you found or did on this "
+    "site -- this goes straight back to whoever delegated this to you.\n"
+)
 
 DEEPSEARCH_SYSTEM_PROMPT = (
     "You are deepsearch, the browser automation and research specialist. You perform web "
@@ -609,6 +1434,18 @@ DEEPSEARCH_SYSTEM_PROMPT = (
     "- Base every factual claim strictly on text that literally appears in snapshots.\n"
     "- If a tool result starts with 'BLOCKED:' or 'ERROR', do not retry the exact same "
     "action; take a fresh snapshot or try a different approach.\n"
+    "- If you hit a login wall, CAPTCHA, 2FA/one-time-code prompt, or any other verification "
+    "step that requires a real human -- do not guess at credentials, do not retry the same "
+    "form submission repeatedly. Call request_human_help with a short reason instead; it "
+    "notifies the user and waits for them, then hands you back a fresh snapshot once they've "
+    "gotten past it (or tells you to move on if they don't in time).\n"
+    "- If the task genuinely involves SEVERAL INDEPENDENT websites (e.g. \"compare this "
+    "product's price across site A, site B, and site C\"), use delegate_website_task instead of "
+    "visiting them yourself one at a time -- call it once per site, ALL IN THE SAME TURN, so "
+    "they run concurrently instead of sequentially. Only do this when the sites are genuinely "
+    "independent of each other; if one site's result determines what to do on the next, handle "
+    "them directly (or one delegate_website_task call at a time, waiting for each result before "
+    "the next) instead.\n"
     "- When you're done, reply with a clear, complete summary of what you found or did. "
     "Be honest -- this summary goes straight back to the user.\n"
 )
@@ -666,7 +1503,9 @@ def build_deepsearch_subagent(
         # try/finally below correctly never marks this user "live" for a
         # browser that never actually opened.
         live_view_url = None
-        async with BrowserToolProvider(approval_gate, user_id=user.user_id) as provider:
+        async with BrowserToolProvider(
+            approval_gate, user_id=user.user_id, deepsearch_session_id=session_id, model=model,
+        ) as provider:
             live_view_url = provider.live_view_url
             if live_view_url:
                 await db.set_live_browser_active(user.user_id, live_view_url, task_title)
@@ -681,7 +1520,10 @@ def build_deepsearch_subagent(
                 )
                 status = "completed"
                 try:
-                    result = await inner_agent.ainvoke({"messages": messages}, config=run_config)
+                    result = await asyncio.wait_for(
+                        inner_agent.ainvoke({"messages": messages}, config=run_config),
+                        timeout=config.DEEPSEARCH_MAX_SESSION_SECONDS,
+                    )
                     final_messages = result["messages"]
                 except GraphRecursionError:
                     status = "active"
@@ -690,6 +1532,27 @@ def build_deepsearch_subagent(
                     console.system(
                         f"Deepsearch: hit its {config.DEEPSEARCH_MAX_STEPS}-step limit -- "
                         f"saving progress to session #{session_id} for later."
+                    )
+                except asyncio.TimeoutError:
+                    # Belt-and-suspenders session cap (config.DEEPSEARCH_MAX_SESSION_SECONDS)
+                    # -- independent of DEEPSEARCH_MAX_STEPS (a step COUNT,
+                    # not a time bound) and independent of
+                    # request_human_help's own bounded wait, this is what
+                    # actually guarantees a Browserbase session can't stay
+                    # open indefinitely even if something upstream of here
+                    # hangs. `async with` below still runs its normal
+                    # teardown on the way out of this except block, same as
+                    # any other exception.
+                    status = "active"
+                    try:
+                        state_snapshot = await inner_agent.aget_state(run_config)
+                        final_messages = state_snapshot.values.get("messages", messages)
+                    except Exception:  # noqa: BLE001
+                        final_messages = messages
+                    console.system(
+                        f"Deepsearch: hit its {config.DEEPSEARCH_MAX_SESSION_SECONDS}s overall "
+                        f"session time limit -- closing the browser and saving progress to "
+                        f"session #{session_id} for later."
                     )
                 except Exception as e:  # noqa: BLE001
                     status = "active"

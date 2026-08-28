@@ -191,6 +191,23 @@ DEEPSEARCH_CURSOR_OVERLAY = os.environ.get("MESSA_DEEPSEARCH_CURSOR_OVERLAY", "t
     "1", "true", "yes",
 )
 
+# Whether cursor MOVEMENT is real (messa/nodehelpers/cursor_driver.mjs,
+# driving genuine bezier-path mouse events via a second CDP connection --
+# see tools/deepsearch_tools.py's CursorDriver) or the original DOM-only
+# CSS-transition (window.__messaCursor.moveTo(), cursor_overlay.js). Only
+# meaningful when DEEPSEARCH_CURSOR_OVERLAY is also on -- that flag controls
+# whether a visible arrow is drawn AT ALL; this one only controls how it
+# moves once there is one. An explicit, separate rollback lever on purpose:
+# the real driver is a genuine extra Node subprocess talking CDP to
+# Browserbase's remote browser, one more thing that can fail in production
+# in a way the original DOM-only approach never could -- if it ever
+# misbehaves on a real deployment, flipping this to false falls straight
+# back to the original, already-proven-in-production code path without
+# deleting or disabling it.
+DEEPSEARCH_HUMAN_CURSOR_DRIVER = os.environ.get(
+    "MESSA_DEEPSEARCH_HUMAN_CURSOR_DRIVER", "true"
+).strip().lower() in ("1", "true", "yes")
+
 # "Reading" animation on the live view (per explicit user request: deepsearch
 # sitting on a static page for several seconds of LLM think-time between a
 # browser_snapshot and its next action reads as "frozen," not "working"). A
@@ -212,6 +229,73 @@ DEEPSEARCH_CURSOR_OVERLAY = os.environ.get("MESSA_DEEPSEARCH_CURSOR_OVERLAY", "t
 DEEPSEARCH_READING_ANIMATION = os.environ.get("MESSA_DEEPSEARCH_READING_ANIMATION", "true").strip().lower() in (
     "1", "true", "yes",
 )
+
+# Human-in-the-loop pause: deepsearch hits a login wall/CAPTCHA/2FA, calls
+# request_human_help, and waits -- see tools/deepsearch_tools.py's
+# request_human_help tool, db.py's deepsearch_human_help_requests functions,
+# and server.py's _production_deepsearch_pause_loop for the full flow.
+# Timings, in order of how the wait actually plays out:
+#   1. Wait DEEPSEARCH_HUMAN_HELP_INITIAL_WAIT_SECONDS for ANY activity at
+#      all (60s, your number) -- nothing at all by then means give up now.
+#   2. Once activity is seen, extend in
+#      DEEPSEARCH_HUMAN_HELP_EXTEND_SECONDS (20s) increments for as long as
+#      fresh activity keeps appearing each increment.
+#   3. Regardless of how active it still looks,
+#      DEEPSEARCH_HUMAN_HELP_MAX_TOTAL_SECONDS (300s = 5 minutes, your
+#      number) is a hard ceiling on the total wait -- this is what actually
+#      bounds the cost, not the "looks active" heuristic, since "looks
+#      active" alone could in principle keep extending forever.
+# DEEPSEARCH_HUMAN_HELP_POLL_INTERVAL_SECONDS (5s) is how often
+# request_human_help itself checks the page for change while waiting (a
+# different, tighter cadence than the poll LOOP in server.py, which only
+# needs to catch a new row quickly enough to send one timely SMS).
+DEEPSEARCH_HUMAN_HELP_INITIAL_WAIT_SECONDS = int(
+    os.environ.get("MESSA_DEEPSEARCH_HUMAN_HELP_INITIAL_WAIT_SECONDS", "60")
+)
+DEEPSEARCH_HUMAN_HELP_EXTEND_SECONDS = int(
+    os.environ.get("MESSA_DEEPSEARCH_HUMAN_HELP_EXTEND_SECONDS", "20")
+)
+DEEPSEARCH_HUMAN_HELP_MAX_TOTAL_SECONDS = int(
+    os.environ.get("MESSA_DEEPSEARCH_HUMAN_HELP_MAX_TOTAL_SECONDS", "300")
+)
+DEEPSEARCH_HUMAN_HELP_POLL_INTERVAL_SECONDS = int(
+    os.environ.get("MESSA_DEEPSEARCH_HUMAN_HELP_POLL_INTERVAL_SECONDS", "5")
+)
+
+# Belt-and-suspenders hard ceiling on one deepsearch run's total wall-clock
+# time (wraps inner_agent.ainvoke(...) in tools/deepsearch_tools.py's _run
+# with asyncio.wait_for), independent of DEEPSEARCH_MAX_STEPS (a step COUNT,
+# not a time bound -- a run stuck making slow real-world requests could
+# stay under the step cap while still running for a very long time) and
+# independent of the human-help timings above. This is the actual answer to
+# "don't leave a rogue browser session eating up money": even a bug
+# somewhere in the request_human_help wait/extend/give-up logic can't hold
+# a Browserbase session open past this, because it's enforced one level
+# above that feature, not only inside it. 1200s = 20 minutes -- comfortably
+# above DEEPSEARCH_HUMAN_HELP_MAX_TOTAL_SECONDS (5 min) plus room for
+# genuine multi-step research work around it.
+DEEPSEARCH_MAX_SESSION_SECONDS = int(os.environ.get("MESSA_DEEPSEARCH_MAX_SESSION_SECONDS", "1200"))
+
+# Multi-site delegation (delegate_website_task, tools/deepsearch_tools.py):
+# how many sub-worker tabs can be running concurrently at once, across
+# however many delegate_website_task calls the model makes in one turn.
+# Enforced by an asyncio.Semaphore shared for the whole deepsearch run, not
+# by trusting the model to count correctly -- calls beyond the cap simply
+# wait for a slot. Deliberately starting LOW (your call: start at 3, raise
+# later once this has run for real) rather than at the 5 you originally
+# suggested -- each concurrent tab is another live browser connection (and,
+# once real human-cursor lands, another Node-side cursor instance), so the
+# cost of getting the cap wrong is directly a cost-and-reliability one, not
+# just a performance tuning knob.
+DEEPSEARCH_MAX_SUBAGENTS = int(os.environ.get("MESSA_DEEPSEARCH_MAX_SUBAGENTS", "3"))
+
+# Step budget for ONE delegate_website_task sub-worker -- deliberately
+# smaller than DEEPSEARCH_MAX_STEPS (the top-level deepsearch agent's own
+# budget covering however many sites it delegates in total): a sub-worker is
+# scoped to exactly one site with a narrow instruction, not the whole task,
+# so it should never need as many steps as the orchestrator that's
+# coordinating several of these at once.
+DEEPSEARCH_SUBAGENT_MAX_STEPS = int(os.environ.get("MESSA_DEEPSEARCH_SUBAGENT_MAX_STEPS", "15"))
 
 # Step budget for executive_assistant (tasks/reminders/notes/contacts/
 # calendar), deliberately small and separate from DEEPSEARCH_MAX_STEPS --

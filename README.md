@@ -1408,6 +1408,261 @@ single-page app with lazy-loaded content, or a page that itself listens for
 synthetic test page here. If the animation looks off on a specific site,
 that's the first place to look.
 
+## Real human-cursor, multi-site delegation, and human-in-the-loop pause
+
+Your three-part ask, in the order I shipped it (each stage independently
+testable, later ones building on the HTTP-transport refactor from stage 2):
+(1) a reliable, cost-bounded pause when deepsearch hits a login wall or
+CAPTCHA, instead of getting stuck or silently giving up; (2) splitting a
+multi-site task across a few concurrent sub-agents instead of visiting sites
+one at a time; (3) swapping the DOM-drawn cursor arrow above for **real**
+`human-cursor` mouse movement. All three land in
+`messa/tools/deepsearch_tools.py`, because (2) and (3) both needed the same
+underlying change first -- more than one browser tab in a single deepsearch
+run -- so they share one plumbing layer.
+
+Before committing to a design I prototyped the riskiest pieces directly in
+this sandbox (scripts kept under `/tmp/` for reference/re-running):
+`@playwright/mcp` run in HTTP mode really does give each separate client
+connection its own isolated tab; `langchain.agents.create_agent` (what this
+file already uses) really does run multiple tool calls from one AI turn
+concurrently, so a model calling a delegation tool several times in one turn
+gets real parallelism for free; and the real `human-cursor` npm package
+really can drive genuine mouse events from a *second*, independent CDP
+connection into a browser some other process (here, `@playwright/mcp`) is
+already driving -- confirmed via a page-side event counter, not just "no
+error was thrown." Full details and caveats for each stage below.
+
+### 1. Human-in-the-loop pause: reliable, notifies you, and bounded on cost
+
+New tool, `request_human_help(reason)`, on every tab's toolset (top-level
+and every delegated sub-worker). `DEEPSEARCH_SYSTEM_PROMPT` tells the model
+to call it when it recognizes a login wall, CAPTCHA, or 2FA/one-time-code
+prompt -- and there's a deterministic backstop too: `guarded()` already
+tracks consecutive tool failures, and after two in a row on a page whose
+last snapshot text matches an obvious login/verification keyword, the error
+message itself nudges the model toward calling the tool instead of retrying
+forever (same "one corrective nudge into the same graph thread" shape
+already used for `executive_assistant`'s quality check -- not a new
+mechanism).
+
+You specifically asked for this to be a **reliable flow, not the browser
+timer controlling everything** -- so the actual mechanics are deterministic
+and DB-backed, not left to one in-flight LLM call to get right:
+
+1. `request_human_help` writes a durable row to a new table
+   (`migrations/008_deepsearch_human_help.sql` --
+   `deepsearch_human_help_requests`) and sets a "waiting for you" flag the
+   live-view page can show.
+2. A **separate background loop** in `server.py`,
+   `_production_deepsearch_pause_loop()` -- same `asyncio.sleep`-polled
+   shape as the existing reminder/cron loops, started and cancelled
+   alongside them -- notices the new row within about 5 seconds and sends
+   **one** fixed-template Sendblue text ("I need your help finishing up --
+   \<reason\>. Jump into the live view: \<link\>"), then marks it notified
+   so it never double-sends. Deliberately a fixed template, not a
+   re-invoked Messa LLM call: reliability was the explicit ask, and
+   re-invoking an LLM mid-flight is exactly the kind of extra failure
+   surface this flow shouldn't depend on (see the empty-promise
+   delegation-dropping bug from an earlier round of this project).
+3. **The actual wait/extend/give-up loop runs inside `request_human_help`
+   itself**, since only it has direct access to that tab's own MCP
+   connection: polls every few seconds for up to
+   `DEEPSEARCH_HUMAN_HELP_INITIAL_WAIT_SECONDS` (60s, your number) with no
+   activity at all before giving up. Real activity (the page's URL changing,
+   or text appearing/changing in an input field -- see
+   `_page_fingerprint`'s comment for why that's encoded as a single packed
+   number, not a URL string) extends the wait in
+   `DEEPSEARCH_HUMAN_HELP_EXTEND_SECONDS` (20s) increments, capped
+   regardless by `DEEPSEARCH_HUMAN_HELP_MAX_TOTAL_SECONDS` (300s = 5
+   minutes, your number) -- that hard cap, not the "looks active" heuristic,
+   is what actually bounds the cost. A URL change is treated as resolved
+   (logins/verifications almost always redirect on success): the tool
+   returns a fresh snapshot and hands control back to the model. A timeout
+   returns a `BLOCKED:` string telling the model to move on to other
+   independent work if there is any, or wrap up and report honestly that
+   this part needs you.
+4. **Belt-and-suspenders session cap**, independent of all of the above:
+   the whole inner agent run is wrapped in
+   `asyncio.wait_for(..., timeout=config.DEEPSEARCH_MAX_SESSION_SECONDS)`
+   (1200s = 20 minutes) in `build_deepsearch_subagent`'s `_run`, so even a
+   bug in the pause logic above can't hold a Browserbase session open
+   indefinitely. This is the actual answer to "we don't want a rogue
+   browser session eating up our finances" -- enforced one level above the
+   feature that's supposed to prevent it, not only inside that feature.
+
+Verified with fakes for the MCP calls and the DB (`/tmp/test_human_help.py`
+-- the give-up-with-no-activity, extend-then-resolve-on-URL-change, and
+hard-cap-enforced-even-with-continuous-activity paths, plus the
+deterministic backstop nudge) and against a real local headless Chromium
+(`/tmp/test_fingerprint_live.py`, including the exact mixed-quotes edge
+case that broke an earlier, string-based version of the page fingerprint --
+see that method's own docstring) and a real `server.py` poll loop
+(`/tmp/test_pause_loop.py`).
+
+### 2. Multi-site delegation: up to `DEEPSEARCH_MAX_SUBAGENTS` tabs at once
+
+New tool, `delegate_website_task(url, instructions)`, on the top-level
+deepsearch toolset only (a sub-worker cannot itself delegate --
+`BrowserToolProvider._owns_server` enforces that directly, not just by
+leaving the tool off a sub-worker's list, so there's no path to recursive
+delegation even by accident). Call it multiple times in the *same* turn for
+genuinely independent multi-site work (e.g. comparing a price across three
+sites) and, per the concurrency behavior confirmed above, they actually run
+in parallel -- `DEEPSEARCH_SYSTEM_PROMPT` tells the model this explicitly,
+and also tells it NOT to use this for a single site or for steps that
+depend on another delegation's result.
+
+Mechanically: the top-level `BrowserToolProvider` no longer runs
+`@playwright/mcp` over stdio. It spawns it as a local HTTP server instead
+(`--port 0 --shared-browser-context --isolated`, plus the existing
+`--cdp-endpoint <Browserbase connectUrl>`) and connects to it as client #1.
+`delegate_website_task` opens a **new**, independent HTTP client connection
+to that *same already-running* server -- no new `@playwright/mcp` process,
+no new Browserbase session -- which lands it on its own isolated tab, runs
+a small `create_agent` loop scoped to exactly that one site (a trimmed
+system prompt, bounded by `DEEPSEARCH_SUBAGENT_MAX_STEPS`, smaller than the
+top-level's own step budget), and returns its summary. Every call is
+bounded by an `asyncio.Semaphore(config.DEEPSEARCH_MAX_SUBAGENTS)` shared
+for the whole run, so calls beyond the cap simply wait for a free slot
+rather than erroring -- no reliance on the model counting concurrency
+itself.
+
+**On your question of "5 sub-agents at once" -- I set `DEEPSEARCH_MAX_SUBAGENTS
+= 3` for now**, matching what you actually picked when asked directly:
+start lower, raise later. Each concurrent tab is another live browser
+connection (and, with real human-cursor below, another Node-side cursor
+instance), so the cost of the cap being wrong is a reliability-and-cost
+question, not just a performance knob -- easy to raise by changing one
+constant (or the `MESSA_DEEPSEARCH_MAX_SUBAGENTS` env var) once this has
+run for real.
+
+**A real bug this surfaced, worth knowing about:** the first version of
+this used `--shared-browser-context` alone (matching the throwaway POC that
+validated the idea, `/tmp/test_mcp_multitab.py`) and it was NOT enough once
+a real `--cdp-endpoint` was involved -- two concurrent connections raced
+onto the very same page (one connection's navigation was literally
+"interrupted by another navigation" from the other). The POC didn't catch
+this because it let `@playwright/mcp` launch its own local browser rather
+than connecting to an externally-owned one, which is exactly how a real
+Browserbase session works. Adding `--isolated` fixed it -- confirmed with a
+dedicated flag-comparison probe before landing on the fix, then re-verified
+against the real shipped code path. This is the sort of thing I'd still
+want watched on a first real run against an actual Browserbase account
+(the flag combination is untested there specifically, only against a real
+local CDP endpoint standing in for one), but the mechanism itself
+(`connectOverCDP` to an arbitrary CDP endpoint) is identical either way.
+
+`messa/live_activity.py` gained a `tabs` dict (per sub-worker: description,
+steps, its own waiting-for-human flag) alongside the existing flat fields,
+which keep meaning exactly what they meant before -- the top-level tab's
+own status. This is deliberately NOT one shared flag: several sub-workers
+hitting `request_human_help` at the same time must never race to clobber
+each other's "waiting for you" reason. **Heads-up I can't fix from here:** I
+only have the backend `/live/<token>/status` endpoint in this repo -- if
+there's a separate frontend for the live-view page, it'll need matching
+changes to actually *render* more than one tab; I don't have that code.
+
+Verified end-to-end against a real local browser (not fakes) in
+`/tmp/test_multisite_delegation_live.py`: real tab isolation through the
+actual shipped `_delegate_website_task` (two concurrent calls, each only
+ever seeing its OWN page's content, verified past the "prefix could be
+faked" concern by checking the browser-evaluated content specifically, not
+just the label); real concurrency (lowering the cap to 1 measurably
+serializes two calls that otherwise overlap); domain-allow blocking short-
+circuiting before a semaphore slot is even taken; and the no-recursive-
+delegation guard.
+
+### 3. Real human-cursor, resolving the open question from before
+
+The [cursor visualization](#cursor-visualization-the-open-question) section
+above left this as an explicit trade-off I didn't want to resolve for you:
+ghost-cursor/human-cursor-style tools need a raw Playwright `Page` object
+we don't hold (we only talk to `@playwright/mcp` as a black-box MCP tool
+server), so genuinely "real" cursor motion looked like it would mean either
+forking `@playwright/mcp` or writing a custom driver. Asked directly, you
+picked the real thing anyway. What actually made it possible without either
+of those: a **second, independent CDP connection**, separate from
+`@playwright/mcp`'s own, connected to the exact same browser. `human-cursor`
+(the real npm package, `human-cursor@1.1.0` -- confirmed a *different*,
+actively-published package from the `CloverLabsAI/human-cursor` GitHub repo
+I'd initially looked at) needs no local browser binary of its own; it only
+calls `chromium.connectOverCDP(...)`, so this doesn't touch the Docker
+image's browser situation at all.
+
+**New file, `messa/nodehelpers/cursor_driver.mjs`**: one small, long-lived
+Node process **per deepsearch run, not per tab** -- started once by the
+top-level `BrowserToolProvider` right after it has a Browserbase
+`connectUrl`, handed down to (and shared by) every `delegate_website_task`
+sub-worker, killed when the run ends. Talks JSON Lines over stdin/stdout
+(no HTTP server, no extra port): `connect` once; `registerTab` per tab,
+finding the right page by a content marker (`window.name`) rather than
+creation order -- confirmed the hard way in a throwaway POC
+(`/tmp/hc_poc/run_poc_multi.py`) that order-based matching has a real race
+(pages can arrive out of creation order), while marker-based matching
+doesn't; `move` (`cursor.moveTo({x, y})` -- deliberately only ever
+*moves*, never clicks; the actual click/type still goes through
+`@playwright/mcp`'s own tools, same separation of concerns the DOM-only
+cursor always had); `unregisterTab`/`shutdown`.
+
+**`BrowserToolProvider`**: after its tools are loaded (top-level and every
+sub-worker alike), sets this tab's own marker via a raw, non-approval-gated
+`browser_evaluate` call and registers it with the shared driver -- and
+re-asserts the marker (fire-and-forget, so it never adds latency to the
+agent's own navigate call) after every `browser_navigate`, since
+`window.name` can reset on a cross-origin navigation. `_move_cursor_to`
+still resolves the target element's on-screen coordinates via
+`browser_evaluate` first (same target the real action is about to use,
+same as before), but now sends the actual move to the Node driver instead
+of calling `window.__messaCursor.moveTo()` in-page.
+
+**`messa/assets/cursor_overlay.js`**, built on your customization rather
+than replaced: added real `mousemove`/`mousedown`/`mouseup` listeners, so
+the SVG arrow now follows the genuine dispatched events `human-cursor`
+produces (snapped instantly per event, no CSS transition layered on top --
+`human-cursor` already dispatches dozens of intermediate events per move,
+confirmed at ~40-56 events for one on-screen move in testing, so the motion
+is already smooth from the real event stream) instead of jumping between
+two transitioned endpoints. Idle-breathing and the resting-spot drift you
+built keep working exactly as before, unchanged, for the gaps where no real
+events are arriving.
+
+**`messa/package.json`** (the first one in this repo) pins
+`playwright@1.55.0` and `human-cursor@1.1.0` -- the exact versions tested
+throughout this work. **Dockerfile**: `npm install --prefix messa` runs
+once at build time, before the `USER user` switch (same pattern as the
+existing `pip install`) -- no `playwright install` needed, since
+`cursor_driver.mjs` never launches its own browser.
+
+**`config.DEEPSEARCH_HUMAN_CURSOR_DRIVER`** (default on) is a dedicated
+rollback lever, separate from `DEEPSEARCH_CURSOR_OVERLAY` (which still just
+means "draw a visible arrow at all"): if the real driver ever misbehaves on
+a live deployment, flipping this to `false` falls straight back to the
+original DOM-only CSS-transition cursor -- already proven in production --
+without deleting or disabling either code path.
+
+Verified against a real local headless Chromium throughout, formalizing the
+`/tmp/hc_poc/` prototype into tests of the actual shipped files, not
+reimplementations of their logic: `/tmp/test_cursor_driver_live.py` drives
+the real `cursor_driver.mjs` directly over its real stdin/stdout protocol
+(marker-based correlation even when tabs are registered in reverse order;
+real dispatched `mousemove` events on the right page and only that page;
+never a `mousedown`; clean shutdown). `/tmp/test_cursor_driver_wiring_live.py`
+goes one level up, through a real `BrowserToolProvider` and an ordinary
+guarded `browser_click` call -- exactly how the real agent loop triggers a
+cursor move -- confirming real mousemove events reach the page both on the
+top-level tab AND on a `delegate_website_task` sub-worker's own tab, through
+the one shared driver instance.
+
+**Caveat, same shape as every other one in this file:** everything above is
+verified against a real local Chromium reached via a plain CDP debug port,
+which is architecturally the same connection mechanism `--cdp-endpoint`
+uses against Browserbase's real remote `connectUrl` -- but I don't have a
+live Browserbase account in this sandbox, so the actual remote endpoint
+itself is untested. I'd recommend one supervised real run of each new
+feature (a multi-site task, a task that deliberately hits a login wall)
+before trusting any of this unattended in production.
+
 ## Changes from your second round of testing
 
 - **Renamed browser_agent -> deepsearch.** Same subagent, new name

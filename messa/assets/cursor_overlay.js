@@ -27,7 +27,8 @@
   el.style.zIndex = "2147483647";
   el.style.pointerEvents = "none";
   el.style.filter = "drop-shadow(0 0 8px rgba(57, 255, 136, 0.5)) drop-shadow(0 4px 10px rgba(0,0,0,0.7))";
-  el.style.transition = "transform 380ms cubic-bezier(0.25, 1, 0.5, 1)";
+  const TRANSITION_ON = "transform 380ms cubic-bezier(0.25, 1, 0.5, 1)";
+  el.style.transition = TRANSITION_ON;
   el.innerHTML =
     '<path d="M 3 3 L 50 20 L 32 32 L 20 50 Z" ' +
     'fill="#39ff88" stroke="#000000" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>';
@@ -51,9 +52,20 @@
     return spots[index % spots.length];
   }
 
-  function setCursorTransform(x, y, scale = 2.7) {
+  function setCursorTransform(x, y, scale = 2.7, instant = false) {
     lastX = x;
     lastY = y;
+    // instant=true (real mouse events, see below) skips the CSS transition:
+    // human-cursor already dispatches dozens of intermediate mousemove
+    // events per bezier-path move (confirmed empirically, see
+    // /tmp/test_cursor_driver_live.py's history -- ~50+ events for one
+    // on-screen move), so the motion is already smooth from the real event
+    // stream itself; layering the transition on TOP of that would make the
+    // arrow visibly lag half a step behind where the real cursor actually
+    // is. The idle-breathing/resting-spot drift below (JS-driven, not from
+    // real events) keeps using the transition -- that's still just two
+    // widely-spaced endpoints, which is exactly what the transition is for.
+    el.style.transition = instant ? "none" : TRANSITION_ON;
     el.style.transform = `translate(${x}px, ${y}px) scale(${scale})`;
   }
 
@@ -124,6 +136,56 @@
   }
 
   window.__messaCursor = { moveTo, returnToRestingSpot };
+
+  // ---------------------------------------------------------------------
+  // Real human-cursor mode (config.DEEPSEARCH_HUMAN_CURSOR_DRIVER, see
+  // tools/deepsearch_tools.py's CursorDriver/cursor_driver.mjs): when that
+  // driver is active, Python never calls window.__messaCursor.moveTo()
+  // above at all -- it moves the mouse via a SECOND, independent CDP
+  // connection instead, which dispatches genuine mousemove/mousedown/
+  // mouseup DOM events on this very page. This arrow needs to follow THOSE
+  // events directly rather than sitting there with nothing telling it to
+  // move. Both mechanisms coexist harmlessly in this one script (it has no
+  // way to know at injection time which mode Python is using, and doesn't
+  // need to): if real events never arrive (driver off, or this is the
+  // DOM-only fallback), this listener simply never fires and moveTo()
+  // above behaves exactly as before.
+  // ---------------------------------------------------------------------
+  let realEventIdleTimer = null;
+
+  function onRealPointerActivity(x, y, scale) {
+    ensureMounted();
+    if (idlePulseInterval) { clearInterval(idlePulseInterval); idlePulseInterval = null; }
+    if (resetTimer) { clearTimeout(resetTimer); resetTimer = null; }
+    setCursorTransform(x, y, scale, /* instant */ true);
+    // No explicit "action finished" signal in a raw DOM event stream the
+    // way the old moveTo() path had (it knew when ITS OWN transition
+    // ended) -- so use a short quiet period after the last real event as
+    // that same signal instead: once real events stop arriving for a
+    // moment (the actual click/type, driven separately by @playwright/mcp,
+    // has presumably happened by then), glide back to an idle resting spot
+    // exactly like moveTo() already does after 1100ms.
+    if (realEventIdleTimer) clearTimeout(realEventIdleTimer);
+    realEventIdleTimer = setTimeout(returnToRestingSpot, 1100);
+  }
+
+  // capture:true, passive:true: listen at the document level regardless of
+  // which element the real event actually targets, and never interfere
+  // with the page's own event handling (this arrow has pointer-events:none
+  // and must stay purely observational).
+  document.addEventListener("mousemove", (e) => {
+    onRealPointerActivity(e.clientX, e.clientY, 2.7);
+  }, { capture: true, passive: true });
+
+  document.addEventListener("mousedown", (e) => {
+    // Pulse down, mirroring moveTo()'s own click-pulse -- but driven by a
+    // REAL mousedown this time, not a timer guessing when the click landed.
+    onRealPointerActivity(e.clientX, e.clientY, 2.1);
+  }, { capture: true, passive: true });
+
+  document.addEventListener("mouseup", (e) => {
+    onRealPointerActivity(e.clientX, e.clientY, 2.7);
+  }, { capture: true, passive: true });
 })();
 
 // ---------------------------------------------------------------------------

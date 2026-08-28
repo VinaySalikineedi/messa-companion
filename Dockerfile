@@ -36,6 +36,19 @@ WORKDIR /app
 COPY --chown=user requirements.txt requirements.txt
 RUN pip install --no-cache-dir --upgrade -r requirements.txt
 
+# messa/package.json pins the real human-cursor driver's own deps
+# (playwright + human-cursor -- see messa/nodehelpers/cursor_driver.mjs).
+# Unlike @playwright/mcp below, these ARE real npm dependencies installed
+# once at build time, not fetched per-run via npx -- installed as root
+# (before USER user) so `npm install` can write into messa/node_modules
+# without a permissions problem, then chown'd to `user` alongside it.
+# No `playwright install` here: cursor_driver.mjs never launches its own
+# browser, only chromium.connectOverCDP(...) against a browser
+# @playwright/mcp is already driving (see that file's own module comment)
+# -- so no browser binary needs to be downloaded for this package at all.
+COPY --chown=user messa/package.json messa/package-lock.json messa/
+RUN npm install --prefix messa --omit=dev && chown -R user:user messa/node_modules
+
 COPY --chown=user . /app
 
 # Ephemeral by default on HF Spaces' free CPU Basic tier: these do NOT

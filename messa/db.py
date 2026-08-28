@@ -1033,3 +1033,78 @@ async def list_deepsearch_sessions(user_id: int, status: str | None = None) -> l
                 user_id,
             )
         return _rows(rows)
+# created the row still being alive/healthy.
+# ---------------------------------------------------------------------------
+
+async def create_human_help_request(
+    user_id: int, deepsearch_session_id: int | None, tab_marker: str, reason: str,
+) -> dict[str, Any] | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "deepsearch_human_help_requests"):
+            return None
+        row = await conn.fetchrow(
+            """
+            INSERT INTO deepsearch_human_help_requests (user_id, deepsearch_session_id, tab_marker, reason)
+            VALUES ($1, $2, $3, $4) RETURNING *
+            """,
+            user_id, deepsearch_session_id, tab_marker, reason,
+        )
+        return dict(row)
+
+
+async def get_waiting_human_help_requests() -> list[dict[str, Any]]:
+    """All still-'waiting' rows across every user, joined with phone_number
+    -- this is what _production_deepsearch_pause_loop polls every few
+    seconds. Deliberately not scoped to one user (unlike most of this
+    file): the poll loop, like the reminder/cron loops it mirrors, is a
+    single global background task covering every user at once."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "deepsearch_human_help_requests"):
+            return []
+        rows = await conn.fetch(
+            """
+            SELECT h.*, u.phone_number
+            FROM deepsearch_human_help_requests h JOIN users u ON u.id = h.user_id
+            WHERE h.status = 'waiting'
+            """,
+        )
+        return _rows(rows)
+
+
+async def mark_human_help_notified(request_id: int) -> None:
+    """Sets notified_at the first (and only) time the poll loop sends the
+    SMS for this row -- get_waiting_human_help_requests keeps returning the
+    row on every poll until it's resolved/timed out, so the caller checks
+    notified_at itself before deciding to send again."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "deepsearch_human_help_requests"):
+            return
+        await conn.execute(
+            "UPDATE deepsearch_human_help_requests SET notified_at = NOW() WHERE id = $1 AND notified_at IS NULL",
+            request_id,
+        )
+
+
+async def resolve_human_help_request(request_id: int) -> None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "deepsearch_human_help_requests"):
+            return
+        await conn.execute(
+            "UPDATE deepsearch_human_help_requests SET status = 'resolved', resolved_at = NOW() WHERE id = $1",
+            request_id,
+        )
+
+
+async def timeout_human_help_request(request_id: int) -> None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "deepsearch_human_help_requests"):
+            return
+        await conn.execute(
+            "UPDATE deepsearch_human_help_requests SET status = 'timed_out', resolved_at = NOW() WHERE id = $1",
+            request_id,
+        )

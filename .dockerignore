@@ -8,3 +8,4 @@ sessions/
 outputs/
 .playwright-mcp/
 .DS_Store
+messa/node_modules/
