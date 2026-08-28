@@ -26,28 +26,65 @@
   el.style.left = "0";
   el.style.zIndex = "2147483647";
   el.style.pointerEvents = "none";
-  el.style.filter = "drop-shadow(0 2px 5px rgba(0,0,0,0.6))";
-  el.style.transition = "transform 220ms ease-in-out";
-  el.style.transform = "translate(-9999px, -9999px)"; // start off-screen, hidden
+  el.style.filter = "drop-shadow(0 4px 10px rgba(0,0,0,0.65))";
+  el.style.transition = "transform 350ms cubic-bezier(0.25, 1, 0.5, 1)";
   el.innerHTML =
     '<path d="M 2 2 L 52 18 L 18 52 Z" ' +
     'fill="#3b82f6" stroke="white" stroke-width="2.5" stroke-linejoin="miter"/>';
 
+  let currentSpotIndex = 0;
+  let resetTimer = null;
+
+  function getRestingSpot(index) {
+    const w = window.innerWidth || 1280;
+    const h = window.innerHeight || 800;
+    const spots = [
+      { x: w - 160, y: h - 140 }, // 0: Bottom Right
+      { x: 120, y: h - 140 },     // 1: Bottom Left
+      { x: w - 160, y: Math.floor(h / 2) }, // 2: Middle Right
+      { x: 120, y: Math.floor(h / 2) },     // 3: Middle Left
+      { x: w - 200, y: 100 }     // 4: Top Right
+    ];
+    return spots[index % spots.length];
+  }
+
+  function setCursorTransform(x, y, scale = 3.5) {
+    el.style.transform = `translate(${x}px, ${y}px) scale(${scale})`;
+  }
+
   function ensureMounted() {
     if (!el.isConnected) {
       (document.body || document.documentElement).appendChild(el);
+      const spot = getRestingSpot(currentSpotIndex);
+      setCursorTransform(spot.x, spot.y, 3.5);
     }
   }
 
-  // Moves the arrow's tip to (x, y) in viewport coordinates and returns a
-  // Promise that resolves once the CSS transition finishes (or after a
-  // fixed fallback delay, in case transitionend never fires -- e.g. the
-  // element was already at that exact position). browser_evaluate awaits
-  // this, so the agent's next action (the real click) waits for the
-  // animation to actually be visible first.
+  function returnToRestingSpot() {
+    ensureMounted();
+    currentSpotIndex = (currentSpotIndex + 1) % 5;
+    const spot = getRestingSpot(currentSpotIndex);
+    setCursorTransform(spot.x, spot.y, 3.5);
+  }
+
   function moveTo(x, y) {
     ensureMounted();
-    el.style.transform = `translate(${x}px, ${y}px)`;
+    if (resetTimer) clearTimeout(resetTimer);
+    setCursorTransform(x, y, 3.5);
+
+    // Pulse down slightly to simulate a click press
+    setTimeout(() => {
+      setCursorTransform(x, y, 2.7);
+      setTimeout(() => {
+        setCursorTransform(x, y, 3.5);
+      }, 120);
+    }, 180);
+
+    // After action completes, glide back to next idle resting spot
+    resetTimer = setTimeout(() => {
+      returnToRestingSpot();
+    }, 1000);
+
     return new Promise((resolve) => {
       let done = false;
       const finish = () => {
@@ -56,9 +93,16 @@
         resolve();
       };
       el.addEventListener("transitionend", finish, { once: true });
-      setTimeout(finish, 260);
+      setTimeout(finish, 360);
     });
   }
 
-  window.__messaCursor = { moveTo };
+  // Initial placement on DOM ready
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", ensureMounted);
+  } else {
+    ensureMounted();
+  }
+
+  window.__messaCursor = { moveTo, returnToRestingSpot };
 })();
