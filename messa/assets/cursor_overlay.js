@@ -18,20 +18,20 @@
 
   const SVG_NS = "http://www.w3.org/2000/svg";
   const el = document.createElementNS(SVG_NS, "svg");
-  el.setAttribute("width", "28");
-  el.setAttribute("height", "28");
-  el.setAttribute("viewBox", "0 0 28 28");
+  el.setAttribute("width", "56");
+  el.setAttribute("height", "56");
+  el.setAttribute("viewBox", "0 0 56 56");
   el.style.position = "fixed";
   el.style.top = "0";
   el.style.left = "0";
   el.style.zIndex = "2147483647";
   el.style.pointerEvents = "none";
-  el.style.filter = "drop-shadow(0 1px 2px rgba(0,0,0,0.5))";
+  el.style.filter = "drop-shadow(0 2px 5px rgba(0,0,0,0.6))";
   el.style.transition = "transform 220ms ease-in-out";
   el.style.transform = "translate(-9999px, -9999px)"; // start off-screen, hidden
   el.innerHTML =
-    '<path d="M2 1 L2 21 L7.5 16.5 L11 24 L14 22.5 L10.5 15 L18 15 Z" ' +
-    'fill="#3b82f6" stroke="white" stroke-width="1.2" stroke-linejoin="round"/>';
+    '<path d="M 2 2 L 52 18 L 18 52 Z" ' +
+    'fill="#3b82f6" stroke="white" stroke-width="2.5" stroke-linejoin="miter"/>';
 
   function ensureMounted() {
     if (!el.isConnected) {
