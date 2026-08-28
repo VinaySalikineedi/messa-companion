@@ -1580,6 +1580,27 @@ def build_deepsearch_subagent(
         # connection itself fails, there's nothing to clear here, and the
         # try/finally below correctly never marks this user "live" for a
         # browser that never actually opened.
+        #
+        # live_activity.start() is called HERE, before BrowserToolProvider
+        # even opens -- not after, like it used to be. This is the actual
+        # fix for the real "only 1 tile ever shows, no matter how many tabs
+        # are really open" bug: __aenter__ (below) creates the Browserbase
+        # session and immediately calls live_activity.set_session_id() to
+        # record bb_session_id, which server.py's _build_live_tiles needs to
+        # look up the real pages[] and build one tile per tab. start()
+        # unconditionally REPLACES this user's whole live_activity entry
+        # with a fresh dict (see its own docstring/module comment) -- when it
+        # ran AFTER __aenter__ returned, it was silently wiping the
+        # bb_session_id that set_session_id had just written moments
+        # earlier, every single time. With bb_session_id always back to None
+        # by the time anyone polled /live/<token>/status, _build_live_tiles
+        # always took its no-bb_session_id fallback path -- exactly one
+        # tile, built from the session-level live_view_url, regardless of
+        # how many tabs Browserbase actually had open. Starting it first
+        # means __aenter__'s set_session_id call (which uses
+        # _state.setdefault, not a fresh dict) lands on top of this same
+        # entry instead of being overwritten by it.
+        live_activity.start(user.user_id, task_title)
         live_view_url = None
         async with BrowserToolProvider(
             approval_gate, user_id=user.user_id, deepsearch_session_id=session_id, model=model,
@@ -1587,10 +1608,6 @@ def build_deepsearch_subagent(
             live_view_url = provider.live_view_url
             if live_view_url:
                 await db.set_live_browser_active(user.user_id, live_view_url, task_title)
-                # Starts this task's chain-of-thought log (see live_activity.py)
-                # -- guarded() below fills it in as tool calls actually happen;
-                # cleared in the finally block regardless of how this run ends.
-                live_activity.start(user.user_id, task_title)
             try:
                 inner_agent = create_agent(
                     model=model, tools=provider.tools, system_prompt=DEEPSEARCH_SYSTEM_PROMPT,

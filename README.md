@@ -2040,6 +2040,69 @@ with the right `navbar=false`/`sandbox` attributes, all 4 render distinct
 content at once with no cross-talk, and a disconnect on one tile leaves the
 other 3 fully intact.
 
+## Still only 1 tile for 5 open tabs -- a real ordering bug in when live_activity.start() ran
+
+Right after the fix above shipped, you reported the exact same "only 1
+tile" symptom on a run with 5 real tabs open in Browserbase's own
+dashboard. Worth being precise about what this was NOT: `live_view_page.py`
+already had the full tile-grid rendering (`buildTile`/`renderGrid`, looping
+over `data.tiles`) from an earlier round, not a single static `<iframe>` --
+so this wasn't a leftover old frontend. The bug was entirely server-side,
+in exactly which tiles `/live/<token>/status` was handing that (correct)
+frontend to render.
+
+### Root cause: `live_activity.start()` was silently wiping `bb_session_id` right after it got set
+
+`_build_live_tiles` (server.py) needs `activity["bb_session_id"]` to call
+`browserbase.get_session_pages()` and build one tile per real open tab; with
+no `bb_session_id`, it falls back to exactly one tile built from the
+session-level `live_view_url` -- by design, as the "never go blank" safety
+net from the previous fix. That fallback path was firing on *every* run,
+not just the rare failure case it was meant for.
+
+The actual sequence in `tools/deepsearch_tools.py`'s `_run()`:
+1. `BrowserToolProvider.__aenter__` creates the Browserbase session and
+   immediately calls `live_activity.set_session_id(user_id, bb_session_id)`
+   -- writing `bb_session_id` into that user's `live_activity` entry.
+2. `__aenter__` returns.
+3. *Then*, back in `_run`, `live_activity.start(user_id, task_title)` used
+   to run -- and `start()`'s whole job (see its own docstring) is to
+   replace that user's entire `live_activity` entry with a brand-new dict,
+   as the correct, intentional reset for a fresh delegation. It doesn't
+   selectively clear fields; it just wasn't expected to run *after*
+   something had already written into that entry for the same run.
+
+So `bb_session_id` got set, then immediately clobbered back to `None`
+moments later, on 100% of runs -- not an intermittent Browserbase API
+hiccup like the previous round's fallback was built for. `_build_live_tiles`
+therefore always hit its fallback path and always rendered exactly one
+tile, regardless of how many tabs were genuinely open. This also explains
+why your own earlier attempt (swapping which URL field wins,
+`debuggerFullscreenUrl or status.get('live_view_url')`) never helped: that
+line of code was never being reached at all, since `pages` was never even
+fetched without a `bb_session_id`.
+
+### Fix: start the log before opening the browser, not after
+
+Moved the `live_activity.start(user.user_id, task_title)` call to right
+before `async with BrowserToolProvider(...)`, instead of inside that block
+after `__aenter__` returns. `task_title` is already known at that point in
+both the fresh-task and resumed-session branches, so this needed no other
+change. Now `start()` creates the entry first; `set_session_id()` (called
+from inside `__aenter__`, moments later) uses `_state.setdefault(...)`, so
+it lands on that same existing entry instead of a later `start()` call
+wiping it out from under it.
+
+Verified two ways: a focused test proves the exact call-order regression
+directly (`start()` then `set_session_id()` preserves `bb_session_id`;
+the old `set_session_id()` then `start()` order reproduces the bug,
+`bb_session_id` comes back `None`) -- appended to `/tmp/test_live_tiles.py`
+so a future refactor that reintroduces this ordering gets caught
+immediately; and the full existing regression suite (multi-site delegation,
+cursor driver wiring, pause loop, live-link tests) re-run clean, confirming
+this reorder didn't disturb anything else that touches `live_activity`
+during the same window.
+
 ## Changes from your second round of testing
 
 - **Renamed browser_agent -> deepsearch.** Same subagent, new name
