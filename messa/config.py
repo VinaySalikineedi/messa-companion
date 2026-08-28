@@ -62,7 +62,7 @@ def _require(name: str) -> str:
 # pinning the dated snapshot (`deepseek/deepseek-v4-pro-0813`) via
 # MESSA_MODEL, no code change needed either way.
 OPENROUTER_API_KEY = _require("OPENROUTER_API_KEY")
-ORCHESTRATOR_MODEL_NAME = os.environ.get("MESSA_MODEL", "deepseek/deepseek-v4-pro-0813")
+ORCHESTRATOR_MODEL_NAME = os.environ.get("MESSA_MODEL", "~deepseek/deepseek-v4-pro")
 SUBAGENT_MODEL_NAME = os.environ.get("MESSA_SUBAGENT_MODEL", "~deepseek/deepseek-v4-flash-latest")
 
 # Backward-compatible alias: kept in case anything (or you) still refers to
@@ -188,6 +188,28 @@ DEEPSEARCH_TIMEOUT_SETTLE_MS = int(os.environ.get("MESSA_DEEPSEARCH_TIMEOUT_SETT
 # session still opens/closes exactly the same either way, only the
 # cosmetic cursor-move calls are skipped.
 DEEPSEARCH_CURSOR_OVERLAY = os.environ.get("MESSA_DEEPSEARCH_CURSOR_OVERLAY", "true").strip().lower() in (
+    "1", "true", "yes",
+)
+
+# "Reading" animation on the live view (per explicit user request: deepsearch
+# sitting on a static page for several seconds of LLM think-time between a
+# browser_snapshot and its next action reads as "frozen," not "working"). A
+# background asyncio task (see tools/deepsearch_tools.py's
+# BrowserToolProvider._start_reading_animation) fires right after each
+# successful browser_snapshot and scroll-centers a few real content elements
+# in sequence, in a discrete "hop, pause, hop, settle" pattern rather than
+# one smooth scroll -- entirely cosmetic, running in parallel with (not
+# blocking) the actual agent loop, and stopped again the instant the model's
+# next real tool call arrives (see _stop_reading_animation, called at the
+# top of every guarded() call). Confirmed empirically in this sandbox
+# (/tmp/test_mcp_concurrency.py) that @playwright/mcp pipelines concurrent
+# tool calls over its stdio transport rather than serializing them, so a
+# long-running background browser_evaluate call does not block/delay the
+# real action's own MCP round trip. Shares messa/assets/cursor_overlay.js's
+# injection (both features ride the same --init-script) but is independently
+# toggleable -- turning this off still leaves the click/type cursor overlay
+# on, and vice versa.
+DEEPSEARCH_READING_ANIMATION = os.environ.get("MESSA_DEEPSEARCH_READING_ANIMATION", "true").strip().lower() in (
     "1", "true", "yes",
 )
 

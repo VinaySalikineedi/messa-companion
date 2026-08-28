@@ -49,6 +49,7 @@ exactly where this one left off.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -126,6 +127,27 @@ _CURSOR_MOVE_FN = (
     "return window.__messaCursor ? window.__messaCursor.moveTo(x, y) : undefined;"
     "}"
 )
+
+# "Reading" scroll animation on the live view (per explicit user request --
+# see config.DEEPSEARCH_READING_ANIMATION's comment and README's "Reading
+# animation" section for the full design rationale, including the
+# human-centers-content question). Shares cursor_overlay.js's injection
+# (same --init-script file defines window.__messaReader alongside
+# window.__messaCursor). Fired as a background asyncio task the instant a
+# browser_snapshot succeeds (BrowserToolProvider._start_reading_animation --
+# NOT awaited inline, so it costs zero latency on the real agent loop) and
+# told to stop the instant any subsequent tool call arrives
+# (_stop_reading_animation, called at the top of every guarded() call).
+# Confirmed empirically (see /tmp/test_mcp_concurrency.py and
+# /tmp/test_reading_animation_live.py from the working session that built
+# this) that @playwright/mcp pipelines concurrent tool calls over its stdio
+# transport rather than queueing one behind the other, so the long-running
+# background browser_evaluate("...__messaReader.start()...") call never
+# delays the real action's own MCP round trip, and a short, separately
+# dispatched "...stop()..." call returns quickly even while that background
+# call is still in flight.
+_READING_ANIMATION_START_FN = "() => window.__messaReader ? window.__messaReader.start(6) : undefined"
+_READING_ANIMATION_STOP_FN = "() => { if (window.__messaReader) window.__messaReader.stop(); }"
 
 
 def _target_values(name: str, kwargs: dict[str, Any]) -> list[str]:
@@ -255,6 +277,12 @@ class BrowserToolProvider:
         # our own cosmetic, non-model-initiated side effect and must never
         # prompt for or be blocked by human approval).
         self._raw_tools_by_name: dict[str, BaseTool] = {}
+        # The in-flight background "reading" scroll animation (see
+        # _start_reading_animation/_stop_reading_animation below), or None
+        # when nothing is currently playing. Fire-and-forget by design --
+        # nobody awaits this except _stop_reading_animation's own best-effort
+        # cleanup, and __aexit__'s final sweep on the way out.
+        self._reading_task: asyncio.Task | None = None
         # Shared mutable state referenced by the closures below.
         self._state = {"consecutive_errors": 0, "snapshot_fresh": False}
 
@@ -323,7 +351,11 @@ class BrowserToolProvider:
                 # own 500ms default.
                 "--timeout-settle", str(config.DEEPSEARCH_TIMEOUT_SETTLE_MS),
             ]
-            if config.DEEPSEARCH_CURSOR_OVERLAY:
+            # Both cosmetic features (click/type cursor overlay, reading
+            # scroll animation) live in the same asset file and ride the
+            # same --init-script injection, but are independently toggled --
+            # only skip injecting the script when BOTH are off.
+            if config.DEEPSEARCH_CURSOR_OVERLAY or config.DEEPSEARCH_READING_ANIMATION:
                 mcp_args += ["--init-script", str(_CURSOR_OVERLAY_SCRIPT_PATH)]
             self._client = MultiServerMCPClient({
                 "playwright": {
@@ -361,6 +393,17 @@ class BrowserToolProvider:
         return self
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        # Belt-and-suspenders: guarded() already stops any in-flight reading
+        # animation before every real action, so normally nothing is left
+        # running by the time a task finishes. But if the run ended via an
+        # exception/step-limit right after a browser_snapshot (before any
+        # further guarded() call could fire the stop signal), a background
+        # task could still be sitting there awaiting a browser_evaluate call
+        # into a session we're about to tear down -- cancel it here so that
+        # never turns into an "Attempted write to closed pipe"-style warning
+        # on shutdown.
+        if self._reading_task is not None and not self._reading_task.done():
+            self._reading_task.cancel()
         if self._session_cm is not None:
             await self._session_cm.__aexit__(exc_type, exc, tb)
         if self._bb_session_id is not None:
@@ -393,12 +436,71 @@ class BrowserToolProvider:
         except Exception as e:  # noqa: BLE001 - cosmetic only, never surfaced to the model
             console.system(f"Deepsearch: cursor overlay move failed (non-fatal): {e}")
 
+    def _start_reading_animation(self) -> None:
+        """Fire-and-forget: launches the background "reading" scroll
+        animation right after a browser_snapshot succeeds. Deliberately NOT
+        awaited here -- awaiting it would block the agent loop for however
+        long the animation runs, defeating the entire point (this exists to
+        fill dead time the agent loop was already going to spend thinking,
+        not to add more). If one is somehow already running (shouldn't
+        happen -- guarded() stops the previous one before any new action,
+        and only browser_snapshot starts one), the JS side's own `running`
+        flag makes a second start() call a safe no-op, so there's no need to
+        guard against that here too."""
+        if not config.DEEPSEARCH_READING_ANIMATION:
+            return
+        evaluate_tool = self._raw_tools_by_name.get("browser_evaluate")
+        if evaluate_tool is None:
+            return
+
+        async def _run() -> None:
+            try:
+                await evaluate_tool.coroutine(
+                    element="the page content", function=_READING_ANIMATION_START_FN,
+                )
+            except Exception as e:  # noqa: BLE001 - cosmetic only, never surfaced to the model
+                console.system(f"Deepsearch: reading animation failed (non-fatal): {e}")
+
+        self._reading_task = asyncio.create_task(_run())
+
+    async def _stop_reading_animation(self) -> None:
+        """Tells any in-flight reading animation to wind down, then forgets
+        about it -- called at the top of every guarded() call (for every
+        tool, not just the cursor-animated ones) since the model's next real
+        action is a signal that "reading" is over, whatever that action is.
+        Deliberately does NOT await self._reading_task itself: the JS side
+        only checks its stop flag between hops, so the background call could
+        still take up to one more hop/pause cycle to actually resolve --
+        waiting for that here would reintroduce exactly the latency this
+        feature isn't supposed to add. It's left to finish on its own time;
+        __aexit__ cancels it outright if the whole session ends first.
+        A no-op (zero extra MCP calls) when nothing is running, so ordinary
+        tool calls pay no cost for a feature that never fired."""
+        task = self._reading_task
+        if task is None or task.done():
+            return
+        self._reading_task = None
+        evaluate_tool = self._raw_tools_by_name.get("browser_evaluate")
+        if evaluate_tool is None:
+            return
+        try:
+            await evaluate_tool.coroutine(element="stop reading", function=_READING_ANIMATION_STOP_FN)
+        except Exception as e:  # noqa: BLE001 - cosmetic only, never surfaced to the model
+            console.system(f"Deepsearch: reading animation stop failed (non-fatal): {e}")
+
     def _guard(self, original: BaseTool) -> BaseTool:
         name = original.name
         state = self._state
         approval_gate = self._approval_gate
 
         async def guarded(*args: Any, **kwargs: Any) -> Any:
+            # A real action is about to happen -- if the "reading" scroll
+            # animation is still playing from the previous browser_snapshot,
+            # tell it to wind down now, before this call's own action, so
+            # the two don't visibly fight over the page (e.g. the reader
+            # scrolling away from something a click is about to target).
+            await self._stop_reading_animation()
+
             display_args = kwargs if kwargs else {"args": args}
             console.tool_call(LABEL, name, display_args)
             action_desc = _describe_action(name, display_args)
@@ -453,6 +555,14 @@ class BrowserToolProvider:
                 console.tool_result(LABEL, name, result)
                 if self._user_id is not None:
                     live_activity.add_step(self._user_id, action_desc)
+                if name == "browser_snapshot":
+                    # The agent is about to spend some think-time deciding
+                    # its next move against this snapshot's content -- fill
+                    # that dead time on the live view instead of leaving the
+                    # page sitting frozen. Fire-and-forget; see
+                    # _start_reading_animation's own docstring for why this
+                    # is never awaited here.
+                    self._start_reading_animation()
                 return result
             except Exception as e:  # noqa: BLE001
                 state["consecutive_errors"] += 1

@@ -1276,6 +1276,138 @@ before the real transition, etc.) can only really be confirmed by watching
 a real session. If the arrow doesn't show up or looks off on a specific
 site, that's the first thing to check.
 
+**Update -- your customized cursor, kept as-is:** You edited
+`cursor_overlay.js` yourself after this landed (bigger 56x56 green arrow
+with a glow, an idle "breathing" drift between five resting spots, a
+click-press pulse, and a glide back to the next resting spot after every
+action) and sent it back over. That customization is now the canonical
+version of the file -- I built the reading animation below *on top of* it
+rather than replacing it with anything of my own; nothing you changed was
+touched. The one thing worth knowing if you tune it further: the reading
+animation (next section) calls the exact same `window.__messaCursor.moveTo`
+your idle-breathing/click-pulse logic is built around, so any further
+changes to `moveTo`'s own behavior automatically apply to both features --
+there's no second, separate copy of that logic to keep in sync.
+
+## Reading animation: making "the agent is thinking" visible
+
+The other half of the same request: deepsearch calling `browser_snapshot`
+and then just sitting on a static page for several seconds of LLM
+think-time before its next action reads as frozen, not working. You asked
+for human-like "scroll a little, pause, then scroll more" movement during
+that gap, flagged the real design problem yourself (humans center whatever
+they're looking at, and a scripted scroll doesn't know what that is), and
+asked for any other effects that would make the live view feel like the
+agent is actually browsing.
+
+**The centering problem, and why it turned out to be the easy part:** the
+trick isn't a scrolling *technique* -- it's picking the right scroll
+*target*. A human's gaze-driven scrolling ends up centering content because
+they're scrolling to keep looking at something specific, not scrolling by
+some fixed number of pixels. So the script picks real content elements off
+the page in document order (headings, paragraphs, list items, images,
+table cells -- skipping anything too small/hidden or bunched right on top
+of the last pick) and scroll-centers each one in turn, using the same math
+as `element.scrollIntoView({block: "center"})`. "Centered" falls out
+automatically once the target is a real piece of content instead of an
+arbitrary offset.
+
+**"Scroll a little, pause, then scroll more,"** taken literally at two
+levels:
+- Between one piece of content and the next, the scroll itself is split
+  into two smaller hops with a short pause between them (a glance, then a
+  settle) rather than one smooth glide or an instant jump.
+- Between pieces of content, there's a longer "reading" pause, scaled
+  (loosely, and clamped) to how much text is in the thing just centered --
+  a short list item gets a shorter pause than a long paragraph.
+
+**Tying it to the cursor, for the "unforgettable" ask:** each stop nudges
+your existing `__messaCursor.moveTo` toward the content just centered,
+which -- because you already built click-pulse and idle-breathing into
+`moveTo` -- means the arrow visibly settles near the text and drifts a
+little on its own, exactly like someone reading with a mouse in hand
+resting near what they're looking at. This reuses your logic rather than
+adding a second, competing cursor behavior.
+
+Implementation:
+
+- **`messa/assets/cursor_overlay.js`** -- appended (not replacing your
+  cursor code above it) with a second, self-contained
+  `window.__messaReader = { start(maxTargets), stop() }`. `start()` picks
+  up to `maxTargets` content elements and works through them with the
+  hop/pause/read pattern above; calling `start()` again while one is
+  already running is a safe no-op (`"already-running"`) rather than
+  stacking two animations. `stop()` just sets a flag the loop checks
+  between hops -- it doesn't try to interrupt an in-flight scroll
+  instantly, which is what keeps it cheap to call.
+- **`BrowserToolProvider._start_reading_animation`** (in
+  `deepsearch_tools.py`): fired the instant a `browser_snapshot` call
+  succeeds, as a plain `asyncio.create_task(...)` that is **never
+  awaited** -- it wraps one long-lived internal `browser_evaluate` call
+  running `__messaReader.start(6)`, entirely in parallel with the agent
+  loop moving on to decide its next step. This is the whole point: the
+  animation fills think-time that was already going to happen, rather
+  than adding any of its own.
+- **`BrowserToolProvider._stop_reading_animation`**: called at the very
+  top of `guarded()`, for every tool call, not just cursor-animated ones --
+  the model choosing to do *anything* next is the signal that "reading" is
+  over. Fires one quick internal `browser_evaluate` running
+  `__messaReader.stop()` and then forgets about the original background
+  task (it's left to wind down and resolve on its own time, typically
+  within one more hop -- waiting for it here would reintroduce exactly the
+  latency this feature isn't supposed to add). A no-op with zero extra MCP
+  calls when nothing is currently running, so a normal tool call pays no
+  cost for a feature that never fired that turn. `__aexit__` cancels
+  anything still outstanding as a last resort if the whole browser session
+  tears down first.
+- **`config.DEEPSEARCH_READING_ANIMATION`** (env:
+  `MESSA_DEEPSEARCH_READING_ANIMATION`, default `true`): shares the same
+  `--init-script` injection as the cursor overlay (one asset file, one
+  flag -- the flag is only *omitted* if both features are off) but is
+  independently toggleable from `DEEPSEARCH_CURSOR_OVERLAY`.
+
+**The concurrency question this design actually depends on, verified
+empirically rather than assumed:** a long-running background
+`browser_evaluate` call and a short, separately-dispatched one sent while
+the first is still in flight -- does `@playwright/mcp` pipeline them over
+its stdio JSON-RPC transport, or queue the second behind the first? If it
+queued them, firing the animation as a background task wouldn't actually
+keep the real action responsive; the real click's own `browser_evaluate`-
+backed cursor move (or the stop signal itself) could sit stuck behind the
+animation's multi-second call regardless of what our Python code does. I
+tested this directly against a real local headless Chromium (no network
+needed, consistent with this sandbox's restricted egress): a 3-second
+in-page `browser_evaluate` call and a near-instant one fired 300ms later
+both resolve independently -- the fast one completes in well under a
+second, not after the slow one. Confirmed again with the actual reading
+animation itself: polling `scrollY` every 500ms while `__messaReader.start()`
+ran in the background stayed fast throughout, and a `stop()` call issued
+mid-animation returned in ~0.5s rather than waiting for the running
+animation to finish. Both scripts are included if you want to re-run them
+against a real Browserbase CDP endpoint later:
+`/tmp/test_mcp_concurrency.py` and `/tmp/test_reading_animation_live.py`
+(the latter also exercises the actual scroll-and-stop mechanics end to end
+against synthetic long-form content, not just the concurrency question).
+
+**What this deliberately does NOT do:** it isn't a model of real reading
+speed (the pacing is a clamped, roughly-proportional visualization, tuned
+for watchability on a live view, not accuracy) and it doesn't try to
+reproduce natural eye movement (saccades, re-reading, skipping around) --
+just a small, distinct number of stops in document order. It also doesn't
+run at all while a real action is pending or in progress -- it's strictly
+a "the agent looks busy while it's actually just thinking" effect, never
+layered on top of a genuine click/type/navigate.
+
+**Caveat, same shape as the cursor section above:** everything here was
+verified against a real local headless Chromium in this sandbox (the
+mechanics: injection, scrolling, centering math, the stop signal, the
+concurrency behavior it depends on), but not against an actual Browserbase
+CDP-remoted session or a real, visually complex website -- a very tall
+single-page app with lazy-loaded content, or a page that itself listens for
+`scroll` events and reacts to them, could behave differently than the
+synthetic test page here. If the animation looks off on a specific site,
+that's the first place to look.
+
 ## Changes from your second round of testing
 
 - **Renamed browser_agent -> deepsearch.** Same subagent, new name
