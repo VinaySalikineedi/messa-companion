@@ -1663,6 +1663,115 @@ itself is untested. I'd recommend one supervised real run of each new
 feature (a multi-site task, a task that deliberately hits a login wall)
 before trusting any of this unattended in production.
 
+## Live view showed a blank page during multi-site delegation -- root cause and fix
+
+Real feedback from a real run: multi-site delegation was genuinely
+delegating (the log panel showed real sub-agent activity, navigation, the
+works), but the live-view iframe itself just sat on a blank `about:blank`
+page the whole time. Two screenshots confirmed it -- the address bar reading
+`about:blank`, a blank white body, while the log underneath kept scrolling
+with real steps. Also folded into this round: showing whichever tab is
+actually active when several are running at once, and tightening
+`delegate_website_task` sub-workers back down to genuinely small, one-site-
+one-goal sessions per your explicit ask ("I dont want these sessions to go
+longer").
+
+### Root cause: `--isolated` moved real activity out of the context Browserbase's live view actually tracks
+
+`self.live_view_url` is captured exactly once, in `__aenter__`, immediately
+after `browserbase.create_session()` -- a single `GET /sessions/{id}/debug`
+call against Browserbase's **default** browser context, before
+`@playwright/mcp` even starts. The multi-site delegation work (previous
+round) added `--isolated` to `@playwright/mcp`'s flags specifically to stop
+two connections from colliding on the same page -- but `--isolated` does
+that by giving each connection its own separate browser **context**, not
+just its own tab. Once real work started happening inside that separate,
+isolated context, the live-view URL captured before it ever existed had
+nothing left to show -- Browserbase's own docs are explicit about this
+("Always use the default context and page when possible to ensure proper
+functionality of Verified features"). The log panel worked the whole time
+because it's driven by `live_activity.py`, an in-memory Python dict, nothing
+to do with Browserbase's own tracking -- which is exactly why the user could
+see real steps scrolling by under a permanently blank video.
+
+### Fix: claim a tab within the shared default context instead of a separate one
+
+`--isolated` is removed from `_spawn_mcp_http_server`'s `mcp_args`
+entirely. In its place, every `delegate_website_task` sub-worker calls
+`@playwright/mcp`'s own `browser_tabs(action="new")` tool as the very first
+thing it does on its fresh connection, in `BrowserToolProvider.__aenter__`,
+before any guarded navigation happens. This claims a genuinely separate tab
+for that connection -- same isolation guarantee `--isolated` gave (verified
+empirically in a throwaway probe, `/tmp/probe_tabs_new.py`: two concurrent
+connections each landed on their own tab, zero cross-talk, zero
+navigation-interruption errors) -- but *within* Browserbase's one shared
+default context, which is the context its live-view/debug-URL tracking
+actually follows end-to-end. The top-level provider needs no change at all:
+it never shares its connection with anyone, so it simply keeps using
+Browserbase's original default page, exactly as it did before multi-site
+delegation existed. Re-verified against the real shipped code with a real
+local Chromium (`/tmp/test_multisite_delegation_live.py`,
+`/tmp/test_cursor_driver_wiring_live.py`) -- both still pass unchanged,
+confirming tab isolation and per-tab cursor movement work the same way
+without `--isolated`, and the MCP server's own "Open tabs" listing in the
+test output now shows every tab living inside one shared context (something
+`--isolated` would never have allowed).
+
+### Follow whichever tab is actually active
+
+The video itself was still stuck on a single fixed URL even setting the
+root cause aside -- the user's other ask was "when multiple agents are
+actively using the page just show whichever one." `live_activity.py` gained
+three more per-user fields: `bb_session_id` (the raw Browserbase session id,
+set once by the owning provider right after it opens the session --
+`live_view_url` alone was never enough to re-query anything), `active_tab_id`
+(`None` for the top-level tab, or a sub-worker's own `tab_id` -- updated on
+**every** guarded tool call, top-level and sub-worker alike, so it always
+names whichever tab most recently did something), and `url` (the top-level
+tab's own current url, mirroring the `url` field each `tabs` entry already
+carried). A new `channels/browserbase.get_session_pages(session_id)` wraps
+the same `/debug` endpoint `get_live_view_url` already used, returning its
+`pages[]` array instead of the session-level url.
+
+`server.py`'s `/live/{token}/status` route now calls a new
+`_resolve_active_tab_live_view_url` helper: when the active tab is a
+sub-worker (not the top-level tab), it fetches `pages[]`, matches by url
+against that tab's own recorded url, and substitutes that page's own
+`debuggerFullscreenUrl` in place of the DB's fixed session-level one --
+falling back to the original url whenever there's nothing to resolve yet
+(no active sub-worker, no session id, no matching page, or the Browserbase
+call itself fails). No frontend change was needed for this: I went and
+actually read `live_view_page.py`'s `ensureStage` function before assuming
+one was required, and it already rebuilds the whole stage (including a
+fresh iframe `.src`) whenever `live_view_url` differs from what's currently
+shown -- it just never *received* a changing url before now. Verified with
+a dedicated new test, `/tmp/test_active_tab_live_view.py`: unit-level checks
+of the resolution logic itself (no override while the top-level tab is
+active, graceful fallback on a missing session id/no match/a failing
+Browserbase call), plus two integration-level runs against a real local
+Chromium proving `bb_session_id`/`active_tab_id`/`url` are genuinely
+populated by the real `__aenter__`/`guarded()` code paths (not a hand-built
+fixture) and resolve to the right per-tab debug url end to end.
+
+### Sub-workers, tightened back down to one site, one goal, no wandering
+
+Explicit ask: "a sub-agent should receive one website and one goal thats
+all, I dont want these sessions to go longer, Its just what deepsearch was
+doing sequentially, I wanted to multi process it with sub-agents so the
+process will get faster." `DEEPSEARCH_SUBAGENT_MAX_STEPS` drops from `15` to
+`8` -- enough for navigate, snapshot, a couple of actions, a final read, not
+a multi-page exploration. `_SUBAGENT_SYSTEM_PROMPT` gained an explicit line
+telling the sub-worker to do exactly what it was asked and nothing more --
+no browsing to other pages or products, no going looking for extra things to
+report -- and to stop and reply the moment its one goal is done rather than
+spending its (now much smaller) step budget wandering. `DEEPSEARCH_SYSTEM_PROMPT`
+(the top-level orchestrator's own prompt) gained a matching line telling it
+to keep each `delegate_website_task` call's `instructions` short and
+self-contained -- one simple goal per call, not several unrelated sub-goals
+bundled together -- reinforcing that this feature is meant to be the same
+per-site work deepsearch always did sequentially, just parallelized, not a
+new or more elaborate kind of task.
+
 ## Changes from your second round of testing
 
 - **Renamed browser_agent -> deepsearch.** Same subagent, new name

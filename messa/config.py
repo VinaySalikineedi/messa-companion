@@ -62,7 +62,7 @@ def _require(name: str) -> str:
 # pinning the dated snapshot (`deepseek/deepseek-v4-pro-0813`) via
 # MESSA_MODEL, no code change needed either way.
 OPENROUTER_API_KEY = _require("OPENROUTER_API_KEY")
-ORCHESTRATOR_MODEL_NAME = os.environ.get("MESSA_MODEL", "~deepseek/deepseek-v4-pro")
+ORCHESTRATOR_MODEL_NAME = os.environ.get("MESSA_MODEL", "deepseek/deepseek-v4-pro-0813")
 SUBAGENT_MODEL_NAME = os.environ.get("MESSA_SUBAGENT_MODEL", "~deepseek/deepseek-v4-flash-latest")
 
 # Backward-compatible alias: kept in case anything (or you) still refers to

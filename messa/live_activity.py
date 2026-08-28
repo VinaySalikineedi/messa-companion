@@ -30,6 +30,20 @@ _state: dict[int, dict] = {}
 
 _DEFAULT_ENTRY = {
     "description": None, "steps": [], "closing": False, "waiting_for_human": None, "tabs": {},
+    # active_tab_id/url/bb_session_id: added for the "follow whichever tab is
+    # actually active" live-view feature (server.py's /live/<token>/status).
+    # active_tab_id is None while the TOP-LEVEL tab is the one most recently
+    # doing something, or a sub-worker's own tab_id -- updated on every
+    # guarded() call (see tools/deepsearch_tools.py's _live_mark_active), so
+    # it always reflects whichever tab most recently acted, a reasonable
+    # proxy for "the one you'd want to be watching" when several run
+    # concurrently. url mirrors the same thing for the top-level tab (a
+    # sub-worker's current url already lives on its own entry in `tabs`).
+    # bb_session_id is the raw Browserbase session id for this run, needed
+    # to re-poll GET /sessions/{id}/debug for a specific tab's OWN debug URL
+    # (channels/browserbase.get_session_pages) -- not persisted to Postgres,
+    # same reasoning as everything else in this module (see module docstring).
+    "active_tab_id": None, "url": None, "bb_session_id": None,
 }
 
 
@@ -38,6 +52,7 @@ def start(user_id: int, initial_description: str | None) -> None:
     _state[user_id] = {
         "description": initial_description or "Working on it...", "steps": [], "closing": False,
         "waiting_for_human": None, "tabs": {},
+        "active_tab_id": None, "url": None, "bb_session_id": None,
     }
 
 
@@ -83,6 +98,40 @@ def clear_waiting_for_human(user_id: int) -> None:
     entry = _state.get(user_id)
     if entry is not None:
         entry["waiting_for_human"] = None
+
+
+def set_session_id(user_id: int, bb_session_id: str) -> None:
+    """Called once by the owning/top-level BrowserToolProvider right after
+    it creates its Browserbase session -- lets server.py's status route
+    re-poll GET /sessions/{id}/debug later to resolve a specific tab's own
+    per-page debug URL (see get_active_live_view_url below)."""
+    entry = _state.setdefault(user_id, dict(_DEFAULT_ENTRY))
+    entry["bb_session_id"] = bb_session_id
+
+
+def set_url(user_id: int, url: str) -> None:
+    """Top-level tab's current url -- mirrors the `url` field each entry in
+    `tabs` already carries for a sub-worker."""
+    entry = _state.setdefault(user_id, dict(_DEFAULT_ENTRY))
+    entry["url"] = url
+
+
+def set_tab_url(user_id: int, tab_id: str, url: str) -> None:
+    entry = _state.setdefault(user_id, dict(_DEFAULT_ENTRY))
+    tab = entry.setdefault("tabs", {}).get(tab_id)
+    if tab is not None:
+        tab["url"] = url
+
+
+def set_active_tab(user_id: int, tab_id: str | None) -> None:
+    """Called on every guarded() tool call (top-level and every sub-worker
+    alike) with that call's own tab_id (None for the top-level tab) -- so
+    this always names whichever tab most recently did something, the proxy
+    server.py's status route uses to decide which tab's live-view debug URL
+    to show right now (see that route for the full "follow the active tab"
+    logic)."""
+    entry = _state.setdefault(user_id, dict(_DEFAULT_ENTRY))
+    entry["active_tab_id"] = tab_id
 
 
 # ---------------------------------------------------------------------------
@@ -149,18 +198,22 @@ def clear_tab(user_id: int, tab_id: str) -> None:
 
 def get(user_id: int) -> dict:
     """Returns {"description": str|None, "steps": list[str], "closing": bool,
-    "waiting_for_human": str|None, "tabs": {tab_id: {...}}} -- never raises,
+    "waiting_for_human": str|None, "tabs": {tab_id: {...}}, "active_tab_id":
+    str|None, "url": str|None, "bb_session_id": str|None} -- never raises,
     just gives back an empty/not-closing/not-waiting/no-tabs log for a user
     with nothing currently tracked."""
     entry = _state.get(user_id)
     if entry is None:
-        return {**dict(_DEFAULT_ENTRY), "tabs": {}}
+        return dict(_DEFAULT_ENTRY, tabs={})
     return {
         "description": entry["description"],
         "steps": list(entry["steps"]),
         "closing": bool(entry.get("closing")),
         "waiting_for_human": entry.get("waiting_for_human"),
         "tabs": {k: dict(v) for k, v in entry.get("tabs", {}).items()},
+        "active_tab_id": entry.get("active_tab_id"),
+        "url": entry.get("url"),
+        "bb_session_id": entry.get("bb_session_id"),
     }
 
 

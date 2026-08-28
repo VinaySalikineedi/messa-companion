@@ -92,6 +92,24 @@ async def get_live_view_url(session_id: str) -> str | None:
     return data.get("debuggerFullscreenUrl") or data.get("debuggerUrl")
 
 
+async def get_session_pages(session_id: str) -> list[dict[str, Any]]:
+    """The same GET /sessions/{id}/debug call as get_live_view_url, but
+    returns its `pages` array instead of the session-level url -- one entry
+    per open tab, each with its own `id`/`url`/`title`/`debuggerUrl`/
+    `debuggerFullscreenUrl` (see https://docs.browserbase.com/reference/api/
+    session-live-urls). Used by server.py's /live/<token>/status route to
+    find a SPECIFIC tab's own live-view link (matched by url against
+    live_activity's per-tab state) instead of always showing the
+    session-level url, which only ever reflects the original default page.
+    Not push/live-updating on Browserbase's side -- callers should re-poll
+    this after noticing a tab-of-interest change, not cache it. Best-effort:
+    callers should treat a failure here as non-fatal (falls back to the
+    session-level live_view_url)."""
+    data = await _request("GET", f"/sessions/{session_id}/debug")
+    pages = data.get("pages")
+    return pages if isinstance(pages, list) else []
+
+
 async def release_session(session_id: str) -> None:
     """End the session early instead of letting it idle out on its own --
     same "don't leave it running when we're done" principle as fully

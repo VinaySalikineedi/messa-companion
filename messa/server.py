@@ -39,7 +39,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from . import background, cli, config, console, db, live_activity
 from .agents.registry import build_orchestrator
 from .approval import AutoApproveGate, DenyApprovalGate
-from .channels import sendblue
+from .channels import browserbase, sendblue
 from .channels.sendblue import SendblueError
 from .live_view_page import render_live_view_page
 from .tools.routines_tools import compute_next_run
@@ -94,10 +94,12 @@ async def live_view_status(token: str) -> JSONResponse:
     tools/deepsearch_tools.py's `set_closing` call -- so the page can swap
     to a clean "Compiling your results..." screen instead of showing
     Browserbase's own CDP-disconnect banner) from live_activity.py's
-    in-memory per-user log. All three go back to None/[]/false the instant
-    `active` is false, regardless of whatever live_activity still happens to
-    hold, so a stale in-memory log can never outlive what the DB says is
-    actually running."""
+    in-memory per-user log. Also attaches `waiting_for_human` (the reason
+    string while tools/deepsearch_tools.py's request_human_help is actively
+    waiting on this tab, else None). All four go back to their empty/false
+    values the instant `active` is false, regardless of whatever
+    live_activity still happens to hold, so a stale in-memory log can never
+    outlive what the DB says is actually running."""
     status = await db.get_live_status_by_token(token)
     if status is None:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -106,7 +108,47 @@ async def live_view_status(token: str) -> JSONResponse:
     status["description"] = activity["description"] if activity else None
     status["steps"] = activity["steps"] if activity else []
     status["closing"] = activity["closing"] if activity else False
+    # Non-None while request_human_help is actively waiting on this tab --
+    # see tools/deepsearch_tools.py's live_activity.set_waiting_for_human
+    # call. The live-view page can use this to show a "waiting for you"
+    # banner instead of looking like the task just silently stalled.
+    status["waiting_for_human"] = activity["waiting_for_human"] if activity else None
+    if activity and not activity["closing"]:
+        override = await _resolve_active_tab_live_view_url(activity)
+        if override:
+            status["live_view_url"] = override
     return JSONResponse(status)
+
+
+async def _resolve_active_tab_live_view_url(activity: dict) -> str | None:
+    """"Follow whichever tab is actually active" (see live_activity.py's
+    active_tab_id/url/bb_session_id fields and their own docstrings): when a
+    multi-site delegation sub-worker's tab is the one that most recently did
+    something, look up ITS OWN per-page live-view url from Browserbase
+    instead of always returning the top-level session's fixed url (which
+    only ever reflects the top-level tab's own page -- a sub-worker's real
+    activity would otherwise never appear at all). Returns None (falls back
+    to the DB's stored session-level url) whenever there's nothing to
+    resolve -- no active sub-worker tab, no session id yet, the lookup
+    fails, or no matching page is found (Browserbase's pages[] isn't
+    push/live-updating; a just-opened tab can take a moment to show up)."""
+    active_tab_id = activity.get("active_tab_id")
+    if not active_tab_id:
+        return None  # top-level tab is active -- its own session-level url already covers it
+    tab = activity.get("tabs", {}).get(active_tab_id)
+    tab_url = tab.get("url") if tab else None
+    bb_session_id = activity.get("bb_session_id")
+    if not tab_url or not bb_session_id:
+        return None
+    try:
+        pages = await browserbase.get_session_pages(bb_session_id)
+    except Exception as e:  # noqa: BLE001
+        console.tool_error("deepsearch", "browserbase_session_pages", str(e))
+        return None
+    match = next((p for p in pages if p.get("url") == tab_url), None)
+    if match is None:
+        return None
+    return match.get("debuggerFullscreenUrl") or match.get("debuggerUrl")
 
 
 @app.post("/webhook/sendblue")
@@ -247,14 +289,58 @@ async def _production_cron_loop() -> None:
         await asyncio.sleep(background.POLL_INTERVAL_SECONDS)
 
 
+async def _production_deepsearch_pause_loop() -> None:
+    """Notifies you when deepsearch is waiting on a login/CAPTCHA/2FA page
+    (see tools/deepsearch_tools.py's request_human_help and db.py's
+    deepsearch_human_help_requests functions) -- same shape as the reminder/
+    cron loops above, but polled much more often (5s vs 30s by default,
+    config.DEEPSEARCH_HUMAN_HELP_POLL_INTERVAL_SECONDS), since a stalled
+    login is time-sensitive in a way a reminder isn't.
+
+    Deliberately sends ONE fixed-template SMS, not a re-invoked Messa LLM
+    call -- request_human_help's own wait/extend/give-up state machine runs
+    entirely inside the in-flight deepsearch call; this loop's only job is
+    "notice a new waiting row, text the user once, remember not to text
+    again." A row keeps showing up in get_waiting_human_help_requests on
+    every poll until request_human_help itself resolves or times it out --
+    notified_at (checked here, set by mark_human_help_notified) is what
+    keeps that from becoming a text every 5 seconds."""
+    while True:
+        try:
+            waiting = await db.get_waiting_human_help_requests()
+            for req in waiting:
+                if req.get("notified_at") is not None:
+                    continue
+                link = None
+                try:
+                    token = await db.get_or_create_live_share_token(req["user_id"])
+                    if token and config.LIVE_VIEW_BASE_URL:
+                        link = f"{config.LIVE_VIEW_BASE_URL}/live/{token}"
+                except Exception as e:  # noqa: BLE001 - the SMS is still worth sending without a link
+                    console.system(f"[deepsearch pause notify] link lookup failed: {e}")
+                text = f"Hey, I need your help finishing up -- {req['reason']}."
+                if link:
+                    text += f" Jump into the live view when you get a sec: {link}"
+                try:
+                    await sendblue.send_message(req["phone_number"], text)
+                except SendblueError as e:
+                    console.system(f"[deepsearch pause notify failed] request=#{req['id']}: {e}")
+                    continue
+                await db.mark_human_help_notified(req["id"])
+        except Exception as e:  # noqa: BLE001 - a background loop must never die silently mid-process
+            console.system(f"[deepsearch pause poller error] {e}")
+        await asyncio.sleep(config.DEEPSEARCH_HUMAN_HELP_POLL_INTERVAL_SECONDS)
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     global _bg_tasks
     _bg_tasks = [
         asyncio.create_task(_production_reminder_loop()),
         asyncio.create_task(_production_cron_loop()),
+        asyncio.create_task(_production_deepsearch_pause_loop()),
     ]
-    console.system("Started production reminder/cron delivery pollers.")
+    console.system("Started production reminder/cron/deepsearch-pause delivery pollers.")
 
 
 @app.on_event("shutdown")

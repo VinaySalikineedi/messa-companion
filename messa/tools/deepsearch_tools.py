@@ -35,28 +35,53 @@ rather than an unpersisted one-off session.
 
 Multi-site delegation: the top-level BrowserToolProvider owns one Browserbase
 session and runs `@playwright/mcp` as a local HTTP server against it with
-`--shared-browser-context --isolated` (rather than the single stdio
-connection used before) -- this lets the `delegate_website_task` tool open
-brand-new, independent MCP client connections to that SAME server, each
-landing on its own isolated tab within the one Browserbase session, instead
-of opening (and paying for) a separate Browserbase session per site. Both
-flags matter: `--shared-browser-context` alone was NOT enough once a real
-`--cdp-endpoint` (an externally-owned browser, exactly how a Browserbase
-session is connected -- not a browser `@playwright/mcp` launches itself) is
-involved -- two connections raced onto the very same page until `--isolated`
-was added too (confirmed the hard way, see
-/tmp/test_multisite_delegation_live.py's history; the original
-/tmp/test_mcp_multitab.py POC didn't catch this because it let
-`@playwright/mcp` launch its own local browser rather than connecting to an
-externally-owned one). A model that calls
-`delegate_website_task` several times in one turn gets real concurrency for
-free from LangGraph's own tool-calling loop (see
+`--shared-browser-context` (rather than the single stdio connection used
+before) -- this lets the `delegate_website_task` tool open brand-new,
+independent MCP client connections to that SAME server, each claiming its
+own tab within the one Browserbase session, instead of opening (and paying
+for) a separate Browserbase session per site.
+
+Tab isolation is achieved WITHOUT `--isolated` (an earlier version of this
+used that flag; removed -- see below). `--shared-browser-context` alone
+does NOT stop two connections from colliding on the very same page once a
+real `--cdp-endpoint` (an externally-owned browser, exactly how a
+Browserbase session is connected -- not a browser `@playwright/mcp` launches
+itself) is involved: with neither flag, and neither connection explicitly
+claiming a tab, both connections implicitly share the server's one "current
+page" pointer, so one connection's `browser_navigate` can be "interrupted by
+another navigation" from the other (confirmed the hard way, see
+/tmp/test_multisite_delegation_live.py's history). `--isolated` used to fix
+that by giving each connection its own separate browser CONTEXT -- but that
+also moved every sub-worker's real activity out of Browserbase's default
+context, which is the one thing its live-view/debug-URL tracking actually
+follows (Browserbase's own docs: "Always use the default context and page
+when possible to ensure proper functionality of Verified features") --
+hence the live view showing a permanently blank default page while
+sub-workers were doing real, logged work on tabs Browserbase's tracking
+never saw. The fix: every sub-worker calls `@playwright/mcp`'s own
+`browser_tabs(action="new")` tool as the FIRST thing it does on its fresh
+connection (see __aenter__ below), claiming its own tab WITHIN the shared
+default context instead of a separate one -- confirmed empirically (see
+/tmp/probe_tabs_new.py) that this gives each connection the same isolation
+`--isolated` did (zero cross-talk, zero navigation-interruption errors)
+while everything stays inside the one context Browserbase actually tracks
+end-to-end, including per-tab live-view URLs (channels/browserbase.
+get_session_pages). The top-level provider needs no such call -- it never
+shares its connection with anyone, so it simply keeps using Browserbase's
+original default page, exactly as before multi-site delegation existed.
+
+A model that calls `delegate_website_task` several times in one turn gets
+real concurrency for free from LangGraph's own tool-calling loop (see
 /tmp/test_agent_concurrency.py), bounded by
 `config.DEEPSEARCH_MAX_SUBAGENTS` via a shared `asyncio.Semaphore`. Each
 sub-worker is a full `BrowserToolProvider` in its own right (same guard
 layer, same `request_human_help`), just constructed with `server_url` set
 instead of creating its own session/process -- see that parameter's
-docstring on `__init__`.
+docstring on `__init__`. Each sub-worker is deliberately scoped small and
+bounded -- one site, one goal, a short step budget
+(config.DEEPSEARCH_SUBAGENT_MAX_STEPS) -- mirroring what deepsearch used to
+do sequentially per site before this feature existed, not a new, more
+open-ended kind of task; see _SUBAGENT_SYSTEM_PROMPT below.
 
 Resumability: the `task` tool's schema only carries free-text `description`
 + `subagent_type` (deepagents fixes this; there's no side channel for
@@ -580,23 +605,19 @@ class BrowserToolProvider:
         mcp_args = [
             "@playwright/mcp@latest", "--cdp-endpoint", connect_url,
             "--port", "0", "--shared-browser-context",
-            # --isolated is REQUIRED here, not optional, when combined with
-            # --cdp-endpoint -- confirmed empirically (see
-            # /tmp/test_multisite_delegation_live.py's history and
-            # /tmp/probe_flags.py): without it, two separate client
-            # connections against a --cdp-endpoint-connected browser raced
-            # onto the SAME page (one connection's browser_navigate was
-            # literally "interrupted by another navigation" from the other
-            # connection), instead of each landing on its own isolated tab.
-            # /tmp/test_mcp_multitab.py's original POC didn't catch this
-            # because it launched its OWN local browser (no --cdp-endpoint)
-            # rather than connecting to an externally-owned one the way a
-            # real Browserbase session works -- --isolated is what makes
-            # the externally-owned-browser case behave the same way. Safe
-            # to always pass: each deepsearch run already gets a brand-new
-            # Browserbase session, so there's no persisted local profile to
-            # keep across runs regardless.
-            "--isolated",
+            # Deliberately NOT passing --isolated here (an earlier version
+            # of this did). --isolated stops two connections from colliding
+            # on the same page by giving each its own separate browser
+            # CONTEXT -- but that also moves every sub-worker off
+            # Browserbase's default context, which is the one thing its
+            # live-view/debug-URL tracking follows end-to-end (see the
+            # module docstring's "Multi-site delegation" section for the
+            # full story and the empirical evidence). Instead, every
+            # sub-worker claims its own tab WITHIN this one shared default
+            # context via browser_tabs(action="new") as the first thing it
+            # does on its own connection (see __aenter__ below) -- same
+            # isolation guarantee, but a context Browserbase actually
+            # tracks.
             # --image-responses omit: our subagent model
             # (config.SUBAGENT_MODEL_NAME) isn't confirmed to
             # accept image inputs, so a screenshot tool result
@@ -692,6 +713,11 @@ class BrowserToolProvider:
                 self._bb_session_id = session["id"]
                 connect_url = session["connectUrl"]
                 console.system(f"Deepsearch: opened Browserbase session {self._bb_session_id}.")
+                if self._user_id is not None:
+                    # Lets server.py's status route re-poll this session's
+                    # /debug endpoint later to resolve a specific tab's own
+                    # live-view url (see live_activity.set_session_id).
+                    live_activity.set_session_id(self._user_id, self._bb_session_id)
             except Exception as e:  # noqa: BLE001
                 console.tool_error(LABEL, "browserbase_session_create", str(e))
                 raise
@@ -756,6 +782,20 @@ class BrowserToolProvider:
             self._session = await self._session_cm.__aenter__()
             raw_tools = await load_mcp_tools(self._session)
             self._raw_tools_by_name = {t.name: t for t in raw_tools}
+            if not self._owns_server:
+                # Claim our OWN tab within the shared default browser
+                # context, replacing what the old --isolated flag used to
+                # guarantee (see _spawn_mcp_http_server's comment and the
+                # module docstring's "Multi-site delegation" section).
+                # Deliberately raised (not swallowed) on failure -- this is
+                # the actual isolation mechanism now, not a cosmetic
+                # nicety; a failure here must not silently fall through to
+                # this connection sharing a tab with someone else. The
+                # enclosing try/except below reports it as a normal failed
+                # delegate_website_task result rather than crashing the run.
+                tabs_tool = self._raw_tools_by_name.get("browser_tabs")
+                if tabs_tool is not None:
+                    await tabs_tool.coroutine(action="new")
             self.tools = [self._guard(t) for t in raw_tools]
             # request_human_help isn't a wrapped MCP tool -- it's our own
             # Python method, added directly to the model-facing toolset
@@ -1039,6 +1079,27 @@ class BrowserToolProvider:
         else:
             live_activity.clear_tab_waiting_for_human(self._user_id, self._tab_id)
 
+    def _live_mark_active(self) -> None:
+        """Called at the top of every guarded() call (this tab is the one
+        doing something right now) -- feeds server.py's "follow whichever
+        tab is actually active" live-view logic (see
+        live_activity.set_active_tab's own docstring)."""
+        if self._user_id is None:
+            return
+        live_activity.set_active_tab(self._user_id, None if self._owns_server else self._tab_id)
+
+    def _live_set_url(self, url: str) -> None:
+        """Records this tab's current url after a successful navigation --
+        matched later against Browserbase's own pages[] (by url) to resolve
+        this specific tab's live-view debug link. See
+        channels/browserbase.get_session_pages and server.py's status route."""
+        if self._user_id is None:
+            return
+        if self._owns_server:
+            live_activity.set_url(self._user_id, url)
+        else:
+            live_activity.set_tab_url(self._user_id, self._tab_id, url)
+
     async def _page_fingerprint(self) -> int | None:
         """A cheap, no-side-effect check of "has anything changed" for
         request_human_help's polling loop: the current URL plus the length
@@ -1277,6 +1338,7 @@ class BrowserToolProvider:
             console.tool_call(LABEL, name, display_args)
             action_desc = _describe_action(name, display_args)
             self._live_set_description(action_desc)
+            self._live_mark_active()
 
             if name == "browser_navigate":
                 url = kwargs.get("url") or (args[0] if args else None)
@@ -1335,6 +1397,10 @@ class BrowserToolProvider:
                     # _start_reading_animation's own docstring for why this
                     # is never awaited here.
                     self._start_reading_animation()
+                if name == "browser_navigate":
+                    nav_url = kwargs.get("url") or (args[0] if args else None)
+                    if nav_url:
+                        self._live_set_url(nav_url)
                 if name == "browser_navigate" and self._cursor_driver is not None:
                     # Fire-and-forget, same reasoning as _start_reading_animation
                     # above: re-asserting the marker is a real MCP round trip
@@ -1382,15 +1448,22 @@ class BrowserToolProvider:
 
 # A sub-worker's own system prompt (delegate_website_task) -- deliberately a
 # trimmed copy of DEEPSEARCH_SYSTEM_PROMPT below, not the same string reused
-# verbatim: a sub-worker is scoped to exactly ONE site handed to it by the
-# top-level agent, not an open-ended multi-site task, so it doesn't need
-# (and shouldn't be tempted to use) delegate_website_task or session-
-# resumption guidance that only make sense for the orchestrator.
+# verbatim: a sub-worker is scoped to exactly ONE site and ONE goal handed to
+# it by the top-level agent -- mirroring what deepsearch used to do
+# sequentially per site before multi-site delegation existed, just
+# parallelized, NOT a new, more open-ended kind of task -- so it doesn't
+# need (and shouldn't be tempted to use) delegate_website_task or
+# session-resumption guidance that only make sense for the orchestrator, and
+# is explicitly told to stay narrow rather than explore.
 _SUBAGENT_SYSTEM_PROMPT = (
-    "You are a deepsearch sub-worker, delegated exactly ONE website to work on: {url}. You "
-    "have your OWN browser tab, separate from whoever delegated this to you and from any other "
-    "sub-worker running at the same time -- stay on this one site; you have no visibility into "
-    "what any other tab is doing.\n"
+    "You are a deepsearch sub-worker, delegated exactly ONE website and ONE goal to work on: "
+    "{url}. You have your OWN browser tab, separate from whoever delegated this to you and from "
+    "any other sub-worker running at the same time -- stay on this one site; you have no "
+    "visibility into what any other tab is doing.\n"
+    "- Do exactly what the instructions ask, nothing more. Don't browse to other pages, other "
+    "products, or explore the site beyond what's needed for this one goal, and don't go looking "
+    "for extra things to report -- a short, focused session is what's wanted here, not thorough "
+    "exploration.\n"
     "- After navigating, always call browser_snapshot to read actual page content.\n"
     "- Prefer browser_find or browser_snapshot's `depth` argument over a full snapshot when you "
     "just need to confirm something worked, not the full page layout.\n"
@@ -1403,8 +1476,9 @@ _SUBAGENT_SYSTEM_PROMPT = (
     "- If you hit a login wall, CAPTCHA, 2FA/one-time-code prompt, or any other verification "
     "step that requires a real human, call request_human_help with a short reason instead of "
     "guessing at credentials or retrying the same form repeatedly.\n"
-    "- When you're done, reply with a clear, complete summary of what you found or did on this "
-    "site -- this goes straight back to whoever delegated this to you.\n"
+    "- As soon as the one goal is done, stop and reply immediately with a clear, complete "
+    "summary of what you found or did on this site -- this goes straight back to whoever "
+    "delegated this to you. You have a small, fixed step budget; don't spend it wandering.\n"
 )
 
 DEEPSEARCH_SYSTEM_PROMPT = (
@@ -1445,7 +1519,11 @@ DEEPSEARCH_SYSTEM_PROMPT = (
     "they run concurrently instead of sequentially. Only do this when the sites are genuinely "
     "independent of each other; if one site's result determines what to do on the next, handle "
     "them directly (or one delegate_website_task call at a time, waiting for each result before "
-    "the next) instead.\n"
+    "the next) instead. Each call gets exactly ONE website and ONE simple, self-contained goal -- "
+    "this is just the same per-site work you'd otherwise do sequentially yourself, parallelized, "
+    "not a bigger or more open-ended task, so keep `instructions` short and focused (e.g. "
+    "\"find the price of the wireless mouse\", not a multi-part task with several unrelated "
+    "sub-goals bundled together).\n"
     "- When you're done, reply with a clear, complete summary of what you found or did. "
     "Be honest -- this summary goes straight back to the user.\n"
 )
