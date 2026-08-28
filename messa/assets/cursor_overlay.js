@@ -26,14 +26,17 @@
   el.style.left = "0";
   el.style.zIndex = "2147483647";
   el.style.pointerEvents = "none";
-  el.style.filter = "drop-shadow(0 4px 10px rgba(0,0,0,0.65))";
-  el.style.transition = "transform 350ms cubic-bezier(0.25, 1, 0.5, 1)";
+  el.style.filter = "drop-shadow(0 0 8px rgba(57, 255, 136, 0.5)) drop-shadow(0 4px 10px rgba(0,0,0,0.7))";
+  el.style.transition = "transform 380ms cubic-bezier(0.25, 1, 0.5, 1)";
   el.innerHTML =
     '<path d="M 2 2 L 2 34 L 10 26 L 16 38 L 22 35 L 16 23 L 26 23 Z" ' +
-    'fill="#3b82f6" stroke="white" stroke-width="2.5" stroke-linejoin="round"/>';
+    'fill="#39ff88" stroke="#000000" stroke-width="2" stroke-linejoin="round"/>';
 
   let currentSpotIndex = 0;
   let resetTimer = null;
+  let idlePulseInterval = null;
+  let lastX = 120;
+  let lastY = 120;
 
   function getRestingSpot(index) {
     const w = window.innerWidth || 1280;
@@ -48,15 +51,28 @@
     return spots[index % spots.length];
   }
 
-  function setCursorTransform(x, y, scale = 2.9) {
+  function setCursorTransform(x, y, scale = 2.7) {
+    lastX = x;
+    lastY = y;
     el.style.transform = `translate(${x}px, ${y}px) scale(${scale})`;
+  }
+
+  function startIdleBreathing() {
+    if (idlePulseInterval) clearInterval(idlePulseInterval);
+    // Every 2.4s while idle (e.g. AI reading page/thinking), gently drift +/- 12px
+    idlePulseInterval = setInterval(() => {
+      const offsetX = Math.floor(Math.random() * 24) - 12;
+      const offsetY = Math.floor(Math.random() * 24) - 12;
+      setCursorTransform(lastX + offsetX, lastY + offsetY, 2.7);
+    }, 2400);
   }
 
   function ensureMounted() {
     if (!el.isConnected) {
       (document.body || document.documentElement).appendChild(el);
       const spot = getRestingSpot(currentSpotIndex);
-      setCursorTransform(spot.x, spot.y, 2.9);
+      setCursorTransform(spot.x, spot.y, 2.7);
+      startIdleBreathing();
     }
   }
 
@@ -64,26 +80,29 @@
     ensureMounted();
     currentSpotIndex = (currentSpotIndex + 1) % 5;
     const spot = getRestingSpot(currentSpotIndex);
-    setCursorTransform(spot.x, spot.y, 2.9);
+    setCursorTransform(spot.x, spot.y, 2.7);
+    startIdleBreathing();
   }
 
   function moveTo(x, y) {
     ensureMounted();
     if (resetTimer) clearTimeout(resetTimer);
-    setCursorTransform(x, y, 2.9);
+    if (idlePulseInterval) clearInterval(idlePulseInterval);
+
+    setCursorTransform(x, y, 2.7);
 
     // Pulse down slightly to simulate a click press
     setTimeout(() => {
-      setCursorTransform(x, y, 2.3);
+      setCursorTransform(x, y, 2.1);
       setTimeout(() => {
-        setCursorTransform(x, y, 2.9);
+        setCursorTransform(x, y, 2.7);
       }, 120);
     }, 180);
 
     // After action completes, glide back to next idle resting spot
     resetTimer = setTimeout(() => {
       returnToRestingSpot();
-    }, 1000);
+    }, 1100);
 
     return new Promise((resolve) => {
       let done = false;
@@ -93,7 +112,7 @@
         resolve();
       };
       el.addEventListener("transitionend", finish, { once: true });
-      setTimeout(finish, 360);
+      setTimeout(finish, 380);
     });
   }
 
