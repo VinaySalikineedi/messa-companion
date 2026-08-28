@@ -73,9 +73,14 @@ async def create_session(context_id: str | None) -> dict[str, Any]:
     at least `id` and `connectUrl` (the CDP WebSocket URL).
 
     Pins `browserSettings.viewport` to VIEWPORT_WIDTH x VIEWPORT_HEIGHT --
-    see the comment above those constants for why."""
+    see the comment above those constants for why. Also pins `timeout` to
+    config.BROWSERBASE_SESSION_TIMEOUT_SECONDS -- see that constant's own
+    comment for the real bug this fixes (sessions silently inheriting a low
+    dashboard-configured project default instead of our own, much longer,
+    intended session length)."""
     body: dict[str, Any] = {
         "browserSettings": {"viewport": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT}},
+        "timeout": config.BROWSERBASE_SESSION_TIMEOUT_SECONDS,
     }
     if context_id:
         body["browserSettings"]["context"] = {"id": context_id, "persist": True}

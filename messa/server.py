@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any
+from urllib.parse import urlparse
 
 from fastapi import BackgroundTasks, FastAPI, Header, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -87,17 +88,20 @@ async def live_view_status(token: str) -> JSONResponse:
     link" (the page shows 'this link isn't valid' and stops polling); 200
     with active=false means "valid link, nothing running right now".
 
-    When active, also attaches `description` (what deepsearch is doing
-    right now, one line), `steps` (this task's chain-of-thought log so far),
-    and `closing` (true for the brief window between "the run finished" and
-    "the Browserbase session is actually released" -- see
-    tools/deepsearch_tools.py's `set_closing` call -- so the page can swap
-    to a clean "Compiling your results..." screen instead of showing
-    Browserbase's own CDP-disconnect banner) from live_activity.py's
-    in-memory per-user log. Also attaches `waiting_for_human` (the reason
-    string while tools/deepsearch_tools.py's request_human_help is actively
-    waiting on this tab, else None). All four go back to their empty/false
-    values the instant `active` is false, regardless of whatever
+    When active, also attaches `closing` (true for the brief window between
+    "the run finished" and "the Browserbase session is actually released" --
+    see tools/deepsearch_tools.py's `set_closing` call -- so the page can
+    swap to a clean "Compiling your results..." screen instead of showing
+    Browserbase's own CDP-disconnect banner) and `tiles` -- one entry per
+    currently-open browser tab (the top-level orchestrator tab plus every
+    live `delegate_website_task` sub-worker), each with its OWN `heading`,
+    `description`, `steps`, `waiting_for_human`, and `live_view_url` -- so
+    the page can render every tab someone is actively working, not just one
+    fixed view (see _build_live_tiles below for how each tab's own
+    live_view_url is resolved). `tiles` is `[]` (not omitted) whenever
+    `closing` is true -- the page shows one unified "wrapping up" screen at
+    that point rather than a grid mid-teardown. Everything goes back to
+    empty/false the instant `active` is false, regardless of whatever
     live_activity still happens to hold, so a stale in-memory log can never
     outlive what the DB says is actually running."""
     status = await db.get_live_status_by_token(token)
@@ -105,50 +109,85 @@ async def live_view_status(token: str) -> JSONResponse:
         return JSONResponse({"error": "not found"}, status_code=404)
     user_id = status.pop("user_id", None)
     activity = live_activity.get(user_id) if (status["active"] and user_id is not None) else None
-    status["description"] = activity["description"] if activity else None
-    status["steps"] = activity["steps"] if activity else []
-    status["closing"] = activity["closing"] if activity else False
-    # Non-None while request_human_help is actively waiting on this tab --
-    # see tools/deepsearch_tools.py's live_activity.set_waiting_for_human
-    # call. The live-view page can use this to show a "waiting for you"
-    # banner instead of looking like the task just silently stalled.
-    status["waiting_for_human"] = activity["waiting_for_human"] if activity else None
-    if activity and not activity["closing"]:
-        override = await _resolve_active_tab_live_view_url(activity)
-        if override:
-            status["live_view_url"] = override
-    return JSONResponse(status)
+    closing = activity["closing"] if activity else False
+    tiles = await _build_live_tiles(status, activity) if (activity and not closing) else []
+    return JSONResponse({"active": status["active"], "closing": closing, "tiles": tiles})
 
 
-async def _resolve_active_tab_live_view_url(activity: dict) -> str | None:
-    """"Follow whichever tab is actually active" (see live_activity.py's
-    active_tab_id/url/bb_session_id fields and their own docstrings): when a
-    multi-site delegation sub-worker's tab is the one that most recently did
-    something, look up ITS OWN per-page live-view url from Browserbase
-    instead of always returning the top-level session's fixed url (which
-    only ever reflects the top-level tab's own page -- a sub-worker's real
-    activity would otherwise never appear at all). Returns None (falls back
-    to the DB's stored session-level url) whenever there's nothing to
-    resolve -- no active sub-worker tab, no session id yet, the lookup
-    fails, or no matching page is found (Browserbase's pages[] isn't
-    push/live-updating; a just-opened tab can take a moment to show up)."""
-    active_tab_id = activity.get("active_tab_id")
-    if not active_tab_id:
-        return None  # top-level tab is active -- its own session-level url already covers it
-    tab = activity.get("tabs", {}).get(active_tab_id)
-    tab_url = tab.get("url") if tab else None
-    bb_session_id = activity.get("bb_session_id")
-    if not tab_url or not bb_session_id:
-        return None
+def _tile_heading(url: str | None) -> str:
+    """A short, human-friendly label for one tab's tile heading -- the
+    hostname of whatever it's working on (e.g. "booking.com"), matching how
+    a browser's own tab strip labels tabs. Falls back for anything that
+    isn't a normal http(s) url (a bare data: url mid-navigation, or no url
+    yet at all right as a tab opens)."""
+    if not url:
+        return "New tab"
     try:
-        pages = await browserbase.get_session_pages(bb_session_id)
-    except Exception as e:  # noqa: BLE001
-        console.tool_error("deepsearch", "browserbase_session_pages", str(e))
-        return None
-    match = next((p for p in pages if p.get("url") == tab_url), None)
-    if match is None:
-        return None
-    return match.get("debuggerFullscreenUrl") or match.get("debuggerUrl")
+        host = urlparse(url).netloc
+    except Exception:  # noqa: BLE001
+        host = ""
+    if not host:
+        return "New tab"
+    return host[4:] if host.startswith("www.") else host
+
+
+async def _build_live_tiles(status: dict, activity: dict) -> list[dict]:
+    """Builds one tile per currently-open browser tab -- the top-level
+    orchestrator tab (id "top") plus every live delegate_website_task
+    sub-worker tab (see live_activity.py's `tabs` dict) -- each carrying its
+    OWN live_view_url, resolved from Browserbase's per-page debug urls
+    (channels/browserbase.get_session_pages) rather than the one fixed
+    session-level url every tab used to share, which is what made a
+    sub-worker's real activity invisible no matter which tab was doing the
+    work. One get_session_pages call covers every tile in this poll (not
+    one call per tile) -- matched by each tab's own last-known url (see
+    tools/deepsearch_tools.py's _live_set_url/_live_set_tab_url). A tile
+    whose url has no match yet (Browserbase's pages[] isn't push-live --
+    a just-opened tab can take a moment to show up) gets live_view_url:
+    None; the page renders a "connecting..." placeholder for that tile
+    until a later poll resolves it. Never raises: a failed Browserbase call
+    just means every tile falls back to whatever url it already had (the
+    top tile still has the DB's session-level url; a sub-worker tile with
+    no prior resolution just stays in its placeholder state one poll
+    longer)."""
+    bb_session_id = activity.get("bb_session_id")
+    pages_by_url: dict[str, dict] = {}
+    if bb_session_id:
+        try:
+            pages = await browserbase.get_session_pages(bb_session_id)
+            pages_by_url = {p["url"]: p for p in pages if p.get("url")}
+        except Exception as e:  # noqa: BLE001
+            console.tool_error("deepsearch", "browserbase_session_pages", str(e))
+
+    active_tab_id = activity.get("active_tab_id")
+
+    def resolve(url: str | None, fallback: str | None = None) -> str | None:
+        page = pages_by_url.get(url) if url else None
+        if page:
+            return page.get("debuggerFullscreenUrl") or page.get("debuggerUrl") or fallback
+        return fallback
+
+    top_url = activity.get("url")
+    tiles = [{
+        "id": "top",
+        "heading": status.get("task") or "Deepsearch",
+        "description": activity.get("description"),
+        "steps": activity.get("steps") or [],
+        "waiting_for_human": activity.get("waiting_for_human"),
+        "live_view_url": resolve(top_url, fallback=status.get("live_view_url")),
+        "active": active_tab_id is None,
+    }]
+    for tab_id, tab in (activity.get("tabs") or {}).items():
+        tiles.append({
+            "id": tab_id,
+            "heading": _tile_heading(tab.get("url")),
+            "description": tab.get("description"),
+            "steps": tab.get("steps") or [],
+            "waiting_for_human": tab.get("waiting_for_human"),
+            "live_view_url": resolve(tab.get("url")),
+            "active": tab_id == active_tab_id,
+        })
+    return tiles
 
 
 @app.post("/webhook/sendblue")

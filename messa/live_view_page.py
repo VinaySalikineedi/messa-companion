@@ -1,7 +1,7 @@
 """The public, tokenized /live/<token> page (Phase 3): a permanent per-user
 link, texted alongside every deepsearch delegation (see agents/registry.py's
-live_view_str), that shows Browserbase's live iframe while a browsing task
-is running and a calm "nothing happening right now" state otherwise.
+live_view_str), that shows Browserbase's live browser view while a browsing
+task is running and a calm "nothing happening right now" state otherwise.
 
 Kept as one self-contained HTML/CSS/JS string (no build step, no external
 assets -- this needs to render correctly from a bare `GET`, including from
@@ -9,54 +9,75 @@ whatever in-app browser iMessage/SMS opens links in) rather than a template
 file, matching how small this project keeps its other single-purpose
 surfaces. The page itself never talks to Postgres -- it only ever calls its
 own `/live/<token>/status` JSON endpoint (see server.py), polling every few
-seconds so it flips from idle to live (and back) with no manual refresh,
-and now also carries `description` (what deepsearch is doing *right now*,
-one line) and `steps` (the running chain-of-thought log for *this* task
-only -- both come from messa/live_activity.py, an in-memory, per-user log
-that tools/deepsearch_tools.py's guarded tool-call wrapper writes to on
-every browser action, and clears the moment the task's browser closes).
+seconds.
 
-Two visual skins, same markup/JS, different CSS -- so you can compare them
-side by side before picking one:
+Multi-tab grid (this round): earlier versions of this page showed exactly
+one fixed video, the top-level tab's own -- real work happening on a
+delegate_website_task sub-worker's tab was invisible no matter what, since
+that one video never pointed at it (see README's "Live view showed a blank
+page during multi-site delegation" section for the full history of that
+bug). Real feedback from a real run made clear that following just ONE
+"currently active" tab still wasn't right either -- when several sub-workers
+run concurrently, the whole point is seeing ALL of them at once, the way
+Browserbase's own dashboard shows one live link per open tab (see
+https://docs.browserbase.com/platform/browser/observability/session-live-view).
+So this page now renders a responsive GRID of tiles, one per currently-open
+browser tab (the top-level orchestrator's own tab plus every live
+delegate_website_task sub-worker) -- each with its own heading (the site
+it's working on), its own live video, and its own short (3-4 line) log,
+added the moment server.py's /status route reports a new tab and removed
+the moment that tab closes. See server.py's `_build_live_tiles` for how
+each tile's own live_view_url is resolved from Browserbase's per-page debug
+urls, and live_activity.py for where each tab's own description/steps/url
+are recorded.
 
-  - "polished": a soft-gradient background behind a single lifted, rounded
-    card -- description above the video, chain-of-thought below, closest
-    to a normal consumer product surface.
-  - "terminal": black background, monospace, a fake terminal titlebar,
-    "$ "-prefixed description/log lines, a blinking cursor on the last log
-    line -- gritty/dev-tool looking, same information, different mood.
+Two visual skins, same markup/JS, different CSS variables:
+
+  - "polished" (default): a clean, light, editorial look -- soft neutral
+    background, one tile per tab as a lifted rounded card, generous
+    whitespace, restrained motion. This is the one actually designed for
+    (per explicit ask: "apple like website that is clean but elegant and
+    good quality") -- the production-facing skin.
+  - "terminal": black background, monospace, a fake terminal titlebar per
+    tile -- kept working (same markup, same JS, just different CSS
+    variables) for anyone with an old `?style=terminal` link bookmarked, but
+    not the one this round's design effort went into.
 
 LIVE_VIEW_STYLE below is "the variable you can change": flip it and
-redeploy to switch the *default* skin. For quick side-by-side comparisons
-without redeploying, append `?style=polished` or `?style=terminal` to any
-live link (see server.py's live_view_page route) -- that overrides the
-default for just that one page load, nothing is stored.
+redeploy to switch the *default* skin. `?style=polished` / `?style=terminal`
+on any live link overrides the default for just that one page load.
 
 Security note: `token` is only ever a value this module itself generates
 (`secrets.token_urlsafe`, see db.get_or_create_live_share_token) -- alphanumeric
 plus '-'/'_' only, never user-supplied free text -- so it's safe to embed
 directly into the JS below with no HTML-escaping needed. Nothing else here
-does string interpolation of untrusted data: descriptions, chain-of-thought
-lines, task titles, and the Browserbase URL are all fetched client-side via
-JSON and written with textContent/`.src` (never innerHTML), so none of that
-server-generated-but-ultimately-model-influenced text can inject anything.
+does string interpolation of untrusted data: headings, descriptions,
+chain-of-thought lines, task titles, and every live_view_url are all
+fetched client-side via JSON and written with textContent/`.src` (never
+innerHTML), so none of that server-generated-but-ultimately-model-influenced
+text can inject anything.
 """
 from __future__ import annotations
 
 # "The variable you can change" (see module docstring): pick which skin
 # renders by default when a live link is opened with no ?style= override.
-LIVE_VIEW_STYLE = "terminal"  # "polished" | "terminal"
+LIVE_VIEW_STYLE = "polished"  # "polished" | "terminal"
 
 _VALID_STYLES = ("polished", "terminal")
 
-# Must match channels/browserbase.py's VIEWPORT_WIDTH/HEIGHT -- `.video-wrap`
-# below is sized to this exact aspect ratio so Browserbase's embedded
-# live-view iframe fills it edge-to-edge instead of letterboxing (the "dead
-# space below the browser window" the polished/terminal card used to show
-# when it stretched to fill whatever flex space was left over, regardless of
-# the actual browser viewport's shape).
+# Must match channels/browserbase.py's VIEWPORT_WIDTH/HEIGHT -- each tile's
+# video area uses this as a plain CSS aspect-ratio, so Browserbase's
+# embedded live-view page fills it edge-to-edge with no letterboxing.
 BROWSER_VIEWPORT_WIDTH = 1280
 BROWSER_VIEWPORT_HEIGHT = 800
+
+# How many of a tile's most recent chain-of-thought lines to show in its
+# (deliberately small, per-tile) log -- per explicit ask: "bottom log
+# updates maybe max of 3-5 lines showing as we are fitting multiple browser
+# screens." The full history is still capped/kept server-side
+# (live_activity.MAX_STEPS = 60) for anything that wants it later; this is
+# purely how much of it one tile displays at once.
+TILE_LOG_LINES = 4
 
 
 def render_live_view_page(token: str, style: str | None = None) -> str:
@@ -70,48 +91,73 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
 <style>
   * {{ box-sizing: border-box; }}
 
-  /* ---- "polished" skin: soft gradient canvas, one lifted rounded card ---- */
+  /* ---- "polished" skin: clean, light, editorial -- the designed-for
+     production look. Restrained palette, one accent color, soft shadows
+     instead of hard borders where possible. ---- */
   [data-style="polished"] {{
-    --bg: #eef3f6;
-    --bg-gradient: radial-gradient(circle at 28% 18%, #e4f7ef 0%, #eef3f6 42%, #edf0f8 100%);
+    --bg: #f5f5f7;
     --panel: #ffffff;
+    --panel-translucent: rgba(255, 255, 255, 0.86);
     --card-bg: #ffffff;
-    --border: #e2e8f0;
-    --text: #1a2233;
-    --muted: #6b7686;
-    --accent: #4f8cff;
-    --live: #ff5566;
-    --radius: 20px;
-    --shadow: 0 24px 64px -24px rgba(31, 45, 61, 0.35), 0 4px 16px rgba(31, 45, 61, 0.08);
-    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --border: #e5e5ea;
+    --border-soft: #eeeef1;
+    --text: #1d1d1f;
+    --muted: #86868b;
+    --muted-strong: #6e6e73;
+    --accent: #0071e3;
+    --accent-soft: rgba(0, 113, 227, 0.12);
+    --live: #ff3b30;
+    --warn: #ff9f0a;
+    --warn-soft: rgba(255, 159, 10, 0.12);
+    --radius: 18px;
+    --radius-sm: 12px;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 12px 32px -16px rgba(0, 0, 0, 0.18);
+    --shadow-lifted: 0 2px 6px rgba(0, 0, 0, 0.05), 0 24px 48px -20px rgba(0, 0, 0, 0.25);
+    --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Helvetica, Arial, sans-serif;
+    --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   }}
   @media (prefers-color-scheme: dark) {{
     [data-style="polished"] {{
-      --bg: #0b0d12;
-      --bg-gradient: radial-gradient(circle at 28% 18%, #16241f 0%, #0b0d12 42%, #0d0f16 100%);
-      --panel: #14171f;
-      --card-bg: #161a23;
-      --border: #262b38;
-      --text: #e7e9ee;
-      --muted: #8b93a7;
-      --shadow: 0 24px 64px -24px rgba(0, 0, 0, 0.6), 0 4px 16px rgba(0, 0, 0, 0.3);
+      --bg: #000000;
+      --panel: #1c1c1e;
+      --panel-translucent: rgba(28, 28, 30, 0.86);
+      --card-bg: #1c1c1e;
+      --border: #2c2c2e;
+      --border-soft: #262628;
+      --text: #f5f5f7;
+      --muted: #8e8e93;
+      --muted-strong: #aeaeb2;
+      --accent: #0a84ff;
+      --accent-soft: rgba(10, 132, 255, 0.16);
+      --warn-soft: rgba(255, 159, 10, 0.16);
+      --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 12px 32px -16px rgba(0, 0, 0, 0.6);
+      --shadow-lifted: 0 2px 6px rgba(0, 0, 0, 0.4), 0 24px 48px -20px rgba(0, 0, 0, 0.7);
     }}
   }}
 
-  /* ---- "terminal" skin: black, monospace, gritty, always dark ---- */
+  /* ---- "terminal" skin: black, monospace, gritty -- kept for old links,
+     not the design focus this round (see module docstring). ---- */
   [data-style="terminal"] {{
     --bg: #0a0a0a;
-    --bg-gradient: #0a0a0a;
     --panel: #000000;
+    --panel-translucent: rgba(0, 0, 0, 0.86);
     --card-bg: #050505;
     --border: #1f2a1f;
+    --border-soft: #16201a;
     --text: #c9f2d0;
     --muted: #5f8f68;
+    --muted-strong: #7fb389;
     --accent: #39ff88;
+    --accent-soft: rgba(57, 255, 136, 0.12);
     --live: #ff5566;
+    --warn: #ffd166;
+    --warn-soft: rgba(255, 209, 102, 0.14);
     --radius: 4px;
-    --shadow: 0 0 0 1px rgba(57, 255, 136, 0.15), 0 0 40px rgba(57, 255, 136, 0.06);
+    --radius-sm: 3px;
+    --shadow: 0 0 0 1px rgba(57, 255, 136, 0.1);
+    --shadow-lifted: 0 0 0 1px rgba(57, 255, 136, 0.18), 0 0 40px rgba(57, 255, 136, 0.06);
     --font: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    --font-mono: var(--font);
   }}
 
   html, body {{ height: 100%; margin: 0; }}
@@ -121,22 +167,33 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
     background: var(--bg);
     color: var(--text);
     font-family: var(--font);
+    -webkit-font-smoothing: antialiased;
   }}
+
   header {{
     flex: 0 0 auto;
     display: flex;
     align-items: center;
     gap: 0.6rem;
-    padding: 0.9rem 1.1rem;
-    border-bottom: 1px solid var(--border);
-    background: var(--panel);
+    padding: 0.95rem 1.4rem;
+    border-bottom: 1px solid var(--border-soft);
+    background: var(--panel-translucent);
+    backdrop-filter: saturate(180%) blur(14px);
+    -webkit-backdrop-filter: saturate(180%) blur(14px);
+    position: sticky;
+    top: 0;
+    z-index: 10;
   }}
-  header .brand {{ font-weight: 600; letter-spacing: 0.01em; color: var(--text); }}
+  header .brand {{ font-weight: 600; letter-spacing: -0.01em; color: var(--text); font-size: 0.95rem; }}
   [data-style="terminal"] header .brand::before {{ content: "> "; color: var(--muted); }}
+  header .tile-count {{
+    color: var(--muted);
+    font-size: 0.82rem;
+    margin-left: 0.15rem;
+  }}
 
   /* ---- live indicator: a solid core + two staggered outward-fading rings
-     (a "radar ping"), instead of the old single box-shadow pulse -- reads
-     as a genuine live/recording indicator rather than a blinking dot. ---- */
+     (a "radar ping"). ---- */
   .live-indicator {{
     position: relative;
     width: 10px;
@@ -166,7 +223,7 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
   [data-style="terminal"] .live-indicator .ring {{ border-radius: 2px; }}
   .live-indicator.live .core {{
     background: var(--live);
-    box-shadow: 0 0 7px 1px rgba(255, 85, 102, 0.65);
+    box-shadow: 0 0 7px 1px rgba(255, 59, 48, 0.55);
   }}
   .live-indicator.live .ring {{ animation: ring-ping 1.8s cubic-bezier(0.2, 0.6, 0.4, 1) infinite; }}
   .live-indicator.live .ring.d2 {{ animation-delay: 0.9s; }}
@@ -191,19 +248,12 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
 
   main {{
     flex: 1 1 auto;
-    /* Without this, flexbox refuses to shrink `main` below its content's
-       min-content height (a classic flexbox trap) -- meaning a tall enough
-       card could push the whole document taller than the viewport instead
-       of being contained/scrolling internally, which is exactly the
-       "bounding box extends downward" failure mode this page needs to
-       avoid. */
     min-height: 0;
     position: relative;
     display: flex;
-    background: var(--bg-gradient);
   }}
 
-  /* ---- idle / invalid states ---- */
+  /* ---- idle / invalid / closing single-card states ---- */
   .state {{
     flex: 1 1 auto;
     display: flex;
@@ -211,29 +261,56 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
     justify-content: center;
     padding: 2rem;
   }}
-  .state .card {{ text-align: center; max-width: 26rem; }}
-  .state h1 {{ font-size: 1.15rem; margin: 0 0 0.5rem; color: var(--text); }}
+  .state .card {{ text-align: center; max-width: 27rem; }}
+  .state h1 {{ font-size: 1.2rem; margin: 0 0 0.5rem; color: var(--text); font-weight: 600; letter-spacing: -0.01em; }}
   [data-style="terminal"] .state h1::before {{ content: "$ "; color: var(--accent); }}
-  .state p {{ color: var(--muted); margin: 0; line-height: 1.5; font-size: 0.95rem; }}
-  .state .icon {{ font-size: 2rem; margin-bottom: 0.75rem; opacity: 0.8; }}
+  .state p {{ color: var(--muted); margin: 0; line-height: 1.55; font-size: 0.95rem; }}
+  .state .icon {{ font-size: 2.1rem; margin-bottom: 0.85rem; opacity: 0.85; }}
   [data-style="terminal"] .state .icon {{ display: none; }}
 
-  /* ---- active state: the lifted card (description / video / chain-of-thought) ---- */
-  .stage {{
+  .closing-card {{
+    width: 100%;
+    max-width: 420px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1rem;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-lifted);
+    padding: 2.5rem 2rem;
+  }}
+  .closing-card .spinner {{
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    border: 2.5px solid var(--border);
+    border-top-color: var(--accent);
+    animation: spin 0.75s linear infinite;
+  }}
+  [data-style="terminal"] .closing-card .spinner {{ border-radius: 2px; }}
+  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+  .closing-card .label {{ font-size: 0.98rem; color: var(--text); font-weight: 500; }}
+  [data-style="terminal"] .closing-card .label::before {{ content: "$ "; color: var(--muted); }}
+
+  /* ---- the grid of tiles ---- */
+  .grid-wrap {{
     flex: 1 1 auto;
     min-height: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 0.9rem;
-    overflow: hidden;
+    overflow-y: auto;
+    padding: 1.5rem;
   }}
-  .stage .card {{
-    width: 100%;
-    max-width: 1320px;
-    height: 100%;
-    max-height: 900px;
-    min-height: 0;
+  .grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(380px, 460px));
+    justify-content: center;
+    gap: 1.35rem;
+    max-width: 1480px;
+    margin: 0 auto;
+  }}
+
+  .tile {{
     display: flex;
     flex-direction: column;
     background: var(--card-bg);
@@ -241,152 +318,132 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
     border-radius: var(--radius);
     box-shadow: var(--shadow);
     overflow: hidden;
+    transition: box-shadow 0.25s ease, border-color 0.25s ease, opacity 0.3s ease, transform 0.3s ease;
   }}
-  .titlebar {{ display: none; }}
-  [data-style="terminal"] .titlebar {{
+  .tile.tile-active {{
+    border-color: var(--accent);
+    box-shadow: var(--shadow), 0 0 0 3px var(--accent-soft);
+  }}
+  /* enter/exit transitions -- driven by a class toggled in JS one frame
+     after insertion, and removed just before a closed tab's tile is torn
+     out of the DOM, so tiles visibly settle in and fade out instead of
+     the grid re-flowing abruptly under an operator's eyes every poll. */
+  .tile.tile-enter {{ opacity: 0; transform: translateY(6px) scale(0.98); }}
+  .tile.tile-exit {{ opacity: 0; transform: scale(0.97); }}
+
+  .tile-head {{
+    flex: 0 0 auto;
     display: flex;
     align-items: center;
-    gap: 6px;
-    padding: 0.55rem 0.75rem;
-    background: #111;
-    border-bottom: 1px solid var(--border);
-    flex: 0 0 auto;
+    gap: 0.55rem;
+    padding: 0.8rem 1rem;
+    border-bottom: 1px solid var(--border-soft);
   }}
-  .tb-dot {{ width: 10px; height: 10px; border-radius: 50%; }}
-  .tb-dot.r {{ background: #ff5f56; }}
-  .tb-dot.y {{ background: #ffbd2e; }}
-  .tb-dot.g {{ background: #27c93f; }}
-  .tb-path {{ margin-left: 8px; color: #6b7280; font-size: 0.75rem; }}
-
-  .desc {{
+  .tile-head .dot {{
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--accent);
     flex: 0 0 auto;
-    padding: 0.85rem 1.1rem;
+    animation: pulse-soft 1.8s infinite;
+  }}
+  [data-style="terminal"] .tile-head .dot {{ border-radius: 1px; }}
+  @keyframes pulse-soft {{
+    0%, 100% {{ opacity: 1; }}
+    50% {{ opacity: 0.35; }}
+  }}
+  .tile-head .heading {{
+    font-weight: 600;
     font-size: 0.92rem;
     color: var(--text);
-    border-bottom: 1px solid var(--border);
+    letter-spacing: -0.01em;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    background: var(--card-bg);
   }}
-  [data-style="polished"] .desc {{ font-weight: 500; }}
-  [data-style="polished"] .desc::before {{
-    content: "";
-    display: inline-block;
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--accent);
-    margin-right: 0.55rem;
-    animation: pulse-soft 1.6s infinite;
+  [data-style="terminal"] .tile-head .heading::before {{ content: "$ "; color: var(--muted); }}
+  .tile-head .waiting-pill {{
+    margin-left: auto;
+    flex: 0 0 auto;
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    color: var(--warn);
+    background: var(--warn-soft);
+    padding: 0.2rem 0.5rem;
+    border-radius: 999px;
+    white-space: nowrap;
   }}
-  @keyframes pulse-soft {{
-    0%, 100% {{ opacity: 1; }}
-    50% {{ opacity: 0.3; }}
-  }}
-  [data-style="terminal"] .desc {{ color: var(--accent); }}
-  [data-style="terminal"] .desc::before {{ content: "$ "; color: var(--muted); }}
+  [data-style="terminal"] .tile-head .waiting-pill {{ border-radius: 2px; }}
 
-  /* Height is set in px by fitVideo() below, not by CSS aspect-ratio --
-     a pure-CSS aspect-ratio here fought with the card's own fixed max-height
-     whenever the two didn't agree (the video demanding more height than was
-     actually left after the desc/log rows, and overflowing/clipping the
-     card instead of shrinking). fitVideo() instead measures the real space
-     left after everything else in the card, then gives the video the
-     largest box matching the real Browserbase viewport's aspect ratio (see
-     BROWSER_VIEWPORT_WIDTH/HEIGHT above and channels/browserbase.py) that
-     still fits -- full card width whenever there's room (this is also
-     what makes the browsing window itself bigger), a bit shorter only if a
-     short window would otherwise squeeze the log away entirely. `flex: 0 0
-     auto` so this element's height is exactly what fitVideo() sets, not
-     stretched or shrunk again by flex-grow. */
-  .video-wrap {{
+  .tile-desc {{
+    flex: 0 0 auto;
+    padding: 0.55rem 1rem;
+    font-size: 0.82rem;
+    color: var(--muted-strong);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    border-bottom: 1px solid var(--border-soft);
+  }}
+  [data-style="terminal"] .tile-desc {{ color: var(--accent); }}
+  [data-style="terminal"] .tile-desc::before {{ content: "$ "; color: var(--muted); }}
+
+  .tile-video {{
     flex: 0 0 auto;
     width: 100%;
+    aspect-ratio: {BROWSER_VIEWPORT_WIDTH} / {BROWSER_VIEWPORT_HEIGHT};
     position: relative;
     background: #000;
   }}
-  .video-wrap iframe {{ position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }}
-
-  /* flex: 1 1 auto + min-height: 0 (not 0 0 auto/max-height) is the fix for
-     "the bounding box must not grow downward as updates accumulate": the
-     card's total height is fixed (max-height above), video-wrap above takes
-     only its own aspect-ratio height, and .log absorbs exactly whatever's
-     left -- new chain-of-thought lines scroll *inside* that fixed space
-     instead of pushing the card taller. */
-  .log {{
-    flex: 1 1 auto;
-    min-height: 0;
-    overflow-y: auto;
-    padding: 0.55rem 1.1rem;
-    font-size: 0.8rem;
-    line-height: 1.65;
-    color: var(--muted);
-    border-top: 1px solid var(--border);
-    background: var(--panel);
-  }}
-  /* Deliberately NOT display:none when empty (an earlier version did this):
-     .log now has a fixed share of the card's height via flex: 1 1 auto, so
-     hiding it when empty would leave that space blank anyway -- the same
-     dead-space problem, just relocated. An empty log is just an empty
-     scrollable panel until the first chain-of-thought line arrives. */
-  .log .empty-hint {{ color: var(--muted); opacity: 0.75; font-style: italic; }}
-  [data-style="terminal"] .log .empty-hint {{ font-style: normal; }}
-  .log .line {{ white-space: pre-wrap; word-break: break-word; }}
-  [data-style="polished"] .log .line::before {{ content: "\\2022  "; color: var(--accent); }}
-  [data-style="terminal"] .log {{ color: var(--text); }}
-  [data-style="terminal"] .log .line::before {{ content: "> "; color: var(--accent); }}
-  [data-style="terminal"] .log .line:last-child::after {{
-    content: "\\2588";
-    color: var(--accent);
-    margin-left: 2px;
-    animation: blink 1s step-end infinite;
-  }}
-  @keyframes blink {{ 50% {{ opacity: 0; }} }}
-
-  /* ---- closing: swapped in for `.video-wrap` the instant the backend
-     reports `closing: true` (see live_activity.set_closing) -- replaces
-     Browserbase's own iframe content, so its "Debugging connection was
-     closed" CDP-disconnect banner never has a chance to render. ---- */
-  .video-wrap.is-closing {{
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background: #000;
-  }}
-  .closing-msg {{
+  .tile-video iframe {{ position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }}
+  .tile-video .connecting {{
+    position: absolute;
+    inset: 0;
     display: flex;
     flex-direction: column;
     align-items: center;
-    gap: 0.85rem;
-    color: #f2f2f2;
-    font-size: 0.95rem;
-    letter-spacing: 0.01em;
+    justify-content: center;
+    gap: 0.6rem;
+    color: #8e8e93;
+    background: #0b0b0c;
   }}
-  [data-style="terminal"] .closing-msg {{ color: var(--accent); }}
-  [data-style="terminal"] .closing-msg::before {{ content: "$ "; color: var(--muted); }}
-  .closing-msg .spinner {{
-    width: 26px;
-    height: 26px;
+  .tile-video .connecting .spinner {{
+    width: 20px;
+    height: 20px;
     border-radius: 50%;
-    border: 2.5px solid rgba(255, 255, 255, 0.22);
-    border-top-color: #f2f2f2;
-    animation: spin 0.75s linear infinite;
+    border: 2px solid rgba(255, 255, 255, 0.18);
+    border-top-color: #b8b8bd;
+    animation: spin 0.8s linear infinite;
   }}
-  [data-style="terminal"] .closing-msg .spinner {{
-    border-radius: 2px;
-    border-color: rgba(57, 255, 136, 0.22);
-    border-top-color: var(--accent);
+  [data-style="terminal"] .tile-video .connecting .spinner {{ border-radius: 2px; }}
+  .tile-video .connecting span.label {{ font-size: 0.78rem; }}
+
+  .tile-log {{
+    flex: 1 1 auto;
+    min-height: 5.6rem;
+    max-height: 5.6rem;
+    overflow-y: auto;
+    padding: 0.55rem 1rem;
+    font-size: 0.76rem;
+    line-height: 1.55;
+    color: var(--muted);
+    background: var(--panel);
   }}
-  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
+  .tile-log .empty-hint {{ color: var(--muted); opacity: 0.7; font-style: italic; }}
+  [data-style="terminal"] .tile-log .empty-hint {{ font-style: normal; }}
+  .tile-log .line {{ white-space: pre-wrap; word-break: break-word; }}
+  [data-style="polished"] .tile-log .line::before {{ content: "\\2022  "; color: var(--accent); }}
+  [data-style="terminal"] .tile-log {{ color: var(--text); }}
+  [data-style="terminal"] .tile-log .line::before {{ content: "> "; color: var(--accent); }}
 
   footer {{
     flex: 0 0 auto;
     padding: 0.6rem 1.1rem;
     text-align: center;
     color: var(--muted);
-    font-size: 0.75rem;
-    border-top: 1px solid var(--border);
+    font-size: 0.74rem;
+    border-top: 1px solid var(--border-soft);
     background: var(--panel);
   }}
 </style>
@@ -400,6 +457,7 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
     </span>
     <span class="live-label">LIVE</span>
     <span class="brand">Messa</span>
+    <span class="tile-count" id="tileCount"></span>
   </header>
   <main id="main">
     <div class="state">
@@ -415,57 +473,30 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
 <script>
 (function () {{
   var TOKEN = "{token}";
-  var VIDEO_RATIO = {BROWSER_VIEWPORT_WIDTH} / {BROWSER_VIEWPORT_HEIGHT};
-  var MIN_LOG_HEIGHT = 90;   // px always left for the chain-of-thought log,
-                              // even on a short window, so the video never
-                              // squeezes it away entirely
-  var MIN_VIDEO_HEIGHT = 120; // px floor for the video itself
+  var TILE_LOG_LINES = {TILE_LOG_LINES};
   var main = document.getElementById("main");
   var dot = document.getElementById("dot");
-  // Tracks what's *currently rendered* in #main -- "idle", "invalid", or
-  // "active:<liveViewUrl>" -- so each render function only touches the DOM
-  // when the state actually changed, instead of every 4s poll tick. This is
-  // NOT the same thing as "have we ever rendered anything yet": the page
-  // starts on the static "Loading..." markup already in the HTML, which
-  // isn't any of these three states, so shownState starts at null. That
-  // distinction matters -- a plain "was a URL set before" check (what an
-  // earlier version of this page used) can't tell "still loading" apart
-  // from "confirmed idle," so the very first idle result -- a brand new
-  // link, or one visited before its first-ever deepsearch run -- would
-  // never overwrite the loading spinner at all.
-  var shownState = null;
-  var stepsShown = 0;      // how many chain-of-thought lines are already
-                            // rendered, so each poll only appends new ones
-  var lastSteps = [];      // most recent full steps array, kept around so
-                            // showClosing() can repopulate the log without
-                            // it blanking out right as the run wraps up
-  var stopped = false;     // true once we've confirmed the token is invalid
+  var tileCountEl = document.getElementById("tileCount");
+  // "loading" | "idle" | "invalid" | "closing" | "grid" -- which of the
+  // non-tile states is currently rendered in #main, so those states only
+  // touch the DOM when they actually change. The grid itself is reconciled
+  // separately (see renderGrid) since it can have 0..N tiles at once and
+  // needs to add/update/remove individual tile elements, not just flip
+  // between a handful of fixed states.
+  var shownState = "loading";
+  var tileEls = {{}};  // tile id -> {{ root, video, log, desc, heading, dot, waiting, stepsRendered }}
+  var stopped = false; // true once we've confirmed the token is invalid
 
-  // Sizes `.video-wrap` in real px: full card width whenever there's room
-  // (matching Browserbase's actual viewport ratio, so its embedded live-view
-  // page fills the box with no letterboxing/dead space), shrinking only if
-  // giving it full-width height would leave less than MIN_LOG_HEIGHT for the
-  // chain-of-thought log below. See the `.video-wrap` CSS comment above for
-  // why this is done in JS rather than a pure CSS aspect-ratio.
-  function fitVideo() {{
-    var card = document.querySelector(".stage .card");
-    var wrap = document.querySelector(".video-wrap");
-    if (!card || !wrap) return;
-    var titlebar = card.querySelector(".titlebar");
-    var desc = card.querySelector(".desc");
-    var chromeHeight = (titlebar ? titlebar.offsetHeight : 0) + (desc ? desc.offsetHeight : 0);
-    var availHeight = card.clientHeight - chromeHeight - MIN_LOG_HEIGHT;
-    var fullWidthHeight = wrap.clientWidth / VIDEO_RATIO;
-    var videoHeight = Math.max(MIN_VIDEO_HEIGHT, Math.min(fullWidthHeight, availHeight));
-    wrap.style.height = videoHeight + "px";
+  function clearTiles() {{
+    tileEls = {{}};
   }}
-  window.addEventListener("resize", fitVideo);
 
   function showIdle() {{
     dot.classList.remove("live");
+    tileCountEl.textContent = "";
     if (shownState === "idle") return;
     shownState = "idle";
-    stepsShown = 0;
+    clearTiles();
     main.innerHTML =
       '<div class="state"><div class="card">' +
       '<div class="icon">&#128065;</div>' +
@@ -475,82 +506,170 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
       '</div></div>';
   }}
 
-  function ensureStage(liveViewUrl) {{
-    var key = "active:" + liveViewUrl;
-    if (shownState === key) return;
-    shownState = key;
-    stepsShown = 0;
-    main.innerHTML =
-      '<div class="stage"><div class="card">' +
-      '<div class="titlebar"><span class="tb-dot r"></span><span class="tb-dot y"></span>' +
-      '<span class="tb-dot g"></span><span class="tb-path">deepsearch &mdash; live</span></div>' +
-      '<div class="desc" id="desc"></div>' +
-      '<div class="video-wrap"><iframe id="frame" allow="clipboard-read; clipboard-write"></iframe></div>' +
-      '<div class="log" id="log"></div>' +
-      '</div></div>';
-    document.getElementById("frame").src = liveViewUrl;
-    fitVideo();
-  }}
-
-  function appendSteps(logEl, steps) {{
-    for (var i = stepsShown; i < steps.length; i++) {{
-      var line = document.createElement("div");
-      line.className = "line";
-      line.textContent = steps[i];
-      logEl.appendChild(line);
-    }}
-    stepsShown = steps.length;
-    logEl.scrollTop = logEl.scrollHeight;
-  }}
-
-  function showActive(data) {{
-    dot.classList.add("live");
-    ensureStage(data.live_view_url);
-    var descEl = document.getElementById("desc");
-    if (descEl) descEl.textContent = data.description || "Working on it\\u2026";
-    var logEl = document.getElementById("log");
-    var steps = data.steps || [];
-    lastSteps = steps;
-    if (logEl) appendSteps(logEl, steps);
-    fitVideo(); // desc text can wrap to a second line, changing available height
-  }}
-
   function showClosing() {{
     // Proactive hand-off (see live_activity.set_closing/server.py's
     // `closing` field): the backend sets this the instant the run is done
     // but *before* the Browserbase session is actually released, so this
-    // replaces the iframe with a clean black screen well before Browserbase's
-    // own embedded page would otherwise render its "Debugging connection
-    // was closed" banner as the CDP connection tears down.
+    // replaces every tile with one clean "wrapping up" card well before
+    // Browserbase's own embedded pages would otherwise render their
+    // "Debugging connection was closed" banners as the CDP connection
+    // tears down.
     dot.classList.remove("live");
+    tileCountEl.textContent = "";
     if (shownState === "closing") return;
     shownState = "closing";
+    clearTiles();
     main.innerHTML =
-      '<div class="stage"><div class="card">' +
-      '<div class="titlebar"><span class="tb-dot r"></span><span class="tb-dot y"></span>' +
-      '<span class="tb-dot g"></span><span class="tb-path">deepsearch &mdash; live</span></div>' +
-      '<div class="desc" id="desc">Wrapping up&hellip;</div>' +
-      '<div class="video-wrap is-closing"><div class="closing-msg">' +
-      '<span class="spinner"></span><span>Compiling your results&hellip;</span>' +
-      '</div></div>' +
-      '<div class="log" id="log"></div>' +
+      '<div class="state"><div class="closing-card">' +
+      '<span class="spinner"></span>' +
+      '<span class="label">Compiling your results&hellip;</span>' +
       '</div></div>';
-    stepsShown = 0;
-    var logEl = document.getElementById("log");
-    if (logEl) appendSteps(logEl, lastSteps);
-    fitVideo();
   }}
 
   function showInvalid() {{
     dot.classList.remove("live");
+    tileCountEl.textContent = "";
     if (shownState === "invalid") return;
     shownState = "invalid";
+    clearTiles();
     main.innerHTML =
       '<div class="state"><div class="card">' +
       '<div class="icon">&#128683;</div>' +
       '<h1>This link isn&rsquo;t valid</h1>' +
       '<p>Double check the link Messa sent you, or ask her to resend it.</p>' +
       '</div></div>';
+  }}
+
+  function ensureGridShown() {{
+    if (shownState === "grid") return;
+    shownState = "grid";
+    clearTiles();
+    main.innerHTML = '<div class="grid-wrap"><div class="grid" id="grid"></div></div>';
+  }}
+
+  function buildTile(tile) {{
+    var root = document.createElement("div");
+    root.className = "tile tile-enter";
+    root.innerHTML =
+      '<div class="tile-head">' +
+        '<span class="dot"></span>' +
+        '<span class="heading"></span>' +
+        '<span class="waiting-pill" hidden></span>' +
+      '</div>' +
+      '<div class="tile-desc"></div>' +
+      '<div class="tile-video"></div>' +
+      '<div class="tile-log"></div>';
+    var refs = {{
+      root: root,
+      heading: root.querySelector(".heading"),
+      waiting: root.querySelector(".waiting-pill"),
+      desc: root.querySelector(".tile-desc"),
+      video: root.querySelector(".tile-video"),
+      log: root.querySelector(".tile-log"),
+      // Deliberately NOT initialized to `null` here: a tile's live_view_url
+      // legitimately starts out `null` too (still connecting), and
+      // updateTileVideo below skips re-rendering when the new value equals
+      // currentSrc -- starting both at `null` would mean that FIRST real
+      // "still connecting" render never happens at all (silently blank
+      // instead of showing the connecting placeholder). `undefined` never
+      // equals `null`, so the first call always proceeds.
+      currentSrc: undefined,
+    }};
+    return refs;
+  }}
+
+  function updateTileVideo(refs, liveViewUrl) {{
+    if (liveViewUrl === refs.currentSrc) return;
+    refs.currentSrc = liveViewUrl;
+    if (!liveViewUrl) {{
+      refs.video.innerHTML =
+        '<div class="connecting"><span class="spinner"></span>' +
+        '<span class="label">Connecting&hellip;</span></div>';
+      return;
+    }}
+    var iframe = document.createElement("iframe");
+    iframe.setAttribute("allow", "clipboard-read; clipboard-write");
+    iframe.src = liveViewUrl;
+    refs.video.innerHTML = "";
+    refs.video.appendChild(iframe);
+  }}
+
+  function updateTileLog(refs, steps) {{
+    var recent = (steps || []).slice(-TILE_LOG_LINES);
+    refs.log.innerHTML = "";
+    if (recent.length === 0) {{
+      var hint = document.createElement("div");
+      hint.className = "empty-hint";
+      hint.textContent = "Getting started\\u2026";
+      refs.log.appendChild(hint);
+      return;
+    }}
+    for (var i = 0; i < recent.length; i++) {{
+      var line = document.createElement("div");
+      line.className = "line";
+      line.textContent = recent[i];
+      refs.log.appendChild(line);
+    }}
+    refs.log.scrollTop = refs.log.scrollHeight;
+  }}
+
+  function updateTile(refs, tile) {{
+    refs.heading.textContent = tile.heading || "New tab";
+    refs.desc.textContent = tile.description || "Working on it\\u2026";
+    refs.root.classList.toggle("tile-active", !!tile.active);
+    if (tile.waiting_for_human) {{
+      refs.waiting.hidden = false;
+      refs.waiting.textContent = "Waiting for you";
+      refs.waiting.title = tile.waiting_for_human;
+    }} else {{
+      refs.waiting.hidden = true;
+      refs.waiting.removeAttribute("title");
+    }}
+    updateTileVideo(refs, tile.live_view_url);
+    updateTileLog(refs, tile.steps);
+  }}
+
+  function renderGrid(tiles) {{
+    dot.classList.add("live");
+    ensureGridShown();
+    var grid = document.getElementById("grid");
+    if (!grid) return;
+
+    tileCountEl.textContent = tiles.length > 1 ? tiles.length + " tabs active" : "";
+
+    var seen = {{}};
+    tiles.forEach(function (tile, index) {{
+      seen[tile.id] = true;
+      var refs = tileEls[tile.id];
+      if (!refs) {{
+        refs = buildTile(tile);
+        tileEls[tile.id] = refs;
+        grid.appendChild(refs.root);
+        // Next frame: drop tile-enter so the CSS transition actually
+        // animates from its initial (faded/offset) state instead of
+        // snapping straight to final -- browsers coalesce a same-frame
+        // class add+remove into a no-op transition otherwise.
+        requestAnimationFrame(function () {{
+          requestAnimationFrame(function () {{ refs.root.classList.remove("tile-enter"); }});
+        }});
+      }} else if (grid.children[index] !== refs.root) {{
+        // Keep DOM order matching the backend's own (stable, insertion-
+        // ordered) tile order -- cheap since this only reorders on an
+        // actual add/remove, not every poll.
+        grid.insertBefore(refs.root, grid.children[index] || null);
+      }}
+      updateTile(refs, tile);
+    }});
+
+    Object.keys(tileEls).forEach(function (id) {{
+      if (seen[id]) return;
+      var refs = tileEls[id];
+      delete tileEls[id];
+      refs.root.classList.add("tile-exit");
+      setTimeout(function () {{
+        if (refs.root.parentNode) refs.root.parentNode.removeChild(refs.root);
+      }}, 320);
+    }});
   }}
 
   function poll() {{
@@ -563,12 +682,12 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
           return;
         }}
         return res.json().then(function (data) {{
-          if (data.active && data.closing) {{
-            showClosing();
-          }} else if (data.active) {{
-            showActive(data);
-          }} else {{
+          if (!data.active) {{
             showIdle();
+          }} else if (data.closing) {{
+            showClosing();
+          }} else {{
+            renderGrid(data.tiles || []);
           }}
         }});
       }})

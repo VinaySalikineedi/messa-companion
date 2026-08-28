@@ -1772,6 +1772,124 @@ bundled together -- reinforcing that this feature is meant to be the same
 per-site work deepsearch always did sequentially, just parallelized, not a
 new or more elaborate kind of task.
 
+## Live view redesigned as a multi-tile grid, plus a real 5-minute session cutoff bug
+
+More real feedback from a real run: the cursor and multi-agent delegation
+themselves were confirmed working well, but the live view was *still*
+showing a blank page in your screenshots even after the previous round's
+`--isolated` fix -- because that fix made ONE tab visible (whichever was
+"active"), and your screenshots happened to be taken while a *different*
+tab than the one being followed was the one doing something. Your own
+proposed fix was better than mine: don't follow one tab at a time at all --
+show every open tab at once, the way Browserbase's own dashboard does (one
+live-view link per tab, per
+https://docs.browserbase.com/platform/browser/observability/session-live-view).
+Also reported: browser sessions cutting off at the 5-minute mark
+*entirely*, not scoped to one stuck tab; and a request to make the live page
+itself production-quality.
+
+### Root cause of the 5-minute cutoff: never our own code, a Browserbase project setting
+
+`DEEPSEARCH_HUMAN_HELP_MAX_TOTAL_SECONDS` is also 300 seconds (5 minutes),
+so it looked like the obvious suspect -- but reading through
+`request_human_help`, it only ever gives up on the ONE tab that's waiting
+and returns a `BLOCKED` string; it never closes the browser or ends the run.
+`DEEPSEARCH_MAX_SESSION_SECONDS` (1200s = 20 minutes) is the actual overall
+session cap, wrapped around both the top-level agent's own run and each
+`delegate_website_task` call. Neither of those is 5 minutes. The real cause,
+confirmed against Browserbase's own API docs: `browserbase.create_session`
+never passed a `timeout` in its request body, so every session silently
+inherited "the Project's `defaultTimeout`" -- a dashboard setting outside
+this repo entirely, evidently defaulting to 5 minutes on this project. That
+explains the exact symptom reported ("the whole browser session is cutting
+off at 5 min mark closing the entire task") regardless of whether a task
+ever hit a login wall at all. Fix: `config.BROWSERBASE_SESSION_TIMEOUT_SECONDS`
+(default 1800s = 30 minutes, comfortably above our own 1200s cap so our own
+code is what actually bounds a session day to day) is now passed explicitly
+on every `create_session` call -- no more dependency on an out-of-repo
+dashboard default.
+
+### The live view is now a grid: one tile per open tab, added and removed live
+
+`server.py`'s `/live/{token}/status` route no longer resolves a single
+"currently active" `live_view_url` (the previous round's approach) -- it now
+returns a `tiles` array, one entry per currently-open browser tab (the
+top-level orchestrator's own tab plus every live `delegate_website_task`
+sub-worker), each carrying its own `heading`, `description`, `steps`,
+`waiting_for_human`, and its own resolved `live_view_url`. A new
+`_build_live_tiles` helper makes exactly ONE `browserbase.get_session_pages`
+call per poll (not one per tile) and matches every tab's own last-known url
+against that single `pages[]` result -- a tab whose url has no match yet
+(Browserbase's `pages[]` isn't push-live; a just-opened tab can take a
+moment to show up) gets `live_view_url: null` rather than a stale or wrong
+url, and the page shows a "Connecting..." placeholder for that tile until a
+later poll resolves it. The top tile's heading is the task title Messa
+already sets (`live_view_task`); a sub-worker's tile heading is the
+hostname it's working on (`booking.com`, not the full url) via a small
+`_tile_heading` helper. The `active_tab_id` tracking added last round
+(originally meant to pick ONE tab to follow) wasn't thrown away -- it's now
+used to put a subtle accent ring on whichever tile is *currently* the busiest
+one, a nice-to-have on top of showing all of them rather than the whole
+mechanism.
+
+`live_view_page.py` is a substantial rewrite: a responsive CSS grid
+(`repeat(auto-fit, minmax(380px, 460px))`, centered) instead of one fixed
+card, each tile built and torn down by JS as tabs open and close (a
+`tile-enter`/`tile-exit` class pair driven by `requestAnimationFrame` gives
+new tiles a soft fade-and-settle-in and closed ones a fade-out, instead of
+the grid jumping under your eyes every 4-second poll). Each tile is
+deliberately small: a heading row (with a "Waiting for you" pill when that
+tab's `request_human_help` is active), one line of current description, the
+video, and a short log capped to `TILE_LOG_LINES = 4` most-recent lines --
+per your explicit ask ("bottom log updates maybe max of 3-5 lines"). The old
+per-tile-height `fitVideo()` JS hack (needed because a pure CSS
+`aspect-ratio` used to fight with the single big card's own fixed
+`max-height`) is gone entirely -- a grid tile just sizes itself, so a plain
+CSS `aspect-ratio: 1280/800` on the video area does the job with no JS
+involved.
+
+Design itself: rebuilt the "polished" skin from scratch as the actual
+production-facing one this time -- a light, neutral, San-Francisco-font
+look (`--bg: #f5f5f7`, white cards, a single blue accent, soft shadows
+instead of hard borders, `backdrop-filter: blur` on the sticky header) aimed
+squarely at "apple like website that is clean but elegant." Full dark-mode
+variables alongside it. The "terminal" skin (black/monospace/gritty) still
+works -- same markup, same JS, just its existing CSS variables -- for anyone
+with an old `?style=terminal` link bookmarked, but it wasn't where this
+round's design effort went; the docstring at the top of `live_view_page.py`
+says so explicitly.
+
+Verified with a real headless Chromium rendering the actual shipped page
+(not a mockup) against a mocked `/status` endpoint: multiple tiles render
+with zero JS console errors; a tile with no `live_view_url` yet shows the
+"Connecting..." placeholder correctly (an early version of this had a bug
+here -- comparing `null === null` on first render skipped ever drawing the
+placeholder at all, since a genuinely-still-connecting tab and "nothing
+rendered yet" both started out `null`; fixed by tracking a tile's rendered
+state with `undefined`, which never equals `null`, instead); a tile closing
+and a new one opening mid-poll animates correctly and lands the new tile in
+the freed grid slot; both the light and dark palettes and both skins render
+cleanly. On the backend, a new `/tmp/test_live_tiles.py` covers
+`_tile_heading` (plain hostnames, `data:`/`about:blank` urls, `None`),
+`_build_live_tiles` (url resolution with a match / no match yet / no
+session id / a failing Browserbase call; heading computation; the `active`
+flag), and the full `/live/<token>/status` route end-to-end through
+FastAPI's `TestClient` with real `live_activity` state populated the same
+way the real guarded()/`_delegate_website_task` code paths would. It
+supersedes the previous round's `/tmp/test_active_tab_live_view.py`, whose
+`server._resolve_active_tab_live_view_url` no longer exists (replaced by
+`_build_live_tiles`) -- that old file is left in place for the record but
+would fail if re-run as-is.
+
+**Caveat, same shape as every other one in this file:** the grid and tile
+resolution logic is verified against a real headless Chromium and a real
+FastAPI route with mocked Browserbase responses, not a live Browserbase
+account -- I don't have one in this sandbox. The one thing I'd specifically
+want watched on a real multi-site run: how quickly a newly-opened
+sub-worker tab's `pages[]` entry actually appears (governs how long its
+tile sits on "Connecting..." before the real video shows up), since that's
+paced entirely by Browserbase's own indexing, not anything in this code.
+
 ## Changes from your second round of testing
 
 - **Renamed browser_agent -> deepsearch.** Same subagent, new name

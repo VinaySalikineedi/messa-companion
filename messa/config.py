@@ -99,6 +99,27 @@ COMPOSIO_EMAIL_ACCOUNT = os.environ.get("COMPOSIO_EMAIL_CONNECTED_ACCOUNT_ID")
 # deepsearch to work at all now -- there's no local-Chromium fallback.
 BROWSERBASE_API_KEY = os.environ.get("BROWSERBASE_API_KEY")
 
+# Explicit session timeout (seconds), passed on every browserbase.create_session
+# call. Root-caused a real bug: whole deepsearch sessions -- including ones
+# that never touched request_human_help at all -- were cutting off at
+# exactly 5 minutes. DEEPSEARCH_HUMAN_HELP_MAX_TOTAL_SECONDS (also 300s) was
+# the obvious suspect but is scoped correctly (it only ever ends ONE tab's
+# wait, never the whole run -- see request_human_help), and
+# DEEPSEARCH_MAX_SESSION_SECONDS is 1200s, not 300s. The actual cause: we
+# never passed Browserbase's own `timeout` param on session creation, so it
+# silently fell back to "the Project's defaultTimeout" (confirmed via
+# https://docs.browserbase.com/reference/api/create-a-session) -- a
+# dashboard setting outside this code, evidently defaulting low (5 minutes)
+# on this project. Passing it explicitly here removes that dependency on an
+# out-of-repo dashboard setting entirely. Sized comfortably above
+# DEEPSEARCH_MAX_SESSION_SECONDS (our own belt-and-suspenders cap, which
+# fires first in the normal case) so this is a generous backstop, not the
+# thing actually bounding a session's length day to day. Browserbase accepts
+# 60-21600 seconds (max 6 hours); this is well inside that range.
+BROWSERBASE_SESSION_TIMEOUT_SECONDS = int(
+    os.environ.get("MESSA_BROWSERBASE_SESSION_TIMEOUT_SECONDS", "1800")
+)
+
 # ---- Live view sharing (Phase 3) ----
 # Base URL for the public /live/<token> page (see server.py + db.py's
 # live_share_token functions). Defaults to the now-permanent custom domain
