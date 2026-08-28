@@ -29,8 +29,8 @@
   el.style.filter = "drop-shadow(0 0 8px rgba(57, 255, 136, 0.5)) drop-shadow(0 4px 10px rgba(0,0,0,0.7))";
   el.style.transition = "transform 380ms cubic-bezier(0.25, 1, 0.5, 1)";
   el.innerHTML =
-    '<path d="M 2 2 L 2 34 L 10 26 L 16 38 L 22 35 L 16 23 L 26 23 Z" ' +
-    'fill="#39ff88" stroke="#000000" stroke-width="2" stroke-linejoin="round"/>';
+    '<path d="M 3 3 L 50 20 L 32 32 L 20 50 Z" ' +
+    'fill="#39ff88" stroke="#000000" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>';
 
   let currentSpotIndex = 0;
   let resetTimer = null;
