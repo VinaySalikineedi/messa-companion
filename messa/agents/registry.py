@@ -37,6 +37,7 @@ from ..tools.document_tools import DOCUMENT_SYSTEM_PROMPT, build_document_tools
 from ..tools.email_tools import EMAIL_SYSTEM_PROMPT, build_email_tools
 from ..tools.executive_tools import build_executive_subagent
 from ..tools.routines_tools import ROUTINES_SYSTEM_PROMPT, build_routines_tools
+from ..tools.web_search_tools import build_web_search_tools
 
 ORCHESTRATOR_LABEL = "messa"
 
@@ -140,6 +141,7 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
     raw_tools: list[BaseTool] = [
         confirm_pending_action, reject_pending_action, list_pending_actions,
         track_project, list_active_projects, save_profile_info, list_deepsearch_sessions,
+        *build_web_search_tools(),
     ]
     return trace_all(raw_tools, ORCHESTRATOR_LABEL)
 
@@ -217,6 +219,16 @@ def _build_system_prompt(user: config.UserContext) -> str:
         "task tool: deepsearch (web browsing/research), executive_assistant (tasks, "
         "reminders, notes, contacts, calendar), email_agent (the user's own inbox), "
         "document_agent (generates PDFs), routines_agent (recurring automations).\n\n"
+        "Speed matters: you also have web_search and fetch_page_text as your OWN direct "
+        "tools (no delegation, no browser, answers in a second or two). Use these yourself "
+        "for a plain factual lookup -- a fact, current news, a definition, 'what's the score', "
+        "'who is X', 'what does this article say' -- instead of delegating to deepsearch, "
+        "which opens an actual browser session and is real overhead when nothing needs to be "
+        "clicked. Reserve deepsearch for anything that genuinely requires interacting with a "
+        "page: clicking through a flow, filling out a form, logging in, building a cart, or a "
+        "site whose content doesn't show up in a plain page fetch (JS-rendered). If web_search/ "
+        "fetch_page_text come back empty or error out, that's your cue to delegate to "
+        "deepsearch instead, not to give up.\n\n"
         f"{known_str}"
         f"{time_str}"
         f"{onboarding_str}"

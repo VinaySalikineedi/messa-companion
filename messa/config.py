@@ -62,7 +62,7 @@ def _require(name: str) -> str:
 # pinning the dated snapshot (`deepseek/deepseek-v4-pro-0813`) via
 # MESSA_MODEL, no code change needed either way.
 OPENROUTER_API_KEY = _require("OPENROUTER_API_KEY")
-ORCHESTRATOR_MODEL_NAME = os.environ.get("MESSA_MODEL", "deepseek/deepseek-v4-pro-0813")
+ORCHESTRATOR_MODEL_NAME = os.environ.get("MESSA_MODEL", "~deepseek/deepseek-v4-pro")
 SUBAGENT_MODEL_NAME = os.environ.get("MESSA_SUBAGENT_MODEL", "~deepseek/deepseek-v4-flash-latest")
 
 # Backward-compatible alias: kept in case anything (or you) still refers to
@@ -165,6 +165,31 @@ DEEPSEARCH_ALLOWED_DOMAINS: list[str] = [
 # need many steps, and hitting this cap is expected/handled (the session is
 # saved and can be resumed) rather than an error condition.
 DEEPSEARCH_MAX_STEPS = int(os.environ.get("MESSA_DEEPSEARCH_MAX_STEPS", "100"))
+
+# How long (ms) @playwright/mcp waits after each action for triggered work
+# (a re-render, an XHR, an animation) to "settle" before returning control --
+# an unconditional per-action wait, not a timeout ceiling like the two
+# below. The package's own default (500ms) is a conservative one-size-fits-
+# all value; most pages settle well under that, so this is turned down a
+# bit as a real, if modest, per-action latency win across every single
+# click/type/navigate deepsearch makes. Not verified against a live
+# Browserbase session from this sandbox (no live account here) -- if you
+# start seeing "stale snapshot"/race-condition-looking failures on slower
+# sites after this change, raise it back toward 500.
+DEEPSEARCH_TIMEOUT_SETTLE_MS = int(os.environ.get("MESSA_DEEPSEARCH_TIMEOUT_SETTLE_MS", "200"))
+
+# Visible cursor on the live view (see tools/deepsearch_tools.py's
+# BrowserToolProvider._move_cursor_to and messa/assets/cursor_overlay.js).
+# Deliberately opt-out rather than opt-in: this is a real, if small, per-
+# click latency cost (one extra internal browser_evaluate round-trip plus
+# the CSS transition itself, ~250ms) in exchange for a visible pointer on
+# the live-view page -- an explicit trade users asked for. Turn it off
+# (false) if that latency isn't worth it for your use case; the browser
+# session still opens/closes exactly the same either way, only the
+# cosmetic cursor-move calls are skipped.
+DEEPSEARCH_CURSOR_OVERLAY = os.environ.get("MESSA_DEEPSEARCH_CURSOR_OVERLAY", "true").strip().lower() in (
+    "1", "true", "yes",
+)
 
 # Step budget for executive_assistant (tasks/reminders/notes/contacts/
 # calendar), deliberately small and separate from DEEPSEARCH_MAX_STEPS --

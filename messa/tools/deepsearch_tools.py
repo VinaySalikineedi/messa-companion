@@ -52,6 +52,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -86,6 +87,64 @@ SNAPSHOT_DEPENDENT_TOOLS = {
 }
 
 _SESSION_REF_RE = re.compile(r"session\s*#?\s*(\d+)", re.IGNORECASE)
+
+# @playwright/mcp's own snapshot refs (from browser_snapshot's output, e.g.
+# "[ref=e12]") are always exactly this "e<number>" shape -- verified
+# empirically against the real, currently-pinned package version (see
+# README's "Deepsearch speed" section) by running it headless in this
+# sandbox and inspecting a live snapshot's ref format directly, not
+# assumed from documentation. browser_click/type/hover/select_option/drag
+# all accept a `target` that's EITHER one of these opaque refs OR "a unique
+# element selector" (role=.../text=.../css.../#id) that Playwright resolves
+# fresh on every call -- a selector carries none of the staleness risk a
+# ref does (the whole reason SNAPSHOT_DEPENDENT_TOOLS below requires a
+# fresh browser_snapshot first), so only an actual ref-shaped target needs
+# one.
+_SNAPSHOT_REF_RE = re.compile(r"^e\d+$")
+
+# Cursor visualization on the live view (per explicit user request, after
+# evaluating ghost-cursor/"Playwright-cursor" -- see README's "Cursor
+# visualization" section for why those need a raw Playwright Page object
+# we don't have, and why this cheaper, in-page approach was chosen
+# instead). --init-script (a real, confirmed @playwright/mcp flag) injects
+# messa/assets/cursor_overlay.js into every page before any of its own
+# scripts run, which defines window.__messaCursor.moveTo(x, y) -- an SVG
+# arrow that CSS-transitions to a point and resolves once the transition
+# finishes. BrowserToolProvider._move_cursor_to below calls that, via a
+# raw (non-model-facing, non-approval-gated) browser_evaluate call, for
+# whichever element a click/type/hover/select_option is about to target --
+# using the exact SAME target the real action will use next, so the arrow
+# genuinely goes where the click will land rather than somewhere
+# approximate.
+_CURSOR_OVERLAY_SCRIPT_PATH = Path(__file__).resolve().parent.parent / "assets" / "cursor_overlay.js"
+CURSOR_ANIMATED_TOOLS = {"browser_click", "browser_type", "browser_hover", "browser_select_option"}
+_CURSOR_MOVE_FN = (
+    "(element) => {"
+    "const rect = element.getBoundingClientRect();"
+    "const x = rect.left + rect.width / 2;"
+    "const y = rect.top + rect.height / 2;"
+    "return window.__messaCursor ? window.__messaCursor.moveTo(x, y) : undefined;"
+    "}"
+)
+
+
+def _target_values(name: str, kwargs: dict[str, Any]) -> list[str]:
+    if name == "browser_drag":
+        return [v for v in (kwargs.get("startTarget"), kwargs.get("endTarget")) if v]
+    v = kwargs.get("target")
+    return [v] if v else []
+
+
+def _requires_fresh_snapshot(name: str, kwargs: dict[str, Any]) -> bool:
+    """True only when every target this call touches looks like an opaque
+    snapshot ref (or no target was given at all, the conservative default).
+    A stable selector-style target skips the freshness requirement entirely
+    -- see the module-level comment above _SNAPSHOT_REF_RE for why that's
+    safe, and the README for the empirical verification behind it."""
+    targets = _target_values(name, kwargs)
+    if not targets:
+        return True
+    return any(_SNAPSHOT_REF_RE.match(t) for t in targets)
 
 
 def _describe_action(name: str, args: dict[str, Any]) -> str:
@@ -189,6 +248,13 @@ class BrowserToolProvider:
         self._bb_session_id: str | None = None
         self.live_view_url: str | None = None
         self.tools: list[BaseTool] = []
+        # Raw (unwrapped) MCP tools by name, kept for internal use only --
+        # currently just browser_evaluate, called directly by
+        # _move_cursor_to without going through _guard()'s approval-gating
+        # (that gate is for the MODEL choosing to run arbitrary JS; this is
+        # our own cosmetic, non-model-initiated side effect and must never
+        # prompt for or be blocked by human approval).
+        self._raw_tools_by_name: dict[str, BaseTool] = {}
         # Shared mutable state referenced by the closures below.
         self._state = {"consecutive_errors": 0, "snapshot_fresh": False}
 
@@ -238,10 +304,31 @@ class BrowserToolProvider:
             # Without PATH/HOME passed through, the spawned npx subprocess
             # can't even find node_modules/npx's own cache -- still needed
             # here even though the browser itself is remote now.
+            mcp_args = [
+                "@playwright/mcp@latest", "--cdp-endpoint", connect_url,
+                # --image-responses omit: our subagent model
+                # (config.SUBAGENT_MODEL_NAME) isn't confirmed to
+                # accept image inputs, so a screenshot tool result
+                # would otherwise embed a base64 image the model
+                # can't actually use -- pure wasted tokens. This
+                # also means we're deliberately NOT enabling
+                # --caps=vision (the coordinate-click tools that
+                # capability adds are useless without a
+                # vision-capable model reading a screenshot first)
+                # -- revisit only once the subagent model is
+                # confirmed to support vision.
+                "--image-responses", "omit",
+                # See config.DEEPSEARCH_TIMEOUT_SETTLE_MS's comment
+                # for why this is turned down from the package's
+                # own 500ms default.
+                "--timeout-settle", str(config.DEEPSEARCH_TIMEOUT_SETTLE_MS),
+            ]
+            if config.DEEPSEARCH_CURSOR_OVERLAY:
+                mcp_args += ["--init-script", str(_CURSOR_OVERLAY_SCRIPT_PATH)]
             self._client = MultiServerMCPClient({
                 "playwright": {
                     "command": "npx",
-                    "args": ["@playwright/mcp@latest", "--cdp-endpoint", connect_url],
+                    "args": mcp_args,
                     "transport": "stdio",
                     "env": dict(os.environ),
                 }
@@ -249,6 +336,7 @@ class BrowserToolProvider:
             self._session_cm = self._client.session("playwright")
             self._session = await self._session_cm.__aenter__()
             raw_tools = await load_mcp_tools(self._session)
+            self._raw_tools_by_name = {t.name: t for t in raw_tools}
             self.tools = [self._guard(t) for t in raw_tools]
             console.system(f"Deepsearch: launched with {len(self.tools)} Playwright tools.")
         except Exception as e:  # noqa: BLE001
@@ -283,6 +371,28 @@ class BrowserToolProvider:
                 console.tool_error(LABEL, "browserbase_release", str(e))
         console.system("Deepsearch: browser closed.")
 
+    async def _move_cursor_to(self, element: str | None, target: str | None) -> None:
+        """Best-effort, cosmetic-only: animate the injected SVG cursor (see
+        cursor_overlay.js) to whatever element `target` resolves to, using
+        the SAME target/ref the real action is about to use, so the arrow
+        genuinely lands where the click will. Calls the RAW browser_evaluate
+        tool directly -- never the guarded/model-facing one -- so this never
+        prompts for human approval and is invisible to the model entirely.
+        Any failure here (element not found, no cursor script loaded, a
+        slow page) is swallowed: this must never block or fail the real
+        action it's decorating."""
+        if not config.DEEPSEARCH_CURSOR_OVERLAY or not target:
+            return
+        evaluate_tool = self._raw_tools_by_name.get("browser_evaluate")
+        if evaluate_tool is None:
+            return
+        try:
+            await evaluate_tool.coroutine(
+                element=element or "target element", target=target, function=_CURSOR_MOVE_FN,
+            )
+        except Exception as e:  # noqa: BLE001 - cosmetic only, never surfaced to the model
+            console.system(f"Deepsearch: cursor overlay move failed (non-fatal): {e}")
+
     def _guard(self, original: BaseTool) -> BaseTool:
         name = original.name
         state = self._state
@@ -308,11 +418,17 @@ class BrowserToolProvider:
             if name == "browser_snapshot":
                 state["snapshot_fresh"] = True
 
-            if name in SNAPSHOT_DEPENDENT_TOOLS and not state["snapshot_fresh"]:
+            if (
+                name in SNAPSHOT_DEPENDENT_TOOLS
+                and _requires_fresh_snapshot(name, display_args)
+                and not state["snapshot_fresh"]
+            ):
                 msg = (
-                    "ERROR: You must call browser_snapshot before using element refs. "
-                    "The page may have changed since your last snapshot. Take a fresh "
-                    "snapshot now, then retry this action with a valid ref."
+                    "ERROR: You must call browser_snapshot before using an element ref like "
+                    "'e12'. The page may have changed since your last snapshot. Take a fresh "
+                    "snapshot now, then retry with a valid ref -- or use a stable selector "
+                    "(role=..., text=..., a CSS selector) instead of a ref, which doesn't "
+                    "require a fresh snapshot at all."
                 )
                 console.tool_result(LABEL, name, msg)
                 return msg
@@ -327,6 +443,9 @@ class BrowserToolProvider:
                         live_activity.add_step(self._user_id, f"Blocked: you declined \"{action_desc}\"")
                     return msg
                 state["snapshot_fresh"] = False
+
+            if name in CURSOR_ANIMATED_TOOLS:
+                await self._move_cursor_to(kwargs.get("element"), kwargs.get("target"))
 
             try:
                 result = await original.coroutine(*args, **kwargs)
@@ -355,13 +474,28 @@ class BrowserToolProvider:
 
 DEEPSEARCH_SYSTEM_PROMPT = (
     "You are deepsearch, the browser automation and research specialist. You perform web "
-    "browsing tasks delegated to you by Messa, the orchestrator. You may be picking up a "
-    "task you already made progress on in an earlier run -- if the message history already "
-    "contains snapshots/navigation, you're continuing, not starting over; don't repeat "
-    "completed steps.\n"
+    "browsing tasks delegated to you by Messa, the orchestrator -- Messa only sends you tasks "
+    "that genuinely need a real browser (clicking, forms, logins, carts, anything JS-rendered "
+    "or interactive); a plain lookup she could answer with a quick search shouldn't reach you "
+    "at all. You may be picking up a task you already made progress on in an earlier run -- if "
+    "the message history already contains snapshots/navigation, you're continuing, not "
+    "starting over; don't repeat completed steps.\n"
     "- Break the goal into steps.\n"
     "- After navigating, always call browser_snapshot to read actual page content.\n"
-    "- Only use element refs from the MOST RECENT snapshot.\n"
+    "- Speed matters -- users notice how long this takes. Prefer the cheaper tool for what you "
+    "actually need right now instead of defaulting to a full browser_snapshot every time:\n"
+    "  - browser_find(text=... or regex=...) locates one specific element (and its ref) "
+    "without capturing the whole page -- use it when you know what you're looking for.\n"
+    "  - browser_snapshot's own `depth` argument returns a shallower tree when you just need "
+    "to confirm something worked, not the full page layout.\n"
+    "  - browser_click/browser_type/browser_hover/browser_select_option/browser_drag accept "
+    "EITHER an element ref from a snapshot ('e12') OR a stable selector directly (e.g. "
+    "'role=button[name=\"Add to cart\"]', 'text=Submit', a CSS selector) -- a stable selector "
+    "doesn't require a fresh snapshot first, so reuse one directly for a repeat interaction "
+    "(e.g. clicking the same kind of button again) instead of re-snapshotting.\n"
+    "- Only use an element REF from the MOST RECENT snapshot -- a ref from an older snapshot "
+    "may point at the wrong element if the page changed since. This restriction doesn't apply "
+    "to selector-style targets, which Playwright resolves fresh every time.\n"
     "- Base every factual claim strictly on text that literally appears in snapshots.\n"
     "- If a tool result starts with 'BLOCKED:' or 'ERROR', do not retry the exact same "
     "action; take a fresh snapshot or try a different approach.\n"

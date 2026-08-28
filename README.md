@@ -1047,6 +1047,235 @@ point at this as the real counterpart, and `routines_agent`'s system
 prompt/docstring no longer says a confirmed job "isn't actually executed
 yet" -- it is, now, in production.
 
+## Deepsearch speed: evaluating your researched tools
+
+You and other users reported deepsearch feeling slow, and separately asked
+about a visible cursor on the live view. You'd researched seven specific
+tools/techniques and asked me to evaluate and implement them. Here's what
+I found, verified where I could, and did -- three implemented now (no new
+architecture, no new risk), one implemented in a deliberately narrower
+form than proposed, one I'd recommend against, and one still open (the
+cursor) because it's got a real trade-off against the speed goal you also
+asked for -- see the question at the end of this section.
+
+### What I verified, and how
+
+Before touching anything, I checked what our actual dependency already
+supports, rather than assuming from documentation. `@playwright/mcp` (the
+exact package deepsearch already runs, `--help` output captured against
+the pinned `@latest` version) turns out to already implement most of what
+you researched -- it just wasn't configured or prompted to use it. I also
+spun up a real headless instance of it in this sandbox (using the
+pre-installed Chromium) and called `browser_snapshot`/`browser_find`
+directly to see actual tool schemas and the actual `ref` format (`e6`,
+`e7`, ...) rather than guessing -- a live public site couldn't be reached
+from here (same sandbox network restriction as everywhere else in this
+project), but the tool schemas and ref format came back real and exact.
+
+### 1. Accessibility Tree (AXTree) pruning -- already how we work, tuned further
+
+Deepsearch was never vision-based -- `browser_snapshot` already returns an
+accessibility tree, not a screenshot, which is the whole idea behind this
+suggestion. What WAS missing: `@playwright/mcp` ships a purpose-built
+`browser_find(text=... / regex=...)` tool -- "cheaper than capturing the
+whole snapshot when you only need to locate an element" -- and
+`browser_snapshot` itself takes a `depth` argument for a shallower tree,
+but `DEEPSEARCH_SYSTEM_PROMPT` never told the model either existed, so it
+always reached for a full snapshot. Both are now called out explicitly in
+the prompt. Also added two CLI flags on the `@playwright/mcp` subprocess
+launch (`tools/deepsearch_tools.py`'s `BrowserToolProvider.__aenter__`):
+`--image-responses omit` (never embeds a base64 screenshot in a tool
+result -- our subagent model isn't confirmed to accept image input at
+all, so that would be pure wasted tokens today) and a tuned-down
+`--timeout-settle` (`config.DEEPSEARCH_TIMEOUT_SETTLE_MS`, default 200ms
+vs the package's own 500ms default -- an unconditional per-action wait,
+so this is a real, if modest, latency cut on every single click/type/
+navigate). **Caveat:** I couldn't verify the settle-time change against a
+live Browserbase session (no live account here) -- if you see stale-
+snapshot-looking flakiness after this on slower sites, raise it back
+toward 500 via `MESSA_DEEPSEARCH_TIMEOUT_SETTLE_MS`.
+
+### 2. Vision + Set-of-Marks navigation -- available, NOT enabled by default
+
+`@playwright/mcp` also already has this built in (`--caps=vision`, adding
+coordinate-click tools like `browser_mouse_click_xy`) -- Playwright's own
+docs are explicit that it "trades efficiency for coverage": more tokens
+(screenshots) and slower, used only for elements a page's accessibility
+tree doesn't expose at all (canvas UIs, some custom widgets). I did NOT
+enable it: your subagent model (`config.SUBAGENT_MODEL_NAME`) isn't
+confirmed to accept image inputs on OpenRouter, and coordinate-click tools
+are useless without a model that can actually look at the screenshot
+first -- turning this on today would just add tool-schema token overhead
+for a capability the model can't use, the opposite of the goal. If you
+confirm/switch to a vision-capable subagent model later, this is a
+one-flag addition (`--caps vision`) plus a prompt note to use it only as
+a last resort when accessibility-tree navigation genuinely fails.
+
+### 3. Stagehand by Browserbase -- recommend against, for now
+
+Verified: Stagehand does have first-class Python, TypeScript, and Go SDKs
+with matching `act`/`extract`/`observe`/`agent` primitives, and does
+offer server-side caching of successful actions (its real speed/cost
+lever -- skipping the LLM call on a repeat action against a page it's
+seen before). But three things weigh against adopting it right now: (a)
+`stagehand-py` on PyPI is explicitly self-described as "an early release"
+seeking feedback -- meaningfully less mature than the TypeScript SDK; (b)
+it requires `BROWSERBASE_PROJECT_ID` in addition to the API key we
+already use, a new required config value; (c) most importantly, adopting
+it means replacing deepsearch's tool layer entirely with Stagehand's own
+primitives -- which directly reverses the explicit call you made when we
+moved deepsearch onto Browserbase (see "Browserbase" above): "This
+deliberately does *not* use Browserbase's own Stagehand/agent product...
+Keeping your own fine-tuned agent driving the browser: yes, fully
+preserved." I didn't want to quietly walk that back. The caching idea
+itself is worth revisiting later if repeat-task volume grows (the same
+grocery-cart-style request happening often for the same user/site is
+exactly Stagehand's best case) -- but as a deliberate future option, not
+something I built into this pass.
+
+### 4. Direct Playwright Role/Text selectors -- already supported, guard relaxed to use it
+
+This was the single biggest concrete win, and it needed zero new
+dependencies: `browser_click`/`browser_type`/`browser_hover`/
+`browser_select_option`/`browser_drag` already accept a `target` that's
+EITHER an opaque snapshot ref ("e12") OR, per the tool's own schema,
+"a unique element selector" (`role=button[name="Submit"]`, `text=Submit`,
+a CSS selector) -- resolved fresh by Playwright on every call. Our own
+guard layer (`SNAPSHOT_DEPENDENT_TOOLS` in `deepsearch_tools.py`) was
+needlessly requiring a fresh `browser_snapshot` before EVERY one of these
+calls, even when the model already had a perfectly stable selector and
+didn't need a ref at all -- forcing an unnecessary full-snapshot round
+trip before every single interaction. `_requires_fresh_snapshot` now only
+enforces that requirement when the target actually looks like an opaque
+ref (verified live: always exactly `e<number>`, via `_SNAPSHOT_REF_RE`) --
+a selector-style target skips the check entirely, since Playwright
+resolves it fresh regardless of what changed on the page. The system
+prompt now tells the model to reuse a stable selector directly for a
+repeat interaction instead of re-snapshotting. Covered by a unit test
+against the exact ref/selector shapes involved.
+
+### 5. Hybrid non-browser lookup tool -- implemented, given to Messa directly
+
+This is the other big win, and probably the most impactful for typical
+usage: a lot of what gets delegated to deepsearch is a plain lookup ("what's
+the score", "who is X", "what does this article say") that doesn't need a
+browser at all -- and deepsearch pays a real, fixed cost before it does
+anything useful (opening a Browserbase session, launching `@playwright/mcp`
+over CDP, a full ReAct loop with the whole Playwright tool schema loaded).
+New `messa/tools/web_search_tools.py` gives Messa two direct tools of her
+own -- `web_search` (DuckDuckGo, via the actively-maintained `ddgs`
+package, no API key) and `fetch_page_text` (plain HTTP GET + HTML-to-text,
+via `httpx`+`beautifulsoup4`) -- and her system prompt now tells her to
+use these herself for a plain factual lookup, reserving deepsearch for
+anything that actually requires clicking, forms, logins, or JS-rendered
+content a plain fetch can't see. Deliberately placed on MESSA's own
+toolset, not nested inside deepsearch -- the whole point is deciding
+"does this need a browser" *before* one ever opens; putting it inside
+deepsearch would mean the Browserbase session is already open by the time
+that decision gets made. Both tools fail closed with a message that
+explicitly points back to deepsearch as the fallback, rather than
+silently giving up, when the plain-HTTP approach can't handle a page.
+**Caveat**, same shape as this project's earlier geocoding-API work: this
+sandbox's own outbound network is restricted to a package-registry
+allowlist, so the live DuckDuckGo call itself can't be exercised
+end-to-end from here (confirmed live: it genuinely 403s through this
+sandbox's proxy) -- verified instead via unit tests against the pure
+formatting/extraction logic and the tools' own failure-handling path with
+DDGS/httpx faked. Any normal deployment target has unrestricted outbound
+HTTPS.
+
+## Cursor visualization: the open question
+
+The other user ask -- a visible cursor moving on the live view -- has a
+real tension with the speed work above that I didn't want to resolve on
+your behalf without asking. What I verified:
+
+- **ghost-cursor** is real and well-maintained, but it's built around
+  direct access to a Puppeteer/Playwright `Page` object (it computes a
+  bezier-curve path and dispatches a sequence of real `mouse.move` events
+  along it) -- something that only exists inside the Node process actually
+  driving the browser. We don't hold that object in our Python code at
+  all; we only talk to `@playwright/mcp` over the MCP protocol as a
+  black-box tool server. Using ghost-cursor for real would mean either
+  forking `@playwright/mcp` to inject it (ongoing maintenance burden
+  against a fast-moving upstream project) or writing and maintaining our
+  own much smaller custom browser driver in place of it -- a real rewrite,
+  not a config change.
+- **"Playwright-cursor"** as a distinct, separate package could not be
+  found under that name in an npm/GitHub search -- what exists are
+  community Playwright *ports* of ghost-cursor itself (`ghost-cursor-
+  playwright`, `playwright-ghost-cursor`, a couple of similarly-named
+  forks with modest adoption), not a separate, established tool. I'd
+  treat "ghost-cursor" and "Playwright-cursor" as the same idea rather
+  than two independent options to evaluate.
+- Either way, a visible, human-paced cursor is drawn deliberately slower
+  than an instant click *by design* (that's what makes it look human/
+  visible at all) -- directly in tension with "the agent is too slow,"
+  and it can be tuned down, but not to zero without the animation
+  becoming imperceptible again.
+- There's a cheaper alternative within our CURRENT architecture, no
+  rewrite required: `@playwright/mcp` has a documented `--init-script
+  <path>` flag (confirmed in the real `--help` output) that runs a JS file
+  in every page before its own scripts do. That script could draw a small
+  floating dot and move it to a target element's bounding box just before
+  each click, entirely inside the page -- no raw CDP mouse events, no
+  forked driver. It's real work (a new init script, and a way for our
+  guard code to trigger the move -- most likely via `browser_evaluate`,
+  which exists today but is currently gated behind approval since it's
+  normally model-invoked; using it internally for this would need to
+  bypass that gate for this one, non-model-chosen purpose) and it still
+  costs a bit of extra time per click, just less than full ghost-cursor-
+  style human-motion simulation.
+
+I asked, and you chose the cheap DOM-overlay approach, with an SVG cursor
+arrow rather than a plain dot. Implemented:
+
+- **`messa/assets/cursor_overlay.js`**: injected into every page via
+  `@playwright/mcp`'s real, confirmed `--init-script` flag (verified in
+  the actual `--help` output, not assumed). Defines
+  `window.__messaCursor.moveTo(x, y)`, drawing a small blue SVG arrow
+  (fixed-position, `pointer-events: none` so it never interferes with the
+  page, always on top) that CSS-transitions to a point over ~220ms and
+  resolves a Promise once the transition finishes.
+- **`BrowserToolProvider._move_cursor_to`** (in `deepsearch_tools.py`):
+  called from the guard for `browser_click`/`browser_type`/`browser_hover`/
+  `browser_select_option` (`CURSOR_ANIMATED_TOOLS`) right before the real
+  action runs, with the SAME `element`/`target` the real action is about
+  to use -- so the arrow genuinely goes where the click will land, not
+  somewhere approximate. It does this via a raw, internal call to the
+  underlying `browser_evaluate` MCP tool -- deliberately bypassing
+  `_guard`'s own approval gate entirely (that gate exists for the MODEL
+  choosing to run arbitrary JS; this is our own cosmetic, non-model-
+  initiated side effect and must never prompt for or be blocked by human
+  approval). Any failure here (element not found, page not settled yet) is
+  swallowed and logged, never allowed to block or fail the real action --
+  this is decoration, not a dependency the automation relies on.
+- **`config.DEEPSEARCH_CURSOR_OVERLAY`** (env: `MESSA_DEEPSEARCH_CURSOR_OVERLAY`,
+  default `true`): an explicit off-switch, since this is a real, if small,
+  added cost per click (one extra internal `browser_evaluate` round-trip
+  plus the ~220-260ms transition) -- turning it off skips both the
+  `--init-script` flag and every `_move_cursor_to` call entirely, with the
+  automation itself completely unaffected either way.
+
+**What this deliberately does NOT do**, consistent with the "cheap" framing
+you chose over the full rewrite: no bezier-curve path or multi-step human-
+motion simulation (ghost-cursor's actual technique) -- just one clean move
+per interaction. `browser_drag` isn't included in `CURSOR_ANIMATED_TOOLS`
+(a drag has two endpoints, not one, and animating both cheaply needs a bit
+more thought) -- worth revisiting if drag-based flows come up.
+
+**Caveat, same shape as everywhere else in this section:** I could not
+verify this against a live Browserbase live-view session from this
+sandbox (no live account here) -- I confirmed the injected script's JS is
+syntactically valid (`node --check`) and that `_move_cursor_to` calls
+through correctly with fakes standing in for the real MCP tool, but
+whether Browserbase's live-view screencast visibly renders this overlay
+exactly as expected (z-index conflicts with a specific site's own fixed-
+position elements, an unusually slow page where the 260ms fallback fires
+before the real transition, etc.) can only really be confirmed by watching
+a real session. If the arrow doesn't show up or looks off on a specific
+site, that's the first thing to check.
+
 ## Changes from your second round of testing
 
 - **Renamed browser_agent -> deepsearch.** Same subagent, new name

@@ -43,3 +43,12 @@ python-dateutil>=2.9.0
 fastapi>=0.121.0
 uvicorn[standard]>=0.38.0
 httpx>=0.28.1
+
+# Messa's own direct web_search/fetch_page_text tools (messa/tools/
+# web_search_tools.py) -- a no-browser fallback for plain lookups, so
+# deepsearch's full Browserbase+Playwright MCP session is reserved for
+# tasks that actually need to interact with a page. ddgs (formerly
+# "duckduckgo-search", renamed) needs no API key; beautifulsoup4 turns a
+# fetched page's raw HTML into readable text.
+duckduckgo-search>=7.0.0
+beautifulsoup4>=4.12.0
