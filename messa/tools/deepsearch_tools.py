@@ -224,7 +224,7 @@ class CursorDriver:
         self._pending: dict[int, asyncio.Future] = {}
         self._reader_task: asyncio.Task | None = None
 
-    async def start(self, cdp_url: str) -> bool:
+    async def start(self, cdp_url: str, init_script_path: str | None = None) -> bool:
         """Spawns cursor_driver.mjs and connects it to the SAME CDP
         endpoint @playwright/mcp itself is using (a second, independent
         connection -- see the module docstring's "Multi-site delegation"
@@ -233,7 +233,19 @@ class CursorDriver:
         connection can genuinely move the mouse on a page a different
         process is driving). Returns False (never raises) on any failure --
         the caller falls back to the DOM-only cursor for the whole run
-        rather than trying to partially recover."""
+        rather than trying to partially recover.
+
+        `init_script_path`, when given, is registered via THIS connection's
+        own `context.addInitScript()` (see cursor_driver.mjs's own comment
+        on the `connect` handler for the full story) -- the actual, verified
+        way cursor_overlay.js reaches a real page in --cdp-endpoint mode,
+        since @playwright/mcp's own --init-script flag was confirmed (by a
+        real local reproduction against a real --cdp-endpoint-connected
+        instance) to silently never fire in that mode at all, on any tab.
+        `_spawn_mcp_http_server` still passes --init-script too, best-effort,
+        for the one case this driver doesn't cover: DEEPSEARCH_CURSOR_OVERLAY
+        on with DEEPSEARCH_HUMAN_CURSOR_DRIVER off (no CursorDriver running
+        at all)."""
         try:
             self._proc = await asyncio.create_subprocess_exec(
                 "node", str(_CURSOR_DRIVER_SCRIPT_PATH),
@@ -243,7 +255,10 @@ class CursorDriver:
                 env=dict(os.environ),
             )
             self._reader_task = asyncio.create_task(self._read_loop())
-            resp = await self._call("connect", timeout=15, cdpUrl=cdp_url)
+            connect_kwargs: dict[str, Any] = {"cdpUrl": cdp_url}
+            if init_script_path:
+                connect_kwargs["initScriptPath"] = init_script_path
+            resp = await self._call("connect", timeout=15, **connect_kwargs)
             ok = bool(resp and resp.get("ok"))
             if not ok:
                 console.system(f"Deepsearch: cursor driver connect failed: {resp}")
@@ -742,7 +757,17 @@ class BrowserToolProvider:
                 # the cosmetic cursor upgrade didn't come up.
                 if config.DEEPSEARCH_CURSOR_OVERLAY and config.DEEPSEARCH_HUMAN_CURSOR_DRIVER:
                     driver = CursorDriver()
-                    started = await driver.start(connect_url)
+                    # See CursorDriver.start's own docstring: this is what
+                    # actually gets cursor_overlay.js onto the page in
+                    # --cdp-endpoint mode -- @playwright/mcp's own
+                    # --init-script flag (still passed below, best-effort)
+                    # was confirmed not to fire at all in this mode.
+                    init_script_path = (
+                        str(_CURSOR_OVERLAY_SCRIPT_PATH)
+                        if (config.DEEPSEARCH_CURSOR_OVERLAY or config.DEEPSEARCH_READING_ANIMATION)
+                        else None
+                    )
+                    started = await driver.start(connect_url, init_script_path=init_script_path)
                     self._cursor_driver = driver if started else None
             except Exception as e:  # noqa: BLE001
                 console.tool_error(LABEL, "browserbase_cdp_connect", str(e))

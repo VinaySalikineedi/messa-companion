@@ -2103,6 +2103,88 @@ cursor driver wiring, pause loop, live-link tests) re-run clean, confirming
 this reorder didn't disturb anything else that touches `live_activity`
 during the same window.
 
+## Tiles stable, but no live logs and no visible cursor -- two more real bugs
+
+Once tiles stopped flickering, you flagged two things left: each tile's
+description/log wasn't updating even though real work was happening, and
+the cursor never appeared on any tab despite actions clearly executing.
+Both were real, separate bugs, not the same root cause -- and the cursor
+one uncovered something bigger than just the cursor.
+
+### Missing live logs: enrichment matched by EXACT url, which routinely doesn't match
+
+`_build_live_tiles` builds one tile per real Browserbase page, then
+enriches it with our own tracked description/step log by looking up that
+page's url in a dict keyed by whatever url we last told `browser_navigate`
+to go to. That's fragile: what we navigated to and what Browserbase's
+`pages[]` later reports as that tab's real, current url routinely differ
+on a redirect (`kayak.com` -> `https://www.kayak.com/`), an added query
+string, or a trailing slash -- any mismatch meant the lookup silently
+missed and that tile's log just never populated, even while the tab was
+genuinely active.
+
+Fixed with a hostname-based fallback match (`_host_key`, tried after an
+exact url match fails) -- reliable specifically because of this app's own
+design: `DEEPSEARCH_SYSTEM_PROMPT` enforces one website per
+`delegate_website_task` call, so in ordinary use every concurrently open
+tab is already on a distinct host, making hostname matching essentially as
+unambiguous as a working url match would have been. Verified with a test
+that deliberately gives the fake Browserbase pages redirected/www/query-
+string-drifted urls and confirms both the top-level tile and a sub-worker
+tile still show their real, live description and steps.
+
+### Cursor invisible: `--init-script` never fires in `--cdp-endpoint` mode -- confirmed locally, root-caused, and fixed
+
+This one had a much bigger real cause than "the cursor is broken":
+`@playwright/mcp`'s `--init-script` flag -- the mechanism the whole cursor
+overlay AND the reading-animation feature depend on to get
+`cursor_overlay.js` onto a page at all -- silently never runs when
+`@playwright/mcp` connects to an already-running browser via
+`--cdp-endpoint` (deepsearch's real mode against Browserbase). It only
+works when `@playwright/mcp` launches its own local browser, a different
+internal code path. This wasn't a guess: reproduced directly against a
+real local Chromium with `@playwright/mcp`'s actual package, both for the
+tab that already existed at connect time and for a brand-new tab opened
+afterward -- `window.__messaCursor` came back `"undefined"` on both, every
+time. Meaning: the cursor overlay (and reading-animation) has likely never
+actually worked against a real Browserbase session, regardless of which
+cursor mode was configured -- this was the first time it got tested against
+the real thing end-to-end.
+
+The fix doesn't route through `--init-script` or `context.addInitScript()`
+at all (a follow-up local test showed `addInitScript` registered from one
+independent CDP connection also doesn't reliably reach a page a *different*
+independent connection is the one navigating -- the exact shape of
+`cursor_driver.mjs` vs. `@playwright/mcp`, two separate connections to the
+same Browserbase session). Instead, `cursor_driver.mjs`'s `registerTab`
+handler now directly `page.evaluate()`s `cursor_overlay.js`'s source onto
+the exact page it just found, the moment it finds it -- an immediate
+execution in a document that already exists, not a "run before future
+scripts" registration, which a follow-up local test confirmed works
+reliably regardless of which connection later drives that page.
+`registerTab` already runs once when a tab opens and again after every
+`browser_navigate` (`_assert_cursor_marker`), so this same call re-mounts
+the overlay after a real navigation wipes it, with no new call site needed.
+`--init-script` stays in `_spawn_mcp_http_server` too, best-effort, for the
+one gap this doesn't cover (`DEEPSEARCH_CURSOR_OVERLAY` on with
+`DEEPSEARCH_HUMAN_CURSOR_DRIVER` off, so no `cursor_driver.mjs` running at
+all).
+
+Verified end-to-end against the real `cursor_driver.mjs` process (its
+actual JSON-lines protocol, not a stand-in) driving a page navigated
+entirely by a *separate* connection: the overlay mounts on first
+`registerTab`, survives a real `move` command actually moving the arrow,
+and correctly re-mounts after a real navigation wipes the page and
+`registerTab` runs again -- matching exactly how Python re-asserts the
+cursor marker after every `browser_navigate` today.
+
+### Cursor size
+
+Also fixed while in there: the arrow's scale was `2.7` (`2.1` mid-click) on
+a 56x56 base SVG -- about 151px on the real 1280x800 browser viewport,
+nearly 12% of its width. Now `0.65`/`0.5` -- about 36px, clearly visible
+without dominating the screen. Confirmed with a rendered screenshot.
+
 ## Changes from your second round of testing
 
 - **Renamed browser_agent -> deepsearch.** Same subagent, new name

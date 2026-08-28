@@ -131,6 +131,33 @@ def _tile_heading(url: str | None) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
+def _host_key(url: str | None) -> str | None:
+    """Hostname-based matching key for _build_live_tiles's enrichment step
+    -- a real, reproducible fix for "the tiles stopped showing live
+    thoughts/actions" once tile existence started coming straight from
+    Browserbase's own pages[] (see that function's own docstring): matching
+    a real page to our own tracked description/steps by EXACT url equality
+    is fragile in practice -- what we last told @playwright/mcp to navigate
+    to (`activity["url"]`/a sub-worker's `tabs[id]["url"]`) and what
+    Browserbase's pages[] later reports as that tab's real, current url
+    routinely differ on a redirect, an added/stripped trailing slash, a
+    www. prefix, or a query string the site itself appends -- any of which
+    would silently make `known_by_url.get(url)` miss, leaving that tile's
+    description/log permanently empty even while real work is happening on
+    it. Hostname is a far more robust identifier here specifically because
+    of this app's own design: DEEPSEARCH_SYSTEM_PROMPT enforces one website
+    per delegate_website_task call, so in ordinary use every concurrently
+    open tab is already on a DISTINCT host -- host equality is essentially
+    as unambiguous as url equality would be if it worked, without the
+    redirect/formatting fragility. Reuses _tile_heading's own hostname
+    extraction (same www-stripping) so both sides of a match are computed
+    identically. Returns None for anything that isn't a real, distinguishing
+    host (a still-blank tab, a data: url mid-navigation) -- matching on
+    "New tab" would risk attaching one blank tab's log to a different one."""
+    heading = _tile_heading(url)
+    return heading if heading != "New tab" else None
+
+
 def _hide_navbar(url: str | None) -> str | None:
     """Appends Browserbase's documented `navbar=false` param to a live-view
     url, hiding its own embedded chrome (address bar/tab strip) so the tile
@@ -207,30 +234,46 @@ async def _build_live_tiles(status: dict, activity: dict) -> list[dict]:
     pages = sorted(pages, key=lambda p: p.get("id") or p.get("url") or "")
 
     known_by_url: dict[str, dict] = {}
+    known_by_host: dict[str, dict] = {}
+
+    def _track(url: str | None, entry: dict) -> None:
+        if not url:
+            return
+        known_by_url[url] = entry
+        host_key = _host_key(url)
+        if host_key:
+            # last-write-wins on a host collision (two tracked tabs somehow
+            # on the same host) -- acceptable, matches this dict's existing
+            # exact-url behavior for the same edge case.
+            known_by_host[host_key] = entry
+
     top_url = activity.get("url")
     if top_url:
-        known_by_url[top_url] = {
+        _track(top_url, {
             "heading": status.get("task"),
             "description": activity.get("description"),
             "steps": activity.get("steps") or [],
             "waiting_for_human": activity.get("waiting_for_human"),
             "tab_id": None,
-        }
+        })
     for tab_id, tab in (activity.get("tabs") or {}).items():
-        if tab.get("url"):
-            known_by_url[tab["url"]] = {
-                "heading": None,
-                "description": tab.get("description"),
-                "steps": tab.get("steps") or [],
-                "waiting_for_human": tab.get("waiting_for_human"),
-                "tab_id": tab_id,
-            }
+        _track(tab.get("url"), {
+            "heading": None,
+            "description": tab.get("description"),
+            "steps": tab.get("steps") or [],
+            "waiting_for_human": tab.get("waiting_for_human"),
+            "tab_id": tab_id,
+        })
 
     active_tab_id = activity.get("active_tab_id")
     tiles = []
     for i, page in enumerate(pages):
         url = page.get("url")
-        known = known_by_url.get(url)
+        # Exact url match first (still the most precise when it happens to
+        # line up); hostname match as the robust fallback -- see
+        # _host_key's own docstring for why exact url matching alone was
+        # silently losing every tile's live description/log.
+        known = known_by_url.get(url) or known_by_host.get(_host_key(url))
         tiles.append({
             "id": page.get("id") or url or f"page-{i}",
             "heading": (known.get("heading") if known else None) or _tile_heading(url),

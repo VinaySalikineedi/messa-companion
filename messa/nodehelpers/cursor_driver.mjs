@@ -45,6 +45,7 @@
 
 import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
 
 // createRequire rather than `import { chromium } from 'playwright'`: both
 // playwright and human-cursor are CommonJS packages, and require() is the
@@ -66,6 +67,25 @@ let browser = null;
 let context = null;
 // marker -> { page, cursor }
 const tabs = new Map();
+
+// cursor_overlay.js's own source, read once at connect time (see the
+// `connect` handler) -- injected directly via page.evaluate() every time a
+// tab is (re)registered, NOT via @playwright/mcp's --init-script flag or
+// this connection's own context.addInitScript(). Both of those were
+// confirmed, by direct local reproduction, to NOT reliably reach a page
+// that a DIFFERENT, independent connectOverCDP connection (i.e.
+// @playwright/mcp's own, completely separate from this driver's) is the
+// one actually navigating -- which is deepsearch's exact real
+// architecture, so neither mechanism ever actually got cursor_overlay.js
+// (or the reading-animation feature sharing the same file) onto a real
+// page in production. A direct, immediate page.evaluate() of the script's
+// source, run through THIS driver's own connection right after it finds
+// the target page (same discovery findPageByMarker already does), was
+// separately confirmed to work reliably regardless of which connection
+// later drives that page -- it's not a "run before future scripts"
+// registration, it's just running JS in the document that already exists
+// right now, which any CDP client attached to that same renderer can do.
+let overlaySource = null;
 
 async function findPageByMarker(marker, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
@@ -102,6 +122,21 @@ async function handleCommand(msg) {
     }
     context = contexts[0];
     log(`connected to ${msg.cdpUrl}`);
+
+    // Best-effort, kept as a secondary/future-proofing registration --
+    // see overlaySource's own comment above for why the REAL, verified
+    // injection now happens in registerTab below instead. Harmless either
+    // way: cursor_overlay.js's own top-of-file guards make it safe to run
+    // more than once on the same document.
+    if (msg.initScriptPath) {
+      try {
+        overlaySource = readFileSync(msg.initScriptPath, 'utf8');
+        await context.addInitScript({ path: msg.initScriptPath });
+        log(`loaded overlay script (${overlaySource.length} bytes) and registered it as a best-effort context-level init script`);
+      } catch (e) {
+        log(`failed to load/register overlay script (non-fatal, registerTab's direct evaluate is the real mechanism): ${e && e.message || e}`);
+      }
+    }
     return {};
   }
 
@@ -110,6 +145,26 @@ async function handleCommand(msg) {
     const page = await findPageByMarker(msg.marker, msg.timeoutMs ?? 8000);
     if (!page) {
       throw new Error(`no page with window.name === ${JSON.stringify(msg.marker)} appeared in time`);
+    }
+    // The actual fix for "cursor overlay never appears": directly evaluate
+    // cursor_overlay.js's source onto this exact page RIGHT NOW, through
+    // THIS driver's own connection -- see overlaySource's module comment
+    // for why this (immediate execution in a document that already exists)
+    // works reliably where addInitScript/--init-script (a "run before
+    // future scripts" registration, confirmed unreliable across
+    // independent connections) did not. registerTab is called once when a
+    // tab first opens AND again after every browser_navigate on it (see
+    // Python's _assert_cursor_marker) -- re-running this here every time is
+    // exactly what re-mounts the overlay after a real navigation wipes the
+    // page's JS state, with no separate call path needed for that. Best-
+    // effort: a mid-navigation page (evaluate racing a new document load)
+    // must never fail tab registration itself, just this cosmetic step.
+    if (overlaySource) {
+      try {
+        await page.evaluate(overlaySource);
+      } catch (e) {
+        log(`overlay script evaluate failed for tab ${msg.marker} (non-fatal): ${e && e.message || e}`);
+      }
     }
     // performRandomMoves=false: idle-breathing/resting-spot motion is the
     // DOM overlay's job (cursor_overlay.js) -- this driver only ever moves

@@ -70,9 +70,24 @@
     return spots[index % spots.length];
   }
 
-  function setCursorTransform(x, y, scale = 1.35, instant = false) {
+  // scale 0.65 (0.5 during the click-pulse) -- was 2.7/2.1, which rendered
+  // the 56x56 base SVG at ~151px on the real 1280x800 browser viewport
+  // (nearly 12% of its width, confirmed oversized -- explicit user
+  // feedback). 0.65 renders at ~36px, proportionate for a viewport this
+  // size while still being clearly visible on the live view.
+  function setCursorTransform(x, y, scale = 0.65, instant = false) {
     lastX = x;
     lastY = y;
+    // instant=true (real mouse events, see below) skips the CSS transition:
+    // human-cursor already dispatches dozens of intermediate mousemove
+    // events per bezier-path move (confirmed empirically, see
+    // /tmp/test_cursor_driver_live.py's history -- ~50+ events for one
+    // on-screen move), so the motion is already smooth from the real event
+    // stream itself; layering the transition on TOP of that would make the
+    // arrow visibly lag half a step behind where the real cursor actually
+    // is. The idle-breathing/resting-spot drift below (JS-driven, not from
+    // real events) keeps using the transition -- that's still just two
+    // widely-spaced endpoints, which is exactly what the transition is for.
     el.style.transition = instant ? "none" : TRANSITION_ON;
     el.style.transform = `translate(${x}px, ${y}px) scale(${scale})`;
   }
@@ -83,7 +98,7 @@
     idlePulseInterval = setInterval(() => {
       const offsetX = Math.floor(Math.random() * 24) - 12;
       const offsetY = Math.floor(Math.random() * 24) - 12;
-      setCursorTransform(lastX + offsetX, lastY + offsetY, 1.35);
+      setCursorTransform(lastX + offsetX, lastY + offsetY, 0.65);
     }, 2400);
   }
 
@@ -91,7 +106,7 @@
     if (!el.isConnected) {
       (document.body || document.documentElement).appendChild(el);
       const spot = getRestingSpot(currentSpotIndex);
-      setCursorTransform(spot.x, spot.y, 1.35);
+      setCursorTransform(spot.x, spot.y, 0.65);
       startIdleBreathing();
     }
   }
@@ -100,7 +115,7 @@
     ensureMounted();
     currentSpotIndex = (currentSpotIndex + 1) % 5;
     const spot = getRestingSpot(currentSpotIndex);
-    setCursorTransform(spot.x, spot.y, 1.35);
+    setCursorTransform(spot.x, spot.y, 0.65);
     startIdleBreathing();
   }
 
@@ -109,13 +124,13 @@
     if (resetTimer) clearTimeout(resetTimer);
     if (idlePulseInterval) clearInterval(idlePulseInterval);
 
-    setCursorTransform(x, y, 1.35);
+    setCursorTransform(x, y, 0.65);
 
     // Pulse down slightly to simulate a click press
     setTimeout(() => {
-      setCursorTransform(x, y, 1.05);
+      setCursorTransform(x, y, 0.5);
       setTimeout(() => {
-        setCursorTransform(x, y, 1.35);
+        setCursorTransform(x, y, 0.65);
       }, 120);
     }, 180);
 
@@ -182,15 +197,17 @@
   // with the page's own event handling (this arrow has pointer-events:none
   // and must stay purely observational).
   document.addEventListener("mousemove", (e) => {
-    onRealPointerActivity(e.clientX, e.clientY, 1.35);
+    onRealPointerActivity(e.clientX, e.clientY, 0.65);
   }, { capture: true, passive: true });
 
   document.addEventListener("mousedown", (e) => {
-    onRealPointerActivity(e.clientX, e.clientY, 1.05);
+    // Pulse down, mirroring moveTo()'s own click-pulse -- but driven by a
+    // REAL mousedown this time, not a timer guessing when the click landed.
+    onRealPointerActivity(e.clientX, e.clientY, 0.5);
   }, { capture: true, passive: true });
 
   document.addEventListener("mouseup", (e) => {
-    onRealPointerActivity(e.clientX, e.clientY, 1.35);
+    onRealPointerActivity(e.clientX, e.clientY, 0.65);
   }, { capture: true, passive: true });
 })();
 
