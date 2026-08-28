@@ -18,20 +18,21 @@
 
   const SVG_NS = "http://www.w3.org/2000/svg";
   const el = document.createElementNS(SVG_NS, "svg");
-  el.setAttribute("width", "56");
-  el.setAttribute("height", "56");
-  el.setAttribute("viewBox", "0 0 56 56");
+  el.setAttribute("width", "100");
+  el.setAttribute("height", "40");
+  el.setAttribute("viewBox", "0 0 100 40");
   el.style.position = "fixed";
   el.style.top = "0";
   el.style.left = "0";
   el.style.zIndex = "2147483647";
   el.style.pointerEvents = "none";
-  el.style.filter = "drop-shadow(0 0 8px rgba(57, 255, 136, 0.5)) drop-shadow(0 4px 10px rgba(0,0,0,0.7))";
+  el.style.filter = "drop-shadow(0 0 6px rgba(57, 255, 136, 0.4)) drop-shadow(0 3px 8px rgba(0,0,0,0.6))";
   const TRANSITION_ON = "transform 380ms cubic-bezier(0.25, 1, 0.5, 1)";
   el.style.transition = TRANSITION_ON;
   el.innerHTML =
-    '<path d="M 3 3 L 50 20 L 32 32 L 20 50 Z" ' +
-    'fill="#39ff88" stroke="#000000" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>';
+    '<path d="M 3 3 L 18 16 L 11 16 L 8 22 Z" fill="#39ff88" stroke="#000000" stroke-width="1.8" stroke-linejoin="round" stroke-linecap="round"/>' +
+    '<rect x="18" y="3" width="48" height="17" rx="5" fill="rgba(6, 10, 18, 0.92)" stroke="#39ff88" stroke-width="1.2"/>' +
+    '<text x="42" y="15" fill="#39ff88" font-family="-apple-system, BlinkMacSystemFont, \'Segoe UI\', Roboto, sans-serif" font-size="10" font-weight="700" text-anchor="middle" letter-spacing="0.06em">messa</text>';
 
   let currentSpotIndex = 0;
   let resetTimer = null;
@@ -52,19 +53,9 @@
     return spots[index % spots.length];
   }
 
-  function setCursorTransform(x, y, scale = 2.7, instant = false) {
+  function setCursorTransform(x, y, scale = 1.0, instant = false) {
     lastX = x;
     lastY = y;
-    // instant=true (real mouse events, see below) skips the CSS transition:
-    // human-cursor already dispatches dozens of intermediate mousemove
-    // events per bezier-path move (confirmed empirically, see
-    // /tmp/test_cursor_driver_live.py's history -- ~50+ events for one
-    // on-screen move), so the motion is already smooth from the real event
-    // stream itself; layering the transition on TOP of that would make the
-    // arrow visibly lag half a step behind where the real cursor actually
-    // is. The idle-breathing/resting-spot drift below (JS-driven, not from
-    // real events) keeps using the transition -- that's still just two
-    // widely-spaced endpoints, which is exactly what the transition is for.
     el.style.transition = instant ? "none" : TRANSITION_ON;
     el.style.transform = `translate(${x}px, ${y}px) scale(${scale})`;
   }
@@ -75,7 +66,7 @@
     idlePulseInterval = setInterval(() => {
       const offsetX = Math.floor(Math.random() * 24) - 12;
       const offsetY = Math.floor(Math.random() * 24) - 12;
-      setCursorTransform(lastX + offsetX, lastY + offsetY, 2.7);
+      setCursorTransform(lastX + offsetX, lastY + offsetY, 1.0);
     }, 2400);
   }
 
@@ -83,7 +74,7 @@
     if (!el.isConnected) {
       (document.body || document.documentElement).appendChild(el);
       const spot = getRestingSpot(currentSpotIndex);
-      setCursorTransform(spot.x, spot.y, 2.7);
+      setCursorTransform(spot.x, spot.y, 1.0);
       startIdleBreathing();
     }
   }
@@ -92,7 +83,7 @@
     ensureMounted();
     currentSpotIndex = (currentSpotIndex + 1) % 5;
     const spot = getRestingSpot(currentSpotIndex);
-    setCursorTransform(spot.x, spot.y, 2.7);
+    setCursorTransform(spot.x, spot.y, 1.0);
     startIdleBreathing();
   }
 
@@ -101,13 +92,13 @@
     if (resetTimer) clearTimeout(resetTimer);
     if (idlePulseInterval) clearInterval(idlePulseInterval);
 
-    setCursorTransform(x, y, 2.7);
+    setCursorTransform(x, y, 1.0);
 
     // Pulse down slightly to simulate a click press
     setTimeout(() => {
-      setCursorTransform(x, y, 2.1);
+      setCursorTransform(x, y, 0.85);
       setTimeout(() => {
-        setCursorTransform(x, y, 2.7);
+        setCursorTransform(x, y, 1.0);
       }, 120);
     }, 180);
 
@@ -174,17 +165,15 @@
   // with the page's own event handling (this arrow has pointer-events:none
   // and must stay purely observational).
   document.addEventListener("mousemove", (e) => {
-    onRealPointerActivity(e.clientX, e.clientY, 2.7);
+    onRealPointerActivity(e.clientX, e.clientY, 1.0);
   }, { capture: true, passive: true });
 
   document.addEventListener("mousedown", (e) => {
-    // Pulse down, mirroring moveTo()'s own click-pulse -- but driven by a
-    // REAL mousedown this time, not a timer guessing when the click landed.
-    onRealPointerActivity(e.clientX, e.clientY, 2.1);
+    onRealPointerActivity(e.clientX, e.clientY, 0.85);
   }, { capture: true, passive: true });
 
   document.addEventListener("mouseup", (e) => {
-    onRealPointerActivity(e.clientX, e.clientY, 2.7);
+    onRealPointerActivity(e.clientX, e.clientY, 1.0);
   }, { capture: true, passive: true });
 })();
 

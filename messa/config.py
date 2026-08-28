@@ -62,7 +62,7 @@ def _require(name: str) -> str:
 # pinning the dated snapshot (`deepseek/deepseek-v4-pro-0813`) via
 # MESSA_MODEL, no code change needed either way.
 OPENROUTER_API_KEY = _require("OPENROUTER_API_KEY")
-ORCHESTRATOR_MODEL_NAME = os.environ.get("MESSA_MODEL", "deepseek/deepseek-v4-pro-0813")
+ORCHESTRATOR_MODEL_NAME = os.environ.get("MESSA_MODEL", "~deepseek/deepseek-v4-pro")
 SUBAGENT_MODEL_NAME = os.environ.get("MESSA_SUBAGENT_MODEL", "~deepseek/deepseek-v4-flash-latest")
 
 # Backward-compatible alias: kept in case anything (or you) still refers to
@@ -292,10 +292,13 @@ DEEPSEARCH_MAX_SUBAGENTS = int(os.environ.get("MESSA_DEEPSEARCH_MAX_SUBAGENTS", 
 # Step budget for ONE delegate_website_task sub-worker -- deliberately
 # smaller than DEEPSEARCH_MAX_STEPS (the top-level deepsearch agent's own
 # budget covering however many sites it delegates in total): a sub-worker is
-# scoped to exactly one site with a narrow instruction, not the whole task,
-# so it should never need as many steps as the orchestrator that's
-# coordinating several of these at once.
-DEEPSEARCH_SUBAGENT_MAX_STEPS = int(os.environ.get("MESSA_DEEPSEARCH_SUBAGENT_MAX_STEPS", "15"))
+# scoped to exactly ONE site and ONE goal, not the whole task, mirroring what
+# deepsearch used to do sequentially per site before multi-site delegation
+# existed -- not a new, more open-ended kind of task. Kept deliberately
+# tight (your explicit ask: "I don't want these sessions to go longer") --
+# enough for navigate -> snapshot -> a couple of actions -> a final read, not
+# a multi-page exploration.
+DEEPSEARCH_SUBAGENT_MAX_STEPS = int(os.environ.get("MESSA_DEEPSEARCH_SUBAGENT_MAX_STEPS", "8"))
 
 # Step budget for executive_assistant (tasks/reminders/notes/contacts/
 # calendar), deliberately small and separate from DEEPSEARCH_MAX_STEPS --
