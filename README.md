@@ -1890,6 +1890,63 @@ sub-worker tab's `pages[]` entry actually appears (governs how long its
 tile sits on "Connecting..." before the real video shows up), since that's
 paced entirely by Browserbase's own indexing, not anything in this code.
 
+## Live view tile count was wrong (real bug), and reverting to the terminal skin as default
+
+Real feedback from a real 4-tab run: our tile grid rendered only **1** tile
+even though Browserbase's own debugger showed 4 real tabs open in the
+session. Also: the "polished" redesign from the previous round didn't land
+well visually ("I did not like it to be honest, lets just switch to our
+terminal style for now, we can work on the UI later").
+
+### The undercount bug: tile existence was tied to OUR bookkeeping, not the real browser
+
+`_build_live_tiles` (previous revision) built one tile for the top-level tab
+plus one per `live_activity`'s own `tabs` dict entry -- which only ever
+gets an entry when a tab is opened through `delegate_website_task`. But a
+tab can exist without ever going through that path: the top-level
+connection's own model has `browser_tabs` on its toolset like every other
+`@playwright/mcp` tool (nothing in this codebase hides it), and a click on a
+`target="_blank"` link opens a new tab on its own too -- neither is tracked
+by our delegation bookkeeping at all, so neither ever got a tile, no matter
+how long they stayed open. That's exactly what the 4-tab test caught: 2 of
+those 4 tabs weren't sub-workers our code knew about.
+
+Fix: `_build_live_tiles` now derives tile *existence* straight from
+Browserbase's own `pages[]` (`channels/browserbase.get_session_pages`) --
+whatever tabs are really open, for whatever reason, get a tile. Each real
+page's own `debuggerFullscreenUrl` becomes that tile's video directly (no
+url-matching needed for that part anymore, which also removes a whole class
+of "no match yet -> stuck on Connecting..." failure the previous revision
+could hit). `live_activity`'s own tracked state (the top-level's
+description/steps, each `delegate_website_task` sub-worker's own log) is
+now used only as *best-effort enrichment* -- matched against a real page by
+url, filling in a nicer heading and the running log when we happen to have
+one for it. A page with no match still gets a perfectly good tile, just
+with a plain hostname heading and an empty log instead of enriched ones,
+rather than not existing at all. Tiles are sorted by each page's own
+(stable-for-its-lifetime) id so the grid doesn't visibly reshuffle every
+4-second poll. Covered by a rewritten `/tmp/test_live_tiles.py`, including a
+scenario that specifically reproduces the reported bug (4 real pages, only
+2 known to our own tracking) and asserts all 4 still get tiles.
+
+### Back to the terminal skin as the default
+
+`live_view_page.py`'s `LIVE_VIEW_STYLE` is back to `"terminal"`. This is a
+skin-only reversion -- the underlying multi-tile grid mechanism from the
+previous round (one tile per tab, added/removed live, short per-tile log)
+is unchanged and is what the terminal skin now renders; only the CSS
+variables (colors/fonts/shapes) reverted. The "polished" skin from last
+round still exists and still works (`?style=polished`), just isn't the
+default until that design gets revisited later, per your own framing
+("we can work on the UI later").
+
+### Model note
+
+You mentioned Messa's main agent is currently configured on
+`deepseek/deepseek-v4-pro-0813` -- noted for context; nothing in this round
+depended on which model that env var points at, so no code change was
+needed for it.
+
 ## Changes from your second round of testing
 
 - **Renamed browser_agent -> deepsearch.** Same subagent, new name

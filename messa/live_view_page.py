@@ -33,15 +33,20 @@ are recorded.
 
 Two visual skins, same markup/JS, different CSS variables:
 
-  - "polished" (default): a clean, light, editorial look -- soft neutral
-    background, one tile per tab as a lifted rounded card, generous
-    whitespace, restrained motion. This is the one actually designed for
-    (per explicit ask: "apple like website that is clean but elegant and
-    good quality") -- the production-facing skin.
-  - "terminal": black background, monospace, a fake terminal titlebar per
-    tile -- kept working (same markup, same JS, just different CSS
-    variables) for anyone with an old `?style=terminal` link bookmarked, but
-    not the one this round's design effort went into.
+  - "terminal" (default, for now): black background, monospace, a fake
+    terminal titlebar per tile. Back to being the default per direct
+    feedback on the "polished" redesign below ("I did not like it to be
+    honest, lets just switch to our terminal style for now, we can work on
+    the UI later") -- so this is a deliberate reversion of the *skin*
+    only, not the underlying multi-tile grid mechanism (see the "Multi-tab
+    grid" paragraph above), which stayed and is what the terminal skin
+    below now renders.
+  - "polished": a clean, light, editorial look -- soft neutral background,
+    one tile per tab as a lifted rounded card, generous whitespace,
+    restrained motion. Built for a later round ("apple like website that is
+    clean but elegant and good quality") but shelved as the default until
+    that gets revisited -- still fully working, reachable via
+    `?style=polished`, not deleted.
 
 LIVE_VIEW_STYLE below is "the variable you can change": flip it and
 redeploy to switch the *default* skin. `?style=polished` / `?style=terminal`
@@ -61,7 +66,7 @@ from __future__ import annotations
 
 # "The variable you can change" (see module docstring): pick which skin
 # renders by default when a live link is opened with no ?style= override.
-LIVE_VIEW_STYLE = "polished"  # "polished" | "terminal"
+LIVE_VIEW_STYLE = "terminal"  # "polished" | "terminal"
 
 _VALID_STYLES = ("polished", "terminal")
 

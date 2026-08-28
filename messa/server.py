@@ -132,60 +132,88 @@ def _tile_heading(url: str | None) -> str:
 
 
 async def _build_live_tiles(status: dict, activity: dict) -> list[dict]:
-    """Builds one tile per currently-open browser tab -- the top-level
-    orchestrator tab (id "top") plus every live delegate_website_task
-    sub-worker tab (see live_activity.py's `tabs` dict) -- each carrying its
-    OWN live_view_url, resolved from Browserbase's per-page debug urls
-    (channels/browserbase.get_session_pages) rather than the one fixed
-    session-level url every tab used to share, which is what made a
-    sub-worker's real activity invisible no matter which tab was doing the
-    work. One get_session_pages call covers every tile in this poll (not
-    one call per tile) -- matched by each tab's own last-known url (see
-    tools/deepsearch_tools.py's _live_set_url/_live_set_tab_url). A tile
-    whose url has no match yet (Browserbase's pages[] isn't push-live --
-    a just-opened tab can take a moment to show up) gets live_view_url:
-    None; the page renders a "connecting..." placeholder for that tile
-    until a later poll resolves it. Never raises: a failed Browserbase call
-    just means every tile falls back to whatever url it already had (the
-    top tile still has the DB's session-level url; a sub-worker tile with
-    no prior resolution just stays in its placeholder state one poll
-    longer)."""
+    """Builds one tile per REAL open browser tab, straight from
+    Browserbase's own pages[] (channels/browserbase.get_session_pages) --
+    NOT from our own delegate_website_task bookkeeping (live_activity's
+    `tabs` dict), which is what the previous version of this function used
+    and which undercounted for real: a real test run had 4 tabs genuinely
+    open in the one Browserbase session (visible in Browserbase's own
+    debugger tab strip) but only 1 tile ever rendered, because a tab can
+    exist without ever going through delegate_website_task -- the top-level
+    connection's own model can open extra tabs itself (a link with
+    target="_blank", or calling browser_tabs directly; it's on the
+    top-level's toolset like every other @playwright/mcp tool), and none of
+    those show up in live_activity's `tabs` dict at all, only in
+    Browserbase's own page list. Tying tile EXISTENCE to Browserbase's own
+    pages[] instead fixes this categorically: whatever tabs are really open,
+    for whatever reason, get a tile -- "as new tabs open our web page
+    actively opens new tiles" holds regardless of how a tab came to exist.
+    pages[] isn't push/live-updating on Browserbase's side, but each poll
+    here makes a fresh GET, so a tab that opened since the last poll shows
+    up within one poll interval.
+
+    live_activity's own tracked state (top-level `url`/description/steps,
+    and each delegate_website_task sub-worker's own entry in `tabs`) is
+    used ONLY as best-effort enrichment -- matched against a real page by
+    url, to fill in a nicer heading (the task title for whichever page is
+    the top-level's current one) and the running description/step log we
+    already have for it. A real page with no match (opened by the model
+    directly, not through anything we specifically track) still gets a
+    perfectly good tile -- just with a hostname-derived heading and an
+    empty log instead of enriched ones -- rather than not existing at all.
+
+    Returns [] whenever there's nothing to show yet (no session id, or the
+    Browserbase call itself fails) -- never raises."""
     bb_session_id = activity.get("bb_session_id")
-    pages_by_url: dict[str, dict] = {}
-    if bb_session_id:
-        try:
-            pages = await browserbase.get_session_pages(bb_session_id)
-            pages_by_url = {p["url"]: p for p in pages if p.get("url")}
-        except Exception as e:  # noqa: BLE001
-            console.tool_error("deepsearch", "browserbase_session_pages", str(e))
+    if not bb_session_id:
+        return []
+    try:
+        pages = await browserbase.get_session_pages(bb_session_id)
+    except Exception as e:  # noqa: BLE001
+        console.tool_error("deepsearch", "browserbase_session_pages", str(e))
+        return []
+    if not pages:
+        return []
+    # Stable ordering across polls (by each page's own id, which stays
+    # fixed for that tab's lifetime) -- pages[]'s own array order isn't
+    # documented as stable, and reordering tiles under someone's eyes every
+    # 4s poll would be a jarring regression from the previous insertion-
+    # ordered behavior.
+    pages = sorted(pages, key=lambda p: p.get("id") or p.get("url") or "")
+
+    known_by_url: dict[str, dict] = {}
+    top_url = activity.get("url")
+    if top_url:
+        known_by_url[top_url] = {
+            "heading": status.get("task"),
+            "description": activity.get("description"),
+            "steps": activity.get("steps") or [],
+            "waiting_for_human": activity.get("waiting_for_human"),
+            "tab_id": None,
+        }
+    for tab_id, tab in (activity.get("tabs") or {}).items():
+        if tab.get("url"):
+            known_by_url[tab["url"]] = {
+                "heading": None,
+                "description": tab.get("description"),
+                "steps": tab.get("steps") or [],
+                "waiting_for_human": tab.get("waiting_for_human"),
+                "tab_id": tab_id,
+            }
 
     active_tab_id = activity.get("active_tab_id")
-
-    def resolve(url: str | None, fallback: str | None = None) -> str | None:
-        page = pages_by_url.get(url) if url else None
-        if page:
-            return page.get("debuggerFullscreenUrl") or page.get("debuggerUrl") or fallback
-        return fallback
-
-    top_url = activity.get("url")
-    tiles = [{
-        "id": "top",
-        "heading": status.get("task") or "Deepsearch",
-        "description": activity.get("description"),
-        "steps": activity.get("steps") or [],
-        "waiting_for_human": activity.get("waiting_for_human"),
-        "live_view_url": resolve(top_url, fallback=status.get("live_view_url")),
-        "active": active_tab_id is None,
-    }]
-    for tab_id, tab in (activity.get("tabs") or {}).items():
+    tiles = []
+    for i, page in enumerate(pages):
+        url = page.get("url")
+        known = known_by_url.get(url)
         tiles.append({
-            "id": tab_id,
-            "heading": _tile_heading(tab.get("url")),
-            "description": tab.get("description"),
-            "steps": tab.get("steps") or [],
-            "waiting_for_human": tab.get("waiting_for_human"),
-            "live_view_url": resolve(tab.get("url")),
-            "active": tab_id == active_tab_id,
+            "id": page.get("id") or url or f"page-{i}",
+            "heading": (known.get("heading") if known else None) or _tile_heading(url),
+            "description": known.get("description") if known else None,
+            "steps": (known.get("steps") if known else None) or [],
+            "waiting_for_human": known.get("waiting_for_human") if known else None,
+            "live_view_url": page.get("debuggerFullscreenUrl") or page.get("debuggerUrl"),
+            "active": bool(known and known.get("tab_id") == active_tab_id),
         })
     return tiles
 
