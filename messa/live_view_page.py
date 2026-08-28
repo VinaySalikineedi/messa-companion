@@ -424,6 +424,27 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
   [data-style="terminal"] .tile-video .connecting .spinner {{ border-radius: 2px; }}
   .tile-video .connecting span.label {{ font-size: 0.78rem; }}
 
+  /* ---- disconnected: swapped in on Browserbase's own "browserbase-
+     disconnected" postMessage (see the module docstring's "Handling
+     disconnects" note) -- deliberately blank/calm, no error text, no red,
+     nothing that reads as a fault. Just Messa's own mark on black, the way
+     a video call shows a paused tile instead of an error screen. ---- */
+  .tile-video .disconnected {{
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: #000;
+  }}
+  .tile-video .disconnected .mark {{
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #3a3a3c;
+  }}
+  [data-style="terminal"] .tile-video .disconnected .mark {{ border-radius: 1px; background: #1f2a1f; }}
+
   .tile-log {{
     flex: 1 1 auto;
     min-height: 5.6rem;
@@ -579,6 +600,11 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
       // instead of showing the connecting placeholder). `undefined` never
       // equals `null`, so the first call always proceeds.
       currentSrc: undefined,
+      iframe: null,      // the live <iframe>, once one exists -- matched
+                          // against postMessage's event.source to know
+                          // WHICH tile just disconnected (see
+                          // handleDisconnectMessage below)
+      disconnected: false,
     }};
     return refs;
   }}
@@ -586,6 +612,8 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
   function updateTileVideo(refs, liveViewUrl) {{
     if (liveViewUrl === refs.currentSrc) return;
     refs.currentSrc = liveViewUrl;
+    refs.disconnected = false;
+    refs.iframe = null;
     if (!liveViewUrl) {{
       refs.video.innerHTML =
         '<div class="connecting"><span class="spinner"></span>' +
@@ -593,11 +621,47 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
       return;
     }}
     var iframe = document.createElement("iframe");
+    // allow-same-origin + allow-scripts matches Browserbase's own embedding
+    // example (see module docstring) -- without a sandbox at all the frame
+    // still loads, but this is the documented shape.
+    iframe.setAttribute("sandbox", "allow-same-origin allow-scripts");
     iframe.setAttribute("allow", "clipboard-read; clipboard-write");
     iframe.src = liveViewUrl;
     refs.video.innerHTML = "";
     refs.video.appendChild(iframe);
+    refs.iframe = iframe;
   }}
+
+  function showTileDisconnected(refs) {{
+    // Browserbase's live-view iframe posts this the moment its session/tab
+    // goes away (see module docstring's "Handling disconnects") and would
+    // otherwise render its own raw "could not connect"-style page inside
+    // the iframe -- replaced here with a calm, blank, unmistakably-Messa
+    // placeholder instead, per explicit ask ("disconnected screen shows
+    // error loading is not good to show for the users, we need to show a
+    // blank messa screen"). A tile in this state that's still present on
+    // the next poll (rare -- usually the tab just closes, and the tile
+    // itself is removed by renderGrid) simply stays on this screen; a
+    // fresh, different live_view_url arriving would still rebuild it
+    // normally via updateTileVideo above.
+    if (refs.disconnected) return;
+    refs.disconnected = true;
+    refs.iframe = null;
+    refs.video.innerHTML = '<div class="disconnected"><span class="mark"></span></div>';
+  }}
+
+  // One listener for the whole page (not one per iframe) -- matches the
+  // event's source window against whichever tile's iframe is still live,
+  // so a disconnect on tile 2 never affects tiles 1 or 3.
+  window.addEventListener("message", function (event) {{
+    if (event.data !== "browserbase-disconnected") return;
+    Object.keys(tileEls).forEach(function (id) {{
+      var refs = tileEls[id];
+      if (refs.iframe && refs.iframe.contentWindow === event.source) {{
+        showTileDisconnected(refs);
+      }}
+    }});
+  }});
 
   function updateTileLog(refs, steps) {{
     var recent = (steps || []).slice(-TILE_LOG_LINES);

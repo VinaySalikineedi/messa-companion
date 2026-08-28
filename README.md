@@ -1947,6 +1947,99 @@ You mentioned Messa's main agent is currently configured on
 depended on which model that env var points at, so no code change was
 needed for it.
 
+## Live view went fully blank mid-task, plus disconnect/navbar/scrollbar styling
+
+Real feedback from a real run: the live page showed a **completely blank
+screen** with zero tiles while 5 real tabs were open and working in
+Browserbase's own dashboard -- not a wrong-tab bug this time, an empty grid.
+You'd already tried swapping which URL field `_build_live_tiles` read
+(`debuggerFullscreenUrl or status.get('live_view_url')` instead of
+`debuggerFullscreenUrl or page.get('debuggerUrl')`) and it didn't help,
+which was actually a useful data point: it ruled out "wrong field" as the
+cause before I ever looked at the code.
+
+### Root cause: no fallback when the per-page pipeline produced nothing
+
+`_build_live_tiles` builds its tiles entirely from
+`channels.browserbase.get_session_pages(bb_session_id)` -- a live call to
+Browserbase's `/sessions/{id}/debug` endpoint. The previous revision had
+exactly one path through that function that returned `[]`: whenever that
+call produced no usable pages, for *any* reason -- no `bb_session_id` yet
+recorded, the API call itself failing (network hiccup, rate limit, session
+mid-teardown), or a genuinely empty `pages[]` for a moment. An empty list
+of tiles is indistinguishable from "nothing running" to the frontend, so
+the grid rendered as blank -- even though `status.get('live_view_url')`
+(the session-level URL, always present once a Browserbase session exists)
+was sitting right there unused. Your own fix attempt couldn't have changed
+this, because it only changed *which field wins when both are present* --
+this bug is about the case where the whole per-page pipeline hands back
+nothing at all, upstream of that `or`.
+
+Fixed by giving `_build_live_tiles` a real fallback: when
+`get_session_pages` yields no pages for any reason, it now builds **one**
+tile from `status['live_view_url']` (the same field the very first,
+pre-tile-grid version of this page always showed) instead of returning
+`[]`. Only if that's *also* missing -- meaning there's genuinely no session
+at all -- does it fall through to an empty grid. Verified two ways: a unit
+test that directly reproduces the reported scenario (`active=True`, a real
+session-level url, `get_session_pages` raising) and asserts the response
+always has at least one tile; and the full `/live/<token>/status` route
+through FastAPI's `TestClient`, same assertion, end-to-end.
+
+### Styling and disconnect handling, per Browserbase's own docs
+
+You linked Browserbase's live-view docs page and asked me to apply its
+disconnect-handling and styling guidance. Three changes, all sourced
+directly from that page:
+
+- **`navbar=false`.** The only documented styling query param -- hides
+  Browserbase's own embedded chrome (URL bar, tab strip) inside the
+  iframe. Applied in one place, `_hide_navbar()`, to every `live_view_url`
+  the route hands back (per-page and the new fallback tile both), so every
+  tile gets it automatically rather than each call site remembering to add
+  it.
+- **`sandbox="allow-same-origin allow-scripts"`** on every tile's
+  `<iframe>` -- the exact attribute shape from Browserbase's own embedding
+  example in that doc.
+- **Graceful disconnects.** Per the docs, Browserbase's live-view iframe
+  posts `window.postMessage("browserbase-disconnected", ...)` to its parent
+  when a session or tab goes away, and otherwise renders its own raw
+  "could not connect" page inside the iframe -- exactly the "error loading"
+  screen you said not to show. `live_view_page.py` now has one page-level
+  `message` listener that matches the event's `source` window against
+  whichever tile's iframe it actually came from (so a disconnect on tile 2
+  can never affect tiles 1 or 3), and swaps *only that tile* to a calm,
+  blank, unmistakably-Messa placeholder (a small dark square, no text, no
+  red/alarm styling) instead of letting Browserbase's own error UI show
+  through. Verified with a real headless-Chromium test: 4 tiles rendering
+  simultaneously (matching your actual 4-5 tab scale), each pointed at its
+  own fake page; triggering a disconnect on just one iframe swapped only
+  that tile to the blank placeholder while the other 3 kept rendering their
+  own distinct content, completely unaffected -- screenshots confirm this
+  visually (before/after), not just the assertions.
+
+There's no documented query param for hiding scrollbars (only `navbar` is
+documented), so per the docs' own suggestion that page-level styling goes
+through `page.evaluate()`: `cursor_overlay.js` (already injected into every
+browsed page via `@playwright/mcp`'s `--init-script`) now also injects a
+tiny `<style>` tag hiding the scrollbar (`scrollbar-width: none` +
+`::-webkit-scrollbar { display: none }`) the first time it runs on a page,
+independent of its existing cursor-overlay guard so the two don't interfere
+with each other.
+
+### Verification
+
+Re-ran the full regression suite most relevant to what changed this round
+(`/tmp/test_live_tiles.py`, `/tmp/test_cursor_overlay.py`,
+`/tmp/test_multisite_delegation_live.py`,
+`/tmp/test_cursor_driver_wiring_live.py`, plus the human-help/pause-loop/
+live-link suites) -- all still green, nothing regressed. New:
+`/tmp/test_live_multitile_sim.py`, a real headless-Chromium test at your
+actual reported scale (4 simultaneous tiles, not 2) confirming all 4 load
+with the right `navbar=false`/`sandbox` attributes, all 4 render distinct
+content at once with no cross-talk, and a disconnect on one tile leaves the
+other 3 fully intact.
+
 ## Changes from your second round of testing
 
 - **Renamed browser_agent -> deepsearch.** Same subagent, new name
