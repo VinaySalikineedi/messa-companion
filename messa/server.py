@@ -212,7 +212,7 @@ async def _build_live_tiles(status: dict, activity: dict) -> list[dict]:
             "description": known.get("description") if known else None,
             "steps": (known.get("steps") if known else None) or [],
             "waiting_for_human": known.get("waiting_for_human") if known else None,
-            "live_view_url": page.get("debuggerFullscreenUrl") or page.get("debuggerUrl"),
+            "live_view_url": page.get("debuggerFullscreenUrl") or status.get("live_view_url"),
             "active": bool(known and known.get("tab_id") == active_tab_id),
         })
     return tiles

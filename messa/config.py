@@ -185,7 +185,7 @@ DEEPSEARCH_ALLOWED_DOMAINS: list[str] = [
 # the orchestrator's own RECURSION_LIMIT -- deep research tasks legitimately
 # need many steps, and hitting this cap is expected/handled (the session is
 # saved and can be resumed) rather than an error condition.
-DEEPSEARCH_MAX_STEPS = int(os.environ.get("MESSA_DEEPSEARCH_MAX_STEPS", "100"))
+DEEPSEARCH_MAX_STEPS = int(os.environ.get("MESSA_DEEPSEARCH_MAX_STEPS", "200"))
 
 # How long (ms) @playwright/mcp waits after each action for triggered work
 # (a re-render, an XHR, an animation) to "settle" before returning control --
