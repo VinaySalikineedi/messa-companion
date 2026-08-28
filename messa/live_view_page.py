@@ -610,6 +610,28 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
   }}
 
   function updateTileVideo(refs, liveViewUrl) {{
+    // Once a tile has a live, still-connected iframe, its src is written
+    // EXACTLY ONCE for that tile's whole lifetime and never touched again
+    // here, no matter what url shows up on a later poll. This was the real
+    // cause of "each tab going white and reloading every few seconds":
+    // Browserbase's own live-view url for the very same tab isn't
+    // guaranteed to come back byte-identical on every GET .../debug call
+    // (it can carry its own per-request token), so the old dedup check
+    // (`liveViewUrl === refs.currentSrc`) treated that as a brand new tab
+    // and rebuilt the iframe from scratch on every single poll -- a full
+    // reload of an otherwise perfectly healthy connection, every ~4s.
+    // Browserbase's live view is a genuinely LIVE stream once it's loaded
+    // (it reflects whatever that tab is doing right now, including
+    // in-tab navigation) -- it was never something that needed refreshing
+    // on our polling cadence in the first place, only something that needed
+    // to be created once. A real reconnect after this point only ever
+    // happens two ways: showTileDisconnected (a real
+    // "browserbase-disconnected" postMessage) sets refs.iframe back to
+    // null, or this tile's id disappears from a poll and a fresh buildTile
+    // call (a genuinely new tab) hands back a brand new refs object with no
+    // iframe yet -- both correctly fall through to the rebuild below.
+    if (refs.iframe && !refs.disconnected) return;
+
     if (liveViewUrl === refs.currentSrc) return;
     refs.currentSrc = liveViewUrl;
     refs.disconnected = false;
