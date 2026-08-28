@@ -29,8 +29,8 @@
   el.style.filter = "drop-shadow(0 4px 10px rgba(0,0,0,0.65))";
   el.style.transition = "transform 350ms cubic-bezier(0.25, 1, 0.5, 1)";
   el.innerHTML =
-    '<path d="M 2 2 L 52 18 L 18 52 Z" ' +
-    'fill="#3b82f6" stroke="white" stroke-width="2.5" stroke-linejoin="miter"/>';
+    '<path d="M 2 2 L 2 34 L 10 26 L 16 38 L 22 35 L 16 23 L 26 23 Z" ' +
+    'fill="#3b82f6" stroke="white" stroke-width="2.5" stroke-linejoin="round"/>';
 
   let currentSpotIndex = 0;
   let resetTimer = null;
@@ -48,7 +48,7 @@
     return spots[index % spots.length];
   }
 
-  function setCursorTransform(x, y, scale = 3.5) {
+  function setCursorTransform(x, y, scale = 2.9) {
     el.style.transform = `translate(${x}px, ${y}px) scale(${scale})`;
   }
 
@@ -56,7 +56,7 @@
     if (!el.isConnected) {
       (document.body || document.documentElement).appendChild(el);
       const spot = getRestingSpot(currentSpotIndex);
-      setCursorTransform(spot.x, spot.y, 3.5);
+      setCursorTransform(spot.x, spot.y, 2.9);
     }
   }
 
@@ -64,19 +64,19 @@
     ensureMounted();
     currentSpotIndex = (currentSpotIndex + 1) % 5;
     const spot = getRestingSpot(currentSpotIndex);
-    setCursorTransform(spot.x, spot.y, 3.5);
+    setCursorTransform(spot.x, spot.y, 2.9);
   }
 
   function moveTo(x, y) {
     ensureMounted();
     if (resetTimer) clearTimeout(resetTimer);
-    setCursorTransform(x, y, 3.5);
+    setCursorTransform(x, y, 2.9);
 
     // Pulse down slightly to simulate a click press
     setTimeout(() => {
-      setCursorTransform(x, y, 2.7);
+      setCursorTransform(x, y, 2.3);
       setTimeout(() => {
-        setCursorTransform(x, y, 3.5);
+        setCursorTransform(x, y, 2.9);
       }, 120);
     }, 180);
 
