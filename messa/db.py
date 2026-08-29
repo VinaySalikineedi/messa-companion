@@ -44,6 +44,11 @@ async def get_pool() -> asyncpg.Pool:
         _pool = await asyncpg.create_pool(
             config.DATABASE_URL, min_size=1, max_size=5, statement_cache_size=0,
         )
+        async with _pool.acquire() as conn:
+            try:
+                await conn.execute("ALTER TYPE action_type ADD VALUE IF NOT EXISTS 'create_recurring_cron';")
+            except Exception:  # noqa: BLE001
+                pass
     return _pool
 
 
