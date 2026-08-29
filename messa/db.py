@@ -480,16 +480,18 @@ async def create_task(
     description: str | None = None,
     due_date: datetime | None = None,
     priority: str | None = None,
+    status: str | None = None,
 ) -> dict[str, Any]:
     pool = await get_pool()
+    status_val = status or "todo"
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
-            INSERT INTO tasks (user_id, title, description, due_date, priority)
-            VALUES ($1, $2, $3, $4, COALESCE($5::task_priority, 'medium'))
+            INSERT INTO tasks (user_id, title, description, due_date, priority, status)
+            VALUES ($1, $2, $3, $4, COALESCE($5::task_priority, 'medium'), $6::task_status)
             RETURNING *
             """,
-            user_id, title, description, due_date, priority,
+            user_id, title, description, due_date, priority, status_val,
         )
         return dict(row)
 
