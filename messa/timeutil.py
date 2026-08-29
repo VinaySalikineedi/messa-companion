@@ -158,6 +158,15 @@ def to_local_aware(raw: Any, user_tz: str) -> Optional[datetime]:
 
     tz = ZoneInfo(user_tz)
 
+    import re
+    tz_match = re.search(r"\s+([A-Za-z_]+/[A-Za-z_]+)$", text)
+    if tz_match:
+        try:
+            tz = ZoneInfo(tz_match.group(1))
+            text = text[:tz_match.start()].strip()
+        except Exception:  # noqa: BLE001
+            pass
+
     if text.endswith("Z"):
         # Explicit UTC marker -- the model (or an internal caller) meant
         # UTC on purpose here, so respect it as given rather than

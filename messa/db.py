@@ -632,14 +632,15 @@ async def list_calendar_events(user_id: int, upcoming_only: bool = True) -> list
 
 async def _insert_calendar_event(conn: asyncpg.Connection, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
     user_tz = payload.get("user_timezone")
+    status_val = payload.get("status") or "scheduled"
     row = await conn.fetchrow(
         """
-        INSERT INTO calendar_events (user_id, title, start_time, end_time, location, notes)
-        VALUES ($1, $2, $3, $4, $5, $6) RETURNING *
+        INSERT INTO calendar_events (user_id, title, start_time, end_time, location, notes, status)
+        VALUES ($1, $2, $3, $4, $5, $6, $7::calendar_event_status) RETURNING *
         """,
         user_id, payload["title"],
         _parse_dt(payload["start_time"], user_tz), _parse_dt(payload["end_time"], user_tz),
-        payload.get("location"), payload.get("notes"),
+        payload.get("location"), payload.get("notes"), status_val,
     )
     return dict(row)
 
