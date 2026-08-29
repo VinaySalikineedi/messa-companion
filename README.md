@@ -2185,6 +2185,77 @@ a 56x56 base SVG -- about 151px on the real 1280x800 browser viewport,
 nearly 12% of its width. Now `0.65`/`0.5` -- about 36px, clearly visible
 without dominating the screen. Confirmed with a rendered screenshot.
 
+## Live view gets a second page: reminders, this week's schedule, tasks, projects, contacts
+
+Once the live browsing grid + cursor were working end-to-end, you asked for
+more on the same `/live/<token>` link: "I want to show them the Reminders,
+Schedule as a weeks chart..., Tasks, Projects, contacts, etc. All these on
+one page in different tiles. The browser windows still stay on the first
+page and second page we can keep these and add a toggle on the top to
+switch between them." That's a second, independent page on the exact same
+permanent link, not a new page or a new share mechanism -- so it reuses
+`users.live_share_token` (migration 006) end to end, resolved through a new
+`db.get_user_by_live_token` rather than `get_live_status_by_token` (which
+is scoped to browsing state -- `active`/`live_view_url`/`task` -- and used
+by a different route; keeping them separate meant neither caller has to
+reason about fields it doesn't need).
+
+**Backend:** a new `GET /live/<token>/dashboard` route in `server.py`
+gathers `tasks`, `pending` `reminders`, `active` `projects`, `people`
+(contacts), and this week's `calendar_events` concurrently via
+`asyncio.gather`, using Messa's existing Phase 1 data model unchanged --
+nothing new to migrate for the data itself. "This week" is computed in the
+user's *own* stored timezone (`_week_bounds_utc`, same `ZoneInfo` pattern
+`timeutil.py` already uses elsewhere), Monday 00:00 through the following
+Monday, then handed to a new `db.list_calendar_events_for_range` as a
+tz-aware UTC pair -- doing this in UTC directly would be wrong (a Monday
+morning event could land in "last week" for a user west of UTC). Each
+event's start time then buckets it into one of the 7 returned `days`, and
+times are formatted with a new `_format_time_local`/`_format_due_local`
+pair (`"9:00 AM"`, `"Aug 30"`, `"Aug 30, 3:00 PM"` when a real time-of-day
+is set, nothing when a task has no due date at all). 404 for an unknown
+token, same "a bad link never quietly looks like a valid empty state" rule
+`/live/<token>/status` already follows.
+
+**Frontend (`live_view_page.py`):** the browsing grid you already had
+(`#main`) and the new dashboard (`#page-dashboard`) are both permanent
+sibling elements now, toggled with a header nav (`Live browsing` /
+`Dashboard`) that only ever flips the `hidden` attribute -- switching pages
+never rebuilds either one's DOM. That matters specifically because of how
+carefully the browsing grid avoids re-writing an iframe's `src` (see "Tiles
+stable..." above) -- a naive `innerHTML` swap on toggle would have thrown
+that away and reintroduced the white-flash bug the moment someone switched
+pages during a live run. The dashboard polls its own endpoint separately
+from the 4s browsing poll, on a much slower 30s cadence (tasks/reminders/
+schedule don't change second to second the way a live tab does).
+
+The schedule renders exactly as specced -- a heading with the date range
+and year, then one native `<details>`/`<summary>` disclosure per day, time
+on the left of each event and the title (+ location, when there is one) on
+the right, today's day open by default. Tasks/reminders/projects/contacts
+render as smaller cards below it. Because the whole dashboard re-renders
+on every poll (simplest correct approach for data this size), a day the
+user opened or closed by hand would otherwise silently reset every 30
+seconds -- fixed with a small `openDays` map keyed by date that survives
+across renders, so a manual override sticks until the user changes it
+again. Both new cards reuse the exact same `--card-bg`/`--border`/
+`--radius`/`--shadow`/etc. CSS variables the browsing tiles already define
+per skin, so "terminal" and "polished" both render correctly with zero
+skin-specific dashboard code.
+
+Verified with a real-headless-Chromium test (`test_dashboard_toggle.py`,
+following the same pattern as the multi-tile grid tests): default page on
+load is browsing with the dashboard hidden; toggling in renders all 5
+tiles with correct content, including an empty list showing its own empty
+state rather than a blank card; a day opened or closed by hand survives a
+full dashboard re-render; and four full round trips between pages never
+reload the browsing tile's iframe (checked via the same load-counter
+technique as the reload-bug regression test). The route/data-shaping logic
+itself has its own suite (`test_dashboard_route.py`) covering the week-
+boundary math across timezones (including a same-instant-different-local-
+day case between New York and Tokyo), the date-label formatting, and the
+full JSON shape through FastAPI's `TestClient`.
+
 ## Changes from your second round of testing
 
 - **Renamed browser_agent -> deepsearch.** Same subagent, new name

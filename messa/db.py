@@ -284,6 +284,48 @@ async def get_live_status_by_token(token: str) -> dict[str, Any] | None:
         }
 
 
+async def get_user_by_live_token(token: str) -> dict[str, Any] | None:
+    """Resolves a live-share token straight to the user's own id/name/
+    timezone -- for the /live/<token>/dashboard route (see server.py),
+    which shows a user's tasks/reminders/schedule/projects/contacts
+    regardless of whether a browser is currently active. Deliberately
+    separate from get_live_status_by_token above, which is scoped to
+    browsing state (active/live_view_url/task) and used by a different
+    route (/live/<token>/status) -- keeping them separate means neither
+    caller has to reason about fields it doesn't need. Returns None for an
+    unknown token, or if migration 006 (which added live_share_token)
+    hasn't been applied -- same "no dead link looks like a valid empty
+    state" reasoning as get_live_status_by_token."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_column(conn, "users", "live_share_token"):
+            return None
+        row = await conn.fetchrow(
+            "SELECT id, name, timezone FROM users WHERE live_share_token = $1",
+            token,
+        )
+        return dict(row) if row else None
+
+
+async def list_calendar_events_for_range(user_id: int, start: datetime, end: datetime) -> list[dict[str, Any]]:
+    """All non-cancelled events whose start_time falls within [start, end)
+    -- for the live-view dashboard's weekly schedule tile. Unlike
+    list_calendar_events (which only ever shows events from now onward),
+    this intentionally also includes events EARLIER in the requested range
+    than the current moment, so a Monday-morning event still shows up in
+    "this week" on a Wednesday. `start`/`end` are expected to be tz-aware
+    UTC datetimes -- server.py computes them from the user's own local
+    timezone (week boundaries mean something different in each zone)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM calendar_events WHERE user_id = $1 AND status = 'scheduled' "
+            "AND start_time >= $2 AND start_time < $3 ORDER BY start_time",
+            user_id, start, end,
+        )
+        return _rows(rows)
+
+
 async def save_profile_field(user_id: int, field: str, value: str) -> dict[str, Any]:
     """Save one onboarding field (name/email/city) and advance onboarding_step.
 
@@ -1033,6 +1075,20 @@ async def list_deepsearch_sessions(user_id: int, status: str | None = None) -> l
                 user_id,
             )
         return _rows(rows)
+
+
+# ---------------------------------------------------------------------------
+# Human-in-the-loop pause (deepsearch hit a login wall/CAPTCHA/2FA and is
+# waiting on you) -- see migrations/008_deepsearch_human_help.sql and
+# tools/deepsearch_tools.py's request_human_help tool for the full flow.
+# Additive/no-op-safe, same _has_table pattern as deepsearch_sessions above:
+# these all silently no-op until migration 008 has been applied.
+#
+# create_human_help_request is called from inside the (in-flight,
+# in-process) deepsearch agent call itself; get_waiting_human_help_requests/
+# mark_human_help_notified are polled from server.py's separate
+# _production_deepsearch_pause_loop -- deliberately two different call
+# sites, so the SMS notification doesn't depend on the same async call that
 # created the row still being alive/healthy.
 # ---------------------------------------------------------------------------
 

@@ -31,6 +31,21 @@ each tile's own live_view_url is resolved from Browserbase's per-page debug
 urls, and live_activity.py for where each tab's own description/steps/url
 are recorded.
 
+Dashboard page (this round): a second toggle-able page on the same
+permanent /live/<token> link, showing the user's own reminders, this
+week's schedule, tasks, projects, and contacts -- independent of whether a
+browsing session is active ("I want to add more to the live view page for
+the user on top of the live browsing windows... The browser windows still
+stay on the first page and second page we can keep these and add a toggle
+on the top to switch between them"). Both pages are permanent siblings of
+`#main` (a `.page-area` each), toggled purely via the `hidden` attribute --
+never torn down and rebuilt on switch, so the browsing grid's careful
+"write an iframe's src exactly once" state (see updateTileVideo below)
+survives switching to the dashboard and back. The dashboard polls its own
+`/live/<token>/dashboard` JSON endpoint (see server.py) on a much slower
+cadence than the 4s browsing poll, since tasks/reminders/schedule change
+far less often than a live browser tab does.
+
 Two visual skins, same markup/JS, different CSS variables:
 
   - "terminal" (default, for now): black background, monospace, a fake
@@ -197,6 +212,44 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
     margin-left: 0.15rem;
   }}
 
+  /* ---- page toggle (Live Browsing / Dashboard) ---- */
+  .page-toggle {{
+    margin-left: auto;
+    flex: 0 0 auto;
+    display: flex;
+    gap: 0.25rem;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0.2rem;
+  }}
+  [data-style="terminal"] .page-toggle {{ border-radius: var(--radius-sm); }}
+  .page-toggle .toggle-btn {{
+    appearance: none;
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    padding: 0.34rem 0.75rem;
+    border-radius: 999px;
+    cursor: pointer;
+    transition: background-color 0.2s ease, color 0.2s ease;
+  }}
+  [data-style="terminal"] .page-toggle .toggle-btn {{
+    border-radius: var(--radius-sm);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }}
+  .page-toggle .toggle-btn.active {{
+    background: var(--card-bg);
+    color: var(--text);
+    box-shadow: var(--shadow);
+  }}
+  [data-style="terminal"] .page-toggle .toggle-btn.active {{ color: var(--accent); }}
+
   /* ---- live indicator: a solid core + two staggered outward-fading rings
      (a "radar ping"). ---- */
   .live-indicator {{
@@ -251,12 +304,13 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
     color: var(--live);
   }}
 
-  main {{
+  .page-area {{
     flex: 1 1 auto;
     min-height: 0;
     position: relative;
     display: flex;
   }}
+  .page-area[hidden] {{ display: none; }}
 
   /* ---- idle / invalid / closing single-card states ---- */
   .state {{
@@ -463,6 +517,102 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
   [data-style="terminal"] .tile-log {{ color: var(--text); }}
   [data-style="terminal"] .tile-log .line::before {{ content: "> "; color: var(--accent); }}
 
+  /* ---- dashboard page: schedule/tasks/reminders/projects/contacts,
+     reusing the same --card-bg/--border/--radius/--shadow variables as the
+     browsing tiles so both skins apply automatically with no extra work. ---- */
+  .dash-wrap {{
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 1.5rem;
+  }}
+  .dash-grid {{
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    align-items: start;
+    gap: 1.35rem;
+    max-width: 1480px;
+    margin: 0 auto;
+  }}
+  .dash-card {{
+    display: flex;
+    flex-direction: column;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }}
+  .dash-card.schedule {{ grid-column: 1 / -1; }}
+  .dash-card-head {{
+    flex: 0 0 auto;
+    padding: 0.8rem 1rem;
+    font-weight: 600;
+    font-size: 0.92rem;
+    color: var(--text);
+    letter-spacing: -0.01em;
+    border-bottom: 1px solid var(--border-soft);
+  }}
+  [data-style="terminal"] .dash-card-head::before {{ content: "$ "; color: var(--muted); }}
+  .dash-card-body {{ padding: 0.5rem 0; }}
+  .dash-card:not(.schedule) .dash-card-body {{ padding: 0.7rem 1rem 0.9rem; }}
+  .dash-empty {{
+    color: var(--muted);
+    font-size: 0.85rem;
+    font-style: italic;
+    padding: 0.4rem 1rem 0.6rem;
+  }}
+  [data-style="terminal"] .dash-empty {{ font-style: normal; }}
+
+  /* week schedule: one native <details> disclosure per day, time on the
+     left of each event, title (+ location) on the right -- per explicit
+     spec ("each day is a drop down with time on the left and scheduled
+     event on the right"). */
+  .day-row {{ border-bottom: 1px solid var(--border-soft); }}
+  .day-row:last-child {{ border-bottom: 0; }}
+  .day-row summary {{
+    list-style: none;
+    cursor: pointer;
+    padding: 0.65rem 1rem;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    font-size: 0.88rem;
+    color: var(--text);
+  }}
+  .day-row summary::-webkit-details-marker {{ display: none; }}
+  .day-row summary .day-label {{ font-weight: 600; }}
+  .day-row.today summary .day-label {{ color: var(--accent); }}
+  .day-row summary .count {{ color: var(--muted); font-size: 0.78rem; white-space: nowrap; }}
+  .day-row .events {{
+    padding: 0 1rem 0.85rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }}
+  .event-row {{ display: flex; gap: 0.85rem; font-size: 0.85rem; }}
+  .event-row .time {{
+    flex: 0 0 auto;
+    width: 5.6rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }}
+  .event-row .info {{ flex: 1 1 auto; color: var(--text); min-width: 0; }}
+  .event-row .info .loc {{ color: var(--muted); font-size: 0.78rem; }}
+
+  /* tasks / reminders / projects / contacts -- simple label + meta rows */
+  .dash-list {{ display: flex; flex-direction: column; gap: 0.6rem; }}
+  .dash-item {{
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 0.85rem;
+    font-size: 0.87rem;
+  }}
+  .dash-item .primary {{ color: var(--text); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  .dash-item .meta {{ color: var(--muted); font-size: 0.78rem; white-space: nowrap; flex: 0 0 auto; }}
+
   footer {{
     flex: 0 0 auto;
     padding: 0.6rem 1.1rem;
@@ -484,8 +634,12 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
     <span class="live-label">LIVE</span>
     <span class="brand">Messa</span>
     <span class="tile-count" id="tileCount"></span>
+    <nav class="page-toggle" id="pageToggle">
+      <button type="button" class="toggle-btn active" data-page="browsing">Live browsing</button>
+      <button type="button" class="toggle-btn" data-page="dashboard">Dashboard</button>
+    </nav>
   </header>
-  <main id="main">
+  <main id="main" class="page-area">
     <div class="state">
       <div class="card">
         <div class="icon">&#8230;</div>
@@ -494,15 +648,29 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
       </div>
     </div>
   </main>
+  <div id="page-dashboard" class="page-area" hidden>
+    <div class="state">
+      <div class="card">
+        <div class="icon">&#8230;</div>
+        <h1>Loading&hellip;</h1>
+        <p>Fetching your tasks, reminders, and schedule.</p>
+      </div>
+    </div>
+  </div>
   <footer>textmessa.com &middot; this link is permanent, bookmark it</footer>
 
 <script>
 (function () {{
   var TOKEN = "{token}";
   var TILE_LOG_LINES = {TILE_LOG_LINES};
+  var DASHBOARD_POLL_MS = 30000; // far slower than the 4s browsing poll --
+                                  // tasks/reminders/schedule don't change
+                                  // second to second the way a live tab does
   var main = document.getElementById("main");
   var dot = document.getElementById("dot");
   var tileCountEl = document.getElementById("tileCount");
+  var dashboardPage = document.getElementById("page-dashboard");
+  var pageToggle = document.getElementById("pageToggle");
   // "loading" | "idle" | "invalid" | "closing" | "grid" -- which of the
   // non-tile states is currently rendered in #main, so those states only
   // touch the DOM when they actually change. The grid itself is reconciled
@@ -511,7 +679,29 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
   // between a handful of fixed states.
   var shownState = "loading";
   var tileEls = {{}};  // tile id -> {{ root, video, log, desc, heading, dot, waiting, stepsRendered }}
-  var stopped = false; // true once we've confirmed the token is invalid
+  var stopped = false; // true once we've confirmed the token is invalid (shared by both pollers below)
+
+  // ---- page toggle: both pages are permanent siblings, switching only
+  // ever flips `hidden` -- never rebuilds either page's DOM, so the
+  // browsing grid's iframes (see updateTileVideo's "write src exactly
+  // once" comment) are untouched by a trip to the dashboard and back. ----
+  function showPage(name) {{
+    main.hidden = name !== "browsing";
+    dashboardPage.hidden = name !== "dashboard";
+    if (pageToggle) {{
+      var btns = pageToggle.querySelectorAll(".toggle-btn");
+      for (var i = 0; i < btns.length; i++) {{
+        btns[i].classList.toggle("active", btns[i].getAttribute("data-page") === name);
+      }}
+    }}
+  }}
+  if (pageToggle) {{
+    pageToggle.addEventListener("click", function (event) {{
+      var btn = event.target.closest(".toggle-btn");
+      if (!btn) return;
+      showPage(btn.getAttribute("data-page"));
+    }});
+  }}
 
   function clearTiles() {{
     tileEls = {{}};
@@ -788,7 +978,201 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
       }});
   }}
 
+  // ---------------------------------------------------------------------
+  // Dashboard page: reminders, this week's schedule, tasks, projects, and
+  // contacts -- the user's own data, independent of browsing state (see
+  // server.py's /live/<token>/dashboard and the module docstring above).
+  // ---------------------------------------------------------------------
+  var dashShownState = "loading"; // "loading" | "invalid" | "grid"
+  var openDays = {{}}; // date string -> bool: remembers which schedule days
+                       // the user expanded/collapsed across polls, since
+                       // renderDashboard rebuilds the whole card every poll
+                       // (this data is small and changes slowly enough that
+                       // a full rebuild is simpler than reconciling it the
+                       // way the browsing grid's tiles are, and would
+                       // otherwise silently re-close whatever the user just
+                       // opened out from under them every 30s)
+
+  function showDashboardLoading() {{
+    if (dashShownState === "loading") return;
+    dashShownState = "loading";
+    dashboardPage.innerHTML =
+      '<div class="state"><div class="card">' +
+      '<div class="icon">&#8230;</div>' +
+      '<h1>Loading&hellip;</h1>' +
+      '<p>Fetching your tasks, reminders, and schedule.</p>' +
+      '</div></div>';
+  }}
+
+  function showDashboardInvalid() {{
+    if (dashShownState === "invalid") return;
+    dashShownState = "invalid";
+    dashboardPage.innerHTML =
+      '<div class="state"><div class="card">' +
+      '<div class="icon">&#128683;</div>' +
+      '<h1>This link isn&rsquo;t valid</h1>' +
+      '<p>Double check the link Messa sent you, or ask her to resend it.</p>' +
+      '</div></div>';
+  }}
+
+  function ensureDashboardGridShown() {{
+    if (dashShownState === "grid") return;
+    dashShownState = "grid";
+    dashboardPage.innerHTML = '<div class="dash-wrap"><div class="dash-grid" id="dashGrid"></div></div>';
+  }}
+
+  function dashCard(title, extraClass) {{
+    var card = document.createElement("div");
+    card.className = "dash-card" + (extraClass ? " " + extraClass : "");
+    var head = document.createElement("div");
+    head.className = "dash-card-head";
+    head.textContent = title;
+    var body = document.createElement("div");
+    body.className = "dash-card-body";
+    card.appendChild(head);
+    card.appendChild(body);
+    return {{ card: card, body: body }};
+  }}
+
+  function dashEmpty(text) {{
+    var el = document.createElement("div");
+    el.className = "dash-empty";
+    el.textContent = text;
+    return el;
+  }}
+
+  function buildScheduleCard(week) {{
+    var built = dashCard((week && week.label) || "This week", "schedule");
+    var list = document.createElement("div");
+    list.className = "day-list";
+    var days = (week && week.days) || [];
+    days.forEach(function (day) {{
+      var row = document.createElement("details");
+      row.className = "day-row" + (day.is_today ? " today" : "");
+      var hasOverride = Object.prototype.hasOwnProperty.call(openDays, day.date);
+      row.open = hasOverride ? openDays[day.date] : !!day.is_today;
+      row.addEventListener("toggle", function () {{ openDays[day.date] = row.open; }});
+
+      var summary = document.createElement("summary");
+      var label = document.createElement("span");
+      label.className = "day-label";
+      label.textContent = day.label + (day.is_today ? " \\u2022 today" : "");
+      var count = document.createElement("span");
+      count.className = "count";
+      var n = (day.events || []).length;
+      count.textContent = n === 0 ? "" : (n === 1 ? "1 event" : n + " events");
+      summary.appendChild(label);
+      summary.appendChild(count);
+      row.appendChild(summary);
+
+      var events = document.createElement("div");
+      events.className = "events";
+      if (!day.events || day.events.length === 0) {{
+        events.appendChild(dashEmpty("Nothing scheduled."));
+      }} else {{
+        day.events.forEach(function (ev) {{
+          var er = document.createElement("div");
+          er.className = "event-row";
+          var time = document.createElement("div");
+          time.className = "time";
+          time.textContent = ev.time + (ev.end_time ? "\\u2013" + ev.end_time : "");
+          var info = document.createElement("div");
+          info.className = "info";
+          var title = document.createElement("div");
+          title.textContent = ev.title;
+          info.appendChild(title);
+          if (ev.location) {{
+            var loc = document.createElement("div");
+            loc.className = "loc";
+            loc.textContent = ev.location;
+            info.appendChild(loc);
+          }}
+          er.appendChild(time);
+          er.appendChild(info);
+          events.appendChild(er);
+        }});
+      }}
+      row.appendChild(events);
+      list.appendChild(row);
+    }});
+    built.body.appendChild(list);
+    return built.card;
+  }}
+
+  function dashItem(primaryText, metaText) {{
+    var row = document.createElement("div");
+    row.className = "dash-item";
+    var primary = document.createElement("span");
+    primary.className = "primary";
+    primary.textContent = primaryText;
+    row.appendChild(primary);
+    if (metaText) {{
+      var meta = document.createElement("span");
+      meta.className = "meta";
+      meta.textContent = metaText;
+      row.appendChild(meta);
+    }}
+    return row;
+  }}
+
+  function buildListCard(title, items, renderItem, emptyText) {{
+    var built = dashCard(title);
+    if (!items || items.length === 0) {{
+      built.body.appendChild(dashEmpty(emptyText));
+      return built.card;
+    }}
+    var list = document.createElement("div");
+    list.className = "dash-list";
+    items.forEach(function (item) {{ list.appendChild(renderItem(item)); }});
+    built.body.appendChild(list);
+    return built.card;
+  }}
+
+  function renderTaskItem(t) {{
+    return dashItem(t.title || "Untitled task", [t.priority, t.due].filter(Boolean).join(" \\u00b7 "));
+  }}
+  function renderReminderItem(r) {{
+    return dashItem(r.message || "Reminder", r.time);
+  }}
+  function renderProjectItem(p) {{
+    return dashItem(p.title || "Untitled project", p.status);
+  }}
+  function renderContactItem(c) {{
+    return dashItem(c.name || "Contact", c.relationship);
+  }}
+
+  function renderDashboard(data) {{
+    ensureDashboardGridShown();
+    var grid = document.getElementById("dashGrid");
+    if (!grid) return;
+    grid.innerHTML = "";
+    grid.appendChild(buildScheduleCard(data.week));
+    grid.appendChild(buildListCard("Tasks", data.tasks, renderTaskItem, "No tasks right now."));
+    grid.appendChild(buildListCard("Reminders", data.reminders, renderReminderItem, "No reminders pending."));
+    grid.appendChild(buildListCard("Projects", data.projects, renderProjectItem, "No active projects."));
+    grid.appendChild(buildListCard("Contacts", data.contacts, renderContactItem, "No contacts yet."));
+  }}
+
+  function pollDashboard() {{
+    if (stopped) return;
+    fetch("/live/" + TOKEN + "/dashboard", {{cache: "no-store"}})
+      .then(function (res) {{
+        if (res.status === 404) {{
+          stopped = true;
+          showInvalid();
+          showDashboardInvalid();
+          return;
+        }}
+        return res.json().then(function (data) {{ renderDashboard(data); }});
+      }})
+      .catch(function () {{ /* transient network hiccup -- next tick retries */ }})
+      .then(function () {{
+        if (!stopped) setTimeout(pollDashboard, DASHBOARD_POLL_MS);
+      }});
+  }}
+
   poll();
+  pollDashboard();
 }})();
 </script>
 </body>

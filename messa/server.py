@@ -31,8 +31,10 @@ config.py for the tradeoff and how to opt out of the safe default.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta
 from typing import Any
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 from fastapi import BackgroundTasks, FastAPI, Header, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -284,6 +286,149 @@ async def _build_live_tiles(status: dict, activity: dict) -> list[dict]:
             "active": bool(known and known.get("tab_id") == active_tab_id),
         })
     return tiles
+
+
+# ---------------------------------------------------------------------------
+# Dashboard page (second toggle-able page on /live/<token>): reminders,
+# tasks, projects, contacts, and this week's schedule -- your own data, not
+# tied to whether a browser is currently active. Reuses the SAME
+# permanent live-share token as the browsing page (one link, two things it
+# can show), resolved via db.get_user_by_live_token instead of
+# get_live_status_by_token, since this has nothing to do with browsing
+# state.
+# ---------------------------------------------------------------------------
+
+def _week_bounds_utc(user_tz: str, now: datetime | None = None) -> tuple[datetime, datetime]:
+    """Monday 00:00 through the following Monday 00:00, in the user's OWN
+    local timezone -- "this week" means something different depending on
+    where you live, so this can't just be computed in UTC. Returned as a
+    tz-aware UTC pair, ready to hand straight to
+    db.list_calendar_events_for_range (Postgres/asyncpg compare tz-aware
+    values correctly regardless of which aware zone they're expressed in)."""
+    tz = ZoneInfo(user_tz)
+    local_now = (now or datetime.now(ZoneInfo("UTC"))).astimezone(tz)
+    local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = local_midnight - timedelta(days=local_now.weekday())  # Monday
+    week_end = week_start + timedelta(days=7)
+    return week_start.astimezone(ZoneInfo("UTC")), week_end.astimezone(ZoneInfo("UTC"))
+
+
+def _format_time_local(dt: datetime | None, tz: ZoneInfo) -> str:
+    if dt is None:
+        return ""
+    local_dt = dt.astimezone(tz) if dt.tzinfo else dt.replace(tzinfo=ZoneInfo("UTC")).astimezone(tz)
+    # "%-I" (no leading zero) isn't portable across platforms' libc --
+    # strip a leading zero manually instead so this behaves the same on
+    # any host this ends up deployed to.
+    text = local_dt.strftime("%I:%M %p")
+    return text[1:] if text.startswith("0") else text
+
+
+def _format_due_local(dt: datetime | None, tz: ZoneInfo) -> str | None:
+    """Short due-date label for a task ("Aug 30" or "Aug 30, 3:00 PM" when a
+    real time-of-day was set, not just a bare date) -- None (not shown) when
+    there's no due date at all."""
+    if dt is None:
+        return None
+    local_dt = dt.astimezone(tz) if dt.tzinfo else dt.replace(tzinfo=ZoneInfo("UTC")).astimezone(tz)
+    date_part = local_dt.strftime("%b %-d") if hasattr(local_dt, "strftime") else str(local_dt)
+    if local_dt.hour == 0 and local_dt.minute == 0:
+        return date_part
+    return f"{date_part}, {_format_time_local(dt, tz)}"
+
+
+@app.get("/live/{token}/dashboard")
+async def live_view_dashboard(token: str) -> JSONResponse:
+    """Polled by the dashboard page (the second toggle-able page on
+    /live/<token> -- see live_view_page.py) on its own, slower cadence than
+    the browsing status route, since tasks/reminders/projects/contacts/
+    schedule change far less often than a live browsing session does. 404
+    for an unknown token, same "don't let a bad link quietly look valid"
+    reasoning as /live/<token>/status."""
+    user = await db.get_user_by_live_token(token)
+    if user is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    user_id = user["id"]
+    user_tz_name = user.get("timezone") or config.DEFAULT_TIMEZONE
+    try:
+        tz = ZoneInfo(user_tz_name)
+    except Exception:  # noqa: BLE001 - an unrecognized/corrupt stored timezone must never break this page
+        user_tz_name = config.DEFAULT_TIMEZONE
+        tz = ZoneInfo(user_tz_name)
+
+    week_start_utc, week_end_utc = _week_bounds_utc(user_tz_name)
+
+    tasks, reminders, projects, contacts, week_events = await asyncio.gather(
+        db.list_tasks(user_id),
+        db.list_reminders(user_id, status="pending"),
+        db.list_projects(user_id, status="active"),
+        db.list_people(user_id),
+        db.list_calendar_events_for_range(user_id, week_start_utc, week_end_utc),
+    )
+
+    days = []
+    for i in range(7):
+        day_start_local = week_start_utc.astimezone(tz) + timedelta(days=i)
+        days.append({
+            "date": day_start_local.strftime("%Y-%m-%d"),
+            "label": day_start_local.strftime("%A, %b %-d"),
+            "is_today": day_start_local.date() == datetime.now(tz).date(),
+            "events": [],
+        })
+    for ev in week_events:
+        start = ev.get("start_time")
+        if start is None:
+            continue
+        local_start = start.astimezone(tz) if start.tzinfo else start.replace(tzinfo=ZoneInfo("UTC")).astimezone(tz)
+        day_index = (local_start.date() - week_start_utc.astimezone(tz).date()).days
+        if 0 <= day_index < 7:
+            days[day_index]["events"].append({
+                "id": ev.get("id"),
+                "time": _format_time_local(start, tz),
+                "end_time": _format_time_local(ev.get("end_time"), tz) or None,
+                "title": ev.get("title") or "Untitled event",
+                "location": ev.get("location"),
+            })
+
+    return JSONResponse({
+        "name": user.get("name"),
+        "week": {
+            "label": f"{days[0]['label']} – {days[6]['label']}, {week_start_utc.astimezone(tz).year}",
+            "days": days,
+        },
+        "tasks": [
+            {
+                "id": t.get("id"),
+                "title": t.get("title"),
+                "status": t.get("status"),
+                "priority": t.get("priority"),
+                "due": _format_due_local(t.get("due_date"), tz),
+            }
+            for t in tasks
+        ],
+        "reminders": [
+            {
+                "id": r.get("id"),
+                "message": r.get("message"),
+                "time": _format_due_local(r.get("trigger_time"), tz),
+            }
+            for r in reminders
+        ],
+        "projects": [
+            {"id": p.get("id"), "title": p.get("title"), "status": p.get("status")}
+            for p in projects
+        ],
+        "contacts": [
+            {
+                "id": c.get("id"),
+                "name": c.get("name"),
+                "relationship": c.get("relationship_type"),
+                "notes": c.get("notes"),
+            }
+            for c in contacts
+        ],
+    })
 
 
 @app.post("/webhook/sendblue")
