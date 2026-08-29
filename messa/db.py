@@ -46,7 +46,7 @@ async def get_pool() -> asyncpg.Pool:
         )
         async with _pool.acquire() as conn:
             try:
-                await conn.execute("ALTER TYPE action_type ADD VALUE IF NOT EXISTS 'create_recurring_cron';")
+                await conn.execute("ALTER TABLE pending_actions ALTER COLUMN action_type TYPE VARCHAR(100) USING action_type::text;")
             except Exception:  # noqa: BLE001
                 pass
     return _pool

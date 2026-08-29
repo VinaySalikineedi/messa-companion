@@ -99,7 +99,7 @@ CREATE INDEX ix_calendar_events_status ON calendar_events(status);
 CREATE TABLE pending_actions (
     id SERIAL PRIMARY KEY,
     user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    action_type action_type NOT NULL,
+    action_type VARCHAR(100) NOT NULL,
     payload TEXT NOT NULL, -- JSON serialized dict
     state pending_action_state NOT NULL DEFAULT 'pending',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
