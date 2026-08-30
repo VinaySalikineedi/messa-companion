@@ -133,9 +133,29 @@ def _tile_heading(url: str | None) -> str:
     return host[4:] if host.startswith("www.") else host
 
 
+_GENERIC_PAGE_TITLES = {"", "about:blank", "new tab", "untitled"}
+
+
+def _real_page_title(page: dict) -> str | None:
+    """The actual <title> Chrome reports for this specific page, as
+    Browserbase's pages[] surfaces it (channels/browserbase.get_session_pages)
+    -- e.g. "Google Flights" and "Google Hotels" are two DIFFERENT titles
+    even though both tabs sit on the same google.com host, which is exactly
+    the case a hostname-only heading (_tile_heading) can't distinguish, and
+    exactly what was previously shown as a generic label ("Search live
+    flight and hotel options for a...", the top-level's own task
+    description, per a host-key collision -- see _build_live_tiles). Prefer
+    this over hostname whenever it looks like a genuine title; None for a
+    still-loading/blank page so the caller falls through to hostname."""
+    title = (page.get("title") or "").strip()
+    if not title or title.lower() in _GENERIC_PAGE_TITLES:
+        return None
+    return title
+
+
 def _host_key(url: str | None) -> str | None:
-    """Hostname-based matching key for _build_live_tiles's enrichment step
-    -- a real, reproducible fix for "the tiles stopped showing live
+    """Host+path matching key for _build_live_tiles's enrichment step -- a
+    real, reproducible fix for "the tiles stopped showing live
     thoughts/actions" once tile existence started coming straight from
     Browserbase's own pages[] (see that function's own docstring): matching
     a real page to our own tracked description/steps by EXACT url equality
@@ -146,18 +166,30 @@ def _host_key(url: str | None) -> str | None:
     www. prefix, or a query string the site itself appends -- any of which
     would silently make `known_by_url.get(url)` miss, leaving that tile's
     description/log permanently empty even while real work is happening on
-    it. Hostname is a far more robust identifier here specifically because
-    of this app's own design: DEEPSEARCH_SYSTEM_PROMPT enforces one website
-    per delegate_website_task call, so in ordinary use every concurrently
-    open tab is already on a DISTINCT host -- host equality is essentially
-    as unambiguous as url equality would be if it worked, without the
-    redirect/formatting fragility. Reuses _tile_heading's own hostname
-    extraction (same www-stripping) so both sides of a match are computed
-    identically. Returns None for anything that isn't a real, distinguishing
-    host (a still-blank tab, a data: url mid-navigation) -- matching on
-    "New tab" would risk attaching one blank tab's log to a different one."""
+    it.
+
+    Originally this was bare hostname (DEEPSEARCH_SYSTEM_PROMPT enforces one
+    website per delegate_website_task call, so ordinarily every concurrently
+    open tab sits on a distinct host). That broke down for two tabs on the
+    SAME host with different jobs -- concretely, a Google Flights tab and a
+    Google Hotels tab both live on google.com, and bare-host matching
+    collapsed them onto the same tracked entry, which is what made both
+    tiles show the SAME (wrong) heading in a real run. Including the path
+    (query string still excluded, since sites routinely append/reorder their
+    own params on the exact same logical page -- see the expedia.com test
+    case) keeps the redirect/www/trailing-slash tolerance this was built for
+    while telling .../travel/flights apart from .../travel/hotels. Returns
+    None for anything with no real, distinguishing host (a still-blank tab,
+    a data: url mid-navigation) -- matching on that would risk attaching one
+    blank tab's log to a different one."""
     heading = _tile_heading(url)
-    return heading if heading != "New tab" else None
+    if heading == "New tab":
+        return None
+    try:
+        path = urlparse(url).path.rstrip("/").lower()
+    except Exception:  # noqa: BLE001
+        path = ""
+    return f"{heading}{path}"
 
 
 def _hide_navbar(url: str | None) -> str | None:
@@ -244,9 +276,11 @@ async def _build_live_tiles(status: dict, activity: dict) -> list[dict]:
         known_by_url[url] = entry
         host_key = _host_key(url)
         if host_key:
-            # last-write-wins on a host collision (two tracked tabs somehow
-            # on the same host) -- acceptable, matches this dict's existing
-            # exact-url behavior for the same edge case.
+            # last-write-wins on a host+path collision (two tracked tabs
+            # somehow resolve to the exact same key) -- acceptable, matches
+            # this dict's existing exact-url behavior for the same edge
+            # case. See _host_key's own docstring for why this is keyed on
+            # host+path now, not bare host.
             known_by_host[host_key] = entry
 
     top_url = activity.get("url")
@@ -276,9 +310,17 @@ async def _build_live_tiles(status: dict, activity: dict) -> list[dict]:
         # _host_key's own docstring for why exact url matching alone was
         # silently losing every tile's live description/log.
         known = known_by_url.get(url) or known_by_host.get(_host_key(url))
+        # Heading priority: the top-level tab's own overall-task heading
+        # (only ever set via an exact-url match, see _track above) first;
+        # then the REAL page title Browserbase reports for this exact page
+        # (e.g. "Google Flights" vs "Google Hotels" -- distinct even though
+        # both tabs share the google.com host, which a hostname-only
+        # heading can't tell apart); hostname as the last resort for a
+        # still-loading/blank page with no title yet.
+        known_heading = known.get("heading") if known else None
         tiles.append({
             "id": page.get("id") or url or f"page-{i}",
-            "heading": (known.get("heading") if known else None) or _tile_heading(url),
+            "heading": known_heading or _real_page_title(page) or _tile_heading(url),
             "description": known.get("description") if known else None,
             "steps": (known.get("steps") if known else None) or [],
             "waiting_for_human": known.get("waiting_for_human") if known else None,

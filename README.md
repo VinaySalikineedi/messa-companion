@@ -2819,6 +2819,148 @@ revisiting once you can see real cache-hit data.
   hitting this cap is an expected, handled case (session saved + resumable),
   not an error.
 
+## CTO review of six speed/UX questions -- what got implemented
+
+You asked me to weigh in, CTO-style, on six things after watching a live
+deepsearch run: parallel sub-agent delegation not actually saving time,
+the human cursor never appearing at all, pre-searching before delegating,
+page-transition animations, live-view tile names, and slow page reads.
+You approved implementing everything discussed. Here's what actually
+shipped, plus two things I found along the way that weren't on your list.
+
+**The real reason the cursor never appeared (found while investigating
+#2, more fundamental than the question you asked).** You'd noticed the
+human-cursor driver's real mouse movement never showed up in the live
+view and wondered whether `--init-script` silently doesn't fire when
+connecting over `--cdp-endpoint`. I tested that directly with a real
+Playwright `pageerror` listener and it does fire -- the actual bug was one
+level deeper: `cursor_overlay.js`'s very first block (the one that hides
+the live-view scrollbar) called `.appendChild()` on
+`document.head || document.documentElement` unconditionally, before
+checking either existed. At the exact moment an init script runs on a
+fresh navigation, `document.documentElement` can still be `null`, which
+threw synchronously and aborted the ENTIRE script -- not just the
+scrollbar tweak, but the cursor arrow, the reading animation, and (once
+built) the new click/typing effects too. This explains why the cursor
+was invisible on every single run, not intermittently. Fixed by deferring
+that `appendChild` behind an existence check with a `DOMContentLoaded`
+fallback, the same pattern the file already used elsewhere. Verified with
+a direct `pageerror` probe (no more crash) and against the full
+`--cdp-endpoint`/`--shared-browser-context` production shape, including a
+tab opened after the initial connection (covers `delegate_website_task`'s
+sub-worker tabs too).
+
+**#2: dropped the real human-cursor driver; kept and improved the cheap
+DOM-only one.** The separate Node process (`human-cursor` connecting over
+its own CDP connection, correlating tabs by a `window.name` marker) added
+real complexity and a second point of failure for a visual that, once the
+crash above is fixed, the existing lightweight DOM-drawn arrow already
+delivers. Removed `CursorDriver` entirely (~130 lines), the marker
+correlation logic, `messa/nodehelpers/cursor_driver.mjs`, and the
+`messa/package.json`/`package-lock.json` + Dockerfile `npm install` step
+that only existed to support it -- one less native dependency in the
+image. `DEEPSEARCH_HUMAN_CURSOR_DRIVER` is gone from `config.py`;
+`DEEPSEARCH_CURSOR_OVERLAY` (still default `true`) now controls the DOM
+arrow alone.
+
+While in there, fixed an unrelated latency bug the crash had been
+masking: `_move_cursor_to`'s `browser_evaluate` call used to be awaited
+inline before every real click/type/hover/select_option, so each action
+paid the cursor's own ~380ms CSS-transition round trip as pure added
+latency, N times per run. It's now fired via `asyncio.create_task`
+(`_fire_cursor_move`, same fire-and-forget pattern `_start_reading_animation`
+already used) and tracked in `self._cursor_move_task` for cleanup in
+`__aexit__` -- the visual still happens, it just no longer blocks the
+action behind it.
+
+**Click ripple + typing highlight (your favorite of the ideas).** Riding
+the same evaluate call the cursor move already fires (zero added
+round trips), `cursor_overlay.js` now exposes
+`window.__messaEffects = {ripple, highlightTyping, clearTypingHighlight}`:
+`browser_click` triggers an expanding, fading ring at the click point;
+`browser_type` outlines the target field for ~1.2s then self-clears.
+Both gated by new `DEEPSEARCH_CLICK_RIPPLE`/`DEEPSEARCH_TYPING_HIGHLIGHT`
+flags (default `true`).
+
+**#4: page-transition flash, done without any Python-side signaling.**
+Since a real click/type/etc. already re-injects the init script on every
+navigation, the flash (`DEEPSEARCH_PAGE_TRANSITION_FLASH`, default
+`true`) is self-triggering: a brief green overlay that fades via
+`requestAnimationFrame`, firing on `DOMContentLoaded` or immediately
+depending on `document.readyState`. No new tool call, no new latency.
+
+**#5: fixed the live-view tile heading collision (the real bug behind
+your "tiles should show the actual tab name" ask).** Digging into
+`server.py`'s live-tile tracking, `_host_key(url)` matched by hostname
+alone, so Google Flights (`.../travel/flights`) and Google Hotels
+(`.../travel/hotels`) collided onto the same tracked tile -- explaining
+why tile names looked wrong/generic rather than just "not the real title."
+Fixed by including the URL path in `_host_key` (still tolerant of
+www/trailing-slash/query-string drift, verified against the existing
+`part6_host_fallback_matching_survives_url_drift` test), and by preferring
+Browserbase's own reported page `<title>` over a hostname-derived guess
+whenever a real, non-blank title is available (`_real_page_title`). New
+test: `test_live_tile_title_fix.py`.
+
+**#1: instrumented before guessing.** Rather than jumping straight to a
+model pool on your suggestion alone, added a `_TimingCallback`
+(`langchain_core.callbacks.AsyncCallbackHandler`) that logs real
+per-LLM-call latency, tagged by tab id, on both the top-level run and
+every `delegate_website_task` sub-worker, plus queue-wait and total
+sub-worker wall-clock time. Run a real multi-site task next and the
+console log will show whether the ~20-minute run is dominated by LLM
+call latency (points at a shared-key concurrency ceiling) or by
+everything else (browser/CPU contention, serial waits) -- that answer
+should drive whether the key pool below is actually the fix or a
+different lever is needed. Implemented the pool anyway since you'd
+already decided you wanted it: `SUBAGENT_API_KEY_POOL`
+(`MESSA_OPENROUTER_API_KEY_POOL`, comma-separated) round-robins
+concurrent sub-workers across separate OpenRouter keys via
+`_pick_subagent_model`; with the default single-key setup (nothing
+configured) it's a complete no-op, returning the exact same model
+instance, so nothing changes for you until you actually set the env var.
+
+**#3: pre-search guidance added to the orchestrator's existing
+toolset -- no new tool.** `DEEPSEARCH_SYSTEM_PROMPT` now tells the
+top-level agent that if it doesn't already know the right URL (a specific
+results page, not just a homepage), it should do one quick search itself
+first (google.com or perplexity.ai, in its own tab) for a deep-link or
+reference fact, then delegate with that as a head start -- framed as
+optional ("skip it once you already have a working URL"), and explicitly
+warned never to treat a search result as today's live price/availability
+data (`delegate_website_task` stays the source of truth for that). Costs
+about 117 tokens per run (706 -> 823 for this prompt) for the cases where
+it actually helps.
+
+**#6: a two-tier deterministic backstop on oversized snapshots, not an
+"interactive-only" filter.** I considered filtering `browser_snapshot`'s
+default output to interactive elements only, to make it faster for the
+model to parse, and rejected it -- deepsearch's real work (reading
+flight/hotel prices) depends on static text content, and an
+interactive-only filter would strip exactly that. Instead,
+`_apply_snapshot_size_backstop` (renamed from
+`_nudge_if_oversized_snapshot`) now has two tiers: past
+`DEEPSEARCH_LARGE_SNAPSHOT_CHARS` (12,000, unchanged) it still just
+appends the existing corrective nudge; past a new
+`DEEPSEARCH_SNAPSHOT_HARD_CAP_CHARS` (60,000, deliberately far above the
+first tier so ordinary large pages are never touched) it actually
+truncates the returned text and appends a notice with real kept/total
+character counts and a suggestion to use `browser_find`/`depth=` instead.
+This bounds worst-case latency and token cost on genuinely extreme
+outlier pages without changing behavior for anything smaller.
+
+**Verification.** All of the above went through the full existing
+regression suite (`test_live_tiles.py`, `test_multisite_delegation_live.py`,
+`test_token_compaction.py`, `test_dashboard_route.py`,
+`test_default_briefings.py`, `test_executive_quality_check.py`, and
+others) plus new tests written for each change
+(`test_live_tile_title_fix.py`, `test_cursor_overlay.py` rewritten for
+the new fire-and-forget signature, `test_visual_feedback_live.py` for a
+live end-to-end check of the ripple/highlight effects and dispatch
+latency, `test_subagent_pool_and_timing.py`, `test_presearch_guidance.py`,
+`test_snapshot_size_nudge.py` extended with a genuinely-huge-page case for
+the new truncation tier) -- all passing.
+
 ## Changes from your first round of testing
 
 - **Speed.** `create_deep_agent`'s default harness silently gives every

@@ -62,8 +62,31 @@ def _require(name: str) -> str:
 # pinning the dated snapshot (`deepseek/deepseek-v4-pro-0813`) via
 # MESSA_MODEL, no code change needed either way.
 OPENROUTER_API_KEY = _require("OPENROUTER_API_KEY")
-ORCHESTRATOR_MODEL_NAME = os.environ.get("MESSA_MODEL", "deepseek/deepseek-v4-pro-0813")
+ORCHESTRATOR_MODEL_NAME = os.environ.get("MESSA_MODEL", "~deepseek/deepseek-v4-pro")
 SUBAGENT_MODEL_NAME = os.environ.get("MESSA_SUBAGENT_MODEL", "~deepseek/deepseek-v4-flash-latest")
+
+# A pool of OpenRouter API keys deepsearch's concurrent delegate_website_task
+# sub-workers round-robin across (see tools/deepsearch_tools.py's
+# _delegate_website_task) -- per the CTO discussion on why parallel
+# sub-agents weren't producing the wall-clock speedup a naive 3x-concurrency
+# estimate would suggest. This does NOT change per-call model latency (same
+# model, same provider, same request) -- it exists specifically to spread
+# concurrent sub-workers across separate OpenRouter keys/accounts, in case a
+# SHARED key's own per-key concurrent-request ceiling (common on cheaper
+# tiers) was silently queuing "concurrent" sub-agent LLM calls behind each
+# other server-side, which would look exactly like "the code fires them in
+# parallel but the clock doesn't move." Comma-separated in
+# MESSA_OPENROUTER_API_KEY_POOL; unset (the default) means a pool of exactly
+# one -- OPENROUTER_API_KEY itself -- so behavior is unchanged unless you
+# actually add more keys. This is a real, if unproven-from-this-sandbox,
+# lever: whether it helps depends entirely on whether a shared-key
+# concurrency ceiling is actually the bottleneck, which is why the other
+# half of this change is the per-sub-worker timing log below (see
+# _TimingCallback) -- that's what tells you, from a real run, whether this
+# was worth adding at all.
+SUBAGENT_API_KEY_POOL = [
+    k.strip() for k in os.environ.get("MESSA_OPENROUTER_API_KEY_POOL", "").split(",") if k.strip()
+] or [OPENROUTER_API_KEY]
 
 # Backward-compatible alias: kept in case anything (or you) still refers to
 # "the main model" -- always Messa's own orchestrator model.
@@ -142,6 +165,7 @@ def build_model(
     model_name: str = ORCHESTRATOR_MODEL_NAME,
     *,
     effective_context_tokens: int | None = None,
+    api_key: str | None = None,
 ) -> ChatOpenAI:
     """Build a ChatOpenAI client pointed at OpenRouter.
 
@@ -153,11 +177,17 @@ def build_model(
     NOT the model's real context window). Left unset (the default), the
     returned model behaves exactly as before this was added -- `.profile`
     stays `None` and deepagents falls back to its own generic default.
+
+    api_key, when given, overrides OPENROUTER_API_KEY -- see
+    SUBAGENT_API_KEY_POOL's own comment for why (spreading concurrent
+    delegate_website_task sub-workers across separate OpenRouter keys).
+    Left unset (the default), behavior is unchanged from before this was
+    added.
     """
     model = ChatOpenAI(
         model=model_name,
         base_url="https://openrouter.ai/api/v1",
-        api_key=OPENROUTER_API_KEY,
+        api_key=api_key or OPENROUTER_API_KEY,
     )
     if effective_context_tokens is not None:
         model.profile = {"max_input_tokens": effective_context_tokens}
@@ -292,6 +322,27 @@ DEEPSEARCH_LARGE_SNAPSHOT_CHARS = int(
     os.environ.get("MESSA_DEEPSEARCH_LARGE_SNAPSHOT_CHARS", "12000")
 )
 
+# Second tier of the same backstop, per the CTO discussion on speeding up
+# each sub-agent's "reading the page" step: DEEPSEARCH_LARGE_SNAPSHOT_CHARS
+# above only ever appends a corrective NUDGE -- it doesn't shrink the
+# snapshot the model is about to spend time (and tokens) parsing THIS turn,
+# only asks it to behave differently NEXT time. That leaves the single
+# worst case -- a genuinely enormous page -- fully unaddressed for the call
+# that actually triggered it. This is the deterministic cap on that: a
+# snapshot beyond this many characters gets its content TRUNCATED (not just
+# nudged), directly cutting how much the model has to read and how many
+# tokens the call costs, right now. Deliberately set well above
+# DEEPSEARCH_LARGE_SNAPSHOT_CHARS (not the same value) so an ordinary
+# "large-ish" page -- the common case the nudge is meant to correct
+# behavior on -- is never truncated, only genuinely extreme outliers where
+# losing some content is a better trade than parsing all of it. Picked as a
+# round number with no real production traffic to calibrate against, same
+# caveat as DEEPSEARCH_LARGE_SNAPSHOT_CHARS -- tune down if real usage shows
+# even this is too permissive, or up if legitimate pages are getting cut.
+DEEPSEARCH_SNAPSHOT_HARD_CAP_CHARS = int(
+    os.environ.get("MESSA_DEEPSEARCH_SNAPSHOT_HARD_CAP_CHARS", "60000")
+)
+
 # How long (ms) @playwright/mcp waits after each action for triggered work
 # (a re-render, an XHR, an animation) to "settle" before returning control --
 # an unconditional per-action wait, not a timeout ceiling like the two
@@ -306,32 +357,60 @@ DEEPSEARCH_TIMEOUT_SETTLE_MS = int(os.environ.get("MESSA_DEEPSEARCH_TIMEOUT_SETT
 
 # Visible cursor on the live view (see tools/deepsearch_tools.py's
 # BrowserToolProvider._move_cursor_to and messa/assets/cursor_overlay.js).
-# Deliberately opt-out rather than opt-in: this is a real, if small, per-
-# click latency cost (one extra internal browser_evaluate round-trip plus
-# the CSS transition itself, ~250ms) in exchange for a visible pointer on
-# the live-view page -- an explicit trade users asked for. Turn it off
-# (false) if that latency isn't worth it for your use case; the browser
-# session still opens/closes exactly the same either way, only the
-# cosmetic cursor-move calls are skipped.
+#
+# Two things changed here after a real run showed (a) the arrow never
+# actually appeared in the live-view tiles the user was watching, and (b)
+# there IS a genuine speed cost worth naming: this evaluate() call used to
+# be awaited inline, before the real click/type/hover/select_option it
+# decorates -- meaning every one of those actions paid the cursor's own
+# ~380ms CSS-transition round trip as pure added latency, serialized in
+# front of the real action. Fixed by firing it as a background task instead
+# (fire-and-forget, same established pattern as _start_reading_animation
+# below) -- the real action no longer waits on the cosmetic arrow at all,
+# so this flag is no longer a meaningful latency tradeoff, just a pure
+# visual nicety. The separate real-human-cursor driver (a genuine extra
+# Node subprocess talking CDP to Browserbase's remote browser --
+# messa/nodehelpers/cursor_driver.mjs) was removed entirely (not just
+# disabled) after the same run: it added a whole extra process/connection
+# per run for a cursor that wasn't even visible, which is a bad trade
+# regardless of the latency fix above. What's left is the original,
+# already-proven-in-production DOM-only CSS-transition arrow -- turn this
+# off (false) if you'd rather skip it altogether; the browser session opens/
+# closes exactly the same either way, only the cosmetic cursor-move calls
+# (now free of any latency cost) are skipped.
 DEEPSEARCH_CURSOR_OVERLAY = os.environ.get("MESSA_DEEPSEARCH_CURSOR_OVERLAY", "true").strip().lower() in (
     "1", "true", "yes",
 )
 
-# Whether cursor MOVEMENT is real (messa/nodehelpers/cursor_driver.mjs,
-# driving genuine bezier-path mouse events via a second CDP connection --
-# see tools/deepsearch_tools.py's CursorDriver) or the original DOM-only
-# CSS-transition (window.__messaCursor.moveTo(), cursor_overlay.js). Only
-# meaningful when DEEPSEARCH_CURSOR_OVERLAY is also on -- that flag controls
-# whether a visible arrow is drawn AT ALL; this one only controls how it
-# moves once there is one. An explicit, separate rollback lever on purpose:
-# the real driver is a genuine extra Node subprocess talking CDP to
-# Browserbase's remote browser, one more thing that can fail in production
-# in a way the original DOM-only approach never could -- if it ever
-# misbehaves on a real deployment, flipping this to false falls straight
-# back to the original, already-proven-in-production code path without
-# deleting or disabling it.
-DEEPSEARCH_HUMAN_CURSOR_DRIVER = os.environ.get(
-    "MESSA_DEEPSEARCH_HUMAN_CURSOR_DRIVER", "true"
+# Click ripple + typing highlight (messa/assets/cursor_overlay.js's
+# window.__messaEffects) -- the alternative visual feedback asked for once
+# the human-cursor turned out not to even be visible: an expanding ring at
+# the click point, and a brief colored outline on whatever field is being
+# typed into. Both ride the SAME evaluate() call the cursor-arrow move
+# already fires for browser_click/browser_type (see
+# BrowserToolProvider._move_cursor_to) -- no extra round trip beyond what
+# the arrow alone already costs, and (per DEEPSEARCH_CURSOR_OVERLAY's own
+# comment above) that call is fire-and-forget now, so neither of these adds
+# any latency to the real action either. Independently toggleable from the
+# arrow itself -- e.g. turn the arrow off but keep these, if the arrow ever
+# turns out not to be worth it either.
+DEEPSEARCH_CLICK_RIPPLE = os.environ.get("MESSA_DEEPSEARCH_CLICK_RIPPLE", "true").strip().lower() in (
+    "1", "true", "yes",
+)
+DEEPSEARCH_TYPING_HIGHLIGHT = os.environ.get("MESSA_DEEPSEARCH_TYPING_HIGHLIGHT", "true").strip().lower() in (
+    "1", "true", "yes",
+)
+
+# A brief full-page color flash on every fresh document load (see
+# cursor_overlay.js's self-triggering IIFE -- it needs no call from Python
+# at all, since the whole init-script re-runs on every navigation by
+# construction) -- "page-transition animation" from the CTO discussion:
+# something other than a frozen-looking page during a navigate's own
+# network/load time, which none of the other cosmetic features (arrow,
+# ripple, typing highlight, reading-scroll) cover, since none of them fire
+# during a navigate itself.
+DEEPSEARCH_PAGE_TRANSITION_FLASH = os.environ.get(
+    "MESSA_DEEPSEARCH_PAGE_TRANSITION_FLASH", "true"
 ).strip().lower() in ("1", "true", "yes")
 
 # "Reading" animation on the live view (per explicit user request: deepsearch

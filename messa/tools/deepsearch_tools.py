@@ -100,9 +100,11 @@ exactly where this one left off.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import os
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -110,6 +112,7 @@ from urllib.parse import urlparse
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import SummarizationMiddleware
+from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, messages_from_dict, messages_to_dict
 from langchain_core.runnables import RunnableLambda
@@ -180,159 +183,24 @@ _CURSOR_MOVE_FN = (
     "}"
 )
 
-# Real human-cursor (config.DEEPSEARCH_HUMAN_CURSOR_DRIVER): resolves the
-# SAME target element's bounding-box center as _CURSOR_MOVE_FN above, but
-# returns the coordinates instead of calling window.__messaCursor.moveTo()
-# itself -- the actual move happens over a SEPARATE CDP connection (see
-# CursorDriver below), not via this browser_evaluate call, so this only
-# ever needs to report WHERE to move, never perform the move.
-# Deliberately returns a single PACKED NUMBER, not an {x, y} object or a
-# string -- same reasoning as _page_fingerprint's own docstring: a
-# non-numeric browser_evaluate result gets JSON-quoted/repr-escaped in a
-# way that's proven fragile to parse back out reliably (see that method's
-# docstring for the exact failure mode this sidesteps). x is assumed under
-# 100000 CSS pixels, comfortably beyond any real viewport.
-_CURSOR_RESOLVE_XY_FN = (
+_CURSOR_MOVE_CLICK_FN = (
     "(element) => {"
     "const rect = element.getBoundingClientRect();"
-    "const x = Math.max(0, Math.round(rect.left + rect.width / 2));"
-    "const y = Math.max(0, Math.round(rect.top + rect.height / 2));"
-    "return x * 100000 + y;"
+    "const x = rect.left + rect.width / 2;"
+    "const y = rect.top + rect.height / 2;"
+    "if (window.__messaCursor) window.__messaCursor.moveTo(x, y);"
+    "if (window.__messaEffects) window.__messaEffects.ripple(x, y);"
     "}"
 )
-
-_CURSOR_DRIVER_SCRIPT_PATH = Path(__file__).resolve().parent.parent / "nodehelpers" / "cursor_driver.mjs"
-
-
-class CursorDriver:
-    """Python-side client for messa/nodehelpers/cursor_driver.mjs -- ONE
-    persistent Node subprocess per deepsearch RUN (owned and started by the
-    top-level BrowserToolProvider, then handed to every delegate_website_task
-    sub-worker too -- see that method's own `cursor_driver=self._cursor_driver`
-    -- so a single Node process serves every tab in the run, not one per
-    tab), talking JSON Lines over stdin/stdout. See that file's own module
-    docstring for the full wire protocol and design rationale.
-
-    Every public method here is best-effort and never raises: a failure
-    talking to the driver process must never break or block the real
-    browser action it's decorating. Callers treat a False/None return as
-    "this one cursor move didn't happen," never as a reason to fail the
-    actual click/type/etc. it was decorating."""
-
-    def __init__(self) -> None:
-        self._proc: asyncio.subprocess.Process | None = None
-        self._next_id = 0
-        self._pending: dict[int, asyncio.Future] = {}
-        self._reader_task: asyncio.Task | None = None
-
-    async def start(self, cdp_url: str, init_script_path: str | None = None) -> bool:
-        """Spawns cursor_driver.mjs and connects it to the SAME CDP
-        endpoint @playwright/mcp itself is using (a second, independent
-        connection -- see the module docstring's "Multi-site delegation"
-        note above for why a second connection to the same browser is safe
-        at all, and /tmp/hc_poc/ for the original proof that a second CDP
-        connection can genuinely move the mouse on a page a different
-        process is driving). Returns False (never raises) on any failure --
-        the caller falls back to the DOM-only cursor for the whole run
-        rather than trying to partially recover.
-
-        `init_script_path`, when given, is registered via THIS connection's
-        own `context.addInitScript()` (see cursor_driver.mjs's own comment
-        on the `connect` handler for the full story) -- the actual, verified
-        way cursor_overlay.js reaches a real page in --cdp-endpoint mode,
-        since @playwright/mcp's own --init-script flag was confirmed (by a
-        real local reproduction against a real --cdp-endpoint-connected
-        instance) to silently never fire in that mode at all, on any tab.
-        `_spawn_mcp_http_server` still passes --init-script too, best-effort,
-        for the one case this driver doesn't cover: DEEPSEARCH_CURSOR_OVERLAY
-        on with DEEPSEARCH_HUMAN_CURSOR_DRIVER off (no CursorDriver running
-        at all)."""
-        try:
-            self._proc = await asyncio.create_subprocess_exec(
-                "node", str(_CURSOR_DRIVER_SCRIPT_PATH),
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
-                env=dict(os.environ),
-            )
-            self._reader_task = asyncio.create_task(self._read_loop())
-            connect_kwargs: dict[str, Any] = {"cdpUrl": cdp_url}
-            if init_script_path:
-                connect_kwargs["initScriptPath"] = init_script_path
-            resp = await self._call("connect", timeout=15, **connect_kwargs)
-            ok = bool(resp and resp.get("ok"))
-            if not ok:
-                console.system(f"Deepsearch: cursor driver connect failed: {resp}")
-            return ok
-        except Exception as e:  # noqa: BLE001
-            console.system(f"Deepsearch: cursor driver failed to start (non-fatal, falling back to DOM cursor): {e}")
-            return False
-
-    async def _read_loop(self) -> None:
-        proc = self._proc
-        if proc is None or proc.stdout is None:
-            return
-        while True:
-            try:
-                line = await proc.stdout.readline()
-            except Exception:  # noqa: BLE001
-                return
-            if not line:
-                return
-            try:
-                msg = json.loads(line.decode())
-            except Exception:  # noqa: BLE001
-                continue
-            fut = self._pending.pop(msg.get("id"), None)
-            if fut is not None and not fut.done():
-                fut.set_result(msg)
-
-    async def _call(self, cmd: str, timeout: float = 10.0, **kwargs: Any) -> dict | None:
-        if self._proc is None or self._proc.stdin is None or self._proc.returncode is not None:
-            return None
-        self._next_id += 1
-        req_id = self._next_id
-        fut: asyncio.Future = asyncio.get_event_loop().create_future()
-        self._pending[req_id] = fut
-        try:
-            payload = {"id": req_id, "cmd": cmd, **kwargs}
-            self._proc.stdin.write((json.dumps(payload) + "\n").encode())
-            await self._proc.stdin.drain()
-            return await asyncio.wait_for(fut, timeout=timeout)
-        except Exception as e:  # noqa: BLE001
-            console.system(f"Deepsearch: cursor driver call '{cmd}' failed (non-fatal): {e}")
-            return None
-        finally:
-            self._pending.pop(req_id, None)
-
-    async def register_tab(self, marker: str) -> bool:
-        """Marker-based, NOT creation-order-based (see cursor_driver.mjs's
-        own findPageByMarker) -- confirmed the only reliable way to
-        correlate a tab across a second, independent CDP connection once
-        more than one tab can exist at once."""
-        resp = await self._call("registerTab", marker=marker, timeoutMs=8000)
-        return bool(resp and resp.get("ok"))
-
-    async def move(self, marker: str, x: int, y: int) -> bool:
-        resp = await self._call("move", marker=marker, x=x, y=y)
-        return bool(resp and resp.get("ok"))
-
-    async def unregister_tab(self, marker: str) -> None:
-        await self._call("unregisterTab", marker=marker, timeout=5)
-
-    async def shutdown(self) -> None:
-        if self._proc is None:
-            return
-        try:
-            await self._call("shutdown", timeout=5)
-        finally:
-            if self._proc.returncode is None:
-                try:
-                    await asyncio.wait_for(self._proc.wait(), timeout=3)
-                except asyncio.TimeoutError:
-                    self._proc.terminate()
-            if self._reader_task is not None:
-                self._reader_task.cancel()
+_CURSOR_MOVE_TYPE_FN = (
+    "(element) => {"
+    "const rect = element.getBoundingClientRect();"
+    "const x = rect.left + rect.width / 2;"
+    "const y = rect.top + rect.height / 2;"
+    "if (window.__messaCursor) window.__messaCursor.moveTo(x, y);"
+    "if (window.__messaEffects) window.__messaEffects.highlightTyping(element);"
+    "}"
+)
 
 # "Reading" scroll animation on the live view (per explicit user request --
 # see config.DEEPSEARCH_READING_ANIMATION's comment and README's "Reading
@@ -418,21 +286,40 @@ _SNAPSHOT_SIZE_NUDGE = (
 )
 
 
-def _nudge_if_oversized_snapshot(result: Any) -> Any:
-    """See guarded()'s own comment on config.DEEPSEARCH_LARGE_SNAPSHOT_CHARS
-    for why this exists (a deterministic backstop for the snapshot-size
-    discipline the system prompt already asks for but can't enforce on its
-    own). `result` is @playwright/mcp's raw return shape for
-    browser_snapshot -- a `(content_blocks, artifact)` tuple where
-    content_blocks is a list of `{"type": "text", "text": ...}` dicts,
-    confirmed by direct inspection of a real call, not assumed. Appends the
-    nudge to the LAST text block's own text (there's normally exactly one)
-    rather than altering the tuple's shape, so whatever else consumes this
-    result downstream sees the same structure either way. Returns `result`
-    unchanged (same object, not a defensive copy) whenever the shape isn't
-    what's expected or the snapshot isn't actually oversized -- this must
-    never be the reason a real snapshot result fails to reach the model.
-    """
+def _snapshot_truncation_notice(kept: int, total: int) -> str:
+    return (
+        f"\n\n(This snapshot was cut off after {kept} of {total} characters -- it was well "
+        "over the usual size, so the rest was dropped to keep this step fast. If what you "
+        "need isn't in what you see above, use browser_find(text=...) for one specific "
+        "element, or browser_snapshot(depth=...) for a shallower full-page tree, instead of "
+        "the full snapshot.)"
+    )
+
+
+def _apply_snapshot_size_backstop(result: Any) -> Any:
+    """Two-tier deterministic backstop for browser_snapshot's own size (see
+    guarded()'s comment on when this is called, and
+    config.DEEPSEARCH_LARGE_SNAPSHOT_CHARS/DEEPSEARCH_SNAPSHOT_HARD_CAP_CHARS
+    for the two thresholds' own reasoning). `result` is @playwright/mcp's
+    raw return shape for browser_snapshot -- a `(content_blocks, artifact)`
+    tuple where content_blocks is a list of `{"type": "text", "text": ...}`
+    dicts, confirmed by direct inspection of a real call, not assumed.
+
+    - Under DEEPSEARCH_LARGE_SNAPSHOT_CHARS: returned unchanged.
+    - Between the two thresholds: a corrective NUDGE is appended (asks the
+      model to behave differently NEXT time), but the full content still
+      reaches the model this call -- unchanged from before this tier
+      existed.
+    - Over DEEPSEARCH_SNAPSHOT_HARD_CAP_CHARS: the content itself is
+      TRUNCATED to that many characters (collapsing multiple text blocks
+      into one, since there's normally only one anyway) plus a clear notice
+      explaining what happened and what to do next -- this is what actually
+      shrinks THIS call's own cost/latency, not just future ones.
+
+    Returns `result` unchanged (same object, not a defensive copy) whenever
+    the shape isn't what's expected or the snapshot isn't actually
+    oversized -- this must never be the reason a real snapshot result fails
+    to reach the model."""
     if not isinstance(result, tuple) or len(result) != 2:
         return result
     content, artifact = result
@@ -441,6 +328,11 @@ def _nudge_if_oversized_snapshot(result: Any) -> Any:
     total_len = sum(len(b.get("text", "")) for b in content if isinstance(b, dict))
     if total_len <= config.DEEPSEARCH_LARGE_SNAPSHOT_CHARS:
         return result
+    if total_len > config.DEEPSEARCH_SNAPSHOT_HARD_CAP_CHARS:
+        cap = config.DEEPSEARCH_SNAPSHOT_HARD_CAP_CHARS
+        full_text = "".join(b.get("text", "") for b in content if isinstance(b, dict))
+        truncated = full_text[:cap] + _snapshot_truncation_notice(cap, total_len)
+        return ([{"type": "text", "text": truncated}], artifact)
     new_content = list(content)
     last = dict(new_content[-1])
     last["text"] = last.get("text", "") + _SNAPSHOT_SIZE_NUDGE
@@ -599,6 +491,76 @@ def _deepsearch_summarization_middleware(model: Any) -> SummarizationMiddleware 
     )
 
 
+class _TimingCallback(AsyncCallbackHandler):
+    """Per-LLM-call latency logging -- added to answer the CTO-discussion
+    question of WHY parallel delegate_website_task calls weren't producing
+    the wall-clock speedup a naive Nx-concurrency estimate would suggest.
+    `delegate_website_task` calls made in the same model turn genuinely run
+    concurrently (LangGraph's own ToolNode, confirmed empirically -- see
+    /tmp/test_agent_concurrency.py from this project's own history), so if a
+    20-minute run isn't shrinking toward that, the missing time has to be
+    going somewhere the concurrency mechanism itself can't see: a shared
+    OpenRouter-key concurrency ceiling queuing "concurrent" LLM calls behind
+    each other server-side, or the underlying browser/CPU being the actual
+    bottleneck instead. This callback can't answer that by itself -- it just
+    logs each LLM call's own wall-clock latency, tagged with `label` (e.g.
+    the tab id or "top-level"), so a real run's logs show whether individual
+    LLM calls slow down/queue when several sub-workers run at once (points
+    at the shared-key theory) or stay roughly constant (points at
+    browser/CPU contention instead, in which case a model/key pool wouldn't
+    help and shouldn't be pursued further).
+
+    AsyncCallbackHandler (not the sync BaseCallbackHandler) specifically
+    because deepsearch's whole agent loop is async -- LangChain requires the
+    async variant to get awaited correctly inside an async chain rather than
+    silently running its sync fallback."""
+
+    def __init__(self, label: str) -> None:
+        self.label = label
+        self._starts: dict[Any, float] = {}
+
+    async def on_chat_model_start(self, serialized, messages, *, run_id, **kwargs: Any) -> None:  # noqa: D102
+        self._starts[run_id] = time.monotonic()
+
+    async def on_llm_end(self, response, *, run_id, **kwargs: Any) -> None:  # noqa: D102
+        start = self._starts.pop(run_id, None)
+        if start is not None:
+            console.system(f"Deepsearch: [{self.label}] LLM call took {time.monotonic() - start:.2f}s")
+
+    async def on_llm_error(self, error, *, run_id, **kwargs: Any) -> None:  # noqa: D102
+        start = self._starts.pop(run_id, None)
+        if start is not None:
+            console.system(f"Deepsearch: [{self.label}] LLM call FAILED after {time.monotonic() - start:.2f}s: {error}")
+
+
+# Round-robin cursor shared across a whole deepsearch run's
+# delegate_website_task calls -- module-level (not per-provider-instance)
+# purely so it doesn't reset if something ever constructs more than one
+# top-level provider in the same process; in practice each run's own
+# semaphore-bounded concurrency already caps how many keys are ever in use
+# at once. See config.SUBAGENT_API_KEY_POOL's own comment for why this
+# exists and what it's actually for.
+_subagent_key_cycle = itertools.cycle(config.SUBAGENT_API_KEY_POOL)
+
+
+def _pick_subagent_model(default_model: Any) -> Any:
+    """Returns `default_model` unchanged when only one key is configured
+    (SUBAGENT_API_KEY_POOL's default -- see its own comment), so this is a
+    complete no-op until you actually add more keys. Otherwise builds a
+    FRESH ChatOpenAI client (cheap -- no network call at construction time)
+    bound to the next key in the pool, same model name and effective-
+    context budget as `default_model` was built with, so each concurrent
+    delegate_website_task call gets a different key without any other
+    behavior changing."""
+    if len(config.SUBAGENT_API_KEY_POOL) <= 1:
+        return default_model
+    return config.build_model(
+        config.SUBAGENT_MODEL_NAME,
+        effective_context_tokens=config.SUBAGENT_EFFECTIVE_CONTEXT_TOKENS,
+        api_key=next(_subagent_key_cycle),
+    )
+
+
 class BrowserToolProvider:
     """Owns one Playwright MCP subprocess (connected to a remote Browserbase
     session over CDP) for the duration of an `async with` block.
@@ -619,7 +581,6 @@ class BrowserToolProvider:
         *,
         server_url: str | None = None,
         model: BaseChatModel | None = None,
-        cursor_driver: "CursorDriver | None" = None,
     ):
         self._approval_gate = approval_gate
         self._user_id = user_id
@@ -633,9 +594,8 @@ class BrowserToolProvider:
         # deepsearch_session_id (which identifies the whole TASK, potentially
         # across resumed runs) -- load-bearing now that multi-site
         # delegation gives one deepsearch run several tabs at once, each
-        # needing its own identity for the human-cursor driver (stage 3) and
-        # for telling one tab's human-help request/live-activity entry apart
-        # from another's.
+        # needing its own identity for telling one tab's human-help request/
+        # live-activity entry apart from another's.
         self._tab_id = f"tab-{uuid.uuid4().hex[:10]}"
         # Multi-site delegation (see delegate_website_task below):
         # server_url is None for the TOP-LEVEL provider -- it owns the
@@ -658,16 +618,6 @@ class BrowserToolProvider:
         self._server_url = server_url
         self._owns_server = server_url is None
         self._model = model
-        # Real human-cursor (Stage 3): None means "not using the real
-        # driver for this tab" -- either the feature is off
-        # (config.DEEPSEARCH_HUMAN_CURSOR_DRIVER), it failed to start (see
-        # CursorDriver.start's own fallback), or DEEPSEARCH_CURSOR_OVERLAY
-        # is off entirely (no arrow drawn at all, real or DOM-only). Set
-        # here for a sub-worker (handed down from the top-level provider
-        # that actually owns/started it); set in __aenter__ below for the
-        # owning/top-level provider itself, once it has a connect_url to
-        # start the driver against.
-        self._cursor_driver = cursor_driver
         self._mcp_proc: asyncio.subprocess.Process | None = None
         # Created only for an owning/top-level provider (see __aenter__) --
         # shared across every delegate_website_task call made during this
@@ -693,6 +643,17 @@ class BrowserToolProvider:
         # nobody awaits this except _stop_reading_animation's own best-effort
         # cleanup, and __aexit__'s final sweep on the way out.
         self._reading_task: asyncio.Task | None = None
+        # The in-flight background cursor-arrow move (see _move_cursor_to),
+        # or None. Also fire-and-forget, same reasoning: awaiting the
+        # arrow's own CSS-transition round trip used to add ~380ms of pure
+        # latency in front of every real click/type/hover/select_option --
+        # firing it as a background task instead means the real action
+        # never waits on this purely cosmetic call. Tracked (one slot, most
+        # recent move only -- there's only ever one meaningful cursor per
+        # tab) purely so __aexit__ can cancel a still-in-flight one instead
+        # of leaving a "Task was destroyed but it is pending" warning behind
+        # on shutdown.
+        self._cursor_move_task: asyncio.Task | None = None
         # Shared mutable state referenced by the closures below.
         # last_snapshot_text: the most recent successful browser_snapshot's
         # result, truncated -- read by the deterministic human-help backstop
@@ -745,14 +706,21 @@ class BrowserToolProvider:
             # own 500ms default.
             "--timeout-settle", str(config.DEEPSEARCH_TIMEOUT_SETTLE_MS),
         ]
-        # Both cosmetic features (click/type cursor overlay, reading scroll
-        # animation) live in the same asset file and ride the same
+        # All the cosmetic live-view features (click/type cursor overlay,
+        # click ripple, typing highlight, page-transition flash, reading
+        # scroll animation) live in the same asset file and ride the same
         # --init-script injection, but are independently toggled -- only
-        # skip injecting the script when BOTH are off. A server-wide flag
-        # (set once here, at the ONE process every tab -- top-level and
+        # skip injecting the script when ALL of them are off. A server-wide
+        # flag (set once here, at the ONE process every tab -- top-level and
         # every delegated sub-worker alike -- ultimately connects through),
         # so every tab gets it automatically with no per-tab plumbing.
-        if config.DEEPSEARCH_CURSOR_OVERLAY or config.DEEPSEARCH_READING_ANIMATION:
+        if (
+            config.DEEPSEARCH_CURSOR_OVERLAY
+            or config.DEEPSEARCH_READING_ANIMATION
+            or config.DEEPSEARCH_CLICK_RIPPLE
+            or config.DEEPSEARCH_TYPING_HIGHLIGHT
+            or config.DEEPSEARCH_PAGE_TRANSITION_FLASH
+        ):
             mcp_args += ["--init-script", str(_CURSOR_OVERLAY_SCRIPT_PATH)]
 
         # env=dict(os.environ): a spawned subprocess does NOT inherit the
@@ -841,29 +809,6 @@ class BrowserToolProvider:
             try:
                 self._server_url = await self._spawn_mcp_http_server(connect_url)
                 self._subagent_semaphore = asyncio.Semaphore(config.DEEPSEARCH_MAX_SUBAGENTS)
-                # Real human-cursor (Stage 3): started once per RUN, here,
-                # not per tab -- every sub-worker (see _delegate_website_task)
-                # is handed THIS SAME instance rather than starting its own
-                # Node process. Best-effort and non-fatal: CursorDriver.start
-                # returns False (never raises) on any failure, at which
-                # point self._cursor_driver simply stays None and every tab
-                # for the rest of this run falls back to the DOM-only
-                # cursor -- deepsearch itself must never fail just because
-                # the cosmetic cursor upgrade didn't come up.
-                if config.DEEPSEARCH_CURSOR_OVERLAY and config.DEEPSEARCH_HUMAN_CURSOR_DRIVER:
-                    driver = CursorDriver()
-                    # See CursorDriver.start's own docstring: this is what
-                    # actually gets cursor_overlay.js onto the page in
-                    # --cdp-endpoint mode -- @playwright/mcp's own
-                    # --init-script flag (still passed below, best-effort)
-                    # was confirmed not to fire at all in this mode.
-                    init_script_path = (
-                        str(_CURSOR_OVERLAY_SCRIPT_PATH)
-                        if (config.DEEPSEARCH_CURSOR_OVERLAY or config.DEEPSEARCH_READING_ANIMATION)
-                        else None
-                    )
-                    started = await driver.start(connect_url, init_script_path=init_script_path)
-                    self._cursor_driver = driver if started else None
             except Exception as e:  # noqa: BLE001
                 console.tool_error(LABEL, "browserbase_cdp_connect", str(e))
                 # __aexit__ is NOT called by `async with` when __aenter__
@@ -943,18 +888,6 @@ class BrowserToolProvider:
                 f"Deepsearch: launched with {len(self.tools)} tools "
                 f"({'top-level' if self._owns_server else 'sub-worker ' + self._tab_id})."
             )
-            # Real human-cursor (Stage 3): register THIS tab (top-level or
-            # sub-worker alike -- every tab needs its own marker/cursor
-            # instance) with the shared driver, if one is running. Marker
-            # set via a raw, non-approval-gated browser_evaluate call, same
-            # pattern _move_cursor_to already uses -- this is our own
-            # cosmetic side effect, never something the model chose to do.
-            # Best-effort throughout: any failure here just means this
-            # tab's cursor movement silently falls back to the DOM-only
-            # path for the rest of the run (see _move_cursor_to), never a
-            # reason to fail tool setup.
-            if self._cursor_driver is not None:
-                await self._assert_cursor_marker()
         except Exception as e:  # noqa: BLE001
             console.tool_error(LABEL, "playwright_mcp_connect", str(e))
             if self._owns_server:
@@ -980,28 +913,18 @@ class BrowserToolProvider:
         # on shutdown.
         if self._reading_task is not None and not self._reading_task.done():
             self._reading_task.cancel()
+        if self._cursor_move_task is not None and not self._cursor_move_task.done():
+            self._cursor_move_task.cancel()
         if self._session_cm is not None:
             await self._session_cm.__aexit__(exc_type, exc, tb)
         if not self._owns_server:
-            # A sub-worker only closes its OWN client connection and (if a
-            # real cursor driver is running) its OWN registered tab -- the
-            # shared driver process, the shared server process, and the
-            # Browserbase session all belong to the top-level provider,
-            # which tears those down (below) once the whole deepsearch run
-            # ends, not when one delegated sub-worker's single-site task
-            # finishes.
-            if self._cursor_driver is not None:
-                try:
-                    await self._cursor_driver.unregister_tab(self._tab_id)
-                except Exception as e:  # noqa: BLE001 - cosmetic only
-                    console.system(f"Deepsearch: cursor tab unregister failed (non-fatal): {e}")
+            # A sub-worker only closes its OWN client connection -- the
+            # shared server process and the Browserbase session both belong
+            # to the top-level provider, which tears those down (below)
+            # once the whole deepsearch run ends, not when one delegated
+            # sub-worker's single-site task finishes.
             console.system(f"Deepsearch: sub-worker tab {self._tab_id} closed.")
             return
-        if self._cursor_driver is not None:
-            try:
-                await self._cursor_driver.shutdown()
-            except Exception as e:  # noqa: BLE001 - cosmetic only
-                console.system(f"Deepsearch: cursor driver shutdown failed (non-fatal): {e}")
         if self._mcp_proc is not None and self._mcp_proc.returncode is None:
             try:
                 self._mcp_proc.terminate()
@@ -1019,86 +942,50 @@ class BrowserToolProvider:
                 console.tool_error(LABEL, "browserbase_release", str(e))
         console.system("Deepsearch: browser closed.")
 
-    async def _assert_cursor_marker(self) -> None:
-        """Sets this tab's window.name to self._tab_id (its own marker) and
-        (re-)registers it with the shared cursor driver, if one is running.
-        Called once in __aenter__ and again after every browser_navigate
-        (see guarded()) -- window.name can reset on a cross-origin
-        navigation in modern Chrome, and while the already-registered Page
-        object stays valid for `move` regardless (same tab, just possibly a
-        different window.name), re-asserting it here keeps the marker
-        genuinely accurate rather than silently stale. Best-effort: never
-        raises, never blocks/fails the real action it's running alongside."""
-        if self._cursor_driver is None:
+    def _fire_cursor_move(self, name: str, element: str | None, target: str | None) -> None:
+        """Fire-and-forget entry point for the cosmetic cursor arrow (+
+        click-ripple / typing-highlight, see cursor_overlay.js's
+        window.__messaEffects) -- called from guarded() for every tool in
+        CURSOR_ANIMATED_TOOLS. Deliberately NOT awaited: this used to be an
+        inline `await self._move_cursor_to(...)` before the real action,
+        which meant every click/type/hover/select_option paid the arrow's
+        own ~380ms CSS-transition round trip as pure added latency in front
+        of the real action -- a real, measurable slowdown for a purely
+        cosmetic effect. Backgrounding it (same established pattern as
+        _start_reading_animation) means the real action starts immediately;
+        the arrow/ripple/highlight simply catch up a beat later, which is
+        imperceptible on a live view but saves real wall-clock time on
+        every single interaction across a run. Tracked in
+        self._cursor_move_task (one slot -- only the most recent move
+        matters) purely so __aexit__ can cancel a still-in-flight one
+        instead of leaving a stray pending task behind on shutdown."""
+        if not config.DEEPSEARCH_CURSOR_OVERLAY or not target:
             return
-        evaluate_tool = self._raw_tools_by_name.get("browser_evaluate")
-        if evaluate_tool is None:
-            return
-        try:
-            # No `target=` -- this takes no element, it just needs to run in
-            # this tab's own page context (same no-target shape as
-            # _page_fingerprint's and the reading animation's own
-            # browser_evaluate calls). json.dumps to safely embed the
-            # marker string as a JS string literal, same reasoning as
-            # everywhere else in this file that builds a browser_evaluate
-            # function string with a dynamic value baked in.
-            await evaluate_tool.coroutine(
-                element="cursor marker",
-                function=f"() => {{ window.name = {json.dumps(self._tab_id)}; }}",
-            )
-        except Exception as e:  # noqa: BLE001 - cosmetic only, never surfaced to the model
-            console.system(f"Deepsearch: setting cursor marker failed (non-fatal): {e}")
-            return
-        try:
-            ok = await self._cursor_driver.register_tab(self._tab_id)
-            if not ok:
-                console.system(f"Deepsearch: cursor driver couldn't find tab {self._tab_id} (non-fatal).")
-        except Exception as e:  # noqa: BLE001 - cosmetic only, never surfaced to the model
-            console.system(f"Deepsearch: cursor tab registration failed (non-fatal): {e}")
+        self._cursor_move_task = asyncio.create_task(self._move_cursor_to(name, element, target))
 
-    async def _move_cursor_to(self, element: str | None, target: str | None) -> None:
+    async def _move_cursor_to(self, name: str, element: str | None, target: str | None) -> None:
         """Best-effort, cosmetic-only: animate the injected SVG cursor (see
         cursor_overlay.js) to whatever element `target` resolves to, using
         the SAME target/ref the real action is about to use, so the arrow
-        genuinely lands where the click will. Calls the RAW browser_evaluate
-        tool directly -- never the guarded/model-facing one -- so this never
-        prompts for human approval and is invisible to the model entirely.
-        Any failure here (element not found, no cursor script loaded, a
-        slow page) is swallowed: this must never block or fail the real
-        action it's decorating."""
-        if not config.DEEPSEARCH_CURSOR_OVERLAY or not target:
-            return
+        genuinely lands where the click/type will. For browser_click, also
+        fires the click-ripple effect; for browser_type, also fires the
+        typing-highlight -- both in the SAME evaluate() call as the arrow
+        move (see _CURSOR_MOVE_CLICK_FN/_CURSOR_MOVE_TYPE_FN), so neither
+        adds an extra round trip beyond what the arrow alone already costs.
+        Calls the RAW browser_evaluate tool directly -- never the guarded/
+        model-facing one -- so this never prompts for human approval and is
+        invisible to the model entirely. Only ever invoked via
+        _fire_cursor_move as a background task now (see that method's own
+        docstring for why), so any failure here (element not found, no
+        cursor script loaded, a slow page, or the tab having since closed)
+        is swallowed exactly as before -- it just no longer has a real
+        action waiting on it either way."""
         evaluate_tool = self._raw_tools_by_name.get("browser_evaluate")
         if evaluate_tool is None:
             return
-        if self._cursor_driver is not None:
-            # Real human-cursor path: resolve the target's on-screen
-            # coordinates (same target the real action is about to use,
-            # same first step as the DOM-only path below), then move over
-            # the SEPARATE CDP connection instead of calling
-            # window.__messaCursor.moveTo() in-page -- cursor_overlay.js's
-            # own real mousemove/mousedown listeners pick up the resulting
-            # genuine browser events and move the drawn arrow to match (see
-            # that file's own comment).
-            try:
-                raw = await evaluate_tool.coroutine(
-                    element=element or "target element", target=target, function=_CURSOR_RESOLVE_XY_FN,
-                )
-                text = _parse_evaluate_text(raw)
-                if text is None:
-                    return
-                packed = int(text)
-                x, y = packed // 100000, packed % 100000
-                ok = await self._cursor_driver.move(self._tab_id, x, y)
-                if not ok:
-                    console.system("Deepsearch: real cursor move failed (non-fatal); arrow may lag this one action.")
-            except Exception as e:  # noqa: BLE001 - cosmetic only, never surfaced to the model
-                console.system(f"Deepsearch: real cursor move failed (non-fatal): {e}")
-            return
+        fn = {"browser_click": _CURSOR_MOVE_CLICK_FN, "browser_type": _CURSOR_MOVE_TYPE_FN}.get(name, _CURSOR_MOVE_FN)
         try:
-            await evaluate_tool.coroutine(
-                element=element or "target element", target=target, function=_CURSOR_MOVE_FN,
-            )
+            await evaluate_tool.coroutine(element=element or "target element", target=target, function=fn)
         except Exception as e:  # noqa: BLE001 - cosmetic only, never surfaced to the model
             console.system(f"Deepsearch: cursor overlay move failed (non-fatal): {e}")
 
@@ -1412,21 +1299,37 @@ class BrowserToolProvider:
             return f"BLOCKED: '{url}' is not in the allowed domain list."
 
         assert self._subagent_semaphore is not None  # set alongside server_url in __aenter__
+        wait_start = time.monotonic()
         async with self._subagent_semaphore:
-            console.system(f"Deepsearch: delegating a sub-worker to {url}.")
+            queued_for = time.monotonic() - wait_start
+            console.system(
+                f"Deepsearch: delegating a sub-worker to {url}"
+                + (f" (waited {queued_for:.2f}s for a free semaphore slot)" if queued_for > 0.05 else "")
+                + "."
+            )
+            task_start = time.monotonic()
             try:
                 async with BrowserToolProvider(
                     self._approval_gate, user_id=self._user_id,
                     deepsearch_session_id=self._deepsearch_session_id,
                     server_url=self._server_url, model=self._model,
-                    cursor_driver=self._cursor_driver,
                 ) as worker:
                     if self._user_id is not None:
                         live_activity.set_tab(self._user_id, worker._tab_id, url)
                     try:
-                        _summarization = _deepsearch_summarization_middleware(self._model)
+                        # A pool of >1 key spreads concurrent sub-workers
+                        # across separate OpenRouter keys (see
+                        # config.SUBAGENT_API_KEY_POOL's own comment) --
+                        # with the default pool of one, this is exactly
+                        # self._model, unchanged. Timing callback tagged by
+                        # tab id so a real run's logs show whether
+                        # individual LLM calls slow down when several
+                        # sub-workers run at once (see _TimingCallback's own
+                        # docstring for how to read that).
+                        sub_model = _pick_subagent_model(self._model)
+                        _summarization = _deepsearch_summarization_middleware(sub_model)
                         sub_agent = create_agent(
-                            model=self._model, tools=worker.tools,
+                            model=sub_model, tools=worker.tools,
                             system_prompt=_SUBAGENT_SYSTEM_PROMPT.format(url=url),
                             middleware=[_summarization] if _summarization is not None else [],
                         )
@@ -1436,7 +1339,10 @@ class BrowserToolProvider:
                                     {"messages": [HumanMessage(
                                         content=f"Navigate to {url}, then: {instructions}"
                                     )]},
-                                    config={"recursion_limit": config.DEEPSEARCH_SUBAGENT_MAX_STEPS},
+                                    config={
+                                        "recursion_limit": config.DEEPSEARCH_SUBAGENT_MAX_STEPS,
+                                        "callbacks": [_TimingCallback(worker._tab_id)],
+                                    },
                                 ),
                                 timeout=config.DEEPSEARCH_MAX_SESSION_SECONDS,
                             )
@@ -1459,6 +1365,8 @@ class BrowserToolProvider:
                 # normal (if unhappy) tool result instead.
                 console.tool_error(LABEL, "delegate_website_task", str(e))
                 return f"[{url}] ERROR: couldn't open a tab for this site: {e}"
+            finally:
+                console.system(f"Deepsearch: sub-worker for {url} finished in {time.monotonic() - task_start:.2f}s.")
         return f"[{url}] {summary}"
 
     def _guard(self, original: BaseTool) -> BaseTool:
@@ -1518,7 +1426,7 @@ class BrowserToolProvider:
                 state["snapshot_fresh"] = False
 
             if name in CURSOR_ANIMATED_TOOLS:
-                await self._move_cursor_to(kwargs.get("element"), kwargs.get("target"))
+                self._fire_cursor_move(name, kwargs.get("element"), kwargs.get("target"))
 
             try:
                 result = await original.coroutine(*args, **kwargs)
@@ -1538,41 +1446,26 @@ class BrowserToolProvider:
                     # is never awaited here.
                     self._start_reading_animation()
                     # Deterministic snapshot-size backstop -- see
-                    # config.DEEPSEARCH_LARGE_SNAPSHOT_CHARS's own comment.
-                    # Only nudges a NON-depth-limited call: a depth= snapshot
+                    # config.DEEPSEARCH_LARGE_SNAPSHOT_CHARS/
+                    # DEEPSEARCH_SNAPSHOT_HARD_CAP_CHARS's own comments. Only
+                    # applies to a NON-depth-limited call: a depth= snapshot
                     # is already the disciplined choice, so a large result
                     # from one (an unusually wide shallow tree) isn't the
                     # behavior this is meant to correct.
                     if kwargs.get("depth") is None:
-                        result = _nudge_if_oversized_snapshot(result)
+                        result = _apply_snapshot_size_backstop(result)
                 if name == "browser_navigate":
                     nav_url = kwargs.get("url") or (args[0] if args else None)
                     if nav_url:
                         self._live_set_url(nav_url)
-                if name == "browser_navigate" and self._cursor_driver is not None:
-                    # AWAITED, not fire-and-forget -- this used to be
-                    # `asyncio.create_task(...)` on the theory that
-                    # re-asserting the marker (a browser_evaluate round trip
-                    # plus a cursor_driver.mjs round trip) shouldn't add
-                    # latency to the navigate it's piggybacking on. In
-                    # practice that raced: the model's very next action
-                    # (almost always browser_snapshot) doesn't wait on this
-                    # task, so if the re-assert hadn't finished re-injecting
-                    # cursor_overlay.js onto the new document yet, every
-                    # subsequent action on that page ran with no overlay
-                    # mounted at all -- the drawn arrow just silently stayed
-                    # gone for the rest of that page (confirmed as the "cursor
-                    # goes invisible when the website loads" report: the real
-                    # click still happens, since human-cursor's mouse events
-                    # don't depend on cursor_overlay.js being present -- only
-                    # the visual arrow does). cursor_driver.mjs's registerTab
-                    # now has a fast path for a marker it already tracks
-                    # (skips the up-to-8s "find the page" poll entirely, since
-                    # the Page object is the same instance across a same-tab
-                    # navigation -- see that file's own comment), so this is
-                    # one quick evaluate() call, not a slow search -- cheap
-                    # enough to await inline and remove the race for good.
-                    await self._assert_cursor_marker()
+                    # No cursor-marker re-assert needed here (a real,
+                    # separate-CDP-connection driver used to require one --
+                    # see git history/README for that removed mechanism):
+                    # the DOM-only cursor overlay is (re-)injected by
+                    # @playwright/mcp's own --init-script on every fresh
+                    # document load automatically, same as the reading
+                    # animation and the click-ripple/typing-highlight/
+                    # page-transition-flash scripts.
                 return result
             except Exception as e:  # noqa: BLE001
                 state["consecutive_errors"] += 1
@@ -1675,6 +1568,12 @@ DEEPSEARCH_SYSTEM_PROMPT = (
     "independent, though: if one site's result determines the next step (e.g. which flight "
     "dates to search hotels for), handle those directly or one delegation at a time instead. "
     "See delegate_website_task's own description for the rest.\n"
+    "- Don't know the right URL yet (a specific results page, not just a homepage)? Do one "
+    "quick search yourself first (google.com or perplexity.ai, in your own tab) for a direct "
+    "deep-link or reference fact, THEN delegate with that as your starting point -- a real head "
+    "start, not a required step. Skip it once you already have a working URL, and never treat "
+    "a search result as today's live price/availability -- delegate_website_task is still the "
+    "source of truth for that.\n"
     "- When you're done, reply with a clear, complete, honest summary of what you found or did "
     "-- this goes straight back to the user.\n"
 )
@@ -1723,7 +1622,13 @@ def build_deepsearch_subagent(
         run_config = {
             "configurable": {"thread_id": f"deepsearch-{session_id or 'untracked'}"},
             "recursion_limit": config.DEEPSEARCH_MAX_STEPS,
+            # Per-LLM-call latency logging -- see _TimingCallback's own
+            # docstring for what this is actually diagnosing (the CTO
+            # discussion's "why isn't parallel delegation as fast as
+            # expected" question).
+            "callbacks": [_TimingCallback("top-level")],
         }
+        run_start = time.monotonic()
 
         # live_view_url only gets set (and the "a browser is open right now"
         # DB flag only gets flipped on) *after* BrowserToolProvider.__aenter__
@@ -1837,6 +1742,7 @@ def build_deepsearch_subagent(
             await db.clear_live_browser_active(user.user_id)
             live_activity.clear(user.user_id)
 
+        console.system(f"Deepsearch: whole run took {time.monotonic() - run_start:.2f}s (status={status}).")
         summary = _last_ai_text(final_messages)
 
         if session_id:

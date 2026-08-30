@@ -23,13 +23,45 @@
   // reading animation on -- see tools/deepsearch_tools.py's
   // _spawn_mcp_http_server), regardless of which of those two features is
   // what actually triggered injecting this file.
+  //
+  // FOUND WHILE INVESTIGATING "the cursor never appears in the live view":
+  // this used to append unconditionally, assuming document.head or
+  // document.documentElement is always available by the time an
+  // --init-script/addInitScript-injected script runs. It ISN'T --
+  // confirmed directly (see /home/claude session notes: a real headless
+  // Chromium run via Playwright's own addInitScript threw "Cannot read
+  // properties of null (reading 'appendChild')" from this exact line on a
+  // fresh navigation) -- addInitScript fires before the document has a
+  // documentElement at all on some navigations. Because this was the FIRST
+  // statement in the FIRST top-level IIFE in the file, that uncaught throw
+  // aborted the entire script's evaluation right here, before the cursor
+  // SVG was ever built or window.__messaCursor ever got set -- meaning the
+  // whole cosmetic overlay (arrow, click ripple, typing highlight, page-
+  // transition flash, reading animation, ALL of it) silently failed to
+  // install on every single page, unconditionally. This is almost
+  // certainly the real root cause of the human-cursor never visibly
+  // appearing, independent of and more fundamental than which delivery
+  // mechanism (the old real-cursor-driver's own addInitScript call, or
+  // @playwright/mcp's --init-script flag) was used -- both would hit the
+  // identical crash, since it's the same file either way. Fixed by
+  // deferring the append until document.head/documentElement genuinely
+  // exists, same DOMContentLoaded-fallback pattern already used below for
+  // mounting the cursor SVG itself.
   if (!window.__messaScrollbarHidden) {
     window.__messaScrollbarHidden = true;
     const style = document.createElement("style");
     style.textContent =
       "html { scrollbar-width: none; }" +
       "html::-webkit-scrollbar { width: 0; height: 0; display: none; }";
-    (document.head || document.documentElement).appendChild(style);
+    const mountScrollbarStyle = () => {
+      const target = document.head || document.documentElement;
+      if (target) target.appendChild(style);
+    };
+    if (document.head || document.documentElement) {
+      mountScrollbarStyle();
+    } else {
+      document.addEventListener("DOMContentLoaded", mountScrollbarStyle, { once: true });
+    }
   }
 
   if (window.__messaCursor) return; // already installed on this page
@@ -159,56 +191,119 @@
   }
 
   window.__messaCursor = { moveTo, returnToRestingSpot };
+})();
 
-  // ---------------------------------------------------------------------
-  // Real human-cursor mode (config.DEEPSEARCH_HUMAN_CURSOR_DRIVER, see
-  // tools/deepsearch_tools.py's CursorDriver/cursor_driver.mjs): when that
-  // driver is active, Python never calls window.__messaCursor.moveTo()
-  // above at all -- it moves the mouse via a SECOND, independent CDP
-  // connection instead, which dispatches genuine mousemove/mousedown/
-  // mouseup DOM events on this very page. This arrow needs to follow THOSE
-  // events directly rather than sitting there with nothing telling it to
-  // move. Both mechanisms coexist harmlessly in this one script (it has no
-  // way to know at injection time which mode Python is using, and doesn't
-  // need to): if real events never arrive (driver off, or this is the
-  // DOM-only fallback), this listener simply never fires and moveTo()
-  // above behaves exactly as before.
-  // ---------------------------------------------------------------------
-  let realEventIdleTimer = null;
+// ---------------------------------------------------------------------------
+// Click ripple + typing highlight -- window.__messaEffects.
+//
+// Added after a real run showed the drawn cursor arrow above wasn't even
+// visible in the live-view tiles users were watching (see the removed
+// real-human-cursor driver's own history for the full story) -- these are
+// the cheaper, always-visible alternative asked for: an expanding ring
+// right where a click landed, and a colored outline on whatever field is
+// being typed into. Both are called from the SAME evaluate() call
+// BrowserToolProvider._move_cursor_to already fires for browser_click/
+// browser_type (see _CURSOR_MOVE_CLICK_FN/_CURSOR_MOVE_TYPE_FN in
+// tools/deepsearch_tools.py), which is itself fire-and-forget now (never
+// awaited by the real action) -- so neither of these can ever add latency
+// to a real click or keystroke, only decorate it a beat later.
+(() => {
+  if (window.__messaEffects) return;
 
-  function onRealPointerActivity(x, y, scale) {
-    ensureMounted();
-    if (idlePulseInterval) { clearInterval(idlePulseInterval); idlePulseInterval = null; }
-    if (resetTimer) { clearTimeout(resetTimer); resetTimer = null; }
-    setCursorTransform(x, y, scale, /* instant */ true);
-    // No explicit "action finished" signal in a raw DOM event stream the
-    // way the old moveTo() path had (it knew when ITS OWN transition
-    // ended) -- so use a short quiet period after the last real event as
-    // that same signal instead: once real events stop arriving for a
-    // moment (the actual click/type, driven separately by @playwright/mcp,
-    // has presumably happened by then), glide back to an idle resting spot
-    // exactly like moveTo() already does after 1100ms.
-    if (realEventIdleTimer) clearTimeout(realEventIdleTimer);
-    realEventIdleTimer = setTimeout(returnToRestingSpot, 1100);
+  function ripple(x, y) {
+    const ring = document.createElement("div");
+    ring.style.position = "fixed";
+    ring.style.left = x + "px";
+    ring.style.top = y + "px";
+    ring.style.width = "0px";
+    ring.style.height = "0px";
+    ring.style.border = "3px solid #39ff88";
+    ring.style.borderRadius = "50%";
+    ring.style.transform = "translate(-50%, -50%)";
+    ring.style.pointerEvents = "none";
+    ring.style.zIndex = "2147483646"; // one below the cursor arrow itself
+    ring.style.opacity = "0.9";
+    ring.style.boxShadow = "0 0 12px rgba(57, 255, 136, 0.6)";
+    ring.style.transition = "width 420ms ease-out, height 420ms ease-out, opacity 420ms ease-out";
+    (document.body || document.documentElement).appendChild(ring);
+    // requestAnimationFrame so the browser registers the 0x0 starting
+    // state before the transition target below applies -- setting both in
+    // the same tick would collapse into no visible transition at all.
+    requestAnimationFrame(() => {
+      ring.style.width = "64px";
+      ring.style.height = "64px";
+      ring.style.opacity = "0";
+    });
+    setTimeout(() => ring.remove(), 500);
   }
 
-  // capture:true, passive:true: listen at the document level regardless of
-  // which element the real event actually targets, and never interfere
-  // with the page's own event handling (this arrow has pointer-events:none
-  // and must stay purely observational).
-  document.addEventListener("mousemove", (e) => {
-    onRealPointerActivity(e.clientX, e.clientY, 0.65);
-  }, { capture: true, passive: true });
+  let highlighted = null;
+  let highlightPrevOutline = null;
+  let highlightPrevOffset = null;
+  let highlightTimer = null;
 
-  document.addEventListener("mousedown", (e) => {
-    // Pulse down, mirroring moveTo()'s own click-pulse -- but driven by a
-    // REAL mousedown this time, not a timer guessing when the click landed.
-    onRealPointerActivity(e.clientX, e.clientY, 0.5);
-  }, { capture: true, passive: true });
+  function clearTypingHighlight() {
+    if (highlightTimer) {
+      clearTimeout(highlightTimer);
+      highlightTimer = null;
+    }
+    if (highlighted) {
+      highlighted.style.outline = highlightPrevOutline || "";
+      highlighted.style.outlineOffset = highlightPrevOffset || "";
+      highlighted = null;
+      highlightPrevOutline = null;
+      highlightPrevOffset = null;
+    }
+  }
 
-  document.addEventListener("mouseup", (e) => {
-    onRealPointerActivity(e.clientX, e.clientY, 0.65);
-  }, { capture: true, passive: true });
+  function highlightTyping(element) {
+    clearTypingHighlight();
+    if (!element) return;
+    highlighted = element;
+    highlightPrevOutline = element.style.outline;
+    highlightPrevOffset = element.style.outlineOffset;
+    element.style.outline = "3px solid #39ff88";
+    element.style.outlineOffset = "1px";
+    // Self-clearing (no separate "typing finished" signal from Python is
+    // needed) -- a new highlightTyping() call on a fresh keystroke resets
+    // this timer via the clearTypingHighlight() call above, so the
+    // highlight stays lit for as long as typing keeps happening and fades
+    // shortly after it stops.
+    highlightTimer = setTimeout(clearTypingHighlight, 1200);
+  }
+
+  window.__messaEffects = { ripple, highlightTyping, clearTypingHighlight };
+})();
+
+// ---------------------------------------------------------------------------
+// Page-transition flash -- a brief, subtle full-page color wash on every
+// fresh document load. This whole init-script file re-runs on every
+// navigation (that's what --init-script guarantees), so "runs once per
+// script load" already means "runs once per navigation" -- no signal from
+// Python needed. Covers the one gap none of the other cosmetic features
+// touch: the network/load time DURING a navigate itself, which otherwise
+// looks like a frozen page with nothing indicating work is happening.
+(() => {
+  function flash() {
+    const overlay = document.createElement("div");
+    overlay.style.position = "fixed";
+    overlay.style.inset = "0";
+    overlay.style.background = "rgba(57, 255, 136, 0.08)";
+    overlay.style.pointerEvents = "none";
+    overlay.style.zIndex = "2147483645"; // below both the cursor arrow and ripples
+    overlay.style.transition = "opacity 500ms ease-out";
+    overlay.style.opacity = "1";
+    (document.body || document.documentElement).appendChild(overlay);
+    requestAnimationFrame(() => {
+      overlay.style.opacity = "0";
+    });
+    setTimeout(() => overlay.remove(), 600);
+  }
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", flash);
+  } else {
+    flash();
+  }
 })();
 
 // ---------------------------------------------------------------------------
