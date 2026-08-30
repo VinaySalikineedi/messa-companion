@@ -68,6 +68,11 @@ let context = null;
 // marker -> { page, cursor }
 const tabs = new Map();
 
+// Test-only knob (see pipelineMouseMoves's own comment) -- never set in
+// production, where mouse.move's real cost against a real remote CDP
+// endpoint is already the "network latency" this simulates locally.
+const TEST_ARTIFICIAL_DELAY_MS = Number(process.env.MESSA_CURSOR_DRIVER_TEST_DELAY_MS || 0);
+
 // cursor_overlay.js's own source, read once at connect time (see the
 // `connect` handler) -- injected directly via page.evaluate() every time a
 // tab is (re)registered, NOT via @playwright/mcp's --init-script flag or
@@ -103,6 +108,52 @@ async function findPageByMarker(marker, timeoutMs) {
     await new Promise((r) => setTimeout(r, 150));
   }
   return null;
+}
+
+// See the `move` command handler's own comment for why this exists. Swaps
+// `page.mouse.move` for a wrapper that fires the real CDP call immediately
+// but doesn't make the caller (human-cursor's tracePath) wait for it to
+// land -- turning N sequential round trips into N pipelined ones. Errors are
+// swallowed the same way human-cursor's own tracePath already tolerates a
+// failed move (log-and-continue, `page.isClosed()`-guarded) -- since we no
+// longer let tracePath's own try/catch see the rejection (it never awaits
+// long enough to), we have to replicate that tolerance here instead.
+// Returns { settle } (await once all pipelined moves have actually
+// completed) and `restore` (put the original page.mouse.move back --
+// ALWAYS call this before returning from the `move` handler, success or
+// failure, so a later command on this same page/tab doesn't inherit a
+// wrapped mouse.move it never asked for).
+function pipelineMouseMoves(page) {
+  const originalMove = page.mouse.move.bind(page.mouse);
+  const inFlight = [];
+  page.mouse.move = (x, y, options) => {
+    // TEST_ARTIFICIAL_DELAY_MS only: local Chromium round trips are
+    // sub-millisecond, which makes it hard for a local test to tell
+    // "pipelined" apart from "serial" on wall-clock time alone -- this lets
+    // a test stand in a fixed per-call delay for the real network latency a
+    // remote Browserbase session would add, so the serial-vs-pipelined
+    // difference this whole function exists to produce is actually
+    // observable. Unset (the default, always true in production), this is
+    // a no-op: `delayMs` is 0 and the `if` below never fires.
+    const call = TEST_ARTIFICIAL_DELAY_MS > 0
+      ? new Promise((r) => setTimeout(r, TEST_ARTIFICIAL_DELAY_MS)).then(() => originalMove(x, y, options))
+      : originalMove(x, y, options);
+    const real = call.catch((err) => {
+      if (page.isClosed()) return;
+      log(`pipelined mouse.move(${x}, ${y}) failed (non-fatal, same tolerance human-cursor's own tracePath has): ${err && err.message || err}`);
+    });
+    inFlight.push(real);
+    // Resolve immediately -- this is the whole trick: tracePath's `await
+    // page.mouse.move(...)` moves on to queueing the NEXT point right away
+    // instead of blocking on this one's actual network round trip.
+    return Promise.resolve();
+  };
+  return {
+    restore: () => { page.mouse.move = originalMove; },
+    settle: () => Promise.all(inFlight),
+    // For logging/tests only -- final once settle() has resolved.
+    count: () => inFlight.length,
+  };
 }
 
 async function handleCommand(msg) {
@@ -142,7 +193,21 @@ async function handleCommand(msg) {
 
   if (cmd === 'registerTab') {
     if (!context) throw new Error('registerTab called before connect');
-    const page = await findPageByMarker(msg.marker, msg.timeoutMs ?? 8000);
+    // Fast path: this exact marker is already tracked -- meaning this call
+    // is Python's post-browser_navigate re-assertion on a tab we already
+    // found once (see Python's _assert_cursor_marker, called after EVERY
+    // navigate, now awaited rather than fire-and-forget -- see that
+    // function's own comment for the bug this fixes). A Playwright Page
+    // object stays the same instance across same-tab navigations, so
+    // there's no need to re-poll context.pages() seeking a fresh match by
+    // window.name at all -- that poll (up to 8s) existed for finding a
+    // BRAND NEW page the first time, and running it again here was pure
+    // waste on the re-navigate path, exactly the latency that made this
+    // safe to await impossible before. Skipping straight to the already-
+    // known Page reference makes re-registration a single evaluate() call,
+    // fast enough to await inline without slowing down the agent loop.
+    const already = tabs.get(msg.marker);
+    const page = already ? already.page : await findPageByMarker(msg.marker, msg.timeoutMs ?? 8000);
     if (!page) {
       throw new Error(`no page with window.name === ${JSON.stringify(msg.marker)} appeared in time`);
     }
@@ -168,17 +233,52 @@ async function handleCommand(msg) {
     }
     // performRandomMoves=false: idle-breathing/resting-spot motion is the
     // DOM overlay's job (cursor_overlay.js) -- this driver only ever moves
-    // on an explicit `move` command tied to a real upcoming action.
-    const cursor = createCursor(page, { x: 0, y: 0 }, false);
+    // on an explicit `move` command tied to a real upcoming action. Reuse
+    // the existing cursor instance on the fast path rather than creating a
+    // fresh one, so a re-navigate doesn't visibly snap the arrow back to
+    // (0,0) before its next real move.
+    const cursor = already ? already.cursor : createCursor(page, { x: 0, y: 0 }, false);
     tabs.set(msg.marker, { page, cursor });
-    log(`registered tab for marker ${msg.marker}`);
+    log(`registered tab for marker ${msg.marker}${already ? ' (fast path, already tracked)' : ''}`);
     return {};
   }
 
   if (cmd === 'move') {
     const tab = tabs.get(msg.marker);
     if (!tab) throw new Error(`move: no tab registered for marker ${JSON.stringify(msg.marker)}`);
-    await tab.cursor.moveTo({ x: msg.x, y: msg.y });
+    // Speed fix: human-cursor's own moveTo() -> tracePath() (see
+    // node_modules/human-cursor/lib/spoof.js) walks the ~35-79 bezier points
+    // it generates for this move ONE AT A TIME, `await page.mouse.move(v.x,
+    // v.y)`-ing each before starting the next -- so the wall-clock cost of a
+    // single moveTo() is N sequential CDP round trips to wherever this page
+    // actually lives (locally that's sub-ms each and invisible; against a
+    // remote Browserbase session it's real network latency, N times, per
+    // click/hover/type in the whole run -- confirmed as a real contributor
+    // to the reported 16-minute trip-planning run). tracePath isn't
+    // exported, and there's no option to change this, so pipelineMouseMoves
+    // below temporarily swaps page.mouse.move() out from under it: the
+    // wrapped version fires the REAL move immediately (so N calls hit the
+    // wire back-to-back, in order -- a single CDP connection is one
+    // WebSocket, so receipt order is preserved even though we don't wait for
+    // each ack) but resolves its own promise right away, so tracePath's loop
+    // never blocks waiting for a round trip and races straight on to
+    // queueing the next point. The bezier path itself -- still generated by
+    // human-cursor's own pathWithHumanCurve/HumanizeMouseTrajectory, totally
+    // untouched -- is exactly the same set of points in exactly the same
+    // order; only the DISPATCH is pipelined instead of serialized. We only
+    // block on the real network round trips at the very end, via settle(),
+    // so this command still doesn't return until the mouse has actually
+    // finished arriving -- callers can't tell the difference except that
+    // it's faster.
+    const pipeline = pipelineMouseMoves(tab.page);
+    const moveStart = Date.now();
+    try {
+      await tab.cursor.moveTo({ x: msg.x, y: msg.y });
+    } finally {
+      pipeline.restore();
+    }
+    await pipeline.settle();
+    log(`move for tab ${msg.marker}: ${pipeline.count()} points pipelined in ${Date.now() - moveStart}ms`);
     return {};
   }
 

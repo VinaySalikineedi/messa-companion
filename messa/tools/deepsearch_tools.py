@@ -1280,6 +1280,17 @@ class BrowserToolProvider:
         beyond that simply wait for a free slot rather than erroring, so you
         don't need to count concurrency yourself.
 
+        This applies just as much to planning something with multiple
+        independent LEGS as it does to comparing the same thing across
+        multiple sites -- e.g. "flights from X to Y" and "hotels in Y" are
+        two unrelated searches on two different sites that don't need each
+        other's result to proceed, so delegate both in the same turn
+        (one call per leg: flights, hotels, a rental car, etc.) instead of
+        working through them one at a time yourself. A 16-minute single-tab
+        trip-planning run is exactly the case this was built to speed up --
+        don't leave it running serially just because the request read as
+        "one task" rather than "one task per site."
+
         Do NOT use this for a single site, or for a step that depends on
         another delegate_website_task call's result (e.g. "use the price
         from site A to decide what to search for on site B") -- those need
@@ -1427,15 +1438,29 @@ class BrowserToolProvider:
                     if nav_url:
                         self._live_set_url(nav_url)
                 if name == "browser_navigate" and self._cursor_driver is not None:
-                    # Fire-and-forget, same reasoning as _start_reading_animation
-                    # above: re-asserting the marker is a real MCP round trip
-                    # (a browser_evaluate call) and must never add latency to
-                    # the agent's own navigate call it's piggybacking on. The
-                    # already-registered Page object stays valid for `move`
-                    # regardless of whether window.name actually reset on
-                    # this particular navigation, so nothing here needs to
-                    # complete before the next real action can proceed.
-                    asyncio.create_task(self._assert_cursor_marker())
+                    # AWAITED, not fire-and-forget -- this used to be
+                    # `asyncio.create_task(...)` on the theory that
+                    # re-asserting the marker (a browser_evaluate round trip
+                    # plus a cursor_driver.mjs round trip) shouldn't add
+                    # latency to the navigate it's piggybacking on. In
+                    # practice that raced: the model's very next action
+                    # (almost always browser_snapshot) doesn't wait on this
+                    # task, so if the re-assert hadn't finished re-injecting
+                    # cursor_overlay.js onto the new document yet, every
+                    # subsequent action on that page ran with no overlay
+                    # mounted at all -- the drawn arrow just silently stayed
+                    # gone for the rest of that page (confirmed as the "cursor
+                    # goes invisible when the website loads" report: the real
+                    # click still happens, since human-cursor's mouse events
+                    # don't depend on cursor_overlay.js being present -- only
+                    # the visual arrow does). cursor_driver.mjs's registerTab
+                    # now has a fast path for a marker it already tracks
+                    # (skips the up-to-8s "find the page" poll entirely, since
+                    # the Page object is the same instance across a same-tab
+                    # navigation -- see that file's own comment), so this is
+                    # one quick evaluate() call, not a slow search -- cheap
+                    # enough to await inline and remove the race for good.
+                    await self._assert_cursor_marker()
                 return result
             except Exception as e:  # noqa: BLE001
                 state["consecutive_errors"] += 1
@@ -1539,12 +1564,18 @@ DEEPSEARCH_SYSTEM_PROMPT = (
     "notifies the user and waits for them, then hands you back a fresh snapshot once they've "
     "gotten past it (or tells you to move on if they don't in time).\n"
     "- If the task genuinely involves SEVERAL INDEPENDENT websites (e.g. \"compare this "
-    "product's price across site A, site B, and site C\"), use delegate_website_task instead of "
-    "visiting them yourself one at a time -- call it once per site, ALL IN THE SAME TURN, so "
-    "they run concurrently instead of sequentially. Only do this when the sites are genuinely "
-    "independent of each other; if one site's result determines what to do on the next, handle "
-    "them directly (or one delegate_website_task call at a time, waiting for each result before "
-    "the next) instead. Each call gets exactly ONE website and ONE simple, self-contained goal -- "
+    "product's price across site A, site B, and site C\") OR SEVERAL INDEPENDENT LEGS of a "
+    "bigger plan (e.g. \"flights from X to Y\" and \"hotels in Y\" and \"a rental car in Y\" -- "
+    "each is its own search on its own site that doesn't need the others' results), use "
+    "delegate_website_task instead of visiting them yourself one at a time -- call it once per "
+    "site/leg, ALL IN THE SAME TURN, so they run concurrently instead of sequentially. A trip- or "
+    "plan-shaped request is exactly this: don't work through flights, then hotels, then a car, one "
+    "after another in your own tab, just because the request reads as \"one task\" -- decompose it "
+    "into its independent parts first and delegate each. Only do this when the parts are genuinely "
+    "independent of each other; if one site's result determines what to do on the next (e.g. the "
+    "hotel search depends on which flight dates you actually booked), handle those directly (or "
+    "one delegate_website_task call at a time, waiting for each result before the next) instead. "
+    "Each call gets exactly ONE website and ONE simple, self-contained goal -- "
     "this is just the same per-site work you'd otherwise do sequentially yourself, parallelized, "
     "not a bigger or more open-ended task, so keep `instructions` short and focused (e.g. "
     "\"find the price of the wireless mouse\", not a multi-part task with several unrelated "

@@ -2370,6 +2370,232 @@ back. If that turns out to feel premature in practice, the fix is a one-line
 gate in `ensure_default_briefings` on `user_row["onboarding_step"] ==
 "complete"` -- deliberately left out for now rather than guessed at.
 
+## Cursor going invisible mid-run -- a real race in the post-navigate re-assertion
+
+You reported the cursor showing at the start of a run, then going invisible
+inside a tab once a website finished loading -- browsing itself kept
+working fine (real clicks, real reads), just the drawn arrow vanished.
+
+Root cause: `_assert_cursor_marker` (which re-injects `cursor_overlay.js`
+onto the tab after every `browser_navigate` -- a real navigation wipes all
+page JS state, overlay included) was fired via `asyncio.create_task(...)`
+and never awaited, on the theory that a cursor-driver round trip shouldn't
+add latency to the navigate it's piggybacking on. In practice this raced:
+the model's very next action (almost always `browser_snapshot`, immediately
+followed by real clicks/types) never waited on that background task, so if
+re-injection hadn't finished by the time those next actions ran, the
+overlay was simply never mounted on that page at all -- not "delayed," just
+absent for good until the *next* navigation gave the race another chance to
+go either way. This matches the report exactly: human-cursor's real mouse
+events don't depend on `cursor_overlay.js` being present (only the drawn
+SVG arrow does), so the actual clicking/typing/finding never had any reason
+to be affected.
+
+The honest fix is to await it -- but the old `registerTab` handler in
+`cursor_driver.mjs` made that expensive: every call, first-time or repeat,
+re-polled `context.pages()` for a page matching `window.name` (up to 8
+seconds in the worst case), even though a re-navigate's Page object is the
+exact same instance Playwright already handed back the first time a tab
+opened. `registerTab` now has a fast path -- if the marker is already
+tracked, it reuses the cached Page reference directly and skips the poll
+entirely, turning re-registration into one `evaluate()` call. That's what
+makes it safe to await inline: `deepsearch_tools.py`'s `guarded()` now
+`await`s `_assert_cursor_marker()` after every navigate instead of firing
+it detached, so the next action genuinely can't run until the overlay is
+back.
+
+Verified two ways: `test_cursor_reassert_fast_path.py` drives the real
+`cursor_driver.mjs` process directly and deliberately does NOT reset
+`window.name` after a second navigation (simulating the exact race the old
+code was vulnerable to) -- the fast path still finds the tracked tab and
+remounts the overlay in single-digit milliseconds, something the old
+poll-by-`window.name` implementation could not have done at all in that
+scenario. `test_cursor_navigate_await_fix.py` goes one level up, through
+the real `guarded()` wrapper against a real `BrowserToolProvider` and a
+real local Chromium: it calls the actual guarded `browser_navigate` tool
+twice in a row and checks -- with no sleep, immediately after each call
+returns -- that the overlay is already mounted, which is only possible if
+the re-assertion completed before the awaited call handed control back.
+Both existing cursor tests (`test_cursor_overlay_real_fix_e2e.py`,
+`test_cursor_driver_wiring_live.py`) still pass unchanged.
+
+## Making deepsearch faster -- where the 16 minutes likely went, and the options
+
+You reported a JAX -> SF flights + hotel planning task taking 16 minutes,
+and asked me to think through where that time is actually going and lay
+out options rather than just pick one. I don't have a trace from your
+actual run (Browserbase/OpenRouter logs aren't reachable from here), so
+this is grounded in reading the real code paths that run on every step,
+not a profiler output -- I've said below, for each one, how confident I am
+and why.
+
+**High confidence -- this is a real, uncapped cost on every single click,
+type, hover, and dropdown selection:** `CURSOR_ANIMATED_TOOLS` (`browser_click`,
+`browser_type`, `browser_hover`, `browser_select_option`) all synchronously
+`await self._move_cursor_to(...)` before the real action runs. That calls
+into `human-cursor`'s `moveTo()`, which generates a bezier path of
+**35-80 individual points** (its own randomized default) and dispatches
+each one as a SEPARATE, individually-awaited `page.mouse.move()` CDP call
+-- no batching, no pipelining. Over a remote Browserbase connection, each
+of those round trips is real network latency, not a local call. A single
+click's "move the mouse there first" step alone can plausibly cost
+1-3+ seconds before the click even happens, and a flights+hotel booking
+flow (search fields, date pickers, passenger/cabin dropdowns, result
+filters, picking a specific flight, repeating for a hotel) easily has
+20-50+ such interactions. This is very likely the single largest
+controllable cost in the run.
+
+**Medium-high confidence -- likely serialized when it didn't need to be:**
+`delegate_website_task`'s own docstring and system-prompt guidance
+(`DEEPSEARCH_SYSTEM_PROMPT`) frame concurrent delegation around "compare
+this product's price across site A, B, C" -- it never says "flights on one
+site and a hotel on another are exactly this kind of independent work
+too." A flight search and a hotel search are genuinely independent (neither
+needs the other's result to proceed), which is exactly the shape
+`delegate_website_task` was built to parallelize -- confirmed elsewhere in
+this README that concurrent sub-workers on a shared Browserbase session
+really do run at the same time, not one after another. Nothing in the
+prompt currently nudges the model to recognize a trip-planning request as
+that shape, so it likely did the whole thing in one tab, one leg after the
+other.
+
+**Medium confidence, already partially mitigated:** `DEEPSEARCH_SYSTEM_PROMPT`
+already tells the model to prefer `browser_find`/a depth-limited
+`browser_snapshot` over a full snapshot when possible ("Speed matters --
+users notice how long this takes"). Whether the model actually followed
+that reliably on your run, I can't tell from here -- a full accessibility
+tree on a flights-results page (calendar widgets, filters, dozens of result
+rows) is large, and every extra KB in a snapshot is both slower and more
+expensive on every subsequent model call that still has it in context.
+
+**Lower confidence / smaller likely contribution:** the fixed per-run
+startup cost (opening a Browserbase session, spawning `@playwright/mcp` and
+`cursor_driver.mjs`) is real but probably only single-digit seconds against
+a 16-minute total. `SUBAGENT_MODEL_NAME` (what deepsearch already runs on)
+is already the "flash"/fast tier, not the heavier orchestrator model, so
+switching models is unlikely to be a large additional win by itself. The
+reading-animation/idle-breathing cosmetic scroll does NOT add latency by
+design -- it only fills think-time gaps that were already happening, so
+turning it off would change nothing about total run time (flagging this so
+effort doesn't go there by mistake).
+
+**Options, roughly in order of expected impact for the effort involved:**
+
+1. **Tune down human-cursor's realism** -- pass a lower point-count/spread
+   into `createCursor`'s options in `cursor_driver.mjs` (or add a
+   `DEEPSEARCH_CURSOR_SPEED` config knob with fast/medium/human presets).
+   Cuts the biggest identified cost directly; the visible trade-off is a
+   slightly less organic-looking mouse path. Low risk, moderate effort.
+2. **[IMPLEMENTED -- see "Deepsearch speed fixes" below] Teach
+   delegate_website_task to recognize trip-planning as parallelizable** --
+   add "book a flight and find a hotel" (and similar: flight + car rental,
+   comparing two unrelated services) as an explicit example of independent
+   multi-site work in `DEEPSEARCH_SYSTEM_PROMPT`. No infrastructure change,
+   no new failure mode -- purely a prompt clarification riding on machinery
+   that's already built and tested. Low risk, low effort, likely large win
+   specifically for multi-leg trip requests like this one.
+3. **[IMPLEMENTED -- see "Deepsearch speed fixes" below] Batch/pipeline the
+   cursor's mouse-move dispatch** instead of awaiting each of the 35-80
+   points individually -- send them without waiting for each ack, only
+   confirming the last one, so the real network cost drops from "N round
+   trips" to close to "1 round trip" while still visually tracing the same
+   path. Bigger win than #1 with no visual trade-off at all, but it means
+   patching/wrapping `human-cursor`'s own move logic rather than just
+   tuning its options -- more engineering effort and a little more risk of
+   a subtle regression in the drawn path's smoothness.
+4. **Skip the full human-cursor animation for "minor" interactions**
+   (typing into a field, selecting a dropdown option) and reserve it for
+   clicks a user would actually watch happen -- fewer slow moves overall.
+   Requires a judgment call about which actions "deserve" realism; medium
+   effort, and changes the character of the live view (some actions would
+   visibly snap rather than glide).
+5. **Reinforce/verify the snapshot-size guidance** -- e.g. a deterministic
+   nudge (same shape as this codebase's other backstops) if a snapshot
+   comes back over some size threshold, pushing the model toward
+   `browser_find`/`depth=` on the next call instead of relying on it
+   following the system prompt's advice unprompted. Moderate effort,
+   uncertain size of win without real trace data to confirm how often this
+   actually happens.
+
+I haven't implemented any of these -- wanted you to see the reasoning and
+pick, especially since #1/#3/#4 all trade some amount of "looks human" for
+speed, which is a product call, not just an engineering one.
+
+**You picked #2 ("parallelize trip legs") and #3 ("batch the cursor's
+mouse-move dispatch") -- both implemented, neither trades away any visual
+realism.** #1, #4, and #5 above remain unimplemented and available if the
+run is still too slow after these land.
+
+## Deepsearch speed fixes: parallel trip legs + pipelined cursor movement
+
+**Parallelize trip legs.** `_delegate_website_task`'s own docstring (which
+IS the tool description the model sees -- it's registered via
+`StructuredTool.from_function(..., description=(self._delegate_website_task
+.__doc__ or "").strip())`) and `DEEPSEARCH_SYSTEM_PROMPT`'s "SEVERAL
+INDEPENDENT websites" guidance both previously only framed concurrent
+delegation around comparing the same thing across multiple sites ("this
+product's price across site A, B, C"). Neither ever said a trip's
+independent LEGS -- flights on one site, a hotel on another, a rental car on
+a third -- are exactly the same shape of independent work. Both now say so
+explicitly, with the flights/hotel/rental-car example spelled out and an
+explicit "don't work through legs serially just because the request reads
+as one task" instruction, plus the same caveat as the existing guidance:
+only delegate legs in parallel when they're genuinely independent (a hotel
+search that depends on which flight dates actually got booked still has to
+wait for that result first). No infrastructure changed -- LangGraph's
+`ToolNode` already runs multiple tool calls issued in the same model turn
+concurrently (confirmed elsewhere in this README), so this is purely
+teaching the model, via its own tool description and system prompt, to
+recognize a trip-planning request as "call delegate_website_task once per
+leg, all in the same turn" instead of working through it serially in one
+tab. There's no automated test for prompt wording itself (it's an
+instruction to the model, not deterministic logic) -- I verified the edited
+text reads correctly and re-ran the full regression suite to confirm
+nothing else broke.
+
+**Batch/pipeline the cursor's mouse-move dispatch.** The actual mechanism
+behind the "35-80 individually-awaited round trips per move" cost described
+above: human-cursor's own `tracePath()` (in
+`node_modules/human-cursor/lib/spoof.js`, not something this codebase
+wrote or can pass options into) walks its generated bezier path one point
+at a time, `await page.mouse.move(v.x, v.y)`-ing each before starting the
+next. `cursor_driver.mjs`'s `move` command handler now wraps the target
+page's `page.mouse.move` in a `pipelineMouseMoves()` helper before calling
+`cursor.moveTo()`: the wrapper fires the real CDP call immediately but
+resolves its own promise right away, so tracePath's loop races on to
+queueing the next point instead of blocking on this one's network round
+trip. All N calls hit the wire back-to-back in order (a single CDP
+connection is one WebSocket, so receipt order is preserved even though we
+don't wait for each ack) -- the bezier path itself is still generated by
+human-cursor's own untouched curve logic, exactly the same points in
+exactly the same order, only the dispatch is pipelined instead of
+serialized. The `move` command still doesn't return until every real move
+has actually landed (`pipeline.settle()` awaits all of them), and a failed
+individual move is swallowed with a log line the same way tracePath's own
+built-in tolerance already worked, so callers can't tell the difference
+except that it's faster. Verified with a new test,
+`test_cursor_pipeline_speed.py`, against the real `cursor_driver.mjs`
+process: since local Chromium round trips are sub-millisecond (too fast to
+show a serial-vs-pipelined difference on their own), the driver has a
+test-only `MESSA_CURSOR_DRIVER_TEST_DELAY_MS` env var (unset/zero-cost in
+production) that stands in a fixed artificial per-call delay for what a
+real remote Browserbase round trip would cost. With a 40ms artificial delay
+and a real 47-point move, the old serial behavior would have cost roughly
+47 x 40ms = 1880ms; the pipelined version completed in 97ms -- about 19x
+faster on that run, while the test also confirms it still took at least one
+real delay period (proving it didn't just skip the network cost, only
+stopped serializing it). Also re-ran `test_cursor_reassert_fast_path.py`,
+`test_cursor_overlay_real_fix_e2e.py`, and `test_cursor_navigate_await_fix.py`
+against the changed file -- all still pass, so the pipelining doesn't
+interfere with the fast-path re-registration or the awaited re-assertion
+fix from the cursor-invisibility bug above.
+
+**Not implemented / still on the table:** tuning down human-cursor's point
+count or spread (#1), skipping the full animation for "minor" interactions
+like typing/dropdowns (#4), and a deterministic backstop nudge for
+oversized snapshots (#5) -- all still available if the run is still slower
+than you'd like after these two land.
+
 ## Changes from your second round of testing
 
 - **Renamed browser_agent -> deepsearch.** Same subagent, new name
