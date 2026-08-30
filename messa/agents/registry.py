@@ -219,16 +219,14 @@ def _build_system_prompt(user: config.UserContext) -> str:
         "task tool: deepsearch (web browsing/research), executive_assistant (tasks, "
         "reminders, notes, contacts, calendar), email_agent (the user's own inbox), "
         "document_agent (generates PDFs), routines_agent (recurring automations).\n\n"
-        "Speed matters: you also have web_search and fetch_page_text as your OWN direct "
-        "tools (no delegation, no browser, answers in a second or two). Use these yourself "
-        "for a plain factual lookup -- a fact, current news, a definition, 'what's the score', "
-        "'who is X', 'what does this article say' -- instead of delegating to deepsearch, "
-        "which opens an actual browser session and is real overhead when nothing needs to be "
-        "clicked. Reserve deepsearch for anything that genuinely requires interacting with a "
-        "page: clicking through a flow, filling out a form, logging in, building a cart, or a "
-        "site whose content doesn't show up in a plain page fetch (JS-rendered). If web_search/ "
-        "fetch_page_text come back empty or error out, that's your cue to delegate to "
-        "deepsearch instead, not to give up.\n\n"
+        "Speed matters: you also have web_search and fetch_page_text as your OWN direct tools "
+        "(no delegation, no browser, answers in a second or two) -- use them for a plain "
+        "factual lookup (a fact, news, a definition, 'who is X') instead of delegating to "
+        "deepsearch, which opens a real browser session and is overhead when nothing needs to "
+        "be clicked. Reserve deepsearch for anything that needs interacting with a page: a "
+        "flow, a form, a login, a cart, or JS-rendered content a plain fetch won't show. If "
+        "web_search/fetch_page_text come back empty or error out, delegate to deepsearch "
+        "instead of giving up.\n\n"
         f"{known_str}"
         f"{time_str}"
         f"{onboarding_str}"
@@ -250,15 +248,13 @@ def _build_system_prompt(user: config.UserContext) -> str:
         "in that single response rather than describing one now and coming back for the "
         "rest -- you only get one shot per response to actually act on what you just said "
         "you'd do.\n\n"
-        "Live data means a fresh check, every time: if the user asks for anything that can "
-        "change between messages -- a price, availability, a live status, today's weather -- "
-        "and they're asking again (even just \"try again\" or \"is it back yet\"), delegate to "
-        "deepsearch again. Never answer from what a subagent told you on an earlier turn for "
-        "this kind of request, even if that earlier attempt failed and you're confident the "
-        "failure is still true -- conditions on your end (the browser, the network, an "
-        "external service) can change silently between messages, and telling the user "
-        "'it hasn't changed since I last checked' without actually checking again is a "
-        "worse failure than a slow reply.\n\n"
+        "Live data means a fresh check every time: if the user asks again for anything that "
+        "can change between messages (a price, availability, a live status, today's weather) "
+        "-- even just \"try again\" or \"is it back yet\" -- delegate to deepsearch again. "
+        "Never answer from an earlier turn for this kind of request, even if that attempt "
+        "failed and you're confident it's still true: conditions on your end can change "
+        "silently between messages, and 'it hasn't changed since I last checked' without "
+        "actually checking is a worse failure than a slow reply.\n\n"
         "Deepsearch sessions: a deepsearch reply always starts with "
         "'[deepsearch session #<id> -- completed]' or '...-- not finished, hit its step "
         "limit'. Reference that same 'session #<id>' in your next delegation's description "
@@ -273,16 +269,14 @@ def _build_system_prompt(user: config.UserContext) -> str:
         "session id when the new ask is genuinely a fresh, unrelated task. Use "
         "list_deepsearch_sessions if you need to check on or remind yourself of past "
         "research before starting something that might duplicate it.\n\n"
-        "Confirmation flow: only SCHEDULING requires your confirmation -- executive_assistant's "
-        "calendar-event tools and routines_agent's new-recurring-job tool only PROPOSE the "
-        "change and report back a pending id. You must relay that proposal to the user in plain "
-        "language and get an explicit yes before calling confirm_pending_action; call "
-        "reject_pending_action if they decline or the details need to change. Never call "
-        "confirm_pending_action without the user having just said yes to that specific thing. "
-        "Everything else executive_assistant does -- creating/updating/deleting a task or "
-        "reminder, saving a note, adding/removing a contact -- happens immediately with no "
-        "proposal step; when it tells you one of those is done, it's already done, just relay "
-        "it, don't ask for confirmation that was never needed.\n\n"
+        "Confirmation flow: only SCHEDULING needs your confirmation -- executive_assistant's "
+        "calendar tools and routines_agent's new-job tool only PROPOSE the change and return a "
+        "pending id. Relay that proposal in plain language and get an explicit yes before "
+        "calling confirm_pending_action; call reject_pending_action if they decline or details "
+        "need to change -- never confirm without the user having just said yes to that "
+        "specific thing. Everything else executive_assistant does (create/update/delete a task "
+        "or reminder, save a note, add/remove a contact) happens immediately with no proposal "
+        "step -- when it says one's done, it's done, just relay it.\n\n"
         "Use track_project when a request looks like it'll span multiple turns or tasks "
         "(e.g. planning a trip, redesigning something), so related work stays grouped.\n\n"
         "Be concise -- responses may be read as a text message. Don't restate a subagent's "
@@ -304,8 +298,19 @@ async def build_orchestrator(
     or both independently; real callers (cli.py, server.py) just omit them
     and get the configured defaults."""
     approval_gate = approval_gate or CLIApprovalGate()
-    model = model or config.build_model(config.ORCHESTRATOR_MODEL_NAME)
-    subagent_model = subagent_model or config.build_model(config.SUBAGENT_MODEL_NAME)
+    # effective_context_tokens: see config.py's big comment above
+    # SUBAGENT_EFFECTIVE_CONTEXT_TOKENS/ORCHESTRATOR_EFFECTIVE_CONTEXT_TOKENS
+    # -- without this, every agent's auto-compaction silently falls back to
+    # deepagents' generic 170k-token trigger, since our OpenRouter model
+    # strings don't match anything in LangChain's model-profile lookup.
+    model = model or config.build_model(
+        config.ORCHESTRATOR_MODEL_NAME,
+        effective_context_tokens=config.ORCHESTRATOR_EFFECTIVE_CONTEXT_TOKENS,
+    )
+    subagent_model = subagent_model or config.build_model(
+        config.SUBAGENT_MODEL_NAME,
+        effective_context_tokens=config.SUBAGENT_EFFECTIVE_CONTEXT_TOKENS,
+    )
 
     subagents = [
         build_deepsearch_subagent(user, subagent_model, approval_gate),

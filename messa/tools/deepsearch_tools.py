@@ -109,6 +109,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from langchain.agents import create_agent
+from langchain.agents.middleware import SummarizationMiddleware
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, HumanMessage, messages_from_dict, messages_to_dict
 from langchain_core.runnables import RunnableLambda
@@ -409,6 +410,44 @@ def _looks_like_auth_wall(snapshot_text: str | None) -> bool:
     return any(kw in lowered for kw in _AUTH_WALL_KEYWORDS)
 
 
+_SNAPSHOT_SIZE_NUDGE = (
+    "\n\n(This snapshot was large. Next time, prefer browser_find(text=...) for one "
+    "specific element, or browser_snapshot(depth=...) for a shallower tree, instead of a "
+    "full snapshot -- it's cheaper and faster, and you're carrying this one in full for "
+    "the rest of the run.)"
+)
+
+
+def _nudge_if_oversized_snapshot(result: Any) -> Any:
+    """See guarded()'s own comment on config.DEEPSEARCH_LARGE_SNAPSHOT_CHARS
+    for why this exists (a deterministic backstop for the snapshot-size
+    discipline the system prompt already asks for but can't enforce on its
+    own). `result` is @playwright/mcp's raw return shape for
+    browser_snapshot -- a `(content_blocks, artifact)` tuple where
+    content_blocks is a list of `{"type": "text", "text": ...}` dicts,
+    confirmed by direct inspection of a real call, not assumed. Appends the
+    nudge to the LAST text block's own text (there's normally exactly one)
+    rather than altering the tuple's shape, so whatever else consumes this
+    result downstream sees the same structure either way. Returns `result`
+    unchanged (same object, not a defensive copy) whenever the shape isn't
+    what's expected or the snapshot isn't actually oversized -- this must
+    never be the reason a real snapshot result fails to reach the model.
+    """
+    if not isinstance(result, tuple) or len(result) != 2:
+        return result
+    content, artifact = result
+    if not isinstance(content, list) or not content:
+        return result
+    total_len = sum(len(b.get("text", "")) for b in content if isinstance(b, dict))
+    if total_len <= config.DEEPSEARCH_LARGE_SNAPSHOT_CHARS:
+        return result
+    new_content = list(content)
+    last = dict(new_content[-1])
+    last["text"] = last.get("text", "") + _SNAPSHOT_SIZE_NUDGE
+    new_content[-1] = last
+    return (new_content, artifact)
+
+
 def _target_values(name: str, kwargs: dict[str, Any]) -> list[str]:
     if name == "browser_drag":
         return [v for v in (kwargs.get("startTarget"), kwargs.get("endTarget")) if v]
@@ -502,6 +541,62 @@ def _last_ai_text(messages: list[Any]) -> str:
             if text:
                 return text
     return "(no summary produced)"
+
+
+def _deepsearch_summarization_middleware(model: Any) -> SummarizationMiddleware | None:
+    """Build the auto-compaction middleware deepsearch's own `create_agent`
+    calls need explicitly -- unlike the four subagents built via deepagents'
+    `create_deep_agent` (see config.py's big comment on
+    SUBAGENT_EFFECTIVE_CONTEXT_TOKENS), deepsearch uses plain
+    `langchain.agents.create_agent` directly (see this module's own two
+    call sites), which does NOT attach any summarization middleware on its
+    own -- its own `middleware=` parameter defaults to an empty tuple, full
+    stop, not some quieter fallback. Confirmed by reading create_agent's
+    signature: there is no hidden default here to rely on. That makes
+    deepsearch -- specifically the agent most likely to need this, since it
+    runs up to DEEPSEARCH_MAX_STEPS=100 steps and appends a fresh
+    browser_snapshot on most of them -- the one place in this codebase that
+    was running with ZERO compaction at all before this, not even the
+    generic 170k-token fallback the other agents were quietly defaulting to.
+
+    Trigger/keep are computed directly from
+    config.SUBAGENT_EFFECTIVE_CONTEXT_TOKENS (deepsearch always runs on
+    SUBAGENT_MODEL_NAME) using the same 85%-trigger/10%-keep split
+    deepagents' own compute_summarization_defaults() uses for a model with a
+    known profile -- rather than passing trigger=("fraction", 0.85") and
+    leaning on model.profile being set, this computes the token counts
+    directly, so it works even if a caller ever passes this a model instance
+    config.build_model() didn't tag. No backend/offload here (contrast
+    deepagents' own create_summarization_middleware, which writes evicted
+    history to a filesystem backend the model can read_file back later):
+    deepsearch's toolset has no filesystem tools at all, so an offloaded
+    file would just be unreachable dead weight. Evicted detail becomes the
+    LLM-written summary and nothing more -- acceptable here since
+    deepsearch's whole job is to finish the task and report back a result,
+    not to serve as a queryable transcript of exactly what it clicked 40
+    steps ago.
+
+    Returns `None` (skip compaction rather than error out) when `model`
+    isn't an actual `BaseChatModel` instance -- production call sites
+    always pass one (see config.build_model/registry.py), but this
+    project's own test harness sometimes passes a bare string placeholder
+    (e.g. `model="fake-model"`) to stand in for a real model without ever
+    invoking it. `SummarizationMiddleware` tries to resolve a real provider
+    from a string model at CONSTRUCTION time (confirmed directly -- it
+    raises `ValueError: Unable to infer model provider for
+    model='fake-model'` immediately, not lazily on first use), which would
+    break exactly those tests for a code path they were never exercising in
+    the first place.
+    """
+    if not isinstance(model, BaseChatModel):
+        return None
+    trigger_tokens = int(config.SUBAGENT_EFFECTIVE_CONTEXT_TOKENS * 0.85)
+    keep_tokens = int(config.SUBAGENT_EFFECTIVE_CONTEXT_TOKENS * 0.10)
+    return SummarizationMiddleware(
+        model=model,
+        trigger=("tokens", trigger_tokens),
+        keep=("tokens", keep_tokens),
+    )
 
 
 class BrowserToolProvider:
@@ -1173,14 +1268,20 @@ class BrowserToolProvider:
         except Exception:  # noqa: BLE001
             return None
 
+    # Docstring below IS the tool description sent to the model on every
+    # single call (see the StructuredTool.from_function registration a few
+    # lines down: description=(self._request_human_help.__doc__ or
+    # "").strip()) -- so it stays model-facing only. Implementation
+    # pointers for future maintainers live here instead, as a plain
+    # comment, not inside the docstring: the notify step is a separate
+    # background poll -- see db.create_human_help_request and server.py's
+    # _production_deepsearch_pause_loop.
     async def _request_human_help(self, reason: str) -> str:
         """Model-facing tool: call this when you recognize a login wall,
         CAPTCHA, 2FA prompt, or similar block you cannot get past yourself.
 
-        Writes a durable request that a separate background process (not
-        this call) uses to text the user -- see db.create_human_help_request
-        and server.py's _production_deepsearch_pause_loop -- then waits,
-        polling this tab for real activity: gives up after
+        Writes a durable request that texts the user, then waits, polling
+        this tab for real activity: gives up after
         config.DEEPSEARCH_HUMAN_HELP_INITIAL_WAIT_SECONDS with no activity
         at all; as long as fresh activity keeps appearing, extends the wait
         in config.DEEPSEARCH_HUMAN_HELP_EXTEND_SECONDS increments, capped
@@ -1260,43 +1361,44 @@ class BrowserToolProvider:
             # actually stopped waiting.
             self._live_clear_waiting()
 
+    # Docstring below IS the tool description sent to the model on every
+    # single call -- see the StructuredTool.from_function registration a
+    # few lines down (description=(self._delegate_website_task.__doc__ or
+    # "").strip()) -- so it stays model-facing only; implementation/test
+    # pointers for future maintainers live here as a plain comment instead:
+    # a new MCP client connection against a --shared-browser-context server
+    # always lands on its own isolated tab (confirmed in
+    # /tmp/test_mcp_multitab.py), and LangGraph genuinely runs multiple tool
+    # calls from one AI turn concurrently (confirmed in
+    # /tmp/test_agent_concurrency.py) -- see also the module docstring's
+    # "Multi-site delegation" note.
     async def _delegate_website_task(self, url: str, instructions: str) -> str:
         """Model-facing tool: delegate independent work on ONE website to a
         fresh sub-worker with its OWN browser tab, in the SAME shared
-        Browserbase session -- no new session, no extra billing unit (see
-        the module docstring's "Multi-site delegation" note and
-        /tmp/test_mcp_multitab.py, which confirmed a new MCP client
-        connection against a --shared-browser-context server always lands
-        on its own isolated tab, safely separate from every other
-        connection's).
+        Browserbase session -- no new session, no extra billing unit.
 
         Call this MULTIPLE TIMES IN THE SAME TURN for genuinely independent
         multi-site work (e.g. "check the price on site A and on site B") --
-        LangGraph runs multiple tool calls from one AI turn concurrently, so
-        several delegate_website_task calls made together actually run in
-        parallel, not one after another (confirmed empirically, see
-        /tmp/test_agent_concurrency.py). Up to
+        those calls run in parallel, not one after another. Up to
         config.DEEPSEARCH_MAX_SUBAGENTS sub-workers run at once; extra calls
         beyond that simply wait for a free slot rather than erroring, so you
         don't need to count concurrency yourself.
 
-        This applies just as much to planning something with multiple
-        independent LEGS as it does to comparing the same thing across
-        multiple sites -- e.g. "flights from X to Y" and "hotels in Y" are
-        two unrelated searches on two different sites that don't need each
-        other's result to proceed, so delegate both in the same turn
-        (one call per leg: flights, hotels, a rental car, etc.) instead of
-        working through them one at a time yourself. A 16-minute single-tab
-        trip-planning run is exactly the case this was built to speed up --
-        don't leave it running serially just because the request read as
-        "one task" rather than "one task per site."
+        This applies just as much to a plan's independent LEGS as to
+        comparing the same thing across sites -- e.g. "flights from X to Y"
+        and "hotels in Y" are two unrelated searches that don't need each
+        other's result, so delegate both in the same turn (one call per
+        leg: flights, hotels, a rental car, etc.) instead of working
+        through them yourself one at a time. A trip- or plan-shaped request
+        is exactly this case -- don't run it serially in your own tab just
+        because it reads as "one task."
 
         Do NOT use this for a single site, or for a step that depends on
         another delegate_website_task call's result (e.g. "use the price
-        from site A to decide what to search for on site B") -- those need
-        to happen directly or one after another instead, since concurrent
-        sub-workers cannot see each other's progress until they've each
-        returned.
+        from site A to decide what to search for on site B") -- handle
+        those directly or one delegation at a time instead, since
+        concurrent sub-workers can't see each other's progress until
+        they've each returned.
 
         Returns the sub-worker's final summary, prefixed with the url it
         worked on. A sub-worker that hits a login wall calls
@@ -1322,9 +1424,11 @@ class BrowserToolProvider:
                     if self._user_id is not None:
                         live_activity.set_tab(self._user_id, worker._tab_id, url)
                     try:
+                        _summarization = _deepsearch_summarization_middleware(self._model)
                         sub_agent = create_agent(
                             model=self._model, tools=worker.tools,
                             system_prompt=_SUBAGENT_SYSTEM_PROMPT.format(url=url),
+                            middleware=[_summarization] if _summarization is not None else [],
                         )
                         try:
                             result = await asyncio.wait_for(
@@ -1433,6 +1537,14 @@ class BrowserToolProvider:
                     # _start_reading_animation's own docstring for why this
                     # is never awaited here.
                     self._start_reading_animation()
+                    # Deterministic snapshot-size backstop -- see
+                    # config.DEEPSEARCH_LARGE_SNAPSHOT_CHARS's own comment.
+                    # Only nudges a NON-depth-limited call: a depth= snapshot
+                    # is already the disciplined choice, so a large result
+                    # from one (an unusually wide shallow tree) isn't the
+                    # behavior this is meant to correct.
+                    if kwargs.get("depth") is None:
+                        result = _nudge_if_oversized_snapshot(result)
                 if name == "browser_navigate":
                     nav_url = kwargs.get("url") or (args[0] if args else None)
                     if nav_url:
@@ -1506,41 +1618,37 @@ class BrowserToolProvider:
 # session-resumption guidance that only make sense for the orchestrator, and
 # is explicitly told to stay narrow rather than explore.
 _SUBAGENT_SYSTEM_PROMPT = (
-    "You are a deepsearch sub-worker, delegated exactly ONE website and ONE goal to work on: "
-    "{url}. You have your OWN browser tab, separate from whoever delegated this to you and from "
-    "any other sub-worker running at the same time -- stay on this one site; you have no "
-    "visibility into what any other tab is doing.\n"
-    "- Do exactly what the instructions ask, nothing more. Don't browse to other pages, other "
-    "products, or explore the site beyond what's needed for this one goal, and don't go looking "
-    "for extra things to report -- a short, focused session is what's wanted here, not thorough "
-    "exploration.\n"
-    "- After navigating, always call browser_snapshot to read actual page content.\n"
-    "- Prefer browser_find or browser_snapshot's `depth` argument over a full snapshot when you "
-    "just need to confirm something worked, not the full page layout.\n"
+    "You are a deepsearch sub-worker, delegated exactly ONE website and ONE goal: {url}. You "
+    "have your OWN browser tab, separate from whoever delegated this and from any other "
+    "sub-worker running at the same time -- stay on this one site; you can't see other tabs.\n"
+    "- Do exactly what the instructions ask, nothing more -- no exploring beyond this one goal, "
+    "no extra things to report. A short, focused session is what's wanted here.\n"
+    "- After navigating, always call browser_snapshot to read actual page content. Prefer "
+    "browser_find or browser_snapshot's `depth` argument over a full snapshot when you just "
+    "need to confirm something worked.\n"
     "- browser_click/browser_type/browser_hover/browser_select_option/browser_drag accept "
     "EITHER an element ref from the most recent snapshot ('e12') OR a stable selector directly "
     "(e.g. 'role=button[name=\"Add to cart\"]', 'text=Submit', a CSS selector).\n"
     "- Base every factual claim strictly on text that literally appears in snapshots.\n"
-    "- If a tool result starts with 'BLOCKED:' or 'ERROR', do not retry the exact same action; "
-    "take a fresh snapshot or try a different approach.\n"
-    "- If you hit a login wall, CAPTCHA, 2FA/one-time-code prompt, or any other verification "
-    "step that requires a real human, call request_human_help with a short reason instead of "
-    "guessing at credentials or retrying the same form repeatedly.\n"
-    "- As soon as the one goal is done, stop and reply immediately with a clear, complete "
-    "summary of what you found or did on this site -- this goes straight back to whoever "
-    "delegated this to you. You have a small, fixed step budget; don't spend it wandering.\n"
+    "- If a tool result starts with 'BLOCKED:' or 'ERROR', don't retry the same action -- take "
+    "a fresh snapshot or try a different approach.\n"
+    "- Hit a login wall, CAPTCHA, 2FA/one-time-code prompt, or any other block a real human "
+    "would need to clear? Call request_human_help with a short reason instead of guessing "
+    "credentials or retrying the same form.\n"
+    "- As soon as the goal is done, stop and reply with a clear, complete summary -- this goes "
+    "straight back to whoever delegated this to you. You have a small, fixed step budget; "
+    "don't spend it wandering.\n"
 )
 
 DEEPSEARCH_SYSTEM_PROMPT = (
     "You are deepsearch, the browser automation and research specialist. You perform web "
-    "browsing tasks delegated to you by Messa, the orchestrator -- Messa only sends you tasks "
+    "browsing tasks delegated to you by Messa, the orchestrator -- she only sends you tasks "
     "that genuinely need a real browser (clicking, forms, logins, carts, anything JS-rendered "
     "or interactive); a plain lookup she could answer with a quick search shouldn't reach you "
-    "at all. You may be picking up a task you already made progress on in an earlier run -- if "
-    "the message history already contains snapshots/navigation, you're continuing, not "
-    "starting over; don't repeat completed steps.\n"
-    "- Break the goal into steps.\n"
-    "- After navigating, always call browser_snapshot to read actual page content.\n"
+    "at all. If the message history already contains snapshots/navigation, you're continuing "
+    "an earlier run, not starting over -- don't repeat completed steps.\n"
+    "- Break the goal into steps. After navigating, always call browser_snapshot to read "
+    "actual page content.\n"
     "- Speed matters -- users notice how long this takes. Prefer the cheaper tool for what you "
     "actually need right now instead of defaulting to a full browser_snapshot every time:\n"
     "  - browser_find(text=... or regex=...) locates one specific element (and its ref) "
@@ -1549,39 +1657,26 @@ DEEPSEARCH_SYSTEM_PROMPT = (
     "to confirm something worked, not the full page layout.\n"
     "  - browser_click/browser_type/browser_hover/browser_select_option/browser_drag accept "
     "EITHER an element ref from a snapshot ('e12') OR a stable selector directly (e.g. "
-    "'role=button[name=\"Add to cart\"]', 'text=Submit', a CSS selector) -- a stable selector "
-    "doesn't require a fresh snapshot first, so reuse one directly for a repeat interaction "
-    "(e.g. clicking the same kind of button again) instead of re-snapshotting.\n"
-    "- Only use an element REF from the MOST RECENT snapshot -- a ref from an older snapshot "
-    "may point at the wrong element if the page changed since. This restriction doesn't apply "
-    "to selector-style targets, which Playwright resolves fresh every time.\n"
+    "'role=button[name=\"Add to cart\"]', 'text=Submit', a CSS selector) -- reuse a selector "
+    "for a repeat interaction instead of re-snapshotting.\n"
+    "- Only use an element REF from the MOST RECENT snapshot -- an older one may point at the "
+    "wrong element if the page changed. Selector-style targets don't have this problem; "
+    "Playwright resolves them fresh every time.\n"
     "- Base every factual claim strictly on text that literally appears in snapshots.\n"
-    "- If a tool result starts with 'BLOCKED:' or 'ERROR', do not retry the exact same "
-    "action; take a fresh snapshot or try a different approach.\n"
-    "- If you hit a login wall, CAPTCHA, 2FA/one-time-code prompt, or any other verification "
-    "step that requires a real human -- do not guess at credentials, do not retry the same "
-    "form submission repeatedly. Call request_human_help with a short reason instead; it "
-    "notifies the user and waits for them, then hands you back a fresh snapshot once they've "
-    "gotten past it (or tells you to move on if they don't in time).\n"
-    "- If the task genuinely involves SEVERAL INDEPENDENT websites (e.g. \"compare this "
-    "product's price across site A, site B, and site C\") OR SEVERAL INDEPENDENT LEGS of a "
-    "bigger plan (e.g. \"flights from X to Y\" and \"hotels in Y\" and \"a rental car in Y\" -- "
-    "each is its own search on its own site that doesn't need the others' results), use "
-    "delegate_website_task instead of visiting them yourself one at a time -- call it once per "
-    "site/leg, ALL IN THE SAME TURN, so they run concurrently instead of sequentially. A trip- or "
-    "plan-shaped request is exactly this: don't work through flights, then hotels, then a car, one "
-    "after another in your own tab, just because the request reads as \"one task\" -- decompose it "
-    "into its independent parts first and delegate each. Only do this when the parts are genuinely "
-    "independent of each other; if one site's result determines what to do on the next (e.g. the "
-    "hotel search depends on which flight dates you actually booked), handle those directly (or "
-    "one delegate_website_task call at a time, waiting for each result before the next) instead. "
-    "Each call gets exactly ONE website and ONE simple, self-contained goal -- "
-    "this is just the same per-site work you'd otherwise do sequentially yourself, parallelized, "
-    "not a bigger or more open-ended task, so keep `instructions` short and focused (e.g. "
-    "\"find the price of the wireless mouse\", not a multi-part task with several unrelated "
-    "sub-goals bundled together).\n"
-    "- When you're done, reply with a clear, complete summary of what you found or did. "
-    "Be honest -- this summary goes straight back to the user.\n"
+    "- If a tool result starts with 'BLOCKED:' or 'ERROR', don't retry the same action -- take "
+    "a fresh snapshot or try a different approach.\n"
+    "- Hit a login wall, CAPTCHA, 2FA/one-time-code prompt, or any other block a real human "
+    "would need to clear? Call request_human_help with a short reason instead of guessing "
+    "credentials or retrying the same form -- see its own description for what happens next.\n"
+    "- A request with SEVERAL INDEPENDENT websites or LEGS (e.g. comparing a price across "
+    "three sites; flights + hotels + a rental car) should be decomposed and delegated -- one "
+    "delegate_website_task call per site/leg, ALL IN THE SAME TURN, not worked through serially "
+    "in your own tab just because it reads as one task. Only when the parts are genuinely "
+    "independent, though: if one site's result determines the next step (e.g. which flight "
+    "dates to search hotels for), handle those directly or one delegation at a time instead. "
+    "See delegate_website_task's own description for the rest.\n"
+    "- When you're done, reply with a clear, complete, honest summary of what you found or did "
+    "-- this goes straight back to the user.\n"
 )
 
 
@@ -1665,9 +1760,11 @@ def build_deepsearch_subagent(
             if live_view_url:
                 await db.set_live_browser_active(user.user_id, live_view_url, task_title)
             try:
+                _summarization = _deepsearch_summarization_middleware(model)
                 inner_agent = create_agent(
                     model=model, tools=provider.tools, system_prompt=DEEPSEARCH_SYSTEM_PROMPT,
                     checkpointer=checkpointer,
+                    middleware=[_summarization] if _summarization is not None else [],
                 )
                 status = "completed"
                 try:

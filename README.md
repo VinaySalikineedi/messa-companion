@@ -2591,12 +2591,211 @@ interfere with the fast-path re-registration or the awaited re-assertion
 fix from the cursor-invisibility bug above.
 
 **Not implemented / still on the table:** tuning down human-cursor's point
-count or spread (#1), skipping the full animation for "minor" interactions
-like typing/dropdowns (#4), and a deterministic backstop nudge for
-oversized snapshots (#5) -- all still available if the run is still slower
-than you'd like after these two land.
+count or spread (#1) and skipping the full animation for "minor"
+interactions like typing/dropdowns (#4) -- both still available if the run
+is still slower than you'd like. #5 (a deterministic backstop nudge for
+oversized snapshots) WAS implemented since this note was written -- see
+"Token-cost optimization" below, where it landed as part of the token-cost
+work rather than the speed work, since a large snapshot is exactly as
+expensive in tokens as it is slow in latency.
 
-## Changes from your second round of testing
+## Token-cost optimization: what each agent's prompts actually cost, and where compaction was silently broken
+
+You asked whether the prompts sent to each agent could be made more
+token-efficient without losing quality -- and whether quality could improve
+too. Short answer: yes to both, and the biggest win wasn't prompt wording
+at all. Four things landed, in order of impact:
+
+**1. deepsearch was running with ZERO auto-compaction -- not a tuning
+problem, a missing-safety-net problem.** This is the one I'd flag as the
+real finding here. Every agent in this project sits on top of LangChain/
+deepagents machinery that's supposed to compact a conversation's history
+once it gets too large (summarize the old stuff, keep the recent stuff, so
+a long-running agent doesn't keep re-paying for its entire past on every
+single step). I checked whether that was actually happening, and it wasn't,
+for two separate reasons:
+
+- The four subagents built via deepagents' `create_deep_agent` (Messa
+  herself, executive_assistant, email_agent, document_agent,
+  routines_agent) DO get auto-compaction, but its trigger threshold comes
+  from `model.profile["max_input_tokens"]` -- and I confirmed directly
+  (`config.build_model(...).profile` prints `None`) that a ChatOpenAI
+  instance built from an OpenRouter model string like
+  `"~deepseek/deepseek-v4-pro"` has no profile at all, because LangChain's
+  profile lookup only recognizes OpenAI's own published model names.
+  With no profile, deepagents falls back to a generic default: don't
+  compact until the conversation hits 170,000 raw tokens, then keep only
+  the last 6 messages. Every agent in this project has been running on
+  that fallback the whole time, regardless of anything in its system
+  prompt.
+- deepsearch itself -- the agent that actually needed this most, since it
+  runs up to `DEEPSEARCH_MAX_STEPS=100` steps and appends a fresh
+  `browser_snapshot` on most of them -- doesn't go through
+  `create_deep_agent` at all. It calls `langchain.agents.create_agent`
+  directly (both for the top-level agent and each `delegate_website_task`
+  sub-worker), and that function's own `middleware` parameter defaults to
+  an empty tuple -- confirmed by reading its signature, not assumed. So
+  deepsearch wasn't even getting the 170k fallback the other agents got by
+  default. It had no compaction of any kind.
+
+Why this matters more than prompt wording: a chat-completions-style agent
+loop resends its ENTIRE message history on every single step -- there's no
+server-side conversation state to lean on. So total tokens billed across an
+N-step run is dominated by that growing history, not by the comparatively
+fixed cost of the system prompt/tool schemas -- it's roughly quadratic in
+N, not linear. A 100-step deepsearch run appending multi-thousand-token
+snapshots most of the way through was quietly compounding cost for the
+entire run's length, every time.
+
+Fix, two parts: `config.build_model()` now accepts
+`effective_context_tokens=` and stamps it onto the returned model's
+`.profile` (confirmed to be a plain writable attribute, not something
+LangChain protects) -- `registry.py`'s two call sites pass
+`ORCHESTRATOR_EFFECTIVE_CONTEXT_TOKENS` (120,000, a lighter touch, since
+Messa's own conversation with you is closer to an ongoing relationship than
+a bounded task) and `SUBAGENT_EFFECTIVE_CONTEXT_TOKENS` (60,000, more
+aggressive, since a subagent's job is bounded and old tool-call noise from
+early in one task is rarely worth keeping). deepsearch itself needed its
+own fix on top: `_deepsearch_summarization_middleware()` in
+`deepsearch_tools.py` builds a real `langchain.agents.middleware
+.SummarizationMiddleware` (trigger at 85% of the subagent budget, keep the
+last 10%, same split deepagents' own default logic uses) and both of
+deepsearch's `create_agent(...)` calls now pass it explicitly via
+`middleware=[...]`. No filesystem-backed history offload (deepagents' own
+version supports that, for a model that can `read_file` an evicted-history
+file back later) -- deepsearch has no filesystem tools at all, so that
+would just be unreachable dead weight; evicted detail becomes the LLM's own
+summary and nothing more, which is fine here since deepsearch's job is to
+finish the task and report back, not serve as a queryable transcript of
+exactly what it clicked 40 steps ago.
+
+Verified with a new test, `test_token_compaction.py`, against the real
+`deepagents.middleware.summarization.compute_summarization_defaults` and
+the real `langchain.agents.middleware.SummarizationMiddleware` -- nothing
+about either is mocked. It confirms the profile-stamping actually flips
+deepagents' own trigger from the 170k fallback to the fraction-based path,
+and then proves REAL compaction on a fabricated 121-message, 61,922-token
+history (20 fake browser_snapshot-sized tool results): after
+`before_model()` runs, the history drops to 11 messages and 5,188 tokens --
+a 92% reduction, achieved by calling the actual production code, not by
+asserting a config value looks right.
+
+**2. Trimmed the system prompts and tool docstrings that get resent every
+single step.** The literal thing you asked about. Measured with
+`count_tokens_approximately` (the same approximate counter deepagents
+itself uses for its real trigger decisions, not an arbitrary estimate) --
+before -> after:
+
+- `DEEPSEARCH_SYSTEM_PROMPT`: 1,013 -> 706 tokens (-30%)
+- `delegate_website_task`'s tool description: 620 -> 454 tokens (-27%)
+- `request_human_help`'s tool description: 275 -> 236 tokens (-14%)
+- `_SUBAGENT_SYSTEM_PROMPT` (each delegate_website_task sub-worker):
+  452 -> 382 tokens (-15%)
+- Messa's own orchestrator system prompt: 1,397 -> 1,278 tokens (-8.5%)
+
+Two kinds of cuts, both quality-neutral or quality-positive rather than
+quality-risking: (a) genuine redundancy, like `delegate_website_task`'s
+docstring and `DEEPSEARCH_SYSTEM_PROMPT`'s own bullet about it separately
+re-explaining the same rules in slightly different words -- now the system
+prompt just points at the tool's own description instead of duplicating it,
+which also removes a real maintenance hazard (two copies of the same rule
+can drift out of sync, which had already started happening); (b) internal
+dev-facing asides that were sitting INSIDE model-facing docstrings by
+accident -- `/tmp/test_mcp_multitab.py`-style file citations and
+`db.create_human_help_request`-style code pointers that a human maintainer
+benefits from but the model gets zero behavioral value from, since it's
+resent as part of the tool schema on every call regardless. Those moved to
+plain `#` comments next to the function instead of disappearing.
+
+Deliberately left alone: Messa's "Critical: that acknowledgment and the
+task tool call must be in the SAME response" paragraph and her
+"Deepsearch sessions" paragraph, both of which exist specifically to
+prevent previously-diagnosed real bugs (the "empty promise" delegation-
+dropping failure, and session-continuity guessing). Their repetition reads
+as verbose, but I'm not confident cutting it wouldn't reintroduce exactly
+the bug it was written to prevent, and "sacrificing quality" is the one
+thing you explicitly asked me not to do -- so those two stayed word-for-
+word. Email/document/routines subagents' prompts were already lean
+(109-168 tokens) and weren't worth the edit risk for a handful of tokens
+each.
+
+**3. Enforced the snapshot-size guidance that used to be advisory-only.**
+`DEEPSEARCH_SYSTEM_PROMPT` already told the model to prefer
+`browser_find`/`browser_snapshot(depth=...)` over a full snapshot, but
+nothing enforced it -- and an oversized snapshot a model takes anyway
+doesn't just cost once, it gets resent in full on every subsequent step
+until compaction (above) eventually evicts it. `guarded()`'s
+`browser_snapshot` success path now calls the new
+`_nudge_if_oversized_snapshot()`: a non-depth-limited snapshot that comes
+back over `config.DEEPSEARCH_LARGE_SNAPSHOT_CHARS` (12,000, a round,
+generous default with no real production traffic to calibrate against yet)
+gets a short corrective line appended to its own returned text, same "one
+corrective nudge into the same graph thread" shape as the existing
+auth-wall backstop a few lines below it. This was flagged, unimplemented,
+after the speed investigation above (option #5) -- it landed here instead
+because the same oversized snapshot is exactly as expensive in tokens as
+it is slow in latency, so it belongs with this work.
+
+Verified with a new test, `test_snapshot_size_nudge.py`, against a real
+local Chromium page built with 220 list items specifically so its real
+accessibility-tree snapshot exceeds the threshold (46,634 characters,
+confirmed, not assumed) -- and confirms three things: the oversized full
+snapshot gets the nudge, the exact same page's `depth=1` snapshot does NOT
+(already the disciplined choice, nothing to correct), and an ordinary small
+page's full snapshot does NOT either (must not fire on everyday use).
+
+**4. Investigated real provider-side prompt caching -- didn't implement
+anything, here's why.** This is the theoretically biggest lever (a cache
+hit is typically a fraction of the cost of a fresh read), so it was worth
+checking carefully before writing it off. Two findings:
+
+- deepagents' `create_deep_agent` DOES automatically attach prompt-caching
+  middleware to every agent it builds -- but reading
+  `deepagents/middleware/_prompt_caching.py` directly shows it only ever
+  constructs Anthropic, Bedrock, and Fireworks caching middleware, each
+  with `unsupported_model_behavior="ignore"`. Since this project's models
+  resolve to provider `"openai"` (ChatOpenAI pointed at OpenRouter -- see
+  `registry.py`'s own comment on this), all three silently no-op. This
+  machinery has never done anything for any agent in this project.
+- Separately, `langchain_openai`'s `ChatOpenAI` itself DOES support OpenAI's
+  own native prompt-caching controls (`prompt_cache_key`,
+  `prompt_cache_options`, `prompt_cache_retention`) and parses a
+  `cached_tokens` field back out of the response's usage data -- a real,
+  currently-unused capability. Whether OpenRouter's proxy to your specific
+  DeepSeek-family model actually honors any of this, or does its own
+  automatic caching independently of anything in this codebase (DeepSeek's
+  own real API is documented to cache automatically, no code changes
+  needed, when a request's prefix matches a recent one), isn't something I
+  can verify from this sandbox -- I don't have a live OpenRouter account
+  to test against, deliberately, same as every other such caveat already
+  in this README.
+
+I didn't wire in `prompt_cache_key` blindly, on purpose: picking a cache
+key that's too broad (e.g. one static key shared by every user) risks
+concentrating traffic onto one backend node if OpenRouter actually honors
+it, which could hurt rather than help at real scale, and I have no
+production telemetry from this sandbox to tune it correctly either way.
+**What I'd recommend instead:** after this ships, check a real response's
+`usage` object (or your OpenRouter dashboard) for a `cached_tokens` or
+similar field. If it's already nonzero, some caching may already be
+happening automatically on OpenRouter/DeepSeek's side, independent of
+anything here -- in which case the compaction and prompt-trimming fixes
+above are still exactly the right ones (they shrink what there is to cache
+or resend either way), and a `prompt_cache_key` change becomes a smaller,
+better-informed follow-up rather than a guess.
+
+**Net effect, honestly graded:** the compaction fix (#1) is the one I'd
+point to first -- it's concentrated on exactly the runs that were costing
+the most (a short deepsearch task that never approached 170k tokens saw no
+difference either way; a long one now gets compacted in bounded increments
+instead of ballooning unchecked for up to 100 steps, demonstrated at a 92%
+reduction on the fabricated test history above). The prompt/docstring trims
+(#2) are smaller per-run but apply to every single call across every agent
+and every user, so they compound across volume -- roughly 20-30% off
+deepsearch's per-step fixed cost specifically, the agent that runs the most
+steps. #3 compounds with #1 by keeping the largest recurring item smaller
+in the first place. #4 remains a real, unverified opportunity -- worth
+revisiting once you can see real cache-hit data.
 
 - **Renamed browser_agent -> deepsearch.** Same subagent, new name
   everywhere (config, tracing colors, system prompts, files). If you have

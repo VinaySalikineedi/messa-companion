@@ -69,14 +69,99 @@ SUBAGENT_MODEL_NAME = os.environ.get("MESSA_SUBAGENT_MODEL", "~deepseek/deepseek
 # "the main model" -- always Messa's own orchestrator model.
 MAIN_MODEL_NAME = ORCHESTRATOR_MODEL_NAME
 
+# ---- Token-cost control: how eagerly each agent's history gets compacted ----
+# deepagents' create_deep_agent() always attaches a SummarizationMiddleware
+# to every agent it builds (main + every subagent) -- it isn't optional, and
+# by design we never asked for it explicitly, so its trigger/keep thresholds
+# come entirely from deepagents.middleware.summarization
+# .compute_summarization_defaults(model). That function looks at
+# `model.profile["max_input_tokens"]` to decide HOW to pick thresholds: if
+# present, it uses fractions of it (85% full -> summarize, keep last 10%);
+# if absent, it falls back to a fixed, provider-agnostic default of
+# trigger=170,000 raw tokens / keep=last 6 messages.
+#
+# Confirmed empirically (not documented behavior I'm guessing at): a
+# ChatOpenAI instance built by build_model() below has `.profile is None`,
+# because LangChain's model-profile lookup only recognizes OpenAI's own
+# published model names -- "~deepseek/deepseek-v4-pro" routed through
+# OpenRouter matches nothing in that table. So every agent in this project
+# -- Messa herself and all five subagents -- has been running on the 170k-
+# token fallback the entire time, completely independent of how any of
+# their system prompts are worded.
+#
+# Why that number matters more than it sounds like it should: a chat-
+# completions-style agent loop resends its ENTIRE message history on every
+# single step (there's no server-side conversation state to lean on here),
+# so total tokens billed across an N-step run is dominated by that growing
+# history, not by the comparatively fixed per-step cost of the system
+# prompt/tool schemas -- it's roughly quadratic in N, not linear. deepsearch
+# specifically runs up to DEEPSEARCH_MAX_STEPS=100 steps and appends a fresh
+# browser_snapshot (often several thousand tokens on a busy page -- see the
+# README's "Making deepsearch faster" section) on most of them, so it's the
+# agent most likely to be quietly compounding cost for a long time before
+# 170k is ever reached, if it's reached at all before the run ends.
+#
+# `.profile` is a plain, writable attribute on a BaseChatModel instance --
+# LangChain only ever POPULATES it from that static lookup table, it never
+# protects it from being overwritten afterward (confirmed by just setting
+# it). Stamping a deliberately modest, hand-chosen budget onto it here has
+# NOTHING to do with the model's real context window (OpenRouter/the actual
+# model enforces that on its own, oblivious to whatever we write into a
+# LangChain-side Python attribute) -- it exists purely to tell deepagents'
+# summarization heuristic "start being defensive well before you'd
+# otherwise think to," so long-running tool-heavy work gets compacted in
+# regular, bounded increments instead of ballooning unchecked for dozens of
+# steps and then taking one enormous, late summarization hit (or, on a run
+# that finishes before 170k, never compacting at all).
+#
+# Two different budgets, not one shared value, because the two use cases
+# have different quality trade-offs: SUBAGENT_EFFECTIVE_CONTEXT_TOKENS
+# governs deepsearch (top-level and every delegate_website_task sub-worker)
+# and the other four subagents -- each one is a bounded, single-task
+# delegation where old tool-call noise from early in that task is rarely
+# worth paying to keep around, so an aggressive budget is a clear win.
+# ORCHESTRATOR_EFFECTIVE_CONTEXT_TOKENS governs Messa's own ongoing
+# conversation with the user, which is closer to a persistent relationship
+# than a bounded task -- compacting that too aggressively risks losing
+# "what we talked about a few days ago" continuity for comparatively little
+# savings (a text-message conversation is nowhere near as token-heavy per
+# turn as a tool-call-and-snapshot-heavy browsing run), so it gets a larger,
+# more conservative budget: real savings over the 170k fallback, without
+# meaningfully changing how much conversational history Messa keeps handy.
+# Both are overridable via env var without a code change, same pattern as
+# every other tunable in this file.
+SUBAGENT_EFFECTIVE_CONTEXT_TOKENS = int(
+    os.environ.get("MESSA_SUBAGENT_EFFECTIVE_CONTEXT_TOKENS", "60000")
+)
+ORCHESTRATOR_EFFECTIVE_CONTEXT_TOKENS = int(
+    os.environ.get("MESSA_ORCHESTRATOR_EFFECTIVE_CONTEXT_TOKENS", "120000")
+)
 
-def build_model(model_name: str = ORCHESTRATOR_MODEL_NAME) -> ChatOpenAI:
-    """Build a ChatOpenAI client pointed at OpenRouter."""
-    return ChatOpenAI(
+
+def build_model(
+    model_name: str = ORCHESTRATOR_MODEL_NAME,
+    *,
+    effective_context_tokens: int | None = None,
+) -> ChatOpenAI:
+    """Build a ChatOpenAI client pointed at OpenRouter.
+
+    effective_context_tokens, when given, is stamped onto the returned
+    model's `.profile` as `{"max_input_tokens": ...}` -- see the big
+    comment above SUBAGENT_EFFECTIVE_CONTEXT_TOKENS/
+    ORCHESTRATOR_EFFECTIVE_CONTEXT_TOKENS for why this exists and what it
+    actually controls (deepagents' summarization-compaction thresholds,
+    NOT the model's real context window). Left unset (the default), the
+    returned model behaves exactly as before this was added -- `.profile`
+    stays `None` and deepagents falls back to its own generic default.
+    """
+    model = ChatOpenAI(
         model=model_name,
         base_url="https://openrouter.ai/api/v1",
         api_key=OPENROUTER_API_KEY,
     )
+    if effective_context_tokens is not None:
+        model.profile = {"max_input_tokens": effective_context_tokens}
+    return model
 
 
 # ---- Database ----
@@ -186,6 +271,26 @@ DEEPSEARCH_ALLOWED_DOMAINS: list[str] = [
 # need many steps, and hitting this cap is expected/handled (the session is
 # saved and can be resumed) rather than an error condition.
 DEEPSEARCH_MAX_STEPS = int(os.environ.get("MESSA_DEEPSEARCH_MAX_STEPS", "100"))
+
+# Deterministic backstop for snapshot-size discipline (the "reinforce/verify
+# the snapshot-size guidance" option flagged, unimplemented, in the speed
+# investigation -- now implemented as part of the token-cost work, since a
+# large snapshot is exactly as expensive in tokens as it is slow in
+# latency). DEEPSEARCH_SYSTEM_PROMPT already tells the model to prefer
+# browser_find/browser_snapshot(depth=...) over a full snapshot, but nothing
+# enforced it -- a model that ignores that guidance on a big page pays for
+# the oversized snapshot again on EVERY subsequent step for the rest of the
+# run (it's resent in full, every time, until compaction evicts it -- see
+# SUBAGENT_EFFECTIVE_CONTEXT_TOKENS above). guarded()'s browser_snapshot
+# success path appends a corrective nudge (same "one corrective nudge into
+# the same graph thread" shape as the existing auth-wall backstop) when a
+# non-depth-limited snapshot comes back over this many characters. Picked
+# as a round, generous number with no real production traffic to calibrate
+# against -- deliberately loose enough not to fire on an ordinary page, so
+# tune it down if real usage shows it's too permissive.
+DEEPSEARCH_LARGE_SNAPSHOT_CHARS = int(
+    os.environ.get("MESSA_DEEPSEARCH_LARGE_SNAPSHOT_CHARS", "12000")
+)
 
 # How long (ms) @playwright/mcp waits after each action for triggered work
 # (a re-render, an XHR, an animation) to "settle" before returning control --
