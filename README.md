@@ -2961,6 +2961,107 @@ latency, `test_subagent_pool_and_timing.py`, `test_presearch_guidance.py`,
 `test_snapshot_size_nudge.py` extended with a genuinely-huge-page case for
 the new truncation tier) -- all passing.
 
+## Real Gmail OAuth connections, per user, via Composio
+
+The email agent used to be a single shared inbox (`COMPOSIO_EMAIL_CONNECTED_ACCOUNT_ID`,
+one Composio-connected account for the whole app) and its Composio SDK
+calls were written against docs but never run against a live account. You
+asked for the real thing: each user connects their own Gmail via a proper
+OAuth flow, with read + write access (not a blanket full-account grant),
+and can trigger it either during onboarding (opt-in) or any time later by
+just asking. Only `COMPOSIO_API_KEY` needs adding to your env -- everything
+else below is automatic.
+
+**Verified against the actual SDK, not just its docs.** Composio's own
+documentation describes more than one still-partially-current way to start
+an OAuth connection, and one of them (`connected_accounts.initiate()`) is
+mid-retirement specifically for this exact case (Composio-managed auth on a
+redirectable scheme like Gmail's OAuth2) on a rolling cutover between
+2026-05-08 and 2026-07-03 -- today is past that window. Rather than build
+against whichever example page turned up first, I downloaded and read the
+actual installed package sources (`composio==0.21.0`, its `composio-client`
+dependency) directly from PyPI to confirm the real, current method
+signatures, return shapes, and exception types. This is why the connect
+flow below uses `connected_accounts.link()`, not `.initiate()`.
+
+**How connecting works.** A new tool, `request_email_connection`
+(email_agent), asks Composio for a Gmail connect link scoped to exactly the
+four Gmail actions this project calls -- fetch/search, get one message,
+send, reply -- via `auth_configs.create`'s `tool_access_config`, which has
+Composio compute the *minimum* OAuth scopes needed for those specifically.
+That's the actual mechanism behind "read, write privileges to gmail," not a
+blanket account grant. The auth config itself is found-or-created
+automatically and reused by name across restarts, so a redeploy doesn't
+spin up a fresh one (and a fresh consent screen) every time;
+`COMPOSIO_GMAIL_AUTH_CONFIG_ID` overrides this if you ever want to point at
+your own custom Gmail OAuth app instead.
+
+The link itself is texted to the user directly from inside the tool, not
+typed out by the model -- same reasoning as the deepsearch live-view link
+(see cli.py's run_message docstring): a long Composio URL is exactly the
+kind of string an LLM can subtly mangle mid-reply, so the tool sends it via
+Sendblue itself and returns email_agent a short confirmation to relay
+instead ("sent, don't repeat the link"). In the CLI, there's no phone to
+text, so the link is returned directly in the tool's own output, where the
+CLI's console tracing already shows it. An already-connected user calling
+this again gets a friendly "already connected" message (Composio raises
+`ComposioMultipleConnectedAccountsError`, caught explicitly) rather than a
+raw exception or a second, redundant link.
+
+**Confirming it actually connected.** `request_email_connection` doesn't
+block waiting for the user to finish an OAuth flow that might take seconds
+or hours -- it persists a row to a new `email_connection_requests` table
+(`migrations/012_email_connection.sql`) and returns immediately. A new
+background loop, `server.py`'s `_production_email_connection_poll_loop`
+(same decoupled shape as the existing deepsearch-pause and cron/reminder
+loops), polls Composio every 20s for that row's real status: ACTIVE flips
+`users.email_connected` (a cheap cached flag read every turn, so Messa/
+email_agent know without an extra Composio call) and sends one confirmation
+text ("Your Gmail is connected!"); a terminal failure (FAILED/EXPIRED/
+REVOKED) expires the row and tells the user it didn't go through; anything
+still in progress is left alone until the next poll. Requests older than
+`EMAIL_CONNECTION_REQUEST_EXPIRES_HOURS` (24h default) expire silently --
+the user can just ask again. A `check_email_connection_status` tool also
+lets the user ask "is it connected yet?" on demand rather than waiting.
+
+**Onboarding.** A fourth onboarding question, `awaiting_email_connect`,
+now runs after location (before "complete"): Messa asks if the user wants
+her to handle their email, framed as optional and reversible. Saying yes
+calls `save_profile_info('connect_email', 'yes')` (which only advances
+onboarding -- there's no `connect_email` column, deliberately, since the
+real `email_connected` flag is only ever set once Composio actually
+confirms the connection) AND delegates to email_agent's
+`request_email_connection` in the same response, so the link goes out
+immediately rather than needing a second round trip. Saying no just
+advances onboarding with nothing else happening -- exactly your "if not,
+they can always send connect my gmail/email" fallback, since
+`request_email_connection` is available any time after onboarding too.
+
+**A real, pre-existing bug fixed along the way.** Every Composio SDK call
+(the old single-account code included) is synchronous -- a plain
+`requests`-based client -- but the old `_execute` called it directly inside
+`async def` tool functions, meaning any Gmail API call would block the
+*entire* asyncio event loop for its duration: every other user's turn, and
+the FastAPI webhook handler itself, frozen until that one call returned.
+Every Composio call in the rewritten `email_tools.py` (including the
+existing read/send actions) now goes through `asyncio.to_thread`.
+
+**Verification.** New tests: `test_email_oauth_tools.py` (auth-config
+find-or-create/memoization/scoping, the SMS-vs-CLI link delivery split with
+an explicit check that the raw URL never appears in the model-facing return
+text for a real channel, already-connected handling, and the
+`email_connected=False` short-circuit firing *before* any Composio call),
+`test_email_connection_poll_loop.py` (ACTIVE/terminal-failure/still-pending
+status transitions, run against the real loop body the same way the
+existing `test_pause_loop.py` tests its sibling), and
+`test_onboarding_and_email_db.py` (the new onboarding step's DB-level
+advance/no-column-write behavior, plus the full email_connection_requests
+lifecycle and its pre-migration no-op safety). None of these needed a live
+Composio account -- the SDK's own exception types and response shapes are
+faked directly from the real package sources read above, not guessed at.
+Full existing regression suite (16 files total) re-run and passing
+alongside these three new ones.
+
 ## Changes from your first round of testing
 
 - **Speed.** `create_deep_agent`'s default harness silently gives every
@@ -3156,12 +3257,18 @@ zip code" nudge won't fire).
   `messa/background.py`'s poller still only prints what *would* fire, but
   that's intentional -- it's the CLI's console-only preview, not the
   production path (see "Executive assistant rebuild" above).
-- Email agent's Composio integration is written against Composio's
-  documented client API but **not tested against a live account** -- I
-  didn't have a Composio API key while building this. Verify the action
-  slugs in `messa/tools/email_tools.py` against
-  https://docs.composio.dev once you add `COMPOSIO_API_KEY` and connect
-  Gmail.
+- Email agent's Composio integration (see "Real Gmail OAuth connections,
+  per user, via Composio" above) is now written against the actual
+  installed SDK's source -- method signatures, return shapes, and
+  exception types confirmed by reading `composio`/`composio-client`
+  directly, not just docs -- but **still not run against a live
+  account/real OAuth flow end to end**: no Composio API key was available
+  while building this. The one thing worth a supervised first real run:
+  actually connecting a Gmail account through the generated link and
+  confirming `_production_email_connection_poll_loop` picks up the ACTIVE
+  status and texts the confirmation, before trusting it unattended. Gmail
+  only for now, per your ask -- Outlook would need its own action slugs
+  and auth config (see `email_tools.py`'s module docstring for where).
 - No WhatsApp (per your call -- Sendblue doesn't support it; dropped for
   now, add a provider like Meta's WhatsApp Cloud API later if you want it
   back).

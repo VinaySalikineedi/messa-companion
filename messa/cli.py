@@ -78,6 +78,7 @@ async def load_user_context(
         onboarding_step=user_row["onboarding_step"],
         channel=channel,
         live_view_token=live_view_token,
+        email_connected=bool(user_row.get("email_connected", False)),
     )
 
 

@@ -23,17 +23,22 @@ croniter>=6.2.4
 # explicitly rather than relying on something else pulling it in.
 python-dateutil>=2.9.0
 
-# Email agent (Composio) -- optional until COMPOSIO_API_KEY is set, but
-# import-guarded so the app runs without it. Install when you're ready to
-# wire up email:
-#   pip install composio composio_langchain
-# NOTE: on some Linux systems with an old system setuptools, `composio`'s
-# `pysher` dependency can fail to build a wheel (setuptools/distutils
-# "install_layout" AttributeError). If that happens, install inside your
-# venv (you already have one) with a fresh pip/setuptools:
-#   pip install -U pip setuptools wheel && pip install composio composio_langchain
-# composio
-# composio_langchain
+# Email agent (Composio) -- import-guarded (email_tools.py imports it
+# lazily) so the app still runs without it, but now a real dependency: with
+# COMPOSIO_API_KEY set, email_tools.py connects and manages users' Gmail.
+# composio_langchain isn't needed -- this project calls the raw `composio`
+# SDK directly (client.tools.execute, connected_accounts.link/list, etc.)
+# and wraps the results in its own @tool-decorated functions, rather than
+# using composio_langchain's auto-generated LangChain tool wrappers.
+#
+# NOTE: on some Linux systems with an old/Debian-patched system setuptools,
+# `composio`'s `pysher` dependency can fail to build a wheel (setuptools/
+# distutils "install_layout" AttributeError) -- reproduced directly against
+# this exact version while building this feature. The Dockerfile upgrades
+# pip/setuptools/wheel before this install specifically to avoid that; if
+# you install locally and hit it, the same fix applies:
+#   pip install -U pip setuptools wheel && pip install composio
+composio
 
 # Browser agent tools are provided by the Playwright MCP server, which runs
 # via `npx @playwright/mcp@latest` (needs Node.js installed; npx will
@@ -50,5 +55,5 @@ httpx>=0.28.1
 # tasks that actually need to interact with a page. ddgs (formerly
 # "duckduckgo-search", renamed) needs no API key; beautifulsoup4 turns a
 # fetched page's raw HTML into readable text.
-duckduckgo-search>=7.0.0
+ddgs>=9.0.0
 beautifulsoup4>=4.12.0

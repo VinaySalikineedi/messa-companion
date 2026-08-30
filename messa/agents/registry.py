@@ -104,10 +104,13 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
     @tool
     async def save_profile_info(field: str, value: str) -> str:
         """Save one onboarding field the user just told you: field is 'name', 'email',
-        or 'city'. For the optional email step, pass value='skip' if the user doesn't
-        want to share one. This also advances onboarding to the next question. Also use
-        this any time the user corrects their location later (not just during onboarding)
-        -- it re-resolves their timezone from whatever they give you."""
+        'city', or 'connect_email'. For the optional email step, pass value='skip' if the
+        user doesn't want to share one. For connect_email, pass 'yes' or 'no'/'skip' --
+        this only advances onboarding; if they say yes, also delegate to email_agent with
+        request_email_connection in this SAME response (see the onboarding instruction
+        below), since this tool alone doesn't send anything. Also use this any time the
+        user corrects their location later (not just during onboarding) -- it re-resolves
+        their timezone from whatever they give you."""
         row = await db.save_profile_field(uid, field, value)
         msg = f"Saved {field}. Onboarding is now at: {row['onboarding_step']}."
         if field == "city" and value and value.strip().lower() != "skip":
@@ -167,6 +170,18 @@ _ONBOARDING_PROMPTS = {
         "says the timezone couldn't be confidently resolved, ask a follow-up for a zip "
         "code or a more specific city+state before treating it as settled."
     ),
+    "awaiting_email_connect": (
+        "Last onboarding question: ask if they'd like you to handle their email for "
+        "them -- reading/searching their Gmail inbox and sending or replying on their "
+        "behalf when asked (make clear replies/sends always need their OK first). "
+        "Frame it as optional and reversible: they can always say 'connect my gmail' "
+        "or 'connect my email' later instead. If they say yes: call "
+        "save_profile_info('connect_email', 'yes') AND delegate to email_agent with "
+        "request_email_connection, IN THIS SAME RESPONSE -- that's what actually sends "
+        "them the connect link; save_profile_info alone only advances onboarding. If "
+        "they say no (or don't want to decide now), call "
+        "save_profile_info('connect_email', 'no') and move on -- nothing else to do."
+    ),
 }
 
 
@@ -178,6 +193,11 @@ def _build_system_prompt(user: config.UserContext) -> str:
         known.append(f"email: {user.email}")
     if user.city:
         known.append(f"city: {user.city}")
+    known.append(
+        "Gmail is connected (can read/send email via email_agent)"
+        if user.email_connected
+        else "Gmail is NOT connected yet (email_agent can send them a connect link on request)"
+    )
     known_str = ("Known about this user so far -- " + ", ".join(known) + ".\n\n") if known else ""
 
     # Neither Messa's nor any subagent's system prompt used to state the
@@ -318,8 +338,9 @@ async def build_orchestrator(
         {
             "name": "email_agent",
             "description": (
-                "Reads, searches, and sends the user's own email (Gmail/Outlook via "
-                "Composio). Use for anything about the user's inbox."
+                "Reads, searches, and sends the user's own Gmail (via Composio), and "
+                "handles connecting/reconnecting their account. Use for anything about "
+                "the user's inbox, and for 'connect my email/gmail' requests."
             ),
             "system_prompt": EMAIL_SYSTEM_PROMPT,
             "tools": build_email_tools(user, approval_gate),

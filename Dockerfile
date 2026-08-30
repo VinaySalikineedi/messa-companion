@@ -34,7 +34,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY --chown=user requirements.txt requirements.txt
-RUN pip install --no-cache-dir --upgrade -r requirements.txt
+# pip/setuptools/wheel upgraded first, specifically so `composio`'s `pysher`
+# dependency builds cleanly (see requirements.txt's own note -- reproduced
+# directly against an old/Debian-patched setuptools while building the
+# email-connection feature; cheap insurance if this image's base ever
+# drifts the same way).
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && pip install --no-cache-dir --upgrade -r requirements.txt
 
 # (No local npm install step needed here anymore -- the real human-cursor
 # driver, messa/nodehelpers/cursor_driver.mjs, was removed after a real run

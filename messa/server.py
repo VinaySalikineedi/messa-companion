@@ -45,6 +45,7 @@ from .approval import AutoApproveGate, DenyApprovalGate
 from .channels import browserbase, sendblue
 from .channels.sendblue import SendblueError
 from .live_view_page import render_live_view_page
+from .tools import email_tools
 from .tools.routines_tools import compute_next_run
 
 app = FastAPI(title="Messa Sendblue webhook")
@@ -654,6 +655,56 @@ async def _production_deepsearch_pause_loop() -> None:
         await asyncio.sleep(config.DEEPSEARCH_HUMAN_HELP_POLL_INTERVAL_SECONDS)
 
 
+async def _production_email_connection_poll_loop() -> None:
+    """Notifies a user once their Gmail connection actually goes live (see
+    tools/email_tools.py's request_email_connection and
+    db.py's email_connection_requests functions) -- same decoupled shape as
+    the deepsearch pause loop above: request_email_connection only ever
+    creates the durable row and returns immediately (it does NOT block the
+    conversation waiting for the user to finish an OAuth flow that might
+    take anywhere from seconds to hours), and this separate loop is the
+    thing that actually notices completion and texts the confirmation.
+
+    Slower cadence than the deepsearch pause loop (config.
+    EMAIL_CONNECTION_POLL_INTERVAL_SECONDS, 20s by default vs that loop's
+    5s) since nothing in-conversation is blocked waiting on this one.
+    notified_at (set by db.mark_email_connected's own bookkeeping via the
+    row moving out of 'pending') keeps a slow cycle from double-texting;
+    unlike the pause loop, once this fires for a row that row's status is
+    no longer 'pending', so get_pending_email_connection_requests simply
+    stops returning it -- no separate notified_at check needed here."""
+    while True:
+        try:
+            await db.expire_stale_email_connection_requests()
+            pending = await db.get_pending_email_connection_requests()
+            for req in pending:
+                if not req.get("connected_account_id"):
+                    continue
+                status = await email_tools.get_connection_status(req["connected_account_id"])
+                if status == "ACTIVE":
+                    await db.mark_email_connected(req["id"], req["user_id"])
+                    try:
+                        await sendblue.send_message(
+                            req["phone_number"],
+                            "Your Gmail is connected! I can check and send email for you now.",
+                        )
+                    except SendblueError as e:
+                        console.system(f"[email connection notify failed] request=#{req['id']}: {e}")
+                elif status in ("FAILED", "EXPIRED", "REVOKED"):
+                    await db.expire_email_connection_request(req["id"])
+                    try:
+                        await sendblue.send_message(
+                            req["phone_number"],
+                            "That Gmail connection didn't go through -- want me to send a new link?",
+                        )
+                    except SendblueError as e:
+                        console.system(f"[email connection notify failed] request=#{req['id']}: {e}")
+                # Any other status (INITIALIZING, etc.) -- still in progress, check again next cycle.
+        except Exception as e:  # noqa: BLE001 - a background loop must never die silently mid-process
+            console.system(f"[email connection poller error] {e}")
+        await asyncio.sleep(config.EMAIL_CONNECTION_POLL_INTERVAL_SECONDS)
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     global _bg_tasks
@@ -661,8 +712,9 @@ async def _startup() -> None:
         asyncio.create_task(_production_reminder_loop()),
         asyncio.create_task(_production_cron_loop()),
         asyncio.create_task(_production_deepsearch_pause_loop()),
+        asyncio.create_task(_production_email_connection_poll_loop()),
     ]
-    console.system("Started production reminder/cron/deepsearch-pause delivery pollers.")
+    console.system("Started production reminder/cron/deepsearch-pause/email-connection delivery pollers.")
 
 
 @app.on_event("shutdown")

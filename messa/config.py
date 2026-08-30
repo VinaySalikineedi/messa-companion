@@ -202,7 +202,47 @@ DATABASE_URL = _RAW_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://
 
 # ---- Composio (email agent) ----
 COMPOSIO_API_KEY = os.environ.get("COMPOSIO_API_KEY")  # optional until Phase 2 wiring
-COMPOSIO_EMAIL_ACCOUNT = os.environ.get("COMPOSIO_EMAIL_CONNECTED_ACCOUNT_ID")
+
+# Real multi-tenant OAuth now (each user connects their own Gmail): the
+# earlier COMPOSIO_EMAIL_CONNECTED_ACCOUNT_ID single-shared-account env var
+# is gone -- every Composio call is keyed by that specific user's own id
+# (see email_tools.py's _composio_user_id), and the connected account it
+# resolves to is whichever one that user completed the OAuth flow for.
+#
+# COMPOSIO_GMAIL_AUTH_CONFIG_ID is optional: leave it unset and
+# email_tools.py finds-or-creates one Composio-managed Gmail auth config
+# automatically (scoped, via tool_access_config, to exactly the four Gmail
+# actions this project calls -- read/search/get/send/reply -- so Composio
+# computes the minimum OAuth scopes for those, not a blanket full-account
+# grant). That auto-created config is found again (by name) on every cold
+# start rather than recreated, so this only needs setting explicitly if you
+# want to point at your own custom Gmail OAuth app instead of Composio's
+# managed one.
+COMPOSIO_GMAIL_AUTH_CONFIG_ID = os.environ.get("COMPOSIO_GMAIL_AUTH_CONFIG_ID")
+
+# Where Composio sends the user after they finish (or abandon) the OAuth
+# consent screen. Optional -- omit it and Composio shows its own generic
+# "connected" page; there's no callback endpoint of ours to host either
+# way, since connection status is confirmed by polling Composio's API
+# (see _production_email_connection_poll_loop in server.py), not by us
+# receiving a callback request.
+COMPOSIO_GMAIL_CALLBACK_URL = os.environ.get("COMPOSIO_GMAIL_CALLBACK_URL")
+
+# How often the background loop checks pending Gmail connection requests
+# for whether the user has finished the OAuth flow yet. Not time-critical
+# the way the deepsearch human-help pause is (nothing is blocked waiting on
+# it mid-conversation), so a slower cadence than that loop's 5s is fine.
+EMAIL_CONNECTION_POLL_INTERVAL_SECONDS = int(
+    os.environ.get("MESSA_EMAIL_CONNECTION_POLL_INTERVAL_SECONDS", "20")
+)
+
+# A connection request nobody ever finished (closed the tab, changed their
+# mind) shouldn't be polled forever -- bounds both the poll loop's Composio
+# API usage and the table's growth. Expiring is silent (no "did you still
+# want to connect?" text); the user can always just ask again.
+EMAIL_CONNECTION_REQUEST_EXPIRES_HOURS = int(
+    os.environ.get("MESSA_EMAIL_CONNECTION_REQUEST_EXPIRES_HOURS", "24")
+)
 
 # ---- Browserbase (deepsearch's remote browser) ----
 # Two rounds of "Chrome isn't installed" on the HF Space -- each one a real,
@@ -609,6 +649,12 @@ class UserContext:
     channel: str = "cli"
     extra: dict = field(default_factory=dict)
     live_view_token: str | None = None
+    # Cached from users.email_connected (migrations/012_email_connection.sql)
+    # -- cheap per-turn read so the system prompt/onboarding logic knows
+    # without an extra Composio API call. Never the source of truth for
+    # whether a Gmail action will actually succeed (Composio's own response
+    # is); see email_tools.py.
+    email_connected: bool = False
 
     @property
     def onboarding_complete(self) -> bool:

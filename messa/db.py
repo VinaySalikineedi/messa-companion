@@ -93,7 +93,9 @@ def _parse_dt(value: Any, user_tz: str | None = None) -> datetime | None:
 # Users
 # ---------------------------------------------------------------------------
 
-ONBOARDING_STEPS = ["awaiting_name", "awaiting_email", "awaiting_location", "complete"]
+ONBOARDING_STEPS = [
+    "awaiting_name", "awaiting_email", "awaiting_location", "awaiting_email_connect", "complete",
+]
 
 
 def _initial_onboarding_step(name: str | None) -> str:
@@ -334,10 +336,12 @@ async def list_calendar_events_for_range(user_id: int, start: datetime, end: dat
 
 
 async def save_profile_field(user_id: int, field: str, value: str) -> dict[str, Any]:
-    """Save one onboarding field (name/email/city) and advance onboarding_step.
+    """Save one onboarding field (name/email/city/connect_email) and advance
+    onboarding_step.
 
-    `value` may be the literal string 'skip' for the optional email step --
-    that still advances onboarding without writing anything to the column.
+    `value` may be the literal string 'skip' for the optional email step, or
+    'no'/'skip' for connect_email -- both still advance onboarding without
+    writing anything.
 
     For `field == "city"`, this also resolves and stores the user's real
     timezone (via timeutil.resolve_timezone) instead of leaving it on
@@ -347,13 +351,26 @@ async def save_profile_field(user_id: int, field: str, value: str) -> dict[str, 
     (agents/registry.py's save_profile_info tool) whether that resolution
     was unambiguous; when it's False, the caller should ask the user for a
     zip code or "city, state" instead of trusting a guess.
+
+    `field == "connect_email"` is the odd one out: unlike the other three,
+    its answer ('yes'/'no') doesn't get written to a column of its own --
+    it exists purely to advance onboarding past the opt-in question. The
+    real users.email_connected flag (migrations/012_email_connection.sql)
+    is only ever set once Composio actually confirms an active connection
+    (see mark_email_connected, polled by server.py's
+    _production_email_connection_poll_loop) -- saying 'yes' here just means
+    "go ahead and send me a connect link," handled by the caller
+    (agents/registry.py) delegating to email_agent's request_email_connection
+    tool in the same turn, not by this function.
     """
-    if field not in ("name", "email", "city"):
+    if field not in ("name", "email", "city", "connect_email"):
         raise ValueError(f"Unknown profile field: {field}")
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        if field == "email" and not await _has_column(conn, "users", "email"):
+        if field == "connect_email":
+            pass  # no column of its own -- see this function's docstring
+        elif field == "email" and not await _has_column(conn, "users", "email"):
             # Migration 003 not applied yet -- skip storing, still advance.
             pass
         elif value and value.strip().lower() != "skip":
@@ -361,7 +378,12 @@ async def save_profile_field(user_id: int, field: str, value: str) -> dict[str, 
 
         row = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
         current_step = row["onboarding_step"]
-        step_for_field = {"name": "awaiting_name", "email": "awaiting_email", "city": "awaiting_location"}[field]
+        step_for_field = {
+            "name": "awaiting_name",
+            "email": "awaiting_email",
+            "city": "awaiting_location",
+            "connect_email": "awaiting_email_connect",
+        }[field]
         if current_step == step_for_field:
             next_step = ONBOARDING_STEPS[ONBOARDING_STEPS.index(step_for_field) + 1]
             await conn.execute("UPDATE users SET onboarding_step = $2 WHERE id = $1", user_id, next_step)
@@ -825,14 +847,13 @@ async def _insert_cron_job(conn: asyncpg.Connection, user_id: int, payload: dict
     # payload["next_run_at"] is already a tz-aware datetime by the time it
     # gets here (tools/routines_tools.py computes it via compute_next_run,
     # which is timezone-aware end to end) -- no string parsing needed.
-    status_val = payload.get("status") or "active"
     row = await conn.fetchrow(
         """
-        INSERT INTO cron_jobs (user_id, prompt_or_task, cron_expression, user_timezone, next_run_at, status)
-        VALUES ($1, $2, $3, $4, $5, $6::cron_job_status) RETURNING *
+        INSERT INTO cron_jobs (user_id, prompt_or_task, cron_expression, user_timezone, next_run_at)
+        VALUES ($1, $2, $3, $4, $5) RETURNING *
         """,
         user_id, payload["prompt_or_task"], payload["cron_expression"],
-        payload.get("user_timezone", config.DEFAULT_TIMEZONE), payload["next_run_at"], status_val,
+        payload.get("user_timezone", config.DEFAULT_TIMEZONE), payload["next_run_at"],
     )
     return dict(row)
 
@@ -928,8 +949,8 @@ async def ensure_default_briefings(user_row: dict[str, Any]) -> None:
                 await conn.execute(
                     """
                     INSERT INTO cron_jobs
-                        (user_id, prompt_or_task, cron_expression, user_timezone, next_run_at, kind, status)
-                    VALUES ($1, $2, $3, $4, $5, $6, 'active'::cron_job_status)
+                        (user_id, prompt_or_task, cron_expression, user_timezone, next_run_at, kind)
+                    VALUES ($1, $2, $3, $4, $5, $6)
                     """,
                     user_id, spec["prompt_or_task"], spec["cron_expression"], tz_name, next_run, kind,
                 )
@@ -1277,5 +1298,119 @@ async def timeout_human_help_request(request_id: int) -> None:
             return
         await conn.execute(
             "UPDATE deepsearch_human_help_requests SET status = 'timed_out', resolved_at = NOW() WHERE id = $1",
+            request_id,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Gmail connection requests (migrations/012_email_connection.sql) -- durable
+# state for "connect my email", same decoupled shape as the human-help block
+# above: request_email_connection (tools/email_tools.py) creates the row the
+# moment it generates a Composio connect link; server.py's separate
+# _production_email_connection_poll_loop polls Composio for that row's real
+# status and sends exactly one confirmation text once it's active.
+# Additive/no-op-safe: all no-op until migration 012 has been applied.
+# ---------------------------------------------------------------------------
+
+async def create_email_connection_request(user_id: int, connected_account_id: str | None) -> dict[str, Any] | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "email_connection_requests"):
+            return None
+        row = await conn.fetchrow(
+            """
+            INSERT INTO email_connection_requests (user_id, connected_account_id)
+            VALUES ($1, $2) RETURNING *
+            """,
+            user_id, connected_account_id,
+        )
+        return dict(row)
+
+
+async def get_pending_email_connection_requests() -> list[dict[str, Any]]:
+    """All still-'pending' rows across every user, joined with phone_number
+    -- what _production_email_connection_poll_loop polls. Excludes rows
+    older than config.EMAIL_CONNECTION_REQUEST_EXPIRES_HOURS; the loop
+    expires those separately (see expire_stale_email_connection_requests)
+    rather than this function silently hiding them forever."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "email_connection_requests"):
+            return []
+        rows = await conn.fetch(
+            """
+            SELECT e.*, u.phone_number
+            FROM email_connection_requests e JOIN users u ON u.id = e.user_id
+            WHERE e.status = 'pending'
+            AND e.requested_at > NOW() - ($1 || ' hours')::interval
+            """,
+            str(config.EMAIL_CONNECTION_REQUEST_EXPIRES_HOURS),
+        )
+        return _rows(rows)
+
+
+async def expire_stale_email_connection_requests() -> list[dict[str, Any]]:
+    """Silently expires (no notification -- the user can just ask again)
+    any 'pending' row older than the configured window, so the poll loop's
+    working set and the table itself don't grow forever with abandoned
+    requests. Returns the rows it expired, in case a caller wants to log
+    how many."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "email_connection_requests"):
+            return []
+        rows = await conn.fetch(
+            """
+            UPDATE email_connection_requests
+            SET status = 'expired', resolved_at = NOW()
+            WHERE status = 'pending' AND requested_at <= NOW() - ($1 || ' hours')::interval
+            RETURNING *
+            """,
+            str(config.EMAIL_CONNECTION_REQUEST_EXPIRES_HOURS),
+        )
+        return _rows(rows)
+
+
+async def mark_email_connection_notified(request_id: int) -> None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "email_connection_requests"):
+            return
+        await conn.execute(
+            "UPDATE email_connection_requests SET notified_at = NOW() WHERE id = $1 AND notified_at IS NULL",
+            request_id,
+        )
+
+
+async def mark_email_connected(request_id: int, user_id: int) -> None:
+    """Called once Composio confirms the connection is ACTIVE: resolves the
+    request row AND flips the cheap users.email_connected cache in the same
+    transaction, so the two can't drift apart."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            if await _has_table(conn, "email_connection_requests"):
+                await conn.execute(
+                    "UPDATE email_connection_requests SET status = 'active', resolved_at = NOW() WHERE id = $1",
+                    request_id,
+                )
+            if await _has_column(conn, "users", "email_connected"):
+                await conn.execute(
+                    "UPDATE users SET email_connected = TRUE WHERE id = $1", user_id,
+                )
+
+
+async def expire_email_connection_request(request_id: int) -> None:
+    """Called when Composio reports a terminal failure (FAILED/EXPIRED/
+    REVOKED) for a request still marked 'pending' -- distinct from the
+    silent age-based expiry above, this one's worth telling the user about
+    (see _production_email_connection_poll_loop), so it's a separate call
+    even though the DB write is identical to one row of the bulk version."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "email_connection_requests"):
+            return
+        await conn.execute(
+            "UPDATE email_connection_requests SET status = 'expired', resolved_at = NOW() WHERE id = $1",
             request_id,
         )
