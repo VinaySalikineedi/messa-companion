@@ -175,7 +175,12 @@ def build_email_tools(user: config.UserContext, approval_gate: ApprovalGate | No
 
     def _execute_sync(slug: str, **arguments) -> dict:
         client = _get_client()
-        return client.tools.execute(slug=slug, arguments=arguments, user_id=composio_user_id)
+        kwargs: dict = {"slug": slug, "arguments": arguments, "user_id": composio_user_id}
+        if config.COMPOSIO_TOOLKIT_VERSION:
+            kwargs["version"] = config.COMPOSIO_TOOLKIT_VERSION
+        else:
+            kwargs["dangerously_skip_version_check"] = True
+        return client.tools.execute(**kwargs)
 
     async def _execute(slug: str, **arguments) -> dict:
         return await asyncio.to_thread(_execute_sync, slug, **arguments)

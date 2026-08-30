@@ -219,6 +219,7 @@ COMPOSIO_API_KEY = os.environ.get("COMPOSIO_API_KEY")  # optional until Phase 2 
 # want to point at your own custom Gmail OAuth app instead of Composio's
 # managed one.
 COMPOSIO_GMAIL_AUTH_CONFIG_ID = os.environ.get("COMPOSIO_GMAIL_AUTH_CONFIG_ID")
+COMPOSIO_TOOLKIT_VERSION = os.environ.get("COMPOSIO_TOOLKIT_VERSION")
 
 # Where Composio sends the user after they finish (or abandon) the OAuth
 # consent screen. Optional -- omit it and Composio shows its own generic
