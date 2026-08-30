@@ -38,8 +38,12 @@ try:
     from duckduckgo_search import DDGS
     from duckduckgo_search.exceptions import DuckDuckGoSearchException as DDGSException
 except ImportError:
-    from duckduckgo_search import DDGS
-    DDGSException = Exception
+    try:
+        from ddgs import DDGS
+        DDGSException = Exception
+    except ImportError:
+        DDGS = None
+        DDGSException = Exception
 from langchain_core.tools import BaseTool, tool
 
 from .common import trace_all

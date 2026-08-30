@@ -56,4 +56,5 @@ httpx>=0.28.1
 # "duckduckgo-search", renamed) needs no API key; beautifulsoup4 turns a
 # fetched page's raw HTML into readable text.
 ddgs>=9.0.0
+duckduckgo-search>=7.0.0
 beautifulsoup4>=4.12.0
