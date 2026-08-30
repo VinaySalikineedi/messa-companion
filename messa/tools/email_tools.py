@@ -56,7 +56,6 @@ LABEL = "email_agent"
 # these for the OUTLOOK_* equivalents, update EMAIL_SYSTEM_PROMPT, and give
 # _get_or_create_gmail_auth_config_id (below) an Outlook equivalent.
 _SLUG_LIST = "GMAIL_FETCH_EMAILS"
-_SLUG_GET = "GMAIL_GET_MESSAGE"
 _SLUG_SEND = "GMAIL_SEND_EMAIL"
 _SLUG_REPLY = "GMAIL_REPLY_TO_THREAD"
 
@@ -66,7 +65,7 @@ _DESTRUCTIVE = {"send_email", "reply_to_email"}
 # auth config it created on an earlier process/deploy, rather than either
 # creating a new one every cold start or accidentally adopting some
 # unrelated Gmail auth config already sitting in the same Composio project.
-_GMAIL_AUTH_CONFIG_NAME = "Messa Gmail Access (read + send)"
+_GMAIL_AUTH_CONFIG_NAME = "Messa Gmail Access v2"
 
 # In-process memoization only -- see _get_or_create_gmail_auth_config_id's
 # docstring for why nothing needs to persist this to the DB for it to
@@ -99,7 +98,7 @@ def _get_or_create_gmail_auth_config_id(client) -> str:
     """Find-or-create, memoized for this process: the one Composio auth
     config every user's Gmail connects through.
 
-    Deliberately scoped to exactly the four Gmail actions this file calls
+    Deliberately scoped to exactly the Gmail actions this file calls
     (see module docstring) via tool_access_config, so Composio computes the
     minimum OAuth scopes for those specifically -- not a blanket
     full-account grant.
@@ -134,7 +133,7 @@ def _get_or_create_gmail_auth_config_id(client) -> str:
             "type": "use_composio_managed_auth",
             "name": _GMAIL_AUTH_CONFIG_NAME,
             "tool_access_config": {
-                "tools_for_connected_account_creation": [_SLUG_LIST, _SLUG_GET, _SLUG_SEND, _SLUG_REPLY],
+                "tools_for_connected_account_creation": [_SLUG_LIST, _SLUG_SEND, _SLUG_REPLY],
             },
         },
     )
