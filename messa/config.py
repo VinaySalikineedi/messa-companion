@@ -62,7 +62,7 @@ def _require(name: str) -> str:
 # pinning the dated snapshot (`deepseek/deepseek-v4-pro-0813`) via
 # MESSA_MODEL, no code change needed either way.
 OPENROUTER_API_KEY = _require("OPENROUTER_API_KEY")
-ORCHESTRATOR_MODEL_NAME = os.environ.get("MESSA_MODEL", "deepseek/deepseek-v4-pro-0813")
+ORCHESTRATOR_MODEL_NAME = os.environ.get("MESSA_MODEL", "~deepseek/deepseek-v4-pro")
 SUBAGENT_MODEL_NAME = os.environ.get("MESSA_SUBAGENT_MODEL", "~deepseek/deepseek-v4-flash-latest")
 
 # Backward-compatible alias: kept in case anything (or you) still refers to
@@ -185,7 +185,7 @@ DEEPSEARCH_ALLOWED_DOMAINS: list[str] = [
 # the orchestrator's own RECURSION_LIMIT -- deep research tasks legitimately
 # need many steps, and hitting this cap is expected/handled (the session is
 # saved and can be resumed) rather than an error condition.
-DEEPSEARCH_MAX_STEPS = int(os.environ.get("MESSA_DEEPSEARCH_MAX_STEPS", "200"))
+DEEPSEARCH_MAX_STEPS = int(os.environ.get("MESSA_DEEPSEARCH_MAX_STEPS", "100"))
 
 # How long (ms) @playwright/mcp waits after each action for triggered work
 # (a re-render, an XHR, an animation) to "settle" before returning control --
@@ -335,6 +335,69 @@ EXECUTIVE_RECURSION_LIMIT = int(os.environ.get("MESSA_EXECUTIVE_RECURSION_LIMIT"
 # machine/container is actually set to (Neon + your deployment target both
 # run in UTC).
 SERVER_TIMEZONE_NOTE = "UTC"
+
+
+# ---- Default morning/evening briefings ----
+# Auto-provisioned for every user -- new (at account creation) and existing
+# (backfilled the next time they're loaded, see db.ensure_default_briefings
+# and cli.load_user_context) -- rather than something the user has to think
+# to ask Messa for. Each entry becomes one cron_jobs row tagged with this
+# key in the new `kind` column (migrations/011_cron_job_kind.sql), which is
+# what lets ensure_default_briefings tell "already has one" apart from
+# "never had one" without re-creating a briefing a user deliberately
+# cancelled (existence of a row with this kind, regardless of its status,
+# means "leave it alone").
+#
+# The prompt text below is exactly what fires through the same
+# load_user_context -> build_orchestrator -> run_message path a real
+# inbound text would use (see server.py's _production_cron_loop) -- there's
+# no separate "briefing renderer," Messa just answers this prompt for real
+# every time, using whatever's actually in the DB (and a live web_search for
+# weather) at that moment.
+DEFAULT_BRIEFINGS: dict[str, dict[str, str]] = {
+    "morning_briefing": {
+        "cron_expression": "0 7 * * *",  # 7:00 AM, the user's own local time
+        "prompt_or_task": (
+            "Give me my morning briefing as a short text. Check today's calendar events "
+            "and any tasks due today or overdue, and list them briefly. Include a short, "
+            "one-line weather summary for today for my location (use web_search for "
+            "current weather -- don't guess). If I have nothing scheduled and no tasks "
+            "due, don't just say so -- remind me you're happy to help set something up, "
+            "or take care of anything on my mind, including things that need actually "
+            "clicking around a website, since you can browse the web for me. Keep it "
+            "warm, brief, and easy to scan."
+        ),
+    },
+    "evening_briefing": {
+        "cron_expression": "0 20 * * *",  # 8:00 PM, the user's own local time
+        "prompt_or_task": (
+            "Give me my evening briefing as a short text. Summarize what I got done "
+            "today -- tasks completed and events that happened -- then give me a quick "
+            "look at tomorrow: tomorrow's schedule and anything due tomorrow or still "
+            "overdue. If today was quiet (nothing completed, nothing scheduled), say so "
+            "briefly and remind me you're around to help plan tomorrow or take care of "
+            "anything on my mind, including browsing the web for me if it'd help. Keep "
+            "it warm, brief, and easy to scan."
+        ),
+    },
+}
+
+# For existing users who already had a simple, hand-set-up morning/evening
+# briefing BEFORE this feature existed (a plain user-created cron job, via
+# propose_create_recurring_cron -- `kind` is NULL on those rows, since
+# tagging didn't exist yet). Per an explicit "replace entirely" product
+# decision: rather than leave that old job running alongside a brand new
+# tagged one (a real user would get double-texted every morning),
+# db.ensure_default_briefings looks for exactly one untagged job whose own
+# prompt_or_task text contains one of these keywords and retires
+# (cancels) it before creating the new one. Deliberately conservative --
+# see that function's docstring for why zero or multiple matches means
+# "don't touch anything, just create the new one normally" rather than
+# guessing.
+LEGACY_BRIEFING_MATCH_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "morning_briefing": ("morning brief",),
+    "evening_briefing": ("evening brief",),
+}
 
 
 @dataclass

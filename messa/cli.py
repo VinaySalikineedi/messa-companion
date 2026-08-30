@@ -55,9 +55,17 @@ async def load_user_context(
     but for any user created before that feature existed -- or whose city
     was saved before it resolved successfully -- this retries resolution
     against the city already on file, so those accounts self-heal onto the
-    correct timezone without needing to re-answer onboarding."""
+    correct timezone without needing to re-answer onboarding.
+
+    `db.ensure_default_briefings` runs right after, once the timezone above
+    is as resolved as it's going to get this turn -- same self-healing
+    pattern, this time backfilling the morning/evening briefing cron jobs
+    (see config.DEFAULT_BRIEFINGS) for any user who doesn't already have
+    one of each, and correcting either one's local-time meaning if it was
+    provisioned before this user's timezone was confirmed."""
     user_row = await db.get_or_create_user(phone_number, name, config.DEFAULT_TIMEZONE)
     user_row = await db.ensure_timezone_resolved(user_row)
+    await db.ensure_default_briefings(user_row)
     live_view_token = await db.get_or_create_live_share_token(user_row["id"])
     return config.UserContext(
         user_id=user_row["id"],

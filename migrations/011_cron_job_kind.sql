@@ -1,0 +1,12 @@
+-- Migration 011: Tag system-provisioned recurring jobs (morning/evening
+-- briefings) apart from ones a user asked Messa to create themselves.
+--
+-- NULL (the default, for every existing row) means "an ordinary user-
+-- created job, via propose_create_recurring_cron" -- untouched by this.
+-- A non-NULL value (e.g. 'morning_briefing', 'evening_briefing') means
+-- "auto-provisioned by db.ensure_default_briefings" -- that function checks
+-- for a row with this exact kind before creating one, so a user is never
+-- given a second morning briefing, and one they cancel is never silently
+-- recreated (existence of a row with this kind, regardless of status, is
+-- what's checked -- see ensure_default_briefings' own docstring).
+ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS kind VARCHAR(50);

@@ -2256,6 +2256,120 @@ boundary math across timezones (including a same-instant-different-local-
 day case between New York and Tokyo), the date-label formatting, and the
 full JSON shape through FastAPI's `TestClient`.
 
+## Default morning + evening briefings for every user
+
+You already had morning briefings set up for existing users (rows in
+`cron_jobs`, created the ordinary way -- asking Messa, who staged it via
+`propose_create_recurring_cron` for you to confirm). You asked for two
+things: make an evening briefing exist for those same users too, and make
+both automatic going forward -- every new user gets both by default, no one
+has to think to ask.
+
+**Why this couldn't just be "add one row to the database":** there's no
+direct line into your live Neon DB from here, and even if there were, a
+one-time INSERT wouldn't cover new users signing up afterward. So instead
+of a migration that touches data, this is application code that provisions
+both jobs itself, the moment it's needed:
+
+`db.ensure_default_briefings` (new) checks whether a user already has a
+`morning_briefing`/`evening_briefing` cron job (tagged via a new nullable
+`cron_jobs.kind` column, `migrations/011_cron_job_kind.sql` -- NULL for
+every ordinary user-created job, untouched) and creates whichever one is
+missing. It's called from `cli.load_user_context` right after
+`ensure_timezone_resolved` -- the exact same "self-heals on every load"
+spot that function already uses to backfill timezone resolution for
+accounts older than that feature. That one hook covers every path a user
+ever gets loaded through: a brand-new signup's very first turn, an existing
+user's next inbound text, and `_production_cron_loop` loading a user to run
+one of their *existing* due jobs (their morning briefing firing tomorrow at
+7am is itself what backfills their evening one). No manual backfill script
+needed, and no direct production DB access required from this end.
+
+This deliberately bypasses the `propose_create_recurring_cron`/
+`pending_actions` confirmation gate that a model-initiated cron job goes
+through -- that gate exists for a model deciding, on its own, to create new
+standing automation; this is the product itself turning on a default for
+everyone, the same category of thing as `get_or_create_live_share_token`
+silently issuing a live-view link with no confirmation step. Existence of a
+row with that `kind` -- regardless of its status -- is what's checked, so a
+user who later pauses or cancels their evening briefing stays off; this
+never resurrects it.
+
+**Timing:** both fire at fixed default local times -- 7:00 AM and 8:00 PM,
+in whatever timezone is actually stored on the user's row at the moment
+each is provisioned. A user who hasn't confirmed a real timezone yet gets
+provisioned against `config.DEFAULT_TIMEZONE` as a placeholder; the same
+function self-heals that too -- once `ensure_timezone_resolved` confirms a
+real timezone on a later call, `ensure_default_briefings` notices the
+briefing rows' stored zone no longer matches and corrects both the zone and
+`next_run_at`, so "7am" ends up meaning 7am where the user actually lives,
+not wherever the placeholder pointed. It deliberately never touches an
+*unconfirmed* placeholder-to-placeholder match, so nothing is "corrected"
+onto a timezone nobody's actually vouched for yet.
+
+**Content** is entirely prompt-driven, not a template: both jobs' stored
+`prompt_or_task` (in the new `config.DEFAULT_BRIEFINGS` dict) is fired
+through the exact same `load_user_context` -> `build_orchestrator` ->
+`run_message` path a real inbound text takes (see
+`server.py`'s `_production_cron_loop`, already covered above) -- there's no
+separate "briefing renderer" to keep in sync with Messa's own tools. The
+morning prompt asks for today's calendar events and tasks due/overdue, a
+short one-line weather lookup (via Messa's own `web_search` tool -- no new
+integration, no API key), and, if there's nothing scheduled and nothing
+due, a nudge that she can help set something up or take care of anything on
+their mind, including things that need clicking around a real website
+(deepsearch). The evening prompt asks for what got done today, plus a
+preview of tomorrow's schedule and anything due tomorrow or still overdue,
+with the same "quiet day" nudge if there's nothing to report.
+
+### A real bug caught before it shipped: this would have double-texted your 3 existing users
+
+You already had a simple, hand-set-up 6am morning briefing for 3 test
+users -- created the ordinary way, by asking Messa, so those rows'
+`kind` is NULL (only this new provisioning path ever sets it). The first
+version of `ensure_default_briefings` checked for a row tagged
+`kind = 'morning_briefing'` before creating one -- which that existing 6am
+job, being untagged, would never satisfy. Left as written, every one of
+those 3 users would have ended up with TWO morning briefings: their
+original 6am one and a brand new 7am one, forever. You caught this by
+asking what happens to the existing 6am jobs before it ran anywhere.
+
+Per your call ("replace entirely"), `_retire_legacy_briefing_if_any` now
+runs before every insert: it looks for exactly one untagged
+(`kind IS NULL`, not already cancelled) cron job whose own `prompt_or_task`
+text contains "morning brief"/"evening brief" (`config.
+LEGACY_BRIEFING_MATCH_KEYWORDS`), cancels it, and only then creates the new
+tagged row with the fuller content at the new default time. Deliberately
+conservative on the match itself: zero candidates or more than one and it
+does nothing (leaves every existing job alone, still creates the new one
+normally) rather than risk cancelling a real user's real automation on a
+guess -- a false negative just means one recoverable duplicate; a false
+positive means silently deleting something they set up on purpose.
+
+Verified with a hand-built fake asyncpg pool (`test_default_briefings.py`,
+since this is real SQL-shaping logic worth exercising directly rather than
+mocking away): a brand-new user gets exactly two rows inserted, tagged and
+timed correctly; a user who already has both gets zero duplicate inserts,
+including when one of those rows is a cancelled job (existence, not
+status, is what's checked); the timezone self-heal fires only once a
+timezone is actually confirmed, never while it's still an unverified
+placeholder; the legacy-replacement path cancels the one clear match and
+creates the new row with the fuller content in its place, while an
+ambiguous (2+ candidate) match or a genuinely unrelated existing job (a
+weekly check-in, say) is never touched; and the whole function is a clean
+no-op if migration 011 hasn't been applied yet. A separate direct test
+confirms `load_user_context` calls `ensure_default_briefings` with the
+already-timezone-resolved row, in the right order.
+
+**Known trade-off, not fixed here:** a user who signs up but never finishes
+onboarding (never gives a name/city) still gets both jobs provisioned
+against the placeholder timezone right away, per "every user, new or
+existing" as asked -- meaning it's possible for a half-onboarded account to
+get a 7am-somewhere-else-in-the-world text before they've said anything
+back. If that turns out to feel premature in practice, the fix is a one-line
+gate in `ensure_default_briefings` on `user_row["onboarding_step"] ==
+"complete"` -- deliberately left out for now rather than guessed at.
+
 ## Changes from your second round of testing
 
 - **Renamed browser_agent -> deepsearch.** Same subagent, new name

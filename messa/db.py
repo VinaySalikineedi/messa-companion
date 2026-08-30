@@ -13,8 +13,10 @@ import json
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 import asyncpg
+from croniter import croniter
 
 from . import config, timeutil
 
@@ -832,6 +834,110 @@ async def _insert_cron_job(conn: asyncpg.Connection, user_id: int, payload: dict
         payload.get("user_timezone", config.DEFAULT_TIMEZONE), payload["next_run_at"],
     )
     return dict(row)
+
+
+def _compute_next_run_local(cron_expression: str, tz_name: str) -> datetime:
+    # Deliberately duplicated (not imported) from tools/routines_tools.py's
+    # compute_next_run: that module does `from .. import db`, so db
+    # importing back from it would be circular. Same three lines either way.
+    tz = ZoneInfo(tz_name)
+    return croniter(cron_expression, datetime.now(tz)).get_next(datetime)
+
+
+async def _retire_legacy_briefing_if_any(conn: asyncpg.Connection, user_id: int, kind: str) -> None:
+    """Before creating a NEW tagged briefing row, cancel an old, untagged
+    one that's already serving the same purpose -- see
+    config.LEGACY_BRIEFING_MATCH_KEYWORDS' own comment for the "replace
+    entirely" decision this implements. `kind IS NULL` scopes this to jobs
+    that predate the `kind` column entirely (an ordinary user-created job
+    via propose_create_recurring_cron); a job this function itself tagged
+    on an earlier call is never a candidate for re-matching here. Matches
+    on exactly ONE candidate only -- zero or multiple candidates means
+    "don't touch anything," since guessing wrong here means cancelling a
+    real user's real automation."""
+    keywords = config.LEGACY_BRIEFING_MATCH_KEYWORDS.get(kind, ())
+    if not keywords:
+        return
+    candidates = await conn.fetch(
+        "SELECT id, prompt_or_task FROM cron_jobs WHERE user_id = $1 AND kind IS NULL AND status != 'cancelled'",
+        user_id,
+    )
+    matches = [
+        c for c in candidates
+        if any(kw in (c["prompt_or_task"] or "").lower() for kw in keywords)
+    ]
+    if len(matches) != 1:
+        return
+    await conn.execute("UPDATE cron_jobs SET status = 'cancelled' WHERE id = $1", matches[0]["id"])
+
+
+async def ensure_default_briefings(user_row: dict[str, Any]) -> None:
+    """Auto-provisions the morning + evening briefing cron jobs (see
+    config.DEFAULT_BRIEFINGS) for a user who doesn't already have one of
+    each -- every user gets both by default, new or existing, rather than
+    needing to think to ask Messa to set one up. Called from
+    cli.load_user_context on every turn (same "self-heals on load" pattern
+    as ensure_timezone_resolved, right after it) and from get_or_create_user
+    for a brand-new row, so this covers both "new user" and "existing user"
+    without a separate one-off backfill script.
+
+    Tags each row it creates with `kind` (migrations/011_cron_job_kind.sql)
+    so a later call can tell "already has one" apart from "never had one"
+    without re-creating a briefing the user deliberately cancelled or
+    paused -- existence of a row with this kind, regardless of its current
+    status, is what's checked. This is also why it writes directly rather
+    than going through propose_action/create_recurring_cron's confirmation
+    gate: that gate exists for a MODEL deciding to create new standing
+    automation on its own initiative, not for a default the product itself
+    turns on for everyone, the same reasoning get_or_create_live_share_token
+    already applies to auto-issuing a live-view link.
+
+    Also self-heals timing: if a briefing row's stored user_timezone no
+    longer matches the user's own (now-confirmed) timezone -- e.g. it was
+    provisioned before onboarding resolved a real city, using
+    config.DEFAULT_TIMEZONE as a placeholder -- this corrects that row's
+    user_timezone and recomputes next_run_at, so "7am" actually means 7am
+    where the user lives rather than wherever the placeholder pointed.
+    Additive/no-op-safe: does nothing at all if migration 011 hasn't been
+    applied yet.
+
+    Before creating a brand-new row for a kind this user has never had
+    tagged, first checks for (and retires) an old, untagged job already
+    serving that same purpose from before this feature existed -- see
+    _retire_legacy_briefing_if_any and config.LEGACY_BRIEFING_MATCH_KEYWORDS.
+    Explicit product decision: replace those entirely rather than leave a
+    duplicate running alongside the new one.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_column(conn, "cron_jobs", "kind"):
+            return
+        user_id = user_row["id"]
+        tz_name = user_row.get("timezone") or config.DEFAULT_TIMEZONE
+        timezone_confirmed = bool(user_row.get("timezone_confirmed"))
+
+        for kind, spec in config.DEFAULT_BRIEFINGS.items():
+            existing = await conn.fetchrow(
+                "SELECT id, user_timezone FROM cron_jobs WHERE user_id = $1 AND kind = $2",
+                user_id, kind,
+            )
+            if existing is None:
+                await _retire_legacy_briefing_if_any(conn, user_id, kind)
+                next_run = _compute_next_run_local(spec["cron_expression"], tz_name)
+                await conn.execute(
+                    """
+                    INSERT INTO cron_jobs
+                        (user_id, prompt_or_task, cron_expression, user_timezone, next_run_at, kind)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    """,
+                    user_id, spec["prompt_or_task"], spec["cron_expression"], tz_name, next_run, kind,
+                )
+            elif timezone_confirmed and existing["user_timezone"] != tz_name:
+                next_run = _compute_next_run_local(spec["cron_expression"], tz_name)
+                await conn.execute(
+                    "UPDATE cron_jobs SET user_timezone = $2, next_run_at = $3 WHERE id = $1",
+                    existing["id"], tz_name, next_run,
+                )
 
 
 # ---------------------------------------------------------------------------
