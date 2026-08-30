@@ -825,13 +825,14 @@ async def _insert_cron_job(conn: asyncpg.Connection, user_id: int, payload: dict
     # payload["next_run_at"] is already a tz-aware datetime by the time it
     # gets here (tools/routines_tools.py computes it via compute_next_run,
     # which is timezone-aware end to end) -- no string parsing needed.
+    status_val = payload.get("status") or "active"
     row = await conn.fetchrow(
         """
-        INSERT INTO cron_jobs (user_id, prompt_or_task, cron_expression, user_timezone, next_run_at)
-        VALUES ($1, $2, $3, $4, $5) RETURNING *
+        INSERT INTO cron_jobs (user_id, prompt_or_task, cron_expression, user_timezone, next_run_at, status)
+        VALUES ($1, $2, $3, $4, $5, $6::cron_job_status) RETURNING *
         """,
         user_id, payload["prompt_or_task"], payload["cron_expression"],
-        payload.get("user_timezone", config.DEFAULT_TIMEZONE), payload["next_run_at"],
+        payload.get("user_timezone", config.DEFAULT_TIMEZONE), payload["next_run_at"], status_val,
     )
     return dict(row)
 
@@ -927,8 +928,8 @@ async def ensure_default_briefings(user_row: dict[str, Any]) -> None:
                 await conn.execute(
                     """
                     INSERT INTO cron_jobs
-                        (user_id, prompt_or_task, cron_expression, user_timezone, next_run_at, kind)
-                    VALUES ($1, $2, $3, $4, $5, $6)
+                        (user_id, prompt_or_task, cron_expression, user_timezone, next_run_at, kind, status)
+                    VALUES ($1, $2, $3, $4, $5, $6, 'active'::cron_job_status)
                     """,
                     user_id, spec["prompt_or_task"], spec["cron_expression"], tz_name, next_run, kind,
                 )
