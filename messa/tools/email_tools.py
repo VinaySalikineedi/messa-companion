@@ -56,6 +56,7 @@ LABEL = "email_agent"
 # these for the OUTLOOK_* equivalents, update EMAIL_SYSTEM_PROMPT, and give
 # _get_or_create_gmail_auth_config_id (below) an Outlook equivalent.
 _SLUG_LIST = "GMAIL_FETCH_EMAILS"
+_SLUG_GET = "GMAIL_FETCH_EMAILS"
 _SLUG_SEND = "GMAIL_SEND_EMAIL"
 _SLUG_REPLY = "GMAIL_REPLY_TO_THREAD"
 
@@ -209,7 +210,7 @@ def build_email_tools(user: config.UserContext, approval_gate: ApprovalGate | No
         if not user.email_connected:
             return _not_connected_message()
         try:
-            result = await _execute(_SLUG_GET, message_id=message_id)
+            result = await _execute(_SLUG_GET, query=f"id:{message_id}", max_results=1)
         except _NotConfigured as e:
             return str(e)
         return str(result)
