@@ -1,0 +1,17 @@
+name = "messa-personal-email"
+main = "worker.js"
+compatibility_date = "2026-08-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+# Not a secret -- just where Messa's own backend lives. Point this at your
+# deployed server's /webhooks/personal-email/inbound route (e.g. your
+# Hugging Face Space's https://<you>-<space>.hf.space/webhooks/personal-email/inbound,
+# or your own domain once that's wired up).
+[vars]
+MESSA_WEBHOOK_URL = "https://live.textmessa.com/webhooks/personal-email/inbound"
+
+# The actual secret is set separately (never committed to source):
+#   wrangler secret put MESSA_WEBHOOK_SECRET
+# Its value must match MESSA_PERSONAL_EMAIL_WEBHOOK_SECRET in Messa's own
+# .env -- see messa/config.py.

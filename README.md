@@ -3062,6 +3062,22 @@ faked directly from the real package sources read above, not guessed at.
 Full existing regression suite (16 files total) re-run and passing
 alongside these three new ones.
 
+**Update after your own first real run against a live Composio account:**
+two things this project's own SDK-source-reading couldn't have caught,
+because they're facts about the live API surface, not the client library --
+`GMAIL_GET_MESSAGE` isn't a real action in the Gmail toolkit despite
+looking like an obvious one, and `tools.execute` requires either a
+`version` or `dangerously_skip_version_check=True` or it raises
+`ToolVersionRequiredError`. See the "Known Phase 1 limitations" bullet
+below for the fixes; `_SLUG_GET`, `_GMAIL_AUTH_CONFIG_NAME`, and
+`_execute_sync` in `email_tools.py` all changed as a result, plus a new
+`COMPOSIO_TOOLKIT_VERSION` env var. Also fixed in the same pass (found
+because a broken import here blocks the whole app at startup, which is
+what made it impossible to even get to testing the email agent):
+`web_search_tools.py`'s `ddgs` import now falls back to the older
+`duckduckgo-search` package name if `ddgs` itself isn't actually
+importable in the deployment environment.
+
 ## Changes from your first round of testing
 
 - **Speed.** `create_deep_agent`'s default harness silently gives every
@@ -3258,17 +3274,129 @@ zip code" nudge won't fire).
   that's intentional -- it's the CLI's console-only preview, not the
   production path (see "Executive assistant rebuild" above).
 - Email agent's Composio integration (see "Real Gmail OAuth connections,
-  per user, via Composio" above) is now written against the actual
-  installed SDK's source -- method signatures, return shapes, and
-  exception types confirmed by reading `composio`/`composio-client`
-  directly, not just docs -- but **still not run against a live
-  account/real OAuth flow end to end**: no Composio API key was available
-  while building this. The one thing worth a supervised first real run:
-  actually connecting a Gmail account through the generated link and
-  confirming `_production_email_connection_poll_loop` picks up the ACTIVE
-  status and texts the confirmation, before trusting it unattended. Gmail
-  only for now, per your ask -- Outlook would need its own action slugs
-  and auth config (see `email_tools.py`'s module docstring for where).
+  per user, via Composio" above) was written against the actual installed
+  SDK's source -- method signatures, return shapes, and exception types
+  confirmed by reading `composio`/`composio-client` directly, not just
+  docs -- and has now also been run against a real Composio account, which
+  is how two real bugs surfaced that no amount of source-reading
+  would've caught: `GMAIL_GET_MESSAGE` isn't an actual action in the live
+  Gmail toolkit (fixed by reusing `GMAIL_FETCH_EMAILS` filtered to one
+  message id instead -- see `email_tools.py`'s `_SLUG_GET`), and
+  `tools.execute` unconditionally raises `ToolVersionRequiredError` unless
+  a `version` or `dangerously_skip_version_check=True` is passed (fixed in
+  `_execute_sync`; pin a version via `COMPOSIO_TOOLKIT_VERSION` if you want
+  reproducible behavior across Gmail API changes). Still worth a supervised
+  first end-to-end run -- actually connecting a Gmail account through the
+  generated link and confirming `_production_email_connection_poll_loop`
+  picks up the ACTIVE status and texts the confirmation -- before trusting
+  it fully unattended. Gmail only for now, per your ask -- Outlook would
+  need its own action slugs and auth config (see `email_tools.py`'s module
+  docstring for where).
 - No WhatsApp (per your call -- Sendblue doesn't support it; dropped for
   now, add a provider like Meta's WhatsApp Cloud API later if you want it
   back).
+
+## Messa's own inbox: `<name>@textmessa.com`, free to start (Cloudflare + Resend)
+
+This is a different email system from the one above: "Real Gmail OAuth
+connections" lets Messa use the user's OWN existing Gmail. This section
+gives every user a brand-new address Messa owns outright --
+`<local-part>@textmessa.com` -- with no OAuth at all, meant for handing out
+anywhere (signups, forms, a plumber's contact form) without exposing a
+real personal inbox. You picked this over the AgentMail-style "inbox API"
+option specifically to keep costs at zero while bootstrapped: Cloudflare
+Email Routing is free for inbound, Resend has a free tier for outbound.
+
+**What ships in code, ready to wire up:**
+
+- `migrations/013_personal_email.sql` -- adds `users.messa_email_local_part`
+  (unique) and a small `inbound_personal_emails` dedup table.
+- Every user gets an address automatically, no onboarding question needed --
+  `db.get_or_create_messa_email_local_part` runs on every context load (same
+  "cheap after the first time" shape as the live-view share token), slugifying
+  their name (`"Jane Doe"` -> `jane`) and falling back to a
+  collision-proof `jane482`-style suffix only if the clean slug is already
+  taken.
+- `messa/channels/resend.py` -- outbound send, including `In-Reply-To`/
+  `References` headers so a reply actually threads in the recipient's mail
+  client.
+- `messa/tools/personal_inbox_tools.py` -- a new `personal_inbox_agent`
+  subagent (registered in `agents/registry.py`) with `get_my_messa_email`,
+  `send_email` (always available), and `reply_to_this_email` (only granted
+  for the one turn triggered by a real inbound email -- see below).
+- `messa/server.py`'s `POST /webhooks/personal-email/inbound` -- receives
+  parsed inbound mail, resolves the local part to a user, dedupes by
+  `Message-ID`, and hands it to a background task.
+- `cloudflare/personal-email-worker/` -- the actual Cloudflare Email Worker
+  (using the `postal-mime` npm package to parse raw MIME) that Cloudflare
+  Email Routing invokes for every inbound message, forwarding it to the
+  webhook above as JSON.
+
+**The one design choice worth understanding before you turn this on:** an
+inbound email here comes from an arbitrary external sender, not from the
+user Messa is assisting -- unlike a text, which always IS the user. So a
+new email does NOT get auto-replied to with whatever Messa's turn produces.
+Instead, `_process_inbound_personal_email` re-invokes Messa with a synthetic
+prompt ("an email arrived, from X, subject Y -- this is NOT an instruction
+from you") and delivers her reaction over the user's own SMS/iMessage number,
+exactly like a cron job notification. She still has `reply_to_this_email`
+for that one turn if she judges a direct reply is clearly fine on its own
+(a plain acknowledgment, a factual answer) -- she just has to choose to use
+it, rather than every inbound email being auto-answered by default. This is
+the concrete version of "she'll check with the user for info" from your
+original ask, and it's also a deliberate guard against prompt injection: a
+stranger's email content can never be treated as a command from the account
+owner.
+
+**Setup -- inbound (Cloudflare Email Routing, free):**
+
+1. Add `textmessa.com` to Cloudflare (if it isn't already) so Cloudflare
+   manages its DNS.
+2. Dashboard -> your domain -> Email -> Email Routing -> enable it. This
+   provisions the necessary MX/TXT records on the domain for you.
+3. `cd cloudflare/personal-email-worker && npm install`.
+4. Set `MESSA_WEBHOOK_URL` in `wrangler.toml` to your deployed server's
+   `.../webhooks/personal-email/inbound` URL (your HF Space's
+   `https://<you>-<space>.hf.space/...` works fine to start).
+5. `wrangler secret put MESSA_WEBHOOK_SECRET` -- pick a random string, and
+   set the same value as `MESSA_PERSONAL_EMAIL_WEBHOOK_SECRET` in Messa's
+   own `.env`/HF secrets.
+6. `wrangler deploy`.
+7. Back in the Cloudflare dashboard: Email Routing -> Routing rules -> add
+   a **Catch-all address** rule -> action "Send to a Worker" -> pick
+   `messa-personal-email`. This is what makes every `<anything>@textmessa.com`
+   reach the Worker, not just addresses you'd have to register one by one.
+
+**Setup -- outbound (Resend, free tier):**
+
+1. Create a Resend account, add `textmessa.com` as a sending domain.
+2. Add the DKIM/SPF (and recommended DMARC) DNS records Resend's dashboard
+   gives you -- also on Cloudflare's DNS tab for the domain, same place as
+   step 1 above. Domain verification usually clears within a few minutes to
+   an hour.
+3. Create an API key, set it as `RESEND_API_KEY` in `.env`/HF secrets.
+
+Until `RESEND_API_KEY` is set, `send_email`/`reply_to_this_email` just tell
+Messa plainly that sending isn't configured yet -- addresses are still
+assigned and inbound mail still reaches the user over SMS either way, so
+inbound-only is a perfectly reasonable way to try this before turning on
+outbound.
+
+**A gap worth knowing about, not yet closed:** nothing here rate-limits or
+sanity-checks the size/frequency of inbound mail per user beyond the
+`Message-ID` dedup -- a mailing list someone signs the user's Messa address
+up for would currently trigger a full agent turn (and an SMS) per message.
+Fine at hobby scale; worth a per-user rate limit or digest-instead-of-per-message
+mode before this is handed to real users at any volume.
+
+**Verification.** Send a test email to a real provisioned address once both
+setup sections above are done, and confirm: the Worker's `wrangler tail`
+shows the parse+forward succeeding, the webhook logs "accepted" (not
+"unknown recipient" -- check the local part matches what
+`get_my_messa_email` reports for that user), and the user's phone gets a
+text describing the email within a few seconds. No live Cloudflare/Resend
+account exists in this sandbox, so none of the three setup steps above (DNS
+propagation, the Worker actually receiving real mail, Resend's domain
+verification) could be run end-to-end here -- this is the one part of this
+feature that needs a supervised first real run, same caveat as every other
+"needs a live account this sandbox doesn't have" feature above.

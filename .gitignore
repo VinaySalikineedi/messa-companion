@@ -9,4 +9,6 @@ outputs/
 messa/node_modules/
 browser_profiles/
 deepsearch_profiles/
+cloudflare/personal-email-worker/node_modules/
+.wrangler/
 

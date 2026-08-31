@@ -36,19 +36,11 @@ _STALL_PATTERN = re.compile(
 )
 
 
-async def load_user_context(
-    phone_number: str, name: str | None = None, channel: str = "cli"
-) -> config.UserContext:
-    """(Re)reads the user row from the DB. Called at startup and again before
-    every turn, so onboarding fields saved mid-conversation (see
-    agents/registry.py's save_profile_info) are reflected in the next turn's
-    system prompt -- deepagents bakes system_prompt in at agent-build time,
-    so the orchestrator gets rebuilt each turn with fresh context rather than
-    reused across the whole session.
-
-    Shared by the CLI (fixed dev phone number) and the Sendblue webhook
-    server (real inbound phone_number, one per sender) -- see run_message
-    below for the rest of what the server reuses from here.
+async def _context_from_row(user_row: dict, channel: str) -> config.UserContext:
+    """Shared tail end of both load_user_context (below) and
+    load_user_context_by_id: everything from here on only needs the user's
+    row, not how it was looked up (phone number vs a bare id) -- see each
+    caller's own docstring for why there are now two entry points.
 
     `db.ensure_timezone_resolved` runs on every call: a no-op the moment
     timezone_confirmed is true (the common case, one cheap column check),
@@ -62,11 +54,19 @@ async def load_user_context(
     pattern, this time backfilling the morning/evening briefing cron jobs
     (see config.DEFAULT_BRIEFINGS) for any user who doesn't already have
     one of each, and correcting either one's local-time meaning if it was
-    provisioned before this user's timezone was confirmed."""
-    user_row = await db.get_or_create_user(phone_number, name, config.DEFAULT_TIMEZONE)
+    provisioned before this user's timezone was confirmed.
+
+    `db.get_or_create_messa_email_local_part` is the same kind of
+    self-healing/backfill call as the two above, just for a user's own
+    <local-part>@config.TEXTMESSA_EMAIL_DOMAIN address (migrations/
+    013_personal_email.sql) -- cheap after the first time, same shape as
+    get_or_create_live_share_token."""
     user_row = await db.ensure_timezone_resolved(user_row)
     await db.ensure_default_briefings(user_row)
     live_view_token = await db.get_or_create_live_share_token(user_row["id"])
+    messa_email_local_part = await db.get_or_create_messa_email_local_part(
+        user_row["id"], user_row.get("name")
+    )
     return config.UserContext(
         user_id=user_row["id"],
         phone_number=user_row["phone_number"],
@@ -79,7 +79,46 @@ async def load_user_context(
         channel=channel,
         live_view_token=live_view_token,
         email_connected=bool(user_row.get("email_connected", False)),
+        messa_email_local_part=messa_email_local_part,
     )
+
+
+async def load_user_context(
+    phone_number: str, name: str | None = None, channel: str = "cli"
+) -> config.UserContext:
+    """(Re)reads the user row from the DB. Called at startup and again before
+    every turn, so onboarding fields saved mid-conversation (see
+    agents/registry.py's save_profile_info) are reflected in the next turn's
+    system prompt -- deepagents bakes system_prompt in at agent-build time,
+    so the orchestrator gets rebuilt each turn with fresh context rather than
+    reused across the whole session.
+
+    Shared by the CLI (fixed dev phone number) and the Sendblue webhook
+    server (real inbound phone_number, one per sender) -- see run_message
+    below for the rest of what the server reuses from here."""
+    user_row = await db.get_or_create_user(phone_number, name, config.DEFAULT_TIMEZONE)
+    return await _context_from_row(user_row, channel)
+
+
+async def load_user_context_by_id(user_id: int, channel: str = "sms") -> config.UserContext | None:
+    """Same as load_user_context, but for a turn that starts from an
+    already-known user id rather than an inbound phone number -- the one
+    real caller today is server.py's inbound personal-email webhook: an
+    email arrives at <local-part>@config.TEXTMESSA_EMAIL_DOMAIN, which
+    resolves straight to a user_id (db.get_user_by_messa_email_local_part),
+    with no phone number involved at all. `channel` still defaults to
+    "sms" rather than introducing a distinct value, since the reply for
+    that flow genuinely does go out over the user's own SMS/iMessage
+    number (see server.py's _process_inbound_personal_email) -- it's the
+    one-off synthetic prompt text that tells Messa an email triggered this
+    turn, not the channel field, which only controls output *formatting*
+    (see agents/registry.py's channel_str). Returns None if user_id doesn't
+    exist (should not happen in practice: it always comes from a lookup
+    that already confirmed the row exists moments earlier)."""
+    user_row = await db.get_user_by_id(user_id)
+    if user_row is None:
+        return None
+    return await _context_from_row(user_row, channel)
 
 
 async def _load_user_context(channel: str = "cli") -> config.UserContext:

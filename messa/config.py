@@ -245,6 +245,33 @@ EMAIL_CONNECTION_REQUEST_EXPIRES_HOURS = int(
     os.environ.get("MESSA_EMAIL_CONNECTION_REQUEST_EXPIRES_HOURS", "24")
 )
 
+# ---- Messa's own personal-inbox email (separate from the Gmail block above)
+# ----
+# <local-part>@TEXTMESSA_EMAIL_DOMAIN is an address Messa owns outright for
+# each user -- no OAuth, nothing borrowed from the user's real inbox. Inbound
+# is free (Cloudflare Email Routing -> a small Worker in
+# cloudflare/personal-email-worker/ -> server.py's
+# /webhooks/personal-email/inbound); outbound goes through Resend (also has
+# a free tier) -- see channels/resend.py and tools/personal_inbox_tools.py.
+# Both env vars are optional until you're ready to turn this on: with
+# RESEND_API_KEY unset, personal_inbox_tools.py's send/reply tools just say
+# so instead of pretending to work, same pattern as COMPOSIO_API_KEY above.
+TEXTMESSA_EMAIL_DOMAIN = os.environ.get("MESSA_TEXTMESSA_EMAIL_DOMAIN", "textmessa.com")
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
+
+# Shared secret the Cloudflare Worker sends as the X-Messa-Webhook-Secret
+# header on every inbound-email POST -- same role as SENDBLUE_WEBHOOK_SECRET
+# below, and same tradeoff: unset means the endpoint accepts any request
+# with no check (fine for local/dev, not for a real deployment). Set with
+# `wrangler secret put MESSA_WEBHOOK_SECRET` on the Worker side and the
+# matching value here.
+PERSONAL_EMAIL_WEBHOOK_SECRET = os.environ.get("MESSA_PERSONAL_EMAIL_WEBHOOK_SECRET")
+
+# A hostile/huge inbound email (or just a very long newsletter someone
+# forwarded in) shouldn't blow up the synthetic prompt server.py builds for
+# it -- truncated defensively before it ever reaches the model.
+INBOUND_EMAIL_BODY_MAX_CHARS = int(os.environ.get("MESSA_INBOUND_EMAIL_BODY_MAX_CHARS", "4000"))
+
 # ---- Browserbase (deepsearch's remote browser) ----
 # Two rounds of "Chrome isn't installed" on the HF Space -- each one a real,
 # fixable bug (MCP not passing through the environment; a --browser channel
@@ -656,10 +683,28 @@ class UserContext:
     # whether a Gmail action will actually succeed (Composio's own response
     # is); see email_tools.py.
     email_connected: bool = False
+    # From users.messa_email_local_part (migrations/013_personal_email.sql),
+    # provisioned automatically the first time a user's context loads (see
+    # cli.load_user_context / db.get_or_create_messa_email_local_part) --
+    # None only if that migration hasn't been applied yet. Not the same
+    # thing as `email` above (that's the user's own personal address on
+    # file, collected during onboarding); this is the address Messa herself
+    # owns on TEXTMESSA_EMAIL_DOMAIN. See messa_email below for the full
+    # address string.
+    messa_email_local_part: str | None = None
 
     @property
     def onboarding_complete(self) -> bool:
         return self.onboarding_step == "complete"
+
+    @property
+    def messa_email(self) -> str | None:
+        """The user's full Messa-owned address (e.g. "jane@textmessa.com"),
+        or None if it hasn't been provisioned yet (migration 013 not
+        applied). See tools/personal_inbox_tools.py."""
+        if not self.messa_email_local_part:
+            return None
+        return f"{self.messa_email_local_part}@{TEXTMESSA_EMAIL_DOMAIN}"
 
     @property
     def live_view_share_url(self) -> str | None:

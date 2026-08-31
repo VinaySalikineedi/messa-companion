@@ -1,0 +1,17 @@
+{
+  "name": "messa-personal-email-worker",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Cloudflare Email Worker: parses inbound mail for Messa's own personal-inbox addresses and forwards it as JSON to messa/server.py's /webhooks/personal-email/inbound.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {
+    "postal-mime": "^2.2.6"
+  },
+  "devDependencies": {
+    "wrangler": "^3.90.0"
+  }
+}

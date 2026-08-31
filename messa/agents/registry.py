@@ -36,6 +36,7 @@ from ..tools.common import trace_all
 from ..tools.document_tools import DOCUMENT_SYSTEM_PROMPT, build_document_tools
 from ..tools.email_tools import EMAIL_SYSTEM_PROMPT, build_email_tools
 from ..tools.executive_tools import build_executive_subagent
+from ..tools.personal_inbox_tools import PERSONAL_INBOX_SYSTEM_PROMPT, build_personal_inbox_tools
 from ..tools.routines_tools import ROUTINES_SYSTEM_PROMPT, build_routines_tools
 from ..tools.web_search_tools import build_web_search_tools
 
@@ -198,6 +199,8 @@ def _build_system_prompt(user: config.UserContext) -> str:
         if user.email_connected
         else "Gmail is NOT connected yet (email_agent can send them a connect link on request)"
     )
+    if user.messa_email:
+        known.append(f"their own Messa email address is {user.messa_email}")
     known_str = ("Known about this user so far -- " + ", ".join(known) + ".\n\n") if known else ""
 
     # Neither Messa's nor any subagent's system prompt used to state the
@@ -237,8 +240,10 @@ def _build_system_prompt(user: config.UserContext) -> str:
         "You are Messa, a personal assistant reachable by text, email, and (soon) WhatsApp. "
         "You talk to the user directly and delegate specialized work to subagents via the "
         "task tool: deepsearch (web browsing/research), executive_assistant (tasks, "
-        "reminders, notes, contacts, calendar), email_agent (the user's own inbox), "
-        "document_agent (generates PDFs), routines_agent (recurring automations).\n\n"
+        "reminders, notes, contacts, calendar), email_agent (the user's own Gmail), "
+        "personal_inbox_agent (the user's own Messa-owned email address -- a different "
+        "inbox from their Gmail), document_agent (generates PDFs), routines_agent "
+        "(recurring automations).\n\n"
         "Speed matters: you also have web_search and fetch_page_text as your OWN direct tools "
         "(no delegation, no browser, answers in a second or two) -- use them for a plain "
         "factual lookup (a fact, news, a definition, 'who is X') instead of delegating to "
@@ -309,6 +314,7 @@ async def build_orchestrator(
     approval_gate: ApprovalGate | None = None,
     model: Any = None,
     subagent_model: Any = None,
+    inbound_email: dict | None = None,
 ) -> Any:
     """`model` is Messa's own orchestrator model (config.ORCHESTRATOR_MODEL_NAME
     by default); `subagent_model` is what every subagent below uses instead
@@ -316,7 +322,15 @@ async def build_orchestrator(
     these are deliberately two different models now rather than one shared
     instance. Both params exist mainly so tests can inject fakes for either
     or both independently; real callers (cli.py, server.py) just omit them
-    and get the configured defaults."""
+    and get the configured defaults.
+
+    `inbound_email` is passed straight through to
+    tools.personal_inbox_tools.build_personal_inbox_tools -- non-None ONLY
+    for the one turn server.py's inbound-personal-email webhook triggers,
+    which is what conditionally grants personal_inbox_agent its
+    reply_to_this_email tool for just that turn (see that module's
+    docstring). Every other caller omits it and gets the always-on
+    get_my_messa_email/send_email pair only."""
     approval_gate = approval_gate or CLIApprovalGate()
     # effective_context_tokens: see config.py's big comment above
     # SUBAGENT_EFFECTIVE_CONTEXT_TOKENS/ORCHESTRATOR_EFFECTIVE_CONTEXT_TOKENS
@@ -344,6 +358,17 @@ async def build_orchestrator(
             ),
             "system_prompt": EMAIL_SYSTEM_PROMPT,
             "tools": build_email_tools(user, approval_gate),
+            "model": subagent_model,
+        },
+        {
+            "name": "personal_inbox_agent",
+            "description": (
+                "Manages the user's own Messa email address (a real inbox on Messa's own "
+                "domain, separate from their personal Gmail) -- what it is, sending new "
+                "emails from it, and replying to anything that lands in it."
+            ),
+            "system_prompt": PERSONAL_INBOX_SYSTEM_PROMPT,
+            "tools": build_personal_inbox_tools(user, approval_gate, inbound_email=inbound_email),
             "model": subagent_model,
         },
         {

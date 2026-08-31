@@ -10,6 +10,7 @@ and translate results into tool-call strings.
 from __future__ import annotations
 
 import json
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -133,6 +134,17 @@ async def get_or_create_user(
             _initial_onboarding_step(name),
         )
         return dict(row)
+
+
+async def get_user_by_id(user_id: int) -> dict[str, Any] | None:
+    """Straight id lookup -- used wherever a user is already resolved by
+    something other than their phone number (e.g. cli.load_user_context_by_id,
+    for a turn triggered by an inbound personal email rather than an inbound
+    text -- see get_user_by_messa_email_local_part below)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
+        return dict(row) if row else None
 
 
 async def update_user_timezone(user_id: int, timezone_name: str, confirmed: bool = True) -> dict[str, Any] | None:
@@ -1414,3 +1426,107 @@ async def expire_email_connection_request(request_id: int) -> None:
             "UPDATE email_connection_requests SET status = 'expired', resolved_at = NOW() WHERE id = $1",
             request_id,
         )
+
+
+# ---------------------------------------------------------------------------
+# Personal-inbox email (migrations/013_personal_email.sql) -- Messa's own
+# <local-part>@config.TEXTMESSA_EMAIL_DOMAIN address per user, distinct from
+# both the Gmail connection block above and users.email (the user's own
+# on-file contact address, migrations/003_user_email.sql). See
+# tools/personal_inbox_tools.py and server.py's
+# /webhooks/personal-email/inbound. Additive/no-op-safe like everything
+# else in this file: all no-op (return None/True/[]) until migration 013 has
+# been applied.
+# ---------------------------------------------------------------------------
+
+def _slugify_local_part(name: str | None, user_id: int) -> str:
+    """Best-effort local-part from a display name ("Jane Doe" -> "janedoe"),
+    falling back to "user<id>" for a still-nameless brand-new user (email
+    provisioning runs on every context load, including before onboarding
+    asks for a name -- see cli.load_user_context) or a name that's nothing
+    but punctuation/emoji once stripped. Deliberately plain
+    alphanumeric-only: an RFC 5322 local-part technically allows a lot more,
+    but plenty of real mail providers choke on anything fancier, and this is
+    meant to be easy to read aloud/type into a form, not maximally
+    expressive."""
+    base = re.sub(r"[^a-z0-9]+", "", (name or "").lower())[:24]
+    return base if base else f"user{user_id}"
+
+
+async def get_or_create_messa_email_local_part(user_id: int, name: str | None) -> str | None:
+    """Idempotent: returns the existing local part if this user already has
+    one, otherwise claims one now and persists it. Called on every
+    cli.load_user_context (same "cheap after the first time" shape as
+    get_or_create_live_share_token), so a user's address is ready before
+    they ever ask for it.
+
+    Collision handling: tries the clean slug first (e.g. "janedoe"), and
+    only falls back to a decorated one ("janedoe482", using this user's own
+    id) on an actual collision -- rather than pre-emptively checking and
+    then racing another concurrent signup for the same name, the fallback
+    itself (base + a unique user_id) can never collide, so one retry always
+    succeeds without a loop."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_column(conn, "users", "messa_email_local_part"):
+            return None
+        row = await conn.fetchrow("SELECT messa_email_local_part FROM users WHERE id = $1", user_id)
+        if row is None:
+            return None  # unknown user id -- nothing to provision
+        if row["messa_email_local_part"]:
+            return row["messa_email_local_part"]
+
+        base = _slugify_local_part(name, user_id)
+        for candidate in (base, f"{base}{user_id}"):
+            try:
+                await conn.execute(
+                    "UPDATE users SET messa_email_local_part = $2 WHERE id = $1", user_id, candidate,
+                )
+                return candidate
+            except asyncpg.UniqueViolationError:
+                continue  # the clean slug was taken -- try the decorated fallback
+        return None  # unreachable in practice: base+user_id is always unique
+
+
+async def get_user_by_messa_email_local_part(local_part: str) -> dict[str, Any] | None:
+    """Reverse lookup for server.py's inbound webhook: which user does
+    <local_part>@TEXTMESSA_EMAIL_DOMAIN belong to. Case-insensitive (email
+    local parts arrive in whatever case the sender's mail client used;
+    ours are always assigned lowercase, so normalizing the lookup side is
+    enough -- no need to touch what's stored)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_column(conn, "users", "messa_email_local_part"):
+            return None
+        row = await conn.fetchrow(
+            "SELECT * FROM users WHERE messa_email_local_part = $1", local_part.strip().lower(),
+        )
+        return dict(row) if row else None
+
+
+async def record_inbound_personal_email(
+    user_id: int, message_id: str | None, from_address: str, subject: str | None,
+) -> bool:
+    """True if this is a genuinely new inbound email; False if message_id
+    was already recorded (a redelivered webhook, most likely -- see
+    migrations/013_personal_email.sql's docstring) and the caller should
+    skip reprocessing it. A missing/empty message_id (malformed mail, rare
+    but real) always counts as new rather than being deduped against every
+    other message_id-less email that ever arrives -- see the UNIQUE
+    constraint this would otherwise collide against."""
+    if not message_id:
+        return True
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "inbound_personal_emails"):
+            return True
+        row = await conn.fetchrow(
+            """
+            INSERT INTO inbound_personal_emails (user_id, message_id, from_address, subject)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (message_id) DO NOTHING
+            RETURNING id
+            """,
+            user_id, message_id, from_address, subject,
+        )
+        return row is not None
