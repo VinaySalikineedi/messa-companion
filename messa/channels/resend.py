@@ -180,6 +180,10 @@ async def send_email(
     except Exception:  # noqa: BLE001
         response_body = {}
 
+    resend_id = response_body.get("id")
+    if resend_id:
+        message_id = resend_id if resend_id.startswith("<") else f"<{resend_id}>"
+
     # Logged AFTER a confirmed 2xx -- only actually-sent mail enters the
     # thread history, never an attempt that failed partway (the caller sees
     # the ResendError above and never reaches here).
