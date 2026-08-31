@@ -80,6 +80,7 @@ async def _context_from_row(user_row: dict, channel: str) -> config.UserContext:
         live_view_token=live_view_token,
         email_connected=bool(user_row.get("email_connected", False)),
         messa_email_local_part=messa_email_local_part,
+        default_email_provider=user_row.get("default_email_provider") or "messa",
     )
 
 

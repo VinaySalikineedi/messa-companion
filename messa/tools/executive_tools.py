@@ -39,7 +39,7 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from .. import config, db, timeutil
 from ..config import UserContext
-from .common import trace_all
+from .common import last_ai_text, trace_all
 
 LABEL = "executive_assistant"
 
@@ -311,14 +311,6 @@ def _past_due_issue(log: list[tuple[str, datetime]], user: UserContext) -> Optio
     )
 
 
-def _last_ai_text(messages: list[Any]) -> str:
-    for m in reversed(messages):
-        content = getattr(m, "content", "")
-        if getattr(m, "type", None) == "ai" and content:
-            return content if isinstance(content, str) else str(content)
-    return "Done."
-
-
 def build_executive_subagent(user: UserContext, model: BaseChatModel) -> dict[str, Any]:
     """Returns a deepagents `CompiledSubAgent` spec -- deliberately NOT built
     the same way as deepsearch's open-ended research loop. Personal-
@@ -364,7 +356,7 @@ def build_executive_subagent(user: UserContext, model: BaseChatModel) -> dict[st
             result = await inner_agent.ainvoke({"messages": [nudge]}, config=run_config)
             final_messages = result["messages"]
 
-        return {"messages": [AIMessage(content=_last_ai_text(final_messages))]}
+        return {"messages": [AIMessage(content=last_ai_text(final_messages))]}
 
     return {
         "name": "executive_assistant",

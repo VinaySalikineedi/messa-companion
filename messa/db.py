@@ -1430,6 +1430,38 @@ async def expire_email_connection_request(request_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Default email provider (migrations/015_default_email_provider.sql) -- which
+# inbox Messa treats as the default for a generic "send/check my email"
+# request that doesn't name one: 'messa' (their own Messa-owned address,
+# see the personal-inbox section below) or 'gmail' (the Gmail connection
+# block above). Every row -- existing users at migration time, and every
+# user created afterward -- starts at 'messa' via the column's own DEFAULT,
+# so there's no separate backfill step here. The ONLY writer is
+# agents/registry.py's set_default_email_provider tool, called at the
+# user's own explicit request ("use my gmail by default") -- connecting
+# Gmail (mark_email_connected above) never touches this column itself, by
+# deliberate design: connecting an inbox and making it the default are two
+# separate decisions.
+# ---------------------------------------------------------------------------
+
+async def set_default_email_provider(user_id: int, provider: str) -> dict[str, Any] | None:
+    """Returns the updated user row, or None if migration 015 hasn't been
+    applied yet. Does NOT validate `provider` itself -- the enum column
+    does that at the DB level (an invalid value raises, which the caller
+    -- agents/registry.py's set_default_email_provider tool -- avoids by
+    checking against {"messa", "gmail"} before ever calling this)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_column(conn, "users", "default_email_provider"):
+            return None
+        row = await conn.fetchrow(
+            "UPDATE users SET default_email_provider = $2 WHERE id = $1 RETURNING *",
+            user_id, provider,
+        )
+        return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
 # Personal-inbox email (migrations/013_personal_email.sql) -- Messa's own
 # <local-part>@config.TEXTMESSA_EMAIL_DOMAIN address per user, distinct from
 # both the Gmail connection block above and users.email (the user's own
@@ -1638,6 +1670,7 @@ async def log_outbound_personal_email(
     references: str | None = None,
     raw_json: str | None = None,
     sent_autonomously: bool = False,
+    attachment_filename: str | None = None,
 ) -> dict[str, Any] | None:
     """Called by channels/resend.py after every successful send -- the
     single choke point for outbound logging, so nothing that goes through
@@ -1646,23 +1679,53 @@ async def log_outbound_personal_email(
     itself generated and set as the outbound Message-ID header (not
     anything parsed back out of Resend's API response -- see that module's
     docstring for why). No-ops (returns None) pre-migration, same as the
-    inbound counterpart."""
+    inbound counterpart.
+
+    `attachment_filename` (migrations/016_messa_email_attachment.sql):
+    just the filename Messa attached, e.g. "invoice.pdf" -- None for a
+    plain send/reply with nothing attached. Column write is unconditional
+    here (INSERT always includes it, defaulting to whatever NULL Postgres
+    returns for an un-migrated column read elsewhere would need its own
+    guard, but writing a value to a column that doesn't exist yet would
+    itself fail -- see the _has_column guard immediately below for why
+    that's safe: this whole function already no-ops before migration 014,
+    and 016 ships alongside/after 014 in the same additive sequence)."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         if not await _has_table(conn, "messa_email_messages"):
             return None
+        has_attachment_col = await _has_column(conn, "messa_email_messages", "attachment_filename")
         thread_id = _compute_thread_id(message_id, in_reply_to, references)
-        row = await conn.fetchrow(
-            """
-            INSERT INTO messa_email_messages
-                (user_id, direction, thread_id, message_id, in_reply_to, references_header,
-                 from_address, to_address, subject, body_text, raw_json, sent_autonomously)
-            VALUES ($1, 'outbound', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-            RETURNING *
-            """,
-            user_id, thread_id, message_id, in_reply_to, references,
-            from_address, to_address, subject, body_text, raw_json, sent_autonomously,
-        )
+        if has_attachment_col:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO messa_email_messages
+                    (user_id, direction, thread_id, message_id, in_reply_to, references_header,
+                     from_address, to_address, subject, body_text, raw_json, sent_autonomously,
+                     attachment_filename)
+                VALUES ($1, 'outbound', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                RETURNING *
+                """,
+                user_id, thread_id, message_id, in_reply_to, references,
+                from_address, to_address, subject, body_text, raw_json, sent_autonomously,
+                attachment_filename,
+            )
+        else:
+            # migration 016 not applied yet -- degrade gracefully rather
+            # than erroring: the send itself already succeeded by the time
+            # this is called, so failing to log the attachment's filename
+            # must never look like the whole send failed.
+            row = await conn.fetchrow(
+                """
+                INSERT INTO messa_email_messages
+                    (user_id, direction, thread_id, message_id, in_reply_to, references_header,
+                     from_address, to_address, subject, body_text, raw_json, sent_autonomously)
+                VALUES ($1, 'outbound', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                RETURNING *
+                """,
+                user_id, thread_id, message_id, in_reply_to, references,
+                from_address, to_address, subject, body_text, raw_json, sent_autonomously,
+            )
         return dict(row) if row else None
 
 
@@ -1732,14 +1795,24 @@ async def search_personal_emails(
     query: str | None = None,
     since: datetime | None = None,
     until: datetime | None = None,
+    direction: str | None = None,
     limit: int = 25,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
     """Free-text (subject/body ILIKE) plus an optional [since, until) time
     range, most recent first -- the backing query for search_my_emails'
     "did anything come in this morning after 9am" style asks. `since`/
     `until` are already-resolved tz-aware datetimes (the tool itself runs
     the model's date phrase through timeutil.to_local_aware before calling
-    this, same pattern as every other date-taking tool in this codebase)."""
+    this, same pattern as every other date-taking tool in this codebase).
+
+    `direction` ('inbound' or 'outbound', None for both) and `offset` were
+    added for the live-view Emails dashboard page (server.py's
+    /live/<token>/emails route) -- its Inbox/Sent tabs and "load more"
+    pagination -- but are equally usable by search_my_emails itself later;
+    both default to their old no-filter/no-offset behavior so every
+    existing caller (the tool, and the tests written against it) is
+    unaffected."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         if not await _has_table(conn, "messa_email_messages"):
@@ -1755,12 +1828,18 @@ async def search_personal_emails(
         if until is not None:
             args.append(until)
             conditions.append(f"created_at < ${len(args)}")
+        if direction in ("inbound", "outbound"):
+            args.append(direction)
+            conditions.append(f"direction = ${len(args)}")
         args.append(limit)
+        limit_idx = len(args)
+        args.append(offset)
+        offset_idx = len(args)
         rows = await conn.fetch(
             f"""
             SELECT * FROM messa_email_messages
             WHERE {' AND '.join(conditions)}
-            ORDER BY created_at DESC LIMIT ${len(args)}
+            ORDER BY created_at DESC LIMIT ${limit_idx} OFFSET ${offset_idx}
             """,
             *args,
         )

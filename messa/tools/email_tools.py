@@ -37,18 +37,34 @@ mechanism as deepsearch's destructive actions) since they're irreversible
 and not covered by the DB's pending_actions gate. Connecting/checking the
 connection are not destructive -- nothing is sent or changed, only a link
 generated or a status read.
+
+`build_email_subagent` (bottom of this file) is what actually registers
+this as `email_agent` in agents/registry.py -- a `CompiledSubAgent` with
+its own small step budget (config.EMAIL_RECURSION_LIMIT), same shape as
+executive_tools.py's build_executive_subagent and for the same reason: a
+plain declarative `SubAgent` dict has no way to give itself a step budget
+of its own, so without this it silently inherited whatever recursion_limit
+happened to be ambient on the call (config.RECURSION_LIMIT, 100 by
+default) -- a research-sized budget for what's normally a small handful of
+direct Composio calls. `build_email_tools` below is unchanged and still
+usable directly (tests do exactly this); `build_email_subagent` just wraps
+it in a bounded loop.
 """
 from __future__ import annotations
 
 import asyncio
-from typing import Optional
+from typing import Any, Optional
 
+from langchain.agents import create_agent
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import BaseTool, tool
 
 from .. import config, console, db
 from ..approval import ApprovalGate
 from ..channels.sendblue import SendblueError, send_message
-from .common import trace_tool
+from .common import last_ai_text, trace_tool
 
 LABEL = "email_agent"
 
@@ -336,18 +352,94 @@ def build_email_tools(user: config.UserContext, approval_gate: ApprovalGate | No
     ]
 
 
-EMAIL_SYSTEM_PROMPT = (
-    "You are the email specialist: you manage the user's own Gmail inbox via Composio, "
-    "delegated to you by Messa.\n"
-    "- Reading/searching email is safe to do freely, once connected.\n"
-    "- Sending or replying is irreversible and will prompt the user for confirmation before "
-    "it goes out -- warn them what you're about to send first.\n"
-    "- If the user hasn't connected Gmail yet, the read/send tools will tell you so directly "
-    "-- relay that plainly and offer request_email_connection, don't guess at their inbox.\n"
-    "- Call request_email_connection when the user asks to connect their email/Gmail (or "
-    "during onboarding, once they've said yes to Messa handling their email). It sends the "
-    "connect link itself, as its own text -- never try to type out the URL yourself, and "
-    "don't wait around for them to finish; just tell Messa you've sent it.\n"
-    "- If a tool returns 'Email agent isn't configured yet', tell Messa so it can relay "
-    "that the email channel needs setup, instead of pretending the action happened.\n"
-)
+def _build_system_prompt(user: config.UserContext) -> str:
+    connection_str = (
+        "Gmail IS connected -- reading/searching/sending/replying all work normally right now."
+        if user.email_connected
+        else (
+            "Gmail is NOT connected yet -- every read/send tool below will tell you so plainly; "
+            "relay that and offer request_email_connection instead of guessing at inbox contents."
+        )
+    )
+    default_str = (
+        " This is currently the user's DEFAULT inbox for a plain \"send/check my email\" "
+        "request that doesn't name one -- Messa routes those to you directly."
+        if user.default_email_provider == "gmail"
+        else (
+            " This is NOT currently the user's default inbox for an unnamed \"send/check my "
+            "email\" request (that default is their own Messa address, personal_inbox_agent) "
+            "-- Messa only delegates to you here because the user named Gmail/their personal "
+            "email specifically, or is managing the Gmail connection itself."
+        )
+    )
+    return (
+        "You are the email specialist: you manage the user's own Gmail inbox via Composio, "
+        "delegated to you by Messa.\n"
+        f"{connection_str}{default_str}\n\n"
+        "- Reading/searching email is safe to do freely, once connected. Call "
+        "list_recent_emails first to find the message you need -- each result carries the "
+        "message's OWN id and the id of the thread it's part of; use those ids for get_email/"
+        "reply_to_email rather than guessing one you weren't just given.\n"
+        "- reply_to_email needs the THREAD id (not a single message's own id) -- Gmail threads "
+        "the reply server-side once you pass the right one; if you only have a message id, use "
+        "the thread id from that same result instead.\n"
+        "- Sending or replying is irreversible and will prompt the user for confirmation before "
+        "it goes out -- warn them plainly what you're about to send (to whom, roughly what it "
+        "says) BEFORE the tool call, so the confirmation prompt isn't their first look at it.\n"
+        "- If the user hasn't connected Gmail yet, the read/send tools will tell you so directly "
+        "-- relay that plainly and offer request_email_connection, don't guess at their inbox.\n"
+        "- Call request_email_connection when the user asks to connect their email/Gmail (or "
+        "during onboarding, once they've said yes to Messa handling their email). It sends the "
+        "connect link itself, as its own text -- never try to type out the URL yourself, and "
+        "don't wait around for them to finish; just tell Messa you've sent it.\n"
+        "- If a tool returns 'Email agent isn't configured yet', tell Messa so it can relay "
+        "that the email channel needs setup, instead of pretending the action happened.\n"
+        "- You have a small, bounded number of steps for this delegation -- if a call fails, "
+        "report the error back to Messa rather than retrying the exact same call repeatedly.\n"
+    )
+
+
+def build_email_subagent(
+    user: config.UserContext,
+    model: BaseChatModel,
+    approval_gate: ApprovalGate | None = None,
+) -> dict[str, Any]:
+    """Returns a deepagents `CompiledSubAgent` spec -- same shape and same
+    reasoning as executive_tools.py's build_executive_subagent: a plain
+    declarative `SubAgent` dict (what email_agent used to be, registered
+    straight in agents/registry.py) has no field for its own step budget,
+    so it silently inherited whatever recursion_limit happened to be
+    ambient on the call -- config.RECURSION_LIMIT (100 by default), the
+    SAME research-sized budget deepsearch uses, for what's normally a
+    small handful of direct Composio calls (list/get/send/reply, or the
+    connect-link flow). Wrapping this as a CompiledSubAgent lets it set its
+    own config.EMAIL_RECURSION_LIMIT on its own inner create_agent()
+    invocation, independent of whatever the orchestrator's own limit is.
+
+    Unlike executive_assistant, there's no deterministic post-hoc quality
+    check run afterward here -- every read/send tool already checks
+    user.email_connected itself and returns a correct, plain message when
+    it isn't (there's no equivalent "past-due date" class of silent
+    mistake to catch), so this is a single ainvoke with no checkpointer or
+    nudge-retry machinery needed."""
+
+    async def _run(state: dict[str, Any]) -> dict[str, Any]:
+        messages = list(state["messages"])
+        tools = build_email_tools(user, approval_gate)
+        run_config = {"recursion_limit": config.EMAIL_RECURSION_LIMIT}
+        inner_agent = create_agent(
+            model=model, tools=tools, system_prompt=_build_system_prompt(user),
+        )
+        result = await inner_agent.ainvoke({"messages": messages}, config=run_config)
+        return {"messages": [AIMessage(content=last_ai_text(result["messages"]))]}
+
+    return {
+        "name": "email_agent",
+        "description": (
+            "Reads, searches, and sends the user's own Gmail (via Composio), and handles "
+            "connecting/reconnecting their account. Use for anything specifically about the "
+            "user's Gmail inbox, for 'connect my email/gmail' requests, and for a generic "
+            "'send/check my email' request when Gmail is currently the user's default inbox."
+        ),
+        "runnable": RunnableLambda(_run),
+    }

@@ -475,6 +475,152 @@ async def live_view_dashboard(token: str) -> JSONResponse:
     })
 
 
+# ---------------------------------------------------------------------------
+# Emails page (third toggle-able page on /live/<token>): Inbox/Sent list +
+# click-to-open thread view of Messa's OWN email address (migrations/
+# 014_messa_email_messages.sql), reusing the same permanent live-share token
+# as the other two pages (one link, three things it can show). This is
+# specifically personal_inbox_agent's address -- there's no equivalent page
+# for the user's connected Gmail (email_tools.py), same scope boundary as
+# this whole phase's PDF-attachment work.
+# ---------------------------------------------------------------------------
+
+EMAILS_PAGE_SIZE_MAX = 50
+EMAILS_SNIPPET_LEN = 140
+
+
+def _email_snippet(body_text: str | None) -> str:
+    """A single-line preview for the list view -- collapses all whitespace
+    (a multi-paragraph email would otherwise show as a wall of blank space
+    before any real text) and truncates with an ellipsis past
+    EMAILS_SNIPPET_LEN chars."""
+    text = " ".join((body_text or "").split())
+    if len(text) > EMAILS_SNIPPET_LEN:
+        return text[:EMAILS_SNIPPET_LEN].rstrip() + "..."
+    return text
+
+
+def _format_email_time_local(dt: datetime | None, tz: ZoneInfo) -> str:
+    """Full local timestamp for one email row/message. Unlike
+    _format_due_local above, this ALWAYS includes the time-of-day -- a task
+    due date at exactly midnight means "no specific time was set", but an
+    email genuinely sent/received at 12:00 AM still has a real time worth
+    showing."""
+    if dt is None:
+        return ""
+    local_dt = dt.astimezone(tz) if dt.tzinfo else dt.replace(tzinfo=ZoneInfo("UTC")).astimezone(tz)
+    date_part = local_dt.strftime("%b %-d") if hasattr(local_dt, "strftime") else str(local_dt)
+    return f"{date_part}, {_format_time_local(dt, tz)}"
+
+
+def _serialize_email_row(row: dict[str, Any], tz: ZoneInfo) -> dict[str, Any]:
+    """One messa_email_messages row -> the plain JSON shape both /emails and
+    /emails/thread hand to the page's JS. `body` is the full text (used by
+    the thread view); `snippet` is the truncated one-liner (used by the
+    list view) -- sending both avoids the client needing its own truncation
+    logic. Every string field here is untrusted (inbound rows carry
+    whatever an external sender wrote) -- the page's own JS renders all of
+    it with textContent, never innerHTML, per live_view_page.py's module
+    docstring."""
+    return {
+        "id": row.get("id"),
+        "thread_id": row.get("thread_id"),
+        "direction": row.get("direction"),
+        "from_address": row.get("from_address"),
+        "to_address": row.get("to_address"),
+        "subject": row.get("subject") or "(no subject)",
+        "snippet": _email_snippet(row.get("body_text")),
+        "body": row.get("body_text") or "",
+        "time": _format_email_time_local(row.get("created_at"), tz),
+        "sent_autonomously": bool(row.get("sent_autonomously")),
+        "attachment_filename": row.get("attachment_filename"),
+    }
+
+
+@app.get("/live/{token}/emails")
+async def live_view_emails(
+    token: str,
+    direction: str | None = None,
+    q: str | None = None,
+    limit: int = 25,
+    offset: int = 0,
+) -> JSONResponse:
+    """Polled by the Emails page (see live_view_page.py) for its Inbox/Sent
+    list. `direction`: "inbox" or "sent" -- anything else (including
+    omitted) returns both directions. `q`: optional free-text search
+    against subject/body, same matching as search_my_emails. `limit`/
+    `offset`: pagination for the page's "load more" button -- `limit` is
+    capped server-side (EMAILS_PAGE_SIZE_MAX) regardless of what's
+    requested, so a malformed/huge value from the client can't force one
+    giant query. Same 404-for-unknown-token contract as the dashboard route
+    above; also returns the user's own Messa address so the page can show
+    it at the top without a second round trip."""
+    user = await db.get_user_by_live_token(token)
+    if user is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    user_id = user["id"]
+    user_tz_name = user.get("timezone") or config.DEFAULT_TIMEZONE
+    try:
+        tz = ZoneInfo(user_tz_name)
+    except Exception:  # noqa: BLE001 - an unrecognized/corrupt stored timezone must never break this page
+        tz = ZoneInfo(config.DEFAULT_TIMEZONE)
+
+    db_direction = {"inbox": "inbound", "sent": "outbound"}.get((direction or "").strip().lower())
+    capped_limit = max(1, min(limit, EMAILS_PAGE_SIZE_MAX))
+    safe_offset = max(0, offset)
+
+    # Fetch one extra row to know whether there's a next page, without a
+    # separate COUNT query -- trimmed back to capped_limit before returning.
+    rows = await db.search_personal_emails(
+        user_id,
+        query=(q.strip() if q and q.strip() else None),
+        direction=db_direction,
+        limit=capped_limit + 1,
+        offset=safe_offset,
+    )
+    has_more = len(rows) > capped_limit
+    rows = rows[:capped_limit]
+
+    messa_local_part = await db.get_or_create_messa_email_local_part(user_id, user.get("name"))
+    messa_email = f"{messa_local_part}@{config.TEXTMESSA_EMAIL_DOMAIN}" if messa_local_part else None
+
+    return JSONResponse({
+        "messa_email": messa_email,
+        "messages": [_serialize_email_row(r, tz) for r in rows],
+        "has_more": has_more,
+    })
+
+
+@app.get("/live/{token}/emails/thread")
+async def live_view_email_thread(token: str, thread_id: str) -> JSONResponse:
+    """The full chain for one thread -- both directions, chronological --
+    fetched when a row in the Emails page's list is clicked. `thread_id` is
+    a query param rather than a path segment: a real RFC 5322 Message-ID
+    contains characters ("<", ">", "@") that are awkward/unsafe to URL-path-
+    encode reliably but are fine as an ordinary query string value. 404
+    only for an invalid TOKEN -- an unknown or empty thread_id on an
+    otherwise-valid token returns 200 with an empty message list, so the
+    page shows "no messages in this thread" instead of treating it like a
+    broken link."""
+    user = await db.get_user_by_live_token(token)
+    if user is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    user_id = user["id"]
+    user_tz_name = user.get("timezone") or config.DEFAULT_TIMEZONE
+    try:
+        tz = ZoneInfo(user_tz_name)
+    except Exception:  # noqa: BLE001 - an unrecognized/corrupt stored timezone must never break this page
+        tz = ZoneInfo(config.DEFAULT_TIMEZONE)
+
+    rows = await db.get_thread_messages(user_id, thread_id)
+    return JSONResponse({
+        "thread_id": thread_id,
+        "messages": [_serialize_email_row(r, tz) for r in rows],
+    })
+
+
 @app.post("/webhook/sendblue")
 @app.post("/sms/sendblue/webhook")
 async def sendblue_webhook(

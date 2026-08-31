@@ -1,0 +1,22 @@
+-- Additive migration: lets an outbound Messa-email (migrations/
+-- 014_messa_email_messages.sql) carry one file attachment -- specifically,
+-- a PDF tools/document_tools.py's generate_pdf produced, sent via
+-- tools/personal_inbox_tools.py's send_email/reply_to_email ->
+-- channels/resend.py. Scoped to Messa's OWN email only (personal_inbox_agent)
+-- -- NOT tools/email_tools.py's Gmail-via-Composio path, which this project
+-- deliberately left out of attachment support (unverified exact Composio
+-- attachment parameter name without a live account -- see that phase's
+-- README section for the full reasoning).
+--
+-- attachment_filename  NULL for every inbound row (nothing here parses
+--                       inbound MIME attachments -- out of scope, this is
+--                       outbound-only) and for an outbound row with no
+--                       attachment. Just the filename (e.g. "invoice.pdf"),
+--                       not a path -- the file itself already left the
+--                       server as part of the send; this column exists so
+--                       later reads (get_thread_history, search_my_emails,
+--                       and the live-view Emails dashboard page's paperclip
+--                       icon) can show "this message had a PDF attached"
+--                       without needing raw_json.
+
+ALTER TABLE messa_email_messages ADD COLUMN IF NOT EXISTS attachment_filename VARCHAR(255);

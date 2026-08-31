@@ -23,6 +23,25 @@ from .. import console
 from ..approval import ApprovalGate
 
 
+def last_ai_text(messages: list[Any]) -> str:
+    """The most recent non-empty AIMessage's text content, walking backward
+    -- what a small-loop `CompiledSubAgent` (executive_assistant,
+    email_agent) hands back to the orchestrator as its own final reply,
+    once its inner `create_agent` run finishes. Shared here (rather than
+    duplicated per subagent module) since both need the exact same "last
+    thing the model actually said" extraction. Falls back to a plain
+    "Done." if the run somehow ended with no AI text at all (e.g. the
+    model's very last message was a tool call whose result never got a
+    follow-up reply before the loop ended) -- still a real string, so the
+    orchestrator has something to relay rather than crashing on empty
+    content."""
+    for m in reversed(messages):
+        content = getattr(m, "content", "")
+        if getattr(m, "type", None) == "ai" and content:
+            return content if isinstance(content, str) else str(content)
+    return "Done."
+
+
 def trace_tool(
     original: BaseTool,
     label: str,

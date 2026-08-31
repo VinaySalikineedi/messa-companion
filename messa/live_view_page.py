@@ -613,6 +613,186 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
   .dash-item .primary {{ color: var(--text); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
   .dash-item .meta {{ color: var(--muted); font-size: 0.78rem; white-space: nowrap; flex: 0 0 auto; }}
 
+  /* ---- emails page: third toggle-able page, mail-app-style list + a
+     click-to-open thread view of Messa's OWN email address (a different
+     inbox from the user's connected Gmail -- see live_view_page.py's
+     module docstring / server.py's /live/<token>/emails route). Reuses the
+     same --card-bg/--border/--radius/--shadow variables as the browsing
+     tiles and dashboard cards above, and the same .page-toggle/.toggle-btn
+     segmented-control look for its own Inbox/Sent tabs, so both skins keep
+     applying automatically with no new variables introduced. ---- */
+  .emails-wrap {{
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 1.5rem;
+  }}
+  .emails-toolbar {{
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.75rem;
+    max-width: 900px;
+    margin: 0 auto 1rem;
+  }}
+  .email-address-chip {{
+    font-size: 0.78rem;
+    color: var(--muted);
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0.3rem 0.7rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 15rem;
+  }}
+  [data-style="terminal"] .email-address-chip {{ border-radius: var(--radius-sm); }}
+  .email-address-chip:empty {{ display: none; }}
+  .email-tabs {{ margin-left: 0; }}
+  .email-search {{
+    flex: 1 1 12rem;
+    min-width: 8rem;
+    margin-left: auto;
+    background: var(--card-bg);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 0.45rem 0.75rem;
+    font: inherit;
+    font-size: 0.85rem;
+  }}
+  .email-search::placeholder {{ color: var(--muted); }}
+  .email-search:focus {{ outline: none; border-color: var(--accent); }}
+
+  .email-list {{
+    display: flex;
+    flex-direction: column;
+    max-width: 900px;
+    margin: 0 auto;
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }}
+  .email-row {{
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.85rem 1.1rem;
+    border-bottom: 1px solid var(--border-soft);
+    cursor: pointer;
+    transition: background-color 0.15s ease;
+  }}
+  .email-row:last-child {{ border-bottom: 0; }}
+  .email-row:hover, .email-row:focus-visible {{ background: var(--accent-soft); outline: none; }}
+  .email-row-main {{ min-width: 0; flex: 1 1 auto; }}
+  .email-row-top {{ display: flex; align-items: center; gap: 0.45rem; margin-bottom: 0.15rem; }}
+  .email-row-counterpart {{
+    font-weight: 600;
+    font-size: 0.88rem;
+    color: var(--text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }}
+  .email-row-subject {{
+    font-size: 0.85rem;
+    color: var(--text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }}
+  .email-row-snippet {{
+    font-size: 0.8rem;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }}
+  .email-row-time {{
+    flex: 0 0 auto;
+    font-size: 0.76rem;
+    color: var(--muted);
+    white-space: nowrap;
+    padding-top: 0.1rem;
+  }}
+  .email-badge {{
+    flex: 0 0 auto;
+    font-size: 0.64rem;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    padding: 0.1rem 0.4rem;
+    border-radius: 999px;
+  }}
+  [data-style="terminal"] .email-badge {{ border-radius: 2px; }}
+  .email-badge.autonomous {{ color: var(--accent); background: var(--accent-soft); }}
+  .email-badge.attachment {{
+    text-transform: none;
+    font-size: 0.78rem;
+    color: var(--muted);
+    background: transparent;
+    padding: 0;
+  }}
+
+  #emailListFooter {{ display: flex; justify-content: center; padding: 1rem 0 0.25rem; }}
+  .email-loadmore-btn {{
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+  }}
+
+  .email-thread-back {{
+    appearance: none;
+    border: 0;
+    background: transparent;
+    color: var(--accent);
+    font: inherit;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+    padding: 0.3rem 0;
+    max-width: 900px;
+    margin: 0 auto 0.85rem;
+    display: block;
+  }}
+  .email-thread {{
+    display: flex;
+    flex-direction: column;
+    max-width: 900px;
+    margin: 0 auto;
+  }}
+  .email-thread-msg {{
+    background: var(--card-bg);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 0.85rem 1rem;
+    margin-bottom: 0.85rem;
+  }}
+  .email-thread-msg.outbound {{ border-left-color: var(--accent); }}
+  .email-thread-msg-head {{
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    font-size: 0.8rem;
+    color: var(--muted);
+    margin-bottom: 0.5rem;
+  }}
+  .email-thread-msg-badges {{ display: flex; align-items: center; gap: 0.5rem; }}
+  .email-thread-msg-subject {{ font-weight: 600; font-size: 0.9rem; color: var(--text); margin-bottom: 0.35rem; }}
+  .email-thread-msg-body {{
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 0.87rem;
+    line-height: 1.6;
+    color: var(--text);
+  }}
+
   footer {{
     flex: 0 0 auto;
     padding: 0.6rem 1.1rem;
@@ -637,6 +817,7 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
     <nav class="page-toggle" id="pageToggle">
       <button type="button" class="toggle-btn active" data-page="browsing">Live browsing</button>
       <button type="button" class="toggle-btn" data-page="dashboard">Dashboard</button>
+      <button type="button" class="toggle-btn" data-page="emails">Emails</button>
     </nav>
   </header>
   <main id="main" class="page-area">
@@ -657,6 +838,15 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
       </div>
     </div>
   </div>
+  <div id="page-emails" class="page-area" hidden>
+    <div class="state">
+      <div class="card">
+        <div class="icon">&#8230;</div>
+        <h1>Loading&hellip;</h1>
+        <p>Fetching your email.</p>
+      </div>
+    </div>
+  </div>
   <footer>textmessa.com &middot; this link is permanent, bookmark it</footer>
 
 <script>
@@ -670,6 +860,7 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
   var dot = document.getElementById("dot");
   var tileCountEl = document.getElementById("tileCount");
   var dashboardPage = document.getElementById("page-dashboard");
+  var emailsPage = document.getElementById("page-emails");
   var pageToggle = document.getElementById("pageToggle");
   // "loading" | "idle" | "invalid" | "closing" | "grid" -- which of the
   // non-tile states is currently rendered in #main, so those states only
@@ -681,13 +872,15 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
   var tileEls = {{}};  // tile id -> {{ root, video, log, desc, heading, dot, waiting, stepsRendered }}
   var stopped = false; // true once we've confirmed the token is invalid (shared by both pollers below)
 
-  // ---- page toggle: both pages are permanent siblings, switching only
-  // ever flips `hidden` -- never rebuilds either page's DOM, so the
+  // ---- page toggle: all three pages are permanent siblings, switching
+  // only ever flips `hidden` -- never rebuilds any page's DOM, so the
   // browsing grid's iframes (see updateTileVideo's "write src exactly
-  // once" comment) are untouched by a trip to the dashboard and back. ----
+  // once" comment) are untouched by a trip to the dashboard/emails page
+  // and back. ----
   function showPage(name) {{
     main.hidden = name !== "browsing";
     dashboardPage.hidden = name !== "dashboard";
+    emailsPage.hidden = name !== "emails";
     if (pageToggle) {{
       var btns = pageToggle.querySelectorAll(".toggle-btn");
       for (var i = 0; i < btns.length; i++) {{
@@ -1171,8 +1364,283 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
       }});
   }}
 
+  // ---- Emails page: Inbox/Sent list + click-to-open thread view of
+  // Messa's OWN email address (server.py's /live/<token>/emails and
+  // /live/<token>/emails/thread routes; NOT the user's connected Gmail --
+  // that has no equivalent page here). Same untrusted-content discipline
+  // as the rest of this file: subject/body/address text can originate
+  // from an arbitrary external sender, so every such value below is
+  // written with textContent, never innerHTML (see this module's own
+  // docstring). ----
+  var emailsShownState = "loading"; // "loading" | "invalid" | "list" | "thread"
+  var emailsTab = "inbox"; // "inbox" | "sent"
+  var emailsQuery = "";
+  var EMAILS_PAGE_SIZE = 25;
+  var emailsLimit = EMAILS_PAGE_SIZE;
+  var emailsActiveThreadId = null;
+  var emailsSearchDebounce = null;
+
+  function showEmailsInvalid() {{
+    if (emailsShownState === "invalid") return;
+    emailsShownState = "invalid";
+    emailsPage.innerHTML =
+      '<div class="state"><div class="card">' +
+      '<div class="icon">&#128683;</div>' +
+      '<h1>This link isn&rsquo;t valid</h1>' +
+      '<p>Double check the link Messa sent you, or ask her to resend it.</p>' +
+      '</div></div>';
+  }}
+
+  // Builds the persistent list shell (toolbar + list container) once;
+  // later refreshes only touch #emailList/#emailListFooter so the search
+  // box never loses focus/its typed value under a background poll tick --
+  // same "flip state, don't rebuild" discipline as ensureDashboardGridShown.
+  function ensureEmailsShellShown() {{
+    if (emailsShownState === "list") return;
+    emailsShownState = "list";
+    emailsPage.innerHTML =
+      '<div class="emails-wrap">' +
+        '<div class="emails-toolbar">' +
+          '<span class="email-address-chip" id="emailAddressChip"></span>' +
+          '<nav class="page-toggle email-tabs" id="emailTabs">' +
+            '<button type="button" class="toggle-btn' + (emailsTab === "inbox" ? " active" : "") + '" data-tab="inbox">Inbox</button>' +
+            '<button type="button" class="toggle-btn' + (emailsTab === "sent" ? " active" : "") + '" data-tab="sent">Sent</button>' +
+          '</nav>' +
+          '<input type="search" class="email-search" id="emailSearch" placeholder="Search subject or body…">' +
+        '</div>' +
+        '<div class="email-list" id="emailList"></div>' +
+        '<div id="emailListFooter"></div>' +
+      '</div>';
+    document.getElementById("emailTabs").addEventListener("click", function (event) {{
+      var btn = event.target.closest(".toggle-btn");
+      if (!btn) return;
+      var tab = btn.getAttribute("data-tab");
+      if (tab === emailsTab) return;
+      emailsTab = tab;
+      emailsLimit = EMAILS_PAGE_SIZE;
+      var btns = document.getElementById("emailTabs").querySelectorAll(".toggle-btn");
+      for (var i = 0; i < btns.length; i++) {{
+        btns[i].classList.toggle("active", btns[i].getAttribute("data-tab") === tab);
+      }}
+      fetchEmailsList();
+    }});
+    var searchInput = document.getElementById("emailSearch");
+    searchInput.value = emailsQuery;
+    searchInput.addEventListener("input", function () {{
+      var val = searchInput.value;
+      if (emailsSearchDebounce) clearTimeout(emailsSearchDebounce);
+      emailsSearchDebounce = setTimeout(function () {{
+        emailsQuery = val;
+        emailsLimit = EMAILS_PAGE_SIZE;
+        fetchEmailsList();
+      }}, 350);
+    }});
+  }}
+
+  function emailRow(msg) {{
+    var row = document.createElement("div");
+    row.className = "email-row";
+    row.tabIndex = 0;
+    row.addEventListener("click", function () {{ openEmailThread(msg.thread_id); }});
+    row.addEventListener("keydown", function (event) {{
+      if (event.key === "Enter" || event.key === " ") {{ event.preventDefault(); openEmailThread(msg.thread_id); }}
+    }});
+
+    var mainCol = document.createElement("div");
+    mainCol.className = "email-row-main";
+
+    var top = document.createElement("div");
+    top.className = "email-row-top";
+    var counterpart = document.createElement("span");
+    counterpart.className = "email-row-counterpart";
+    counterpart.textContent = msg.direction === "inbound" ? msg.from_address : msg.to_address;
+    top.appendChild(counterpart);
+    if (msg.sent_autonomously) {{
+      var auto = document.createElement("span");
+      auto.className = "email-badge autonomous";
+      auto.textContent = "Auto";
+      auto.title = "Messa sent this on her own judgment, without checking with you first";
+      top.appendChild(auto);
+    }}
+    if (msg.attachment_filename) {{
+      var clip = document.createElement("span");
+      clip.className = "email-badge attachment";
+      clip.textContent = "📎";
+      clip.title = "Attached: " + msg.attachment_filename;
+      top.appendChild(clip);
+    }}
+    mainCol.appendChild(top);
+
+    var subject = document.createElement("div");
+    subject.className = "email-row-subject";
+    subject.textContent = msg.subject;
+    mainCol.appendChild(subject);
+
+    var snippet = document.createElement("div");
+    snippet.className = "email-row-snippet";
+    snippet.textContent = msg.snippet;
+    mainCol.appendChild(snippet);
+
+    row.appendChild(mainCol);
+
+    var time = document.createElement("div");
+    time.className = "email-row-time";
+    time.textContent = msg.time;
+    row.appendChild(time);
+
+    return row;
+  }}
+
+  function renderEmailsList(data) {{
+    ensureEmailsShellShown();
+    var chip = document.getElementById("emailAddressChip");
+    if (chip) chip.textContent = data.messa_email || "";
+    var list = document.getElementById("emailList");
+    var footer = document.getElementById("emailListFooter");
+    if (!list || !footer) return;
+    list.innerHTML = "";
+    var messages = data.messages || [];
+    if (messages.length === 0) {{
+      list.appendChild(dashEmpty(emailsTab === "sent" ? "Nothing sent yet." : "No emails yet."));
+    }} else {{
+      messages.forEach(function (msg) {{ list.appendChild(emailRow(msg)); }});
+    }}
+    footer.innerHTML = "";
+    if (data.has_more) {{
+      var more = document.createElement("button");
+      more.type = "button";
+      more.className = "toggle-btn email-loadmore-btn";
+      more.textContent = "Load more";
+      more.addEventListener("click", function () {{
+        emailsLimit += EMAILS_PAGE_SIZE;
+        fetchEmailsList();
+      }});
+      footer.appendChild(more);
+    }}
+  }}
+
+  function emailThreadMsg(msg) {{
+    var card = document.createElement("div");
+    card.className = "email-thread-msg " + (msg.direction === "outbound" ? "outbound" : "inbound");
+
+    var head = document.createElement("div");
+    head.className = "email-thread-msg-head";
+    var who = document.createElement("span");
+    who.textContent = (msg.direction === "inbound" ? "From " : "To ") +
+      (msg.direction === "inbound" ? msg.from_address : msg.to_address);
+    head.appendChild(who);
+
+    var badges = document.createElement("span");
+    badges.className = "email-thread-msg-badges";
+    if (msg.sent_autonomously) {{
+      var auto = document.createElement("span");
+      auto.className = "email-badge autonomous";
+      auto.textContent = "Auto";
+      auto.title = "Messa sent this on her own judgment, without checking with you first";
+      badges.appendChild(auto);
+    }}
+    if (msg.attachment_filename) {{
+      var clip = document.createElement("span");
+      clip.className = "email-badge attachment";
+      clip.textContent = "📎 " + msg.attachment_filename;
+      badges.appendChild(clip);
+    }}
+    var time = document.createElement("span");
+    time.textContent = msg.time;
+    badges.appendChild(time);
+    head.appendChild(badges);
+    card.appendChild(head);
+
+    var subject = document.createElement("div");
+    subject.className = "email-thread-msg-subject";
+    subject.textContent = msg.subject;
+    card.appendChild(subject);
+
+    var body = document.createElement("div");
+    body.className = "email-thread-msg-body";
+    body.textContent = msg.body;
+    card.appendChild(body);
+
+    return card;
+  }}
+
+  function renderEmailThread(data) {{
+    emailsShownState = "thread";
+    emailsPage.innerHTML =
+      '<div class="emails-wrap">' +
+        '<button type="button" class="email-thread-back" id="emailThreadBack">&larr; Back to list</button>' +
+        '<div class="email-thread" id="emailThread"></div>' +
+      '</div>';
+    document.getElementById("emailThreadBack").addEventListener("click", function () {{
+      emailsActiveThreadId = null;
+      emailsShownState = "loading"; // forces ensureEmailsShellShown to rebuild the list shell
+      fetchEmailsList();
+    }});
+    var container = document.getElementById("emailThread");
+    var messages = data.messages || [];
+    if (messages.length === 0) {{
+      container.appendChild(dashEmpty("No messages in this thread."));
+    }} else {{
+      messages.forEach(function (msg) {{ container.appendChild(emailThreadMsg(msg)); }});
+    }}
+  }}
+
+  function fetchEmailThread(threadId) {{
+    return fetch("/live/" + TOKEN + "/emails/thread?thread_id=" + encodeURIComponent(threadId), {{cache: "no-store"}})
+      .then(function (res) {{
+        if (res.status === 404) {{
+          stopped = true;
+          showInvalid();
+          showDashboardInvalid();
+          showEmailsInvalid();
+          return null;
+        }}
+        return res.json();
+      }});
+  }}
+
+  function openEmailThread(threadId) {{
+    if (stopped || !threadId) return;
+    emailsActiveThreadId = threadId;
+    fetchEmailThread(threadId)
+      .then(function (data) {{ if (data) renderEmailThread(data); }})
+      .catch(function () {{ /* transient -- the list stays showing, the click can be retried */ }});
+  }}
+
+  function fetchEmailsList() {{
+    if (stopped) return Promise.resolve();
+    var url = "/live/" + TOKEN + "/emails?direction=" + encodeURIComponent(emailsTab) +
+      "&limit=" + emailsLimit + "&offset=0";
+    if (emailsQuery) url += "&q=" + encodeURIComponent(emailsQuery);
+    return fetch(url, {{cache: "no-store"}})
+      .then(function (res) {{
+        if (res.status === 404) {{
+          stopped = true;
+          showInvalid();
+          showDashboardInvalid();
+          showEmailsInvalid();
+          return;
+        }}
+        return res.json().then(function (data) {{
+          if (emailsShownState !== "thread") renderEmailsList(data);
+        }});
+      }})
+      .catch(function () {{ /* transient network hiccup -- next tick retries */ }});
+  }}
+
+  function pollEmails() {{
+    if (stopped) return;
+    var work = emailsActiveThreadId
+      ? fetchEmailThread(emailsActiveThreadId)
+          .then(function (data) {{ if (data && emailsShownState === "thread") renderEmailThread(data); }})
+          .catch(function () {{}})
+      : fetchEmailsList();
+    work.then(function () {{ if (!stopped) setTimeout(pollEmails, DASHBOARD_POLL_MS); }});
+  }}
+
   poll();
   pollDashboard();
+  pollEmails();
 }})();
 </script>
 </body>

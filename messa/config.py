@@ -259,6 +259,17 @@ EMAIL_CONNECTION_REQUEST_EXPIRES_HOURS = int(
 TEXTMESSA_EMAIL_DOMAIN = os.environ.get("MESSA_TEXTMESSA_EMAIL_DOMAIN", "textmessa.com")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
 
+# Cap on a PDF (or any other file) attached to an outbound Messa-email send/
+# reply (tools/document_tools.py's generate_pdf -> tools/personal_inbox_tools.py's
+# send_email/reply_to_email -> channels/resend.py). Resend's own hard limit is
+# 40MB for the whole request AFTER base64 encoding (~33% larger than the raw
+# file) plus headers/body/JSON overhead -- this is checked against the RAW
+# file size before encoding, so it's set well under that ceiling (25MB raw
+# -> ~33MB encoded) to leave comfortable room rather than cutting it close.
+MAX_EMAIL_ATTACHMENT_BYTES = int(
+    os.environ.get("MESSA_MAX_EMAIL_ATTACHMENT_BYTES", str(25 * 1024 * 1024))
+)
+
 # Shared secret the Cloudflare Worker sends as the X-Messa-Webhook-Secret
 # header on every inbound-email POST -- same role as SENDBLUE_WEBHOOK_SECRET
 # below, and same tradeoff: unset means the endpoint accepts any request
@@ -581,6 +592,18 @@ DEEPSEARCH_SUBAGENT_MAX_STEPS = int(os.environ.get("MESSA_DEEPSEARCH_SUBAGENT_MA
 # budget would only let a confused run wander instead of failing fast.
 EXECUTIVE_RECURSION_LIMIT = int(os.environ.get("MESSA_EXECUTIVE_RECURSION_LIMIT", "14"))
 
+# Step budget for email_agent (the user's own Gmail via Composio) -- same
+# reasoning as EXECUTIVE_RECURSION_LIMIT just above, and deliberately given
+# its own constant rather than reusing that one: reading/searching/sending/
+# replying to Gmail, or walking someone through the connect-link flow, is a
+# handful of direct Composio calls, not an open-ended research loop --
+# giving it deepsearch's ~100-step ambient budget (what a plain declarative
+# SubAgent dict inherits by default, since nothing in this codebase capped
+# it before) would only let a confused run wander through retries instead
+# of failing fast and telling Messa what actually went wrong. See
+# tools/email_tools.py's build_email_subagent.
+EMAIL_RECURSION_LIMIT = int(os.environ.get("MESSA_EMAIL_RECURSION_LIMIT", "12"))
+
 # All server-side "now" comparisons (due reminders/cron) use tz-aware UTC
 # datetimes explicitly (datetime.now(timezone.utc)) rather than naive
 # datetime.now(), so this holds regardless of what timezone the host
@@ -692,6 +715,16 @@ class UserContext:
     # owns on TEXTMESSA_EMAIL_DOMAIN. See messa_email below for the full
     # address string.
     messa_email_local_part: str | None = None
+    # From users.default_email_provider (migrations/015_default_email_provider.sql):
+    # which inbox Messa treats as the default for a generic "send/check my
+    # email" request that doesn't name one -- "messa" (their own address
+    # above) or "gmail" (their connected Gmail, email_tools.py). Defaults
+    # to "messa" here too (not just at the DB column's own DEFAULT), so
+    # behavior is identical whether or not migration 015 has run yet. Only
+    # ever changed by the user's own explicit request -- see
+    # agents/registry.py's set_default_email_provider tool; connecting
+    # Gmail does NOT change this by itself.
+    default_email_provider: str = "messa"
 
     @property
     def onboarding_complete(self) -> bool:
@@ -705,6 +738,18 @@ class UserContext:
         if not self.messa_email_local_part:
             return None
         return f"{self.messa_email_local_part}@{TEXTMESSA_EMAIL_DOMAIN}"
+
+    @property
+    def messa_display_name(self) -> str:
+        """The From display name every outbound Messa-email send/reply uses
+        (channels/resend.py's `from_name`), so a recipient's mail client
+        shows "Messa, personal assistant of Jane" rather than a bare
+        address -- the user's own explicit ask. Falls back to a name-less
+        phrasing for the rare case Messa doesn't have a name for this user
+        yet (a send that somehow fires before onboarding collects one)."""
+        if self.name:
+            return f"Messa, personal assistant of {self.name}"
+        return "Messa, your personal assistant"
 
     @property
     def live_view_share_url(self) -> str | None:

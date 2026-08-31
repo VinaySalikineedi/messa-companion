@@ -1,14 +1,30 @@
-"""Assembles Messa (the orchestrator) and her five subagents.
+"""Assembles Messa (the orchestrator) and her six subagents.
 
 Uses deepagents' native `subagents=` support on `create_deep_agent`, so
 delegation, the `task` tool, and per-subagent tool/prompt isolation are all
-provided by the framework rather than hand-rolled. Four subagents are plain
-declarative `SubAgent` dicts: name + description (what makes Messa pick it)
-+ system_prompt + its own tool list. deepsearch (the browsing/research
-subagent, formerly called "browser_agent") is a `CompiledSubAgent` instead
--- see tools/deepsearch_tools.py for why (it needs to open/close its own
-Playwright process per delegation, and persists/resumes progress across
-runs that hit their step limit).
+provided by the framework rather than hand-rolled. Three subagents are
+plain declarative `SubAgent` dicts: name + description (what makes Messa
+pick it) + system_prompt + its own tool list -- personal_inbox_agent,
+document_agent, routines_agent. The other three are `CompiledSubAgent`s,
+each for its own reason: deepsearch (the browsing/research subagent,
+formerly called "browser_agent") needs to open/close its own Playwright
+process per delegation and persists/resumes progress across runs that hit
+their step limit (see tools/deepsearch_tools.py); executive_assistant and
+email_agent both need their OWN small step budget, independent of whatever
+recursion_limit happens to be ambient on the call -- a plain SubAgent dict
+has no field for that, it just inherits the ambient one (see
+tools/executive_tools.py's/tools/email_tools.py's build_*_subagent
+docstrings).
+
+Email routing: there are two separate subagents for two separate inboxes
+(personal_inbox_agent -- the user's own address on Messa's own domain --
+and email_agent -- their connected Gmail), and which one handles a GENERIC
+"send/check my email" request is a per-user preference
+(users.default_email_provider, migrations/015_default_email_provider.sql)
+that Messa's own system prompt reads and routes on -- see
+`_build_system_prompt`'s "Email routing" paragraph below, and
+`set_default_email_provider` above, the only thing that ever changes it
+(always at the user's explicit request; connecting Gmail does not).
 
 Confirming or rejecting a *proposed* action (see db.py's pending_actions
 gate) is deliberately kept OFF every subagent and given to Messa directly --
@@ -34,9 +50,9 @@ from ..approval import ApprovalGate, CLIApprovalGate
 from ..tools.deepsearch_tools import build_deepsearch_subagent
 from ..tools.common import trace_all
 from ..tools.document_tools import DOCUMENT_SYSTEM_PROMPT, build_document_tools
-from ..tools.email_tools import EMAIL_SYSTEM_PROMPT, build_email_tools
+from ..tools.email_tools import build_email_subagent
 from ..tools.executive_tools import build_executive_subagent
-from ..tools.personal_inbox_tools import PERSONAL_INBOX_SYSTEM_PROMPT, build_personal_inbox_tools
+from ..tools.personal_inbox_tools import build_personal_inbox_system_prompt, build_personal_inbox_tools
 from ..tools.routines_tools import ROUTINES_SYSTEM_PROMPT, build_routines_tools
 from ..tools.web_search_tools import build_web_search_tools
 
@@ -128,6 +144,37 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
         return msg
 
     @tool
+    async def set_default_email_provider(provider: str) -> str:
+        """Set which inbox you use by default for a GENERIC 'send/check my email'
+        request that doesn't name one -- 'messa' (the user's own address on your
+        domain, personal_inbox_agent) or 'gmail' (their connected Gmail, email_agent).
+        Call this only when the user explicitly asks to change it (e.g. 'use my gmail
+        as default from now on', 'switch back to my messa email', 'make gmail my main
+        email') -- never on your own judgment, and connecting Gmail does NOT change
+        this by itself. Switching to 'gmail' requires it to already be connected: if
+        it isn't, this tells you so instead of changing anything -- offer to connect
+        it first (delegate to email_agent with request_email_connection), then call
+        this again once they confirm it's active."""
+        normalized = (provider or "").strip().lower()
+        if normalized not in ("messa", "gmail"):
+            return "provider must be exactly 'messa' or 'gmail'."
+        if normalized == "gmail" and not user.email_connected:
+            return (
+                "Can't switch the default to Gmail yet -- it isn't connected. Offer to connect "
+                "it (delegate to email_agent with request_email_connection), then call this "
+                "again once the user confirms it's active."
+            )
+        row = await db.set_default_email_provider(uid, normalized)
+        if row is None:
+            return (
+                "Default-email preference isn't set up on this deployment yet (run "
+                "migrations/015_default_email_provider.sql) -- for now, the user's own Messa "
+                "address is used for any unnamed 'send/check my email' request."
+            )
+        label = "their own Messa address" if normalized == "messa" else "their connected Gmail"
+        return f"Default email is now {label}. Use it for any generic send/check-email request that doesn't name an inbox."
+
+    @tool
     async def list_deepsearch_sessions(status: str | None = None) -> str:
         """List the user's deepsearch (browsing/research) sessions, most recent first.
         status: 'active' (unfinished/resumable), 'completed', or omit for all. Use this
@@ -144,7 +191,8 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
 
     raw_tools: list[BaseTool] = [
         confirm_pending_action, reject_pending_action, list_pending_actions,
-        track_project, list_active_projects, save_profile_info, list_deepsearch_sessions,
+        track_project, list_active_projects, save_profile_info, set_default_email_provider,
+        list_deepsearch_sessions,
         *build_web_search_tools(),
     ]
     return trace_all(raw_tools, ORCHESTRATOR_LABEL)
@@ -201,6 +249,16 @@ def _build_system_prompt(user: config.UserContext) -> str:
     )
     if user.messa_email:
         known.append(f"their own Messa email address is {user.messa_email}")
+    if user.default_email_provider == "gmail" and not user.email_connected:
+        known.append(
+            "default email is set to Gmail, but Gmail isn't connected right now -- treat "
+            "personal_inbox_agent as the effective default for any unnamed email request "
+            "until Gmail is reconnected, and mention that mismatch if it's relevant"
+        )
+    elif user.default_email_provider == "gmail":
+        known.append("default email for an unnamed 'send/check my email' request: their connected Gmail (email_agent)")
+    else:
+        known.append("default email for an unnamed 'send/check my email' request: their own Messa address (personal_inbox_agent)")
     known_str = ("Known about this user so far -- " + ", ".join(known) + ".\n\n") if known else ""
 
     # Neither Messa's nor any subagent's system prompt used to state the
@@ -244,6 +302,29 @@ def _build_system_prompt(user: config.UserContext) -> str:
         "personal_inbox_agent (the user's own Messa-owned email address -- a different "
         "inbox from their Gmail), document_agent (generates PDFs), routines_agent "
         "(recurring automations).\n\n"
+        "Email routing -- there are two separate inboxes, and you decide which one handles "
+        "each request: personal_inbox_agent (their own address on your domain) and email_agent "
+        "(their connected Gmail, once set up). For a GENERIC request that doesn't name an inbox "
+        "('send an email to X', 'check my email', 'any new messages?'), delegate to whichever "
+        "one is their current default (see 'Known about this user' above) -- don't ask which "
+        "inbox every time, that default exists so you don't have to. If they explicitly name "
+        "one ('my gmail', 'my real/personal email' -> email_agent; 'my messa email', 'the "
+        "address you gave me', 'the textmessa one' -> personal_inbox_agent), use that one "
+        "regardless of the default. If they ask to change the default ('use my gmail from now "
+        "on', 'switch back to messa email'), call set_default_email_provider -- it'll tell you "
+        "if Gmail needs to be connected first, in which case offer to connect it (email_agent's "
+        "request_email_connection) before trying again. Connecting Gmail does NOT change the "
+        "default on its own -- only this explicit request does.\n\n"
+        "Documents and email: when the user wants something generated AND sent/attached (\"make "
+        "me a PDF of this and email it to me\"), delegate to document_agent first, get the "
+        "exact file path back from its reply, then delegate to personal_inbox_agent with that "
+        "same path relayed verbatim in the description (e.g. \"attach /outputs/quote.pdf and "
+        "send it to jane@example.com\") so it can pass it as attachment_path -- never invent or "
+        "paraphrase the path yourself. This only works for personal_inbox_agent (Messa's own "
+        "email) -- email_agent (Gmail) doesn't support attachments in this build, so if the "
+        "user's default/named inbox is Gmail and they want a document attached, tell them "
+        "plainly that attachments only work from their Messa address right now and offer to "
+        "send it from there instead.\n\n"
         "Speed matters: you also have web_search and fetch_page_text as your OWN direct tools "
         "(no delegation, no browser, answers in a second or two) -- use them for a plain "
         "factual lookup (a fact, news, a definition, 'who is X') instead of delegating to "
@@ -340,17 +421,7 @@ async def build_orchestrator(
     subagents = [
         build_deepsearch_subagent(user, subagent_model, approval_gate),
         build_executive_subagent(user, subagent_model),
-        {
-            "name": "email_agent",
-            "description": (
-                "Reads, searches, and sends the user's own Gmail (via Composio), and "
-                "handles connecting/reconnecting their account. Use for anything about "
-                "the user's inbox, and for 'connect my email/gmail' requests."
-            ),
-            "system_prompt": EMAIL_SYSTEM_PROMPT,
-            "tools": build_email_tools(user, approval_gate),
-            "model": subagent_model,
-        },
+        build_email_subagent(user, subagent_model, approval_gate),
         {
             "name": "personal_inbox_agent",
             "description": (
@@ -358,7 +429,7 @@ async def build_orchestrator(
                 "domain, separate from their personal Gmail) -- what it is, sending new "
                 "emails from it, and replying to anything that lands in it."
             ),
-            "system_prompt": PERSONAL_INBOX_SYSTEM_PROMPT,
+            "system_prompt": build_personal_inbox_system_prompt(user),
             "tools": build_personal_inbox_tools(user, approval_gate),
             "model": subagent_model,
         },

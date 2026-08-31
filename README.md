@@ -3445,3 +3445,254 @@ verification) -- nor the Message-ID round-trip check above -- could be run
 end-to-end here; this is the one part of this feature that needs a
 supervised first real run, same caveat as every other "needs a live account
 this sandbox doesn't have" feature above.
+
+## Default email provider, and email_agent rebuilt as a small-loop CompiledSubAgent
+
+Two related asks. First: with two separate inboxes now real (the Messa-owned
+address above, and the user's own Gmail via Composio -- see "Real Gmail OAuth
+connections" further up), a plain "send an email" or "check my email" is
+ambiguous unless the user always names which one they mean. Second: `email_agent`
+had never gotten the same tuning pass `executive_assistant` got (see "Executive
+assistant rebuild" above) -- it was still a plain declarative `SubAgent` dict
+with a static system prompt, silently inheriting whatever step budget happened
+to be ambient on the call (100, deepsearch-sized) instead of one sized to what
+it actually does.
+
+**Default provider (migrations/015_default_email_provider.sql).** `users.default_email_provider`
+is a new `'messa' | 'gmail'` enum column, `NOT NULL DEFAULT 'messa'` -- which does
+double duty on purpose, per your explicit ask ("even for existing users now,
+make messa's email the default, and the same for anyone who onboards from now
+on"): Postgres backfills every *existing* row to `'messa'` as part of the `ADD
+COLUMN` itself (fast, metadata-only on PG 11+, no separate `UPDATE` needed), and
+every row created *afterward* also starts at `'messa'` since the column's own
+DEFAULT applies with no code change to `get_or_create_user`'s plain INSERT. Both
+halves of the ask fall out of one clause. `config.UserContext.default_email_provider`
+mirrors the same default in Python (`"messa"`), so behavior is identical whether
+or not the migration has actually run yet.
+
+The ONLY thing that ever changes it afterward is the user's own explicit request
+-- Messa's new `set_default_email_provider` tool (agents/registry.py), called
+only when the user says something like "use my gmail as default from now on" or
+"switch back to my messa email". **Connecting Gmail does NOT flip this by
+itself** -- same "the user decides, nothing switches automatically" shape as
+this project's card/top-up decision earlier on. Switching *to* `'gmail'` is
+refused (no DB write at all) if Gmail isn't connected yet -- the tool tells
+Messa so, and to offer `request_email_connection` first.
+
+Messa's own system prompt (`agents/registry.py`'s `_build_system_prompt`) is
+where the actual ROUTING decision happens, in a new "Email routing" paragraph:
+a generic request that doesn't name an inbox goes to whichever subagent matches
+the user's current default; an explicit "my gmail" / "my messa email" always
+overrides the default regardless of what it's set to. The "known about this
+user" block also states the current default plainly, including one edge case:
+if the default is `'gmail'` but Gmail isn't connected right now (e.g. they
+disconnected it, or it expired), Messa is told to treat `personal_inbox_agent`
+as the *effective* default until it's reconnected, rather than routing generic
+requests into a dead end.
+
+**email_agent rebuilt as a `CompiledSubAgent`.** Exactly the same reasoning
+`tools/executive_tools.py`'s `build_executive_subagent` already established:
+a plain declarative `SubAgent` dict has no field for its own step budget, so it
+silently inherits whatever `recursion_limit` happens to be ambient on the
+call -- `config.RECURSION_LIMIT` (100 by default), the same research-sized
+budget deepsearch uses, for a role that's normally a handful of direct Composio
+calls (list, get, send, reply, or the connect-link flow). `tools/email_tools.py`'s
+new `build_email_subagent` wraps the existing `build_email_tools` in a small
+inner `create_agent` loop bounded by the new `config.EMAIL_RECURSION_LIMIT`
+(12, deliberately smaller than executive's 14 -- Gmail actions are even more
+atomic). Unlike executive_assistant, there's no deterministic post-hoc quality
+check afterward -- every read/send tool already checks `user.email_connected`
+itself and reports a correct, plain message when it isn't (there's no
+equivalent "past-due date" class of silent mistake here to catch), so this is
+a single `ainvoke`, no checkpointer/nudge-retry machinery needed. The shared
+"grab the model's last real reply" logic (`_last_ai_text`) moved out of
+`executive_tools.py` into `tools/common.py` (`last_ai_text`) so both
+`CompiledSubAgent`s use the exact same extraction instead of two copies of the
+same few lines.
+
+`EMAIL_SYSTEM_PROMPT` (a static module constant before) is now
+`_build_system_prompt(user)`, a function of the user -- it states plainly
+whether Gmail is connected right now, and whether Gmail is currently the
+user's default inbox (purely for phrasing, e.g. so it doesn't call itself "the
+default" when it isn't) -- plus new guidance on using the message/thread id a
+prior `list_recent_emails`/`get_email` call actually returned, rather than one
+invented on the spot, and specifically that `reply_to_email` wants the THREAD
+id, not a single message's own id. `personal_inbox_agent`'s system prompt
+(`build_personal_inbox_system_prompt`, also now a function of `user` rather
+than a static `PERSONAL_INBOX_SYSTEM_PROMPT` constant) got the same small,
+symmetric addition, purely for phrasing -- the actual routing decision always
+happens one level up, in Messa's own prompt, before either subagent is ever
+invoked.
+
+**Verification.** All of this is testable without a live account (the fake
+Composio client from "Real Gmail OAuth connections" above, plus a `FakeModel`
+driving the real `langchain.agents.create_agent`/LangGraph stack, same
+technique `test_executive_quality_check.py` already established): `EMAIL_RECURSION_LIMIT`
+is confirmed smaller than both `DEEPSEARCH_MAX_STEPS` and the ambient
+`RECURSION_LIMIT` a plain `SubAgent` dict would otherwise inherit; a full
+list -> send -> finalize round trip runs through the real `CompiledSubAgent`
+plumbing with the destructive `send_email` call genuinely going through the
+approval gate; and the dynamic system prompt is confirmed to actually change
+per connection/default state. Separately: `set_default_email_provider` is
+confirmed to refuse switching to Gmail while disconnected (no DB write
+attempted), succeed once connected, work case-insensitively, and report a
+friendly message pre-migration instead of crashing; `cli._context_from_row` is
+confirmed to propagate a real column value and to fall back to `"messa"` for
+both a missing key and an explicit `NULL` (a row saved before this migration
+existed). What's NOT verified here, same caveat as the rest of this file: an
+actual live run where a real user says "use my gmail as default" and a
+subsequent "send an email" actually reaches Gmail instead of the Messa
+address.
+
+## PDF attachments + a real From name on Messa's own email, and a new Emails page on the live-view dashboard
+
+Three asks, all scoped to `personal_inbox_agent` (Messa's own address on
+`TEXTMESSA_EMAIL_DOMAIN`) -- **deliberately NOT** `email_tools.py`/Gmail. When
+this scope came up mid-request I asked directly rather than guessing (the
+tradeoff: Composio's exact Gmail attachment parameter name isn't
+discoverable from public docs or local package inspection without a live
+account -- it's only in the tool's live schema, fetched from Composio's API
+at runtime -- so a wrong guess there risks a broken send to a real inbox).
+The answer was explicit: "Just Messa's own email" -- Resend's attachment API
+*is* fully documented, so that's the one this phase actually builds.
+
+**From display name** (`config.UserContext.messa_display_name`, a new
+property): every send/reply from Messa's own address now carries a real
+display name -- `"Messa, personal assistant of {user.name}"`, or `"Messa,
+your personal assistant"` for the rare case a send fires before onboarding
+has collected a name -- so a recipient's mail client shows who's actually
+writing instead of a bare `jane@textmessa.com`. `channels/resend.py`'s
+`send_email` gained an optional `from_name` parameter that builds Resend's
+`from` field as `"{from_name} <{address}>"` (bare address, unchanged, when
+omitted); `tools/personal_inbox_tools.py`'s `send_email`/`reply_to_email`
+tools pass `user.messa_display_name` on every call automatically -- Messa
+never signs emails herself or mentions this to the user, it just happens.
+
+**PDF attachments** (migrations/016_messa_email_attachment.sql): the
+existing `document_agent` (`tools/document_tools.py`'s `generate_pdf`) always
+returned a file path with a comment noting "a later phase will deliver it
+over text/email" -- this is that phase. `send_email`/`reply_to_email` both
+gained an `attachment_path` parameter; the orchestrator's system prompt
+(`agents/registry.py`) now tells Messa to delegate to `document_agent`
+first, take the *exact* path it reports back, and relay it verbatim into a
+`personal_inbox_agent` delegation -- never invent or paraphrase a path.
+`channels/resend.py` is the actual last line of defense on that path, not
+just the prompt: `_validate_attachment_path` checks existence, that it's a
+real file (not a directory), that it resolves to somewhere *inside*
+`config.OUTPUTS_DIR` (so a model-invented path can never make the server
+read and mail out an arbitrary file), and the raw size against
+`config.MAX_EMAIL_ATTACHMENT_BYTES` (25MB raw by default -- Resend's own hard
+cap is 40MB *after* base64 encoding, which inflates size by ~33%, plus
+headers/body, so this leaves real headroom rather than cutting it close).
+A validated file is base64-encoded into Resend's documented
+`{"attachments": [{"filename", "content"}]}` shape. The attachment's
+filename (not the path -- the file itself already left the server) is
+recorded on `messa_email_messages.attachment_filename`
+(migrations/016, additive, nullable, `NULL` for every inbound row and for
+any outbound row with nothing attached) via
+`db.log_outbound_personal_email`'s new `attachment_filename` parameter --
+guarded by its own `_has_column` check so a deployment that hasn't run
+migration 016 yet degrades gracefully (the send still succeeds and still
+gets logged, just without recording a filename) rather than erroring on an
+already-successful send.
+
+**The Emails page** (third toggle-able page on `/live/<token>`, alongside
+Live Browsing and Dashboard): a mail-app-style Inbox/Sent list with
+click-to-open full-thread view of Messa's own address, requested as "any
+other features you think would look good" left open to me too -- what I
+added beyond the literal ask: a free-text search box (backed by
+`search_personal_emails`'s existing `query` param), a "Load more" button
+instead of fixed pagination, and the user's own Messa address shown at the
+top of the page.
+
+- `db.search_personal_emails` gained `direction` (`'inbound'`/`'outbound'`/
+  `None` for both) and `offset` parameters -- both optional, both default to
+  the exact no-filter/no-offset behavior every existing caller (the
+  `search_my_emails` tool, and this file's own tests) already relied on.
+- Two new routes on `server.py`, same "resolve the token, 404 if unknown"
+  contract as the existing `/live/<token>/dashboard` route (reusing the
+  same permanent `live_share_token`, not a new kind of link):
+  `GET /live/<token>/emails` (query params `direction`, `q`, `limit`,
+  `offset` -- `limit` is capped server-side at `EMAILS_PAGE_SIZE_MAX`
+  regardless of what's requested) returns the list plus the user's own
+  `messa_email` address and a `has_more` flag (computed by fetching one
+  extra row and trimming it off, rather than a separate `COUNT` query); and
+  `GET /live/<token>/emails/thread` (thread id as a **query param**, not a
+  path segment -- a real RFC 5322 Message-ID contains `<`, `>`, `@`, which
+  are awkward/unsafe to reliably URL-path-encode but fine as an ordinary
+  query string value) returns the full chronological chain via the
+  already-existing `db.get_thread_messages`. An unknown `thread_id` on a
+  *valid* token returns 200 with an empty list, not a 404 -- only an
+  invalid token itself is a 404, same "a bad link never quietly looks
+  valid, but a valid link never looks broken either" reasoning the rest of
+  this file already follows.
+- `live_view_page.py`'s `showPage(name)` (previously hardcoded to exactly
+  two pages) now handles three; the new page reuses the file's existing
+  `--card-bg`/`--border`/`--radius`/`--shadow`/`--accent`/`--muted` theme
+  variables throughout (no new variables introduced), and its Inbox/Sent
+  tabs reuse the same `.page-toggle`/`.toggle-btn` segmented-control markup
+  the Live Browsing/Dashboard/Emails nav itself uses, so both the
+  "terminal" and "polished" skins apply automatically with zero page-specific
+  styling work. An autonomous-send badge reads `sent_autonomously`
+  (migrations/014) and a paperclip badge reads `attachment_filename`
+  (migrations/016) on both the list rows and the thread view. Per this
+  file's own module docstring (the security note that's governed every
+  other line of JS in it): subject/body/address/snippet text can originate
+  from an arbitrary external sender, so every one of those fields is
+  written with `textContent`, never `innerHTML` -- verified by extracting
+  the rendered `<script>` block and running it through `node --check` (the
+  file has no build step to run a real bundler/linter through), and by
+  grepping the new JS for the pattern this file's other tests already use
+  to catch a stray `innerHTML` on untrusted content.
+- The list and thread views both poll on the same cadence as the dashboard
+  page (`DASHBOARD_POLL_MS`, 30s) -- a background poll only ever replaces
+  the list/thread it's currently *not* actively displaying against the
+  other (checked via `emailsShownState`), and the list's shell (toolbar +
+  search box) is only ever built once and left alone on refresh, so a poll
+  tick can never steal focus out of the search input mid-type, matching
+  `ensureDashboardGridShown`'s existing "flip state, don't rebuild" pattern
+  in the dashboard page right next to it.
+
+**Verification.** `channels/resend.py`'s own path validation (missing file,
+a directory instead of a file, a path escaping `OUTPUTS_DIR`, over the size
+cap -- each confirmed to raise *before* any network call happens), the
+`from`-field construction (bare address vs `"{name} <addr>"`), a real
+attachment's base64 round-trip and its filename reaching the DB log call,
+`UserContext.messa_display_name`'s named/nameless fallback, and
+`personal_inbox_tools.py`'s `send_email` tool actually passing both
+`from_name` and `attachment_path` through unmodified, are all covered
+against a faked `httpx.AsyncClient` (no real Resend account touched) in a
+new `/tmp/test_email_attachment_and_display_name.py`. The existing
+`/tmp/test_personal_inbox.py` fake DB connection was extended for the new
+`attachment_filename` column (including its own pre-migration-016
+degrade-gracefully path) and for `search_personal_emails`' new
+`direction`/`offset` parameters, with new assertions for both. The two new
+`server.py` routes are covered end-to-end via FastAPI's `TestClient` against
+a monkeypatched `db` (same technique as the existing
+`/tmp/test_dashboard_route.py`) in a new
+`/tmp/test_emails_dashboard_route.py`: 404-for-unknown-token on both routes,
+`direction=inbox`/`sent` mapping to `'inbound'`/`'outbound'`, the
+capped-server-side limit, the `has_more` pagination signal computed both
+true and false, an unrecognized `direction` value falling back to no filter
+instead of a 500, a valid token with an unknown `thread_id` returning 200
+with an empty list rather than a 404, and that autonomous/attachment fields
+and raw subject/body text survive the round trip byte-for-byte (no
+server-side escaping -- that responsibility belongs entirely to the page's
+own `textContent`-only JS, per this file's established security model).
+`live_view_page.py`'s full rendered template (all three pages) was rendered
+and its `<script>`/`<style>` blocks checked for balanced braces and valid
+JS syntax via `node --check`. **Not verified here**, same caveat as
+everywhere else in this file: an actual Resend account sending a real PDF to
+a real inbox (does every mail client actually show the custom From name the
+way it's expected to; does the attachment arrive intact), and a real
+browser click-through of the new Emails page's UI (only its generated
+markup/JS/CSS were checked, not a live rendered DOM interaction the way
+`test_dashboard_toggle.py` does for the Dashboard page).
+
+Also worth noting, found but deliberately not touched in this phase:
+`/tmp/test_dashboard_route.py`'s `part3_full_route` hardcodes absolute
+calendar dates (the week of Aug 24-30, 2026) instead of passing an explicit
+`now` into `_week_bounds_utc` the way `part1_week_bounds` correctly does --
+so it silently starts failing once the real calendar moves past that week
+(confirmed: it fails as of Aug 31, 2026, a pre-existing test-fixture
+expiry unrelated to anything in this phase, not a regression from it).
