@@ -9,7 +9,7 @@ workers_dev = true
 # Hugging Face Space's https://<you>-<space>.hf.space/webhooks/personal-email/inbound,
 # or your own domain once that's wired up).
 [vars]
-MESSA_WEBHOOK_URL = "https://live.textmessa.com/webhooks/personal-email/inbound"
+MESSA_WEBHOOK_URL = "https://vin999-aimessage.hf.space/webhooks/personal-email/inbound"
 
 # The actual secret is set separately (never committed to source):
 #   wrangler secret put MESSA_WEBHOOK_SECRET
