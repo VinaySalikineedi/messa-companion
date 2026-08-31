@@ -546,6 +546,10 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
   .dash-card.schedule {{ grid-column: 1 / -1; }}
   .dash-card-head {{
     flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.6rem;
     padding: 0.8rem 1rem;
     font-weight: 600;
     font-size: 0.92rem;
@@ -554,6 +558,25 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
     border-bottom: 1px solid var(--border-soft);
   }}
   [data-style="terminal"] .dash-card-head::before {{ content: "$ "; color: var(--muted); }}
+  .dash-card-title-text {{ min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  .week-nav {{ flex: 0 0 auto; display: flex; align-items: center; gap: 0.35rem; }}
+  .week-nav-btn {{
+    appearance: none;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    font: inherit;
+    font-size: 0.8rem;
+    font-weight: 600;
+    line-height: 1;
+    padding: 0.25rem 0.55rem;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    transition: background-color 0.15s ease, border-color 0.15s ease;
+  }}
+  .week-nav-btn:hover {{ border-color: var(--accent); color: var(--accent); }}
+  .week-nav-today {{ font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.03em; color: var(--muted); }}
+  .week-nav-today:hover {{ color: var(--accent); }}
   .dash-card-body {{ padding: 0.5rem 0; }}
   .dash-card:not(.schedule) .dash-card-body {{ padding: 0.7rem 1rem 0.9rem; }}
   .dash-empty {{
@@ -1177,6 +1200,11 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
   // server.py's /live/<token>/dashboard and the module docstring above).
   // ---------------------------------------------------------------------
   var dashShownState = "loading"; // "loading" | "invalid" | "grid"
+  var dashWeekOffset = 0; // weeks forward(+)/back(-) from the current week --
+                           // the schedule card's prev/next arrows change
+                           // this and refetch immediately (see changeWeek/
+                           // goToToday below); server.py's own
+                           // DASHBOARD_WEEK_OFFSET_MAX bounds it further.
   var openDays = {{}}; // date string -> bool: remembers which schedule days
                        // the user expanded/collapsed across polls, since
                        // renderDashboard rebuilds the whole card every poll
@@ -1224,7 +1252,7 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
     body.className = "dash-card-body";
     card.appendChild(head);
     card.appendChild(body);
-    return {{ card: card, body: body }};
+    return {{ card: card, head: head, body: body }};
   }}
 
   function dashEmpty(text) {{
@@ -1235,7 +1263,39 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
   }}
 
   function buildScheduleCard(week) {{
-    var built = dashCard((week && week.label) || "This week", "schedule");
+    var built = dashCard("", "schedule");
+    built.head.textContent = ""; // clear the plain-text title dashCard set -- built manually below so the nav buttons can sit alongside it
+    var titleSpan = document.createElement("span");
+    titleSpan.className = "dash-card-title-text";
+    titleSpan.textContent = (week && week.label) || "This week";
+    built.head.appendChild(titleSpan);
+
+    var nav = document.createElement("span");
+    nav.className = "week-nav";
+    var prevBtn = document.createElement("button");
+    prevBtn.type = "button";
+    prevBtn.className = "week-nav-btn";
+    prevBtn.setAttribute("aria-label", "Previous week");
+    prevBtn.textContent = "\\u2039";
+    prevBtn.addEventListener("click", function () {{ changeWeek(-1); }});
+    nav.appendChild(prevBtn);
+    if (dashWeekOffset !== 0) {{
+      var todayBtn = document.createElement("button");
+      todayBtn.type = "button";
+      todayBtn.className = "week-nav-btn week-nav-today";
+      todayBtn.textContent = "Today";
+      todayBtn.addEventListener("click", function () {{ goToToday(); }});
+      nav.appendChild(todayBtn);
+    }}
+    var nextBtn = document.createElement("button");
+    nextBtn.type = "button";
+    nextBtn.className = "week-nav-btn";
+    nextBtn.setAttribute("aria-label", "Next week");
+    nextBtn.textContent = "\\u203a";
+    nextBtn.addEventListener("click", function () {{ changeWeek(1); }});
+    nav.appendChild(nextBtn);
+    built.head.appendChild(nav);
+
     var list = document.createElement("div");
     list.className = "day-list";
     var days = (week && week.days) || [];
@@ -1331,11 +1391,19 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
     return dashItem(p.title || "Untitled project", p.status);
   }}
   function renderContactItem(c) {{
-    return dashItem(c.name || "Contact", c.relationship);
+    var meta = [c.relationship, c.phone_number, c.email].filter(Boolean).join(" \\u00b7 ");
+    return dashItem(c.name || "Contact", meta);
   }}
 
   function renderDashboard(data) {{
     ensureDashboardGridShown();
+    // Keep the client's own offset in sync with whatever the server
+    // actually honored (it clamps to DASHBOARD_WEEK_OFFSET_MAX) -- falls
+    // back to leaving it alone if an older cached response somehow lacks
+    // the field, rather than resetting to 0 under the user.
+    if (data.week && typeof data.week.week_offset === "number") {{
+      dashWeekOffset = data.week.week_offset;
+    }}
     var grid = document.getElementById("dashGrid");
     if (!grid) return;
     grid.innerHTML = "";
@@ -1346,9 +1414,9 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
     grid.appendChild(buildListCard("Contacts", data.contacts, renderContactItem, "No contacts yet."));
   }}
 
-  function pollDashboard() {{
-    if (stopped) return;
-    fetch("/live/" + TOKEN + "/dashboard", {{cache: "no-store"}})
+  function fetchDashboard() {{
+    if (stopped) return Promise.resolve();
+    return fetch("/live/" + TOKEN + "/dashboard?week_offset=" + dashWeekOffset, {{cache: "no-store"}})
       .then(function (res) {{
         if (res.status === 404) {{
           stopped = true;
@@ -1358,10 +1426,26 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
         }}
         return res.json().then(function (data) {{ renderDashboard(data); }});
       }})
-      .catch(function () {{ /* transient network hiccup -- next tick retries */ }})
-      .then(function () {{
-        if (!stopped) setTimeout(pollDashboard, DASHBOARD_POLL_MS);
-      }});
+      .catch(function () {{ /* transient network hiccup -- next tick retries */ }});
+  }}
+
+  // Prev/next/Today buttons in the schedule card's own header (see
+  // buildScheduleCard) call these directly, so a click refetches right
+  // away instead of waiting for the next 30s poll tick.
+  function changeWeek(delta) {{
+    dashWeekOffset += delta;
+    fetchDashboard();
+  }}
+  function goToToday() {{
+    dashWeekOffset = 0;
+    fetchDashboard();
+  }}
+
+  function pollDashboard() {{
+    if (stopped) return;
+    fetchDashboard().then(function () {{
+      if (!stopped) setTimeout(pollDashboard, DASHBOARD_POLL_MS);
+    }});
   }}
 
   // ---- Emails page: Inbox/Sent list + click-to-open thread view of

@@ -44,6 +44,27 @@ from .common import last_ai_text, trace_all
 LABEL = "executive_assistant"
 
 
+def _format_contact_line(r: dict[str, Any]) -> str:
+    """Shared by list_contacts and find_contact-style lookups: name +
+    relationship + notes + (phone_number/email if migrations/
+    017_contacts_phone_email.sql has run and the contact has one on file --
+    silently omitted otherwise, not shown as blank/None)."""
+    parts = [r["name"]]
+    if r.get("relationship_type"):
+        parts.append(f"({r['relationship_type']})")
+    line = " ".join(parts)
+    extra = []
+    if r.get("phone_number"):
+        extra.append(f"phone: {r['phone_number']}")
+    if r.get("email"):
+        extra.append(f"email: {r['email']}")
+    if r.get("notes"):
+        extra.append(r["notes"])
+    if extra:
+        line += " -- " + "; ".join(extra)
+    return line
+
+
 def build_executive_tools(
     user: UserContext, written: Optional[list[tuple[str, datetime]]] = None
 ) -> list[BaseTool]:
@@ -108,15 +129,12 @@ def build_executive_tools(
 
     @tool
     async def list_contacts() -> str:
-        """List the people/contacts the user has told Messa about."""
+        """List the people/contacts the user has told Messa about, including
+        any saved phone number/email."""
         rows = await db.list_people(uid)
         if not rows:
             return "No contacts found."
-        return "\n".join(
-            f"{r['name']}" + (f" ({r['relationship_type']})" if r["relationship_type"] else "")
-            + (f" -- {r['notes']}" if r["notes"] else "")
-            for r in rows
-        )
+        return "\n".join(_format_contact_line(r) for r in rows)
 
     # ---- direct writes: tasks, reminders, notes, contacts -- no confirmation ----
 
@@ -192,10 +210,20 @@ def build_executive_tools(
 
     @tool
     async def upsert_contact(
-        name: str, relationship_type: Optional[str] = None, notes: Optional[str] = None
+        name: str,
+        relationship_type: Optional[str] = None,
+        notes: Optional[str] = None,
+        phone_number: Optional[str] = None,
+        email: Optional[str] = None,
     ) -> str:
-        """Create or update a contact by name. Does not require confirmation."""
-        row = await db.upsert_person(uid, name, relationship_type, notes)
+        """Create or update a contact by name. Does not require confirmation.
+        Save phone_number/email whenever the user mentions them (e.g. "Sam's
+        email is sam@x.com", "save John's number as 555-1234") -- that's
+        what lets Messa later resolve "email Sam" or "text John" to a real
+        address/number without asking again. Only non-null fields change on
+        an update -- passing nothing for phone_number/email leaves whatever
+        was already saved untouched."""
+        row = await db.upsert_person(uid, name, relationship_type, notes, phone_number, email)
         return f"Saved contact '{row['name']}' (#{row['id']})."
 
     @tool

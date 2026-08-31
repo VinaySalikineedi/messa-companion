@@ -381,14 +381,27 @@ def _format_due_local(dt: datetime | None, tz: ZoneInfo) -> str | None:
     return f"{date_part}, {_format_time_local(dt, tz)}"
 
 
+DASHBOARD_WEEK_OFFSET_MAX = 52  # a little over a year out either direction -- plenty for real use, cheap to bound
+
+
 @app.get("/live/{token}/dashboard")
-async def live_view_dashboard(token: str) -> JSONResponse:
+async def live_view_dashboard(token: str, week_offset: int = 0) -> JSONResponse:
     """Polled by the dashboard page (the second toggle-able page on
     /live/<token> -- see live_view_page.py) on its own, slower cadence than
     the browsing status route, since tasks/reminders/projects/contacts/
     schedule change far less often than a live browsing session does. 404
     for an unknown token, same "don't let a bad link quietly look valid"
-    reasoning as /live/<token>/status."""
+    reasoning as /live/<token>/status.
+
+    `week_offset`: how many weeks forward (positive) or back (negative)
+    from the CURRENT week to show -- the page's own prev/next arrows
+    increment/decrement this and refetch, letting the user actually browse
+    their schedule instead of only ever seeing a fixed "this week". Clamped
+    to +/-DASHBOARD_WEEK_OFFSET_MAX so a malformed/huge value can't force a
+    query for a wildly distant week. `is_today` on each day is still
+    computed against the REAL current date regardless of `week_offset`, so
+    it only ever lights up when offset=0 actually contains today -- it
+    never claims some other day in a different week is "today"."""
     user = await db.get_user_by_live_token(token)
     if user is None:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -401,7 +414,9 @@ async def live_view_dashboard(token: str) -> JSONResponse:
         user_tz_name = config.DEFAULT_TIMEZONE
         tz = ZoneInfo(user_tz_name)
 
-    week_start_utc, week_end_utc = _week_bounds_utc(user_tz_name)
+    safe_week_offset = max(-DASHBOARD_WEEK_OFFSET_MAX, min(week_offset, DASHBOARD_WEEK_OFFSET_MAX))
+    shifted_now = datetime.now(ZoneInfo("UTC")) + timedelta(weeks=safe_week_offset)
+    week_start_utc, week_end_utc = _week_bounds_utc(user_tz_name, now=shifted_now)
 
     tasks, reminders, projects, contacts, week_events = await asyncio.gather(
         db.list_tasks(user_id),
@@ -440,6 +455,7 @@ async def live_view_dashboard(token: str) -> JSONResponse:
         "week": {
             "label": f"{days[0]['label']} – {days[6]['label']}, {week_start_utc.astimezone(tz).year}",
             "days": days,
+            "week_offset": safe_week_offset,
         },
         "tasks": [
             {
@@ -469,6 +485,11 @@ async def live_view_dashboard(token: str) -> JSONResponse:
                 "name": c.get("name"),
                 "relationship": c.get("relationship_type"),
                 "notes": c.get("notes"),
+                # Present (as None) even pre-migration-017 -- .get() on a
+                # row that never had the column just returns None, same as
+                # every other optional field here.
+                "phone_number": c.get("phone_number"),
+                "email": c.get("email"),
             }
             for c in contacts
         ],
@@ -546,9 +567,16 @@ async def live_view_emails(
     offset: int = 0,
 ) -> JSONResponse:
     """Polled by the Emails page (see live_view_page.py) for its Inbox/Sent
-    list. `direction`: "inbox" or "sent" -- anything else (including
-    omitted) returns both directions. `q`: optional free-text search
-    against subject/body, same matching as search_my_emails. `limit`/
+    list. Each row is one THREAD (db.list_email_threads), not one message --
+    per explicit product feedback, a per-message list split one
+    conversation into confusing fragments scattered across both tabs;
+    every row now previews its thread's own latest message, and Inbox/Sent
+    membership means "this thread has at least one message in that
+    direction" (Gmail-style: a conversation with a reply legitimately
+    shows up under both tabs, always previewing the same latest message).
+    `direction`: "inbox" or "sent" -- anything else (including omitted)
+    returns both. `q`: optional free-text search against subject/body of
+    ANY message in the thread, same matching as search_my_emails. `limit`/
     `offset`: pagination for the page's "load more" button -- `limit` is
     capped server-side (EMAILS_PAGE_SIZE_MAX) regardless of what's
     requested, so a malformed/huge value from the client can't force one
@@ -572,7 +600,7 @@ async def live_view_emails(
 
     # Fetch one extra row to know whether there's a next page, without a
     # separate COUNT query -- trimmed back to capped_limit before returning.
-    rows = await db.search_personal_emails(
+    rows = await db.list_email_threads(
         user_id,
         query=(q.strip() if q and q.strip() else None),
         direction=db_direction,

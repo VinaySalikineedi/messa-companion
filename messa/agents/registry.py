@@ -51,7 +51,7 @@ from ..tools.deepsearch_tools import build_deepsearch_subagent
 from ..tools.common import trace_all
 from ..tools.document_tools import DOCUMENT_SYSTEM_PROMPT, build_document_tools
 from ..tools.email_tools import build_email_subagent
-from ..tools.executive_tools import build_executive_subagent
+from ..tools.executive_tools import _format_contact_line, build_executive_subagent
 from ..tools.personal_inbox_tools import build_personal_inbox_system_prompt, build_personal_inbox_tools
 from ..tools.routines_tools import ROUTINES_SYSTEM_PROMPT, build_routines_tools
 from ..tools.web_search_tools import build_web_search_tools
@@ -189,10 +189,29 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
             for r in rows
         )
 
+    @tool
+    async def find_contact(name: str) -> str:
+        """Look up a saved contact by name (partial/case-insensitive match,
+        e.g. "sam" matches a saved "Samantha Lee") to get their phone
+        number/email -- call this FIRST whenever the user names someone by
+        name for an email or text ("email Sam about the invoice", "text
+        John I'm running late") WITHOUT also giving you their actual
+        address/number, so you can resolve it yourself instead of asking
+        the user to repeat something they already told Messa once. A
+        direct tool (not a delegation) since this is a cheap lookup, not a
+        multi-step task. If it returns more than one match, ask the user
+        which one they meant before sending anything. If no saved contact
+        has the info you need (or none exists at all), ask the user for it
+        directly -- don't guess an address/number."""
+        rows = await db.find_person_by_name(uid, name)
+        if not rows:
+            return f"No saved contact matching '{name}'."
+        return "\n".join(_format_contact_line(r) for r in rows)
+
     raw_tools: list[BaseTool] = [
         confirm_pending_action, reject_pending_action, list_pending_actions,
         track_project, list_active_projects, save_profile_info, set_default_email_provider,
-        list_deepsearch_sessions,
+        list_deepsearch_sessions, find_contact,
         *build_web_search_tools(),
     ]
     return trace_all(raw_tools, ORCHESTRATOR_LABEL)
@@ -325,6 +344,13 @@ def _build_system_prompt(user: config.UserContext) -> str:
         "user's default/named inbox is Gmail and they want a document attached, tell them "
         "plainly that attachments only work from their Messa address right now and offer to "
         "send it from there instead.\n\n"
+        "Contacts: when the user names someone by name for an email or text ('email Sam about "
+        "the invoice', 'text John I'm running late') without also giving you their actual "
+        "address/number, call find_contact(name) FIRST to resolve it before delegating -- don't "
+        "ask the user to repeat something they may have already told you. If it finds more than "
+        "one match, ask which one before sending anything; if it finds none (or finds the "
+        "contact but not the info you actually need), ask the user directly rather than "
+        "guessing or inventing an address/number.\n\n"
         "Speed matters: you also have web_search and fetch_page_text as your OWN direct tools "
         "(no delegation, no browser, answers in a second or two) -- use them for a plain "
         "factual lookup (a fact, news, a definition, 'who is X') instead of delegating to "

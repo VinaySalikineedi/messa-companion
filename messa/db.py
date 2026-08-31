@@ -620,9 +620,22 @@ async def get_due_reminders_for_delivery(now: datetime | None = None) -> list[di
 
 
 async def mark_reminder_sent(reminder_id: int) -> None:
+    """Called once a reminder has actually been delivered to the user (see
+    server.py's _production_reminder_loop and background.py's CLI-only
+    preview poller). Deletes the row outright rather than merely flipping
+    its status to 'sent' (the previous behavior) -- explicit product
+    decision: a reminder that already did its job (told the user something,
+    at the time they needed to hear it) has no further use sitting around,
+    and leaving it behind read as confusing clutter rather than history.
+    reminder_status's 'sent' enum value is left defined (an enum value is
+    never dropped once shipped) but nothing writes it anymore -- delete
+    captures "this fired" more directly than a status a UI still has to
+    know to filter out. A reminder that's somehow already gone by the time
+    this runs is a silent no-op, same as every other id-keyed delete in
+    this file (e.g. delete_task) -- not an error worth surfacing."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute("UPDATE reminders SET status = 'sent' WHERE id = $1", reminder_id)
+        await conn.execute("DELETE FROM reminders WHERE id = $1", reminder_id)
 
 
 async def create_reminder(
@@ -760,23 +773,55 @@ async def delete_note(user_id: int, note_id: int) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 async def upsert_person(
-    user_id: int, name: str, relationship_type: str | None = None, notes: str | None = None
+    user_id: int,
+    name: str,
+    relationship_type: str | None = None,
+    notes: str | None = None,
+    phone_number: str | None = None,
+    email: str | None = None,
 ) -> dict[str, Any]:
+    """`phone_number`/`email` (migrations/017_contacts_phone_email.sql) let
+    Messa actually reach a saved contact later -- e.g. resolving "email Sam
+    about the invoice" to Sam's own saved address via find_person_by_name
+    below, without the user having to repeat it every time. Guarded by
+    _has_column so a deployment that hasn't run migration 017 yet still
+    saves the columns it already understands (name/relationship_type/
+    notes) instead of erroring on the whole call -- same degrade-gracefully
+    pattern as everywhere else in this file that adds columns to an
+    existing table."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """
-            INSERT INTO people (user_id, name, relationship_type, notes)
-            VALUES ($1, $2, $3, $4)
-            ON CONFLICT ON CONSTRAINT uq_people_user_name
-            DO UPDATE SET
-                relationship_type = COALESCE(EXCLUDED.relationship_type, people.relationship_type),
-                notes = COALESCE(EXCLUDED.notes, people.notes),
-                updated_at = NOW()
-            RETURNING *
-            """,
-            user_id, name, relationship_type, notes,
-        )
+        has_contact_info = await _has_column(conn, "people", "phone_number")
+        if has_contact_info:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO people (user_id, name, relationship_type, notes, phone_number, email)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT ON CONSTRAINT uq_people_user_name
+                DO UPDATE SET
+                    relationship_type = COALESCE(EXCLUDED.relationship_type, people.relationship_type),
+                    notes = COALESCE(EXCLUDED.notes, people.notes),
+                    phone_number = COALESCE(EXCLUDED.phone_number, people.phone_number),
+                    email = COALESCE(EXCLUDED.email, people.email),
+                    updated_at = NOW()
+                RETURNING *
+                """,
+                user_id, name, relationship_type, notes, phone_number, email,
+            )
+        else:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO people (user_id, name, relationship_type, notes)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT ON CONSTRAINT uq_people_user_name
+                DO UPDATE SET
+                    relationship_type = COALESCE(EXCLUDED.relationship_type, people.relationship_type),
+                    notes = COALESCE(EXCLUDED.notes, people.notes),
+                    updated_at = NOW()
+                RETURNING *
+                """,
+                user_id, name, relationship_type, notes,
+            )
         return dict(row)
 
 
@@ -784,6 +829,26 @@ async def list_people(user_id: int) -> list[dict[str, Any]]:
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT * FROM people WHERE user_id = $1 ORDER BY name", user_id)
+        return _rows(rows)
+
+
+async def find_person_by_name(user_id: int, name: str) -> list[dict[str, Any]]:
+    """Case-insensitive, partial-match contact lookup -- e.g. "Sam" matches
+    a saved "Samantha Lee" -- for resolving a name the user mentioned
+    ("email Sam about the invoice") to a saved phone_number/email before
+    delegating to whichever email/text subagent actually sends it. Returns
+    EVERY match, not just the first: a caller with two "Sam"s saved can
+    then ask the user which one instead of silently guessing wrong. An
+    empty list means no contact by that name exists yet. Works fine
+    pre-migration-017 too (no phone_number/email columns yet) -- those two
+    keys are just absent/None on the returned rows rather than the whole
+    call erroring, same pattern as upsert_person above."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM people WHERE user_id = $1 AND name ILIKE $2 ORDER BY name",
+            user_id, f"%{name}%",
+        )
         return _rows(rows)
 
 
@@ -1840,6 +1905,81 @@ async def search_personal_emails(
             SELECT * FROM messa_email_messages
             WHERE {' AND '.join(conditions)}
             ORDER BY created_at DESC LIMIT ${limit_idx} OFFSET ${offset_idx}
+            """,
+            *args,
+        )
+        return _rows(rows)
+
+
+async def list_email_threads(
+    user_id: int,
+    direction: str | None = None,
+    query: str | None = None,
+    limit: int = 25,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    """One row per THREAD (not per message) -- the whole conversation's own
+    latest message, regardless of that message's own direction -- for the
+    live-view Emails page's Inbox/Sent list (server.py's /live/<token>/emails
+    route). Per explicit product feedback: showing one row per individual
+    message split a single back-and-forth conversation into fragments
+    scattered across both tabs, which read as confusing next to a real mail
+    app's behavior (Gmail-style: a conversation is one row, wherever it
+    shows up, always previewing whatever was said last in it).
+
+    `direction` here means "include this thread if EITHER endpoint has ever
+    used it in that direction" -- 'inbound' for Inbox (any thread with at
+    least one message that arrived), 'outbound' for Sent (any thread with
+    at least one message you/Messa sent) -- NOT "only show messages of this
+    direction". A thread with both directions (the common case once
+    there's been a reply) legitimately appears in both tabs, each time
+    previewing the SAME latest message regardless of which tab it's shown
+    under -- exactly like Gmail shows the same conversation under both
+    Inbox and Sent once you've replied to it. `query` matches if ANY
+    message anywhere in the thread's subject/body matches, not just the
+    previewed one -- finding a thread by something said earlier in it, even
+    if the latest reply does't mention it, is expected mail-app behavior.
+
+    Implemented as one query: filter down to qualifying threads first (via
+    membership subqueries against thread_id, so filtering never restricts
+    away messages from other parts of the SAME qualifying thread), then
+    pick each thread's single latest row with ROW_NUMBER() OVER (PARTITION
+    BY thread_id ORDER BY created_at DESC), then page over just those
+    picked rows -- no separate query for "list threads" vs "get the latest
+    message in each"."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "messa_email_messages"):
+            return []
+        conditions = ["user_id = $1"]
+        args: list[Any] = [user_id]
+        if direction in ("inbound", "outbound"):
+            args.append(direction)
+            conditions.append(
+                f"thread_id IN (SELECT thread_id FROM messa_email_messages "
+                f"WHERE user_id = $1 AND direction = ${len(args)})"
+            )
+        if query:
+            args.append(f"%{query}%")
+            q_idx = len(args)
+            conditions.append(
+                f"thread_id IN (SELECT thread_id FROM messa_email_messages "
+                f"WHERE user_id = $1 AND (subject ILIKE ${q_idx} OR body_text ILIKE ${q_idx}))"
+            )
+        args.append(limit)
+        limit_idx = len(args)
+        args.append(offset)
+        offset_idx = len(args)
+        rows = await conn.fetch(
+            f"""
+            SELECT * FROM (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY thread_id ORDER BY created_at DESC) AS rn
+                FROM messa_email_messages
+                WHERE {' AND '.join(conditions)}
+            ) latest_per_thread
+            WHERE rn = 1
+            ORDER BY created_at DESC
+            LIMIT ${limit_idx} OFFSET ${offset_idx}
             """,
             *args,
         )

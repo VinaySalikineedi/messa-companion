@@ -3696,3 +3696,130 @@ calendar dates (the week of Aug 24-30, 2026) instead of passing an explicit
 so it silently starts failing once the real calendar moves past that week
 (confirmed: it fails as of Aug 31, 2026, a pre-existing test-fixture
 expiry unrelated to anything in this phase, not a regression from it).
+
+## Four fixes from live testing: threaded Inbox/Sent, a real weekly-schedule navigator, contacts with phone/email, and reminders that actually clear themselves
+
+All four are direct product feedback after trying the previous phase's
+Emails page and Dashboard live.
+
+**Emails page: one row per thread, not per message.** The previous
+implementation listed individual `messa_email_messages` rows filtered by
+`direction` -- a single back-and-forth conversation showed up as separate
+fragments scattered across Inbox and Sent, which read as confusing next to
+how a real mail app behaves. `db.list_email_threads` (new, alongside the
+still-used-elsewhere `search_personal_emails`) replaces it for the list
+view: one row per `thread_id`, always previewing that thread's own LATEST
+message regardless of that message's own direction, computed in a single
+query via `ROW_NUMBER() OVER (PARTITION BY thread_id ORDER BY created_at
+DESC)` after first narrowing to qualifying threads through membership
+subqueries (so filtering never accidentally excludes an earlier message
+from a thread that still qualifies). `direction` here means "Inbox = any
+thread with at least one inbound message, Sent = any thread with at least
+one outbound message" -- NOT "only inbound/outbound messages" -- so a
+thread you've replied to legitimately shows up under both tabs, each time
+previewing the exact same latest message, exactly like Gmail keeps a
+conversation visible under both Inbox and Sent once there's been a reply.
+`query` now matches against ANY message in the thread, not just the
+previewed one, so a thread is still findable by something said earlier in
+it. `server.py`'s `/live/<token>/emails` route just swapped which db
+function it calls -- the JSON shape, the thread-detail route
+(`/live/<token>/emails/thread`, already always returning the FULL
+chronological thread regardless of direction), and every bit of the
+page's own JS were already correct and needed no changes at all; the
+fragmentation was purely a list-query problem.
+
+**Dashboard schedule: working prev/next/Today navigation.** The schedule
+card was permanently locked to "this week," computed fresh every poll with
+no way to look at any other week. `server.py`'s `/live/<token>/dashboard`
+route now takes a `week_offset` query param (weeks forward/back from the
+real current week, clamped to `+/-DASHBOARD_WEEK_OFFSET_MAX` so a
+malformed/huge value can't force a query for a wildly distant week) and
+shifts `_week_bounds_utc`'s own `now` argument by that many weeks before
+computing the range -- `is_today` on each day is still computed against
+the ACTUAL current date regardless of `week_offset`, so it only ever lights
+up on a day that's really today, never claims some other week's matching
+weekday is "today." The response now also echoes back the `week_offset` it
+actually honored (post-clamp), so the client can stay in sync even if it
+requested something out of range. On the page itself, the schedule card
+builds its own header now (instead of `dashCard`'s plain-text one) with
+"‹"/"›" buttons plus a "Today" button that only appears once you've
+navigated away from the current week -- clicking any of them updates a
+small `dashWeekOffset` client-side variable and refetches immediately
+(factored `fetchDashboard()` out of the polling loop so both the 30s
+background poll and an explicit user click share the same fetch/render
+path) rather than waiting for the next background poll tick. Reuses the
+existing theme variables throughout, same as everything else on this page.
+
+**Contacts can now carry a phone number and email.** The `people` table
+(part of the original base schema, `neon-schema.sql` -- itself never
+touched again after initial creation, per this project's additive-only
+migration philosophy; all evolution since has lived entirely in
+`migrations/*.sql`) only ever had name/relationship/notes.
+`migrations/017_contacts_phone_email.sql` adds nullable `phone_number`/
+`email` columns; `db.upsert_person` gained matching parameters (guarded by
+`_has_column`, so a deployment that hasn't run migration 017 yet still
+saves what it already understood instead of erroring on the whole call),
+and a new `db.find_person_by_name` does a case-insensitive partial-name
+lookup returning every match (not just the first), so an ambiguous name
+can be flagged back to the user rather than silently guessing wrong. This
+is what actually closes the loop on "Messa can access it when the user
+specifies a name and sends email": a new orchestrator-level DIRECT tool
+(`find_contact`, `agents/registry.py`) -- a plain lookup, not a
+delegation, same "cheap enough not to need a whole subagent round trip"
+reasoning as the existing `web_search`/`fetch_page_text` direct tools --
+calls `find_person_by_name` and formats the result. The main system
+prompt now tells Messa to call `find_contact` FIRST whenever the user
+names someone by name for an email or text without also giving an actual
+address/number ("email Sam about the invoice"), ask which one if it finds
+more than one match, and ask the user directly (never guess or invent an
+address) if it finds none or finds the contact but not the info actually
+needed. `executive_tools.py`'s existing `upsert_contact`/`list_contacts`
+tools got the matching parameter/formatting updates (a shared
+`_format_contact_line` helper, reused by `find_contact` too so the two
+surfaces describe a contact identically), and the dashboard's own Contacts
+card now shows phone/email in its meta line as well.
+
+**Reminders actually clear themselves once delivered.** `db.
+mark_reminder_sent` used to just flip a reminder's `status` to `'sent'` --
+technically excluded from the dashboard's own `status='pending'` query and
+`executive_tools.py`'s default `list_reminders()` call, but the row itself
+stuck around indefinitely, which read as confusing leftover clutter rather
+than something that had cleanly finished its job. Per explicit product
+decision, it now `DELETE`s the row outright the moment delivery succeeds
+(`server.py`'s `_production_reminder_loop`, and `background.py`'s
+CLI-only preview poller, both already called this same function -- neither
+needed to change). `reminder_status`'s `'sent'` enum value is left defined
+(an enum value already shipped is never dropped) but nothing writes it
+going forward; a reminder that's somehow already gone by the time this
+runs is a silent no-op, same as every other id-keyed delete already in
+this file.
+
+**Verification.** `db.list_email_threads`' actual grouping/direction-
+membership/search logic (not just the route wrapped around it) is covered
+against a small fake connection that models a realistic multi-thread,
+mixed-direction inbox in a new `/tmp/test_emails_dashboard_route.py` part:
+a thread with both directions previews its true latest message and
+correctly appears under both Inbox and Sent with the identical preview
+either way; an inbound-only thread is Inbox-only; an outbound-only thread
+is Sent-only; search matches an older message in a thread; pagination
+pages over threads, not raw rows; and it no-ops pre-migration. The same
+file's route-level part (now pointed at `list_email_threads` instead of
+the old `search_personal_emails`) and a new part for the dashboard's
+`week_offset` (defaults to 0, round-trips in the response, shifts the
+requested date range by exactly one week per step in either direction,
+and is clamped server-side against an absurd value) both pass, and
+`test_dashboard_toggle.py`'s real-rendered-DOM check confirms the new
+"‹"/"›" controls actually render inside the schedule card's own heading.
+A new `/tmp/test_reminder_autodelete_and_contacts.py` covers
+`mark_reminder_sent`'s delete behavior (including the already-gone-id
+no-op case), `upsert_person`'s new fields (including that a later update
+with no phone/email given never clobbers what's already saved, and the
+pre-migration-017 degrade-gracefully path), `find_person_by_name`'s
+case-insensitive partial matching, and the `find_contact` tool end to end
+(an ambiguous two-match case, a specific single match, and a no-match
+case). **Not verified here**, same caveat as always: a real click-through
+of the week-nav buttons and the Emails page's thread-grouped list against
+a live rendered browser DOM (`test_dashboard_toggle.py` covers the
+schedule card's markup rendering, not a real click on the new buttons),
+and a real end-to-end "email Sam" request against a live model actually
+calling `find_contact` unprompted in the middle of a real conversation.
