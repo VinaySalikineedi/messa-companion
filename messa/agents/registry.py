@@ -314,7 +314,6 @@ async def build_orchestrator(
     approval_gate: ApprovalGate | None = None,
     model: Any = None,
     subagent_model: Any = None,
-    inbound_email: dict | None = None,
 ) -> Any:
     """`model` is Messa's own orchestrator model (config.ORCHESTRATOR_MODEL_NAME
     by default); `subagent_model` is what every subagent below uses instead
@@ -322,15 +321,7 @@ async def build_orchestrator(
     these are deliberately two different models now rather than one shared
     instance. Both params exist mainly so tests can inject fakes for either
     or both independently; real callers (cli.py, server.py) just omit them
-    and get the configured defaults.
-
-    `inbound_email` is passed straight through to
-    tools.personal_inbox_tools.build_personal_inbox_tools -- non-None ONLY
-    for the one turn server.py's inbound-personal-email webhook triggers,
-    which is what conditionally grants personal_inbox_agent its
-    reply_to_this_email tool for just that turn (see that module's
-    docstring). Every other caller omits it and gets the always-on
-    get_my_messa_email/send_email pair only."""
+    and get the configured defaults."""
     approval_gate = approval_gate or CLIApprovalGate()
     # effective_context_tokens: see config.py's big comment above
     # SUBAGENT_EFFECTIVE_CONTEXT_TOKENS/ORCHESTRATOR_EFFECTIVE_CONTEXT_TOKENS
@@ -368,7 +359,7 @@ async def build_orchestrator(
                 "emails from it, and replying to anything that lands in it."
             ),
             "system_prompt": PERSONAL_INBOX_SYSTEM_PROMPT,
-            "tools": build_personal_inbox_tools(user, approval_gate, inbound_email=inbound_email),
+            "tools": build_personal_inbox_tools(user, approval_gate),
             "model": subagent_model,
         },
         {

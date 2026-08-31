@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
@@ -1530,3 +1531,237 @@ async def record_inbound_personal_email(
             user_id, message_id, from_address, subject,
         )
         return row is not None
+
+
+# ---------------------------------------------------------------------------
+# Messa's own email: unified inbound+outbound thread log
+# (migrations/014_messa_email_messages.sql). Superseded the dedup-only
+# inbound_personal_emails table above for anything new -- that table is
+# left alone (a few already-tested rows, no further writes), dedup for new
+# inbound mail now happens against THIS table's message_id UNIQUE
+# constraint instead (log_inbound_personal_email's ON CONFLICT). See
+# tools/personal_inbox_tools.py for how Messa actually uses this (thread
+# history recall, search, and reply_to_email looking up who to reply to).
+# ---------------------------------------------------------------------------
+
+def _compute_thread_id(message_id: str, in_reply_to: str | None, references: str | None) -> str:
+    """The standard convention: the FIRST entry in a message's References
+    header is the root message's own Message-ID, so that's the thread_id --
+    every reply in a well-behaved chain carries the same first entry
+    (References only ever grows by appending, never reordering), so this is
+    a pure function of a message's own headers with no DB lookup needed:
+    every message in a chain resolves to the same thread_id regardless of
+    what order we happen to see them in.
+
+    Falls back to In-Reply-To (a reply whose client only set that header,
+    not References -- less common but real) if References is empty, and
+    finally to the message's own message_id if neither is present, meaning
+    it's starting a new thread.
+
+    Known limitation, not fixed here: a mail client/list server that strips
+    References entirely (some do) makes that reply look like a new thread
+    rather than continuing the old one. Not building a subject-line
+    fallback preemptively -- add one later if this turns out to matter in
+    practice."""
+    refs = (references or "").split()
+    if refs:
+        return refs[0]
+    if in_reply_to and in_reply_to.strip():
+        return in_reply_to.strip()
+    return message_id
+
+
+def _generate_message_id(domain: str) -> str:
+    """A fresh RFC 5322-shaped Message-ID for a message that arrived
+    without a usable one (rare -- malformed mail) or that we're about to
+    send ourselves (channels/resend.py calls this directly, not through
+    log_inbound_personal_email)."""
+    return f"<{uuid.uuid4()}@{domain}>"
+
+
+async def log_inbound_personal_email(
+    user_id: int,
+    message_id: str | None,
+    from_address: str,
+    to_address: str,
+    subject: str | None,
+    body_text: str | None,
+    in_reply_to: str | None = None,
+    references: str | None = None,
+    raw_json: str | None = None,
+) -> dict[str, Any] | None:
+    """Durable write + dedup in one step: ON CONFLICT (message_id) DO
+    NOTHING means a redelivered webhook (see migrations/014's docstring)
+    returns None here instead of creating a second row or re-triggering a
+    turn -- server.py's webhook route uses this same call for both
+    persistence and the dedup check, rather than two separate steps.
+
+    A missing message_id (malformed mail, rare but real) gets a generated
+    one instead of being stored as NULL/empty -- the column is UNIQUE, so
+    every such message needs its own value or the second one would
+    silently collide and look like a duplicate of the first.
+
+    Returns the inserted row (including its computed thread_id) for a
+    genuinely new message; None for a duplicate, or if migration 014 hasn't
+    been applied yet."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "messa_email_messages"):
+            return None
+        real_message_id = message_id.strip() if message_id and message_id.strip() else _generate_message_id(
+            to_address.split("@", 1)[-1] or config.TEXTMESSA_EMAIL_DOMAIN
+        )
+        thread_id = _compute_thread_id(real_message_id, in_reply_to, references)
+        row = await conn.fetchrow(
+            """
+            INSERT INTO messa_email_messages
+                (user_id, direction, thread_id, message_id, in_reply_to, references_header,
+                 from_address, to_address, subject, body_text, raw_json)
+            VALUES ($1, 'inbound', $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ON CONFLICT (message_id) DO NOTHING
+            RETURNING *
+            """,
+            user_id, thread_id, real_message_id, in_reply_to, references,
+            from_address, to_address, subject, body_text, raw_json,
+        )
+        return dict(row) if row else None
+
+
+async def log_outbound_personal_email(
+    user_id: int,
+    message_id: str,
+    from_address: str,
+    to_address: str,
+    subject: str | None,
+    body_text: str | None,
+    in_reply_to: str | None = None,
+    references: str | None = None,
+    raw_json: str | None = None,
+    sent_autonomously: bool = False,
+) -> dict[str, Any] | None:
+    """Called by channels/resend.py after every successful send -- the
+    single choke point for outbound logging, so nothing that goes through
+    resend.send_email can be forgotten regardless of which tool/future
+    caller invoked it. `message_id` here is always the value resend.py
+    itself generated and set as the outbound Message-ID header (not
+    anything parsed back out of Resend's API response -- see that module's
+    docstring for why). No-ops (returns None) pre-migration, same as the
+    inbound counterpart."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "messa_email_messages"):
+            return None
+        thread_id = _compute_thread_id(message_id, in_reply_to, references)
+        row = await conn.fetchrow(
+            """
+            INSERT INTO messa_email_messages
+                (user_id, direction, thread_id, message_id, in_reply_to, references_header,
+                 from_address, to_address, subject, body_text, raw_json, sent_autonomously)
+            VALUES ($1, 'outbound', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            RETURNING *
+            """,
+            user_id, thread_id, message_id, in_reply_to, references,
+            from_address, to_address, subject, body_text, raw_json, sent_autonomously,
+        )
+        return dict(row) if row else None
+
+
+async def get_thread_messages(user_id: int, thread_id: str) -> list[dict[str, Any]]:
+    """Every message (both directions) in one thread, oldest first -- the
+    full conversation view personal_inbox_tools.py's get_thread_history
+    renders for Messa."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "messa_email_messages"):
+            return []
+        rows = await conn.fetch(
+            """
+            SELECT * FROM messa_email_messages
+            WHERE user_id = $1 AND thread_id = $2
+            ORDER BY created_at ASC
+            """,
+            user_id, thread_id,
+        )
+        return _rows(rows)
+
+
+async def find_thread_id_for_counterpart(user_id: int, counterpart_address: str) -> str | None:
+    """The most recent thread_id involving this external address, checked
+    on both sides (they emailed the user, or the user/Messa emailed them) --
+    what get_thread_history resolves "the thread with support@brand.com"
+    into before calling get_thread_messages. None if there's no history
+    with that address at all."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "messa_email_messages"):
+            return None
+        row = await conn.fetchrow(
+            """
+            SELECT thread_id FROM messa_email_messages
+            WHERE user_id = $1 AND (from_address ILIKE $2 OR to_address ILIKE $2)
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            user_id, counterpart_address.strip(),
+        )
+        return row["thread_id"] if row else None
+
+
+async def get_latest_inbound_message_in_thread(user_id: int, thread_id: str) -> dict[str, Any] | None:
+    """The most recent INBOUND row in this thread -- what reply_to_email
+    resolves who-to-reply-to (from_address), the subject, and the
+    Message-ID/References to thread a reply under, from. None if this
+    thread has no inbound messages at all (a thread Messa/the user started
+    outbound and nobody's replied to yet -- nothing to reply TO)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "messa_email_messages"):
+            return None
+        row = await conn.fetchrow(
+            """
+            SELECT * FROM messa_email_messages
+            WHERE user_id = $1 AND thread_id = $2 AND direction = 'inbound'
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            user_id, thread_id,
+        )
+        return dict(row) if row else None
+
+
+async def search_personal_emails(
+    user_id: int,
+    query: str | None = None,
+    since: datetime | None = None,
+    until: datetime | None = None,
+    limit: int = 25,
+) -> list[dict[str, Any]]:
+    """Free-text (subject/body ILIKE) plus an optional [since, until) time
+    range, most recent first -- the backing query for search_my_emails'
+    "did anything come in this morning after 9am" style asks. `since`/
+    `until` are already-resolved tz-aware datetimes (the tool itself runs
+    the model's date phrase through timeutil.to_local_aware before calling
+    this, same pattern as every other date-taking tool in this codebase)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "messa_email_messages"):
+            return []
+        conditions = ["user_id = $1"]
+        args: list[Any] = [user_id]
+        if query:
+            args.append(f"%{query}%")
+            conditions.append(f"(subject ILIKE ${len(args)} OR body_text ILIKE ${len(args)})")
+        if since is not None:
+            args.append(since)
+            conditions.append(f"created_at >= ${len(args)}")
+        if until is not None:
+            args.append(until)
+            conditions.append(f"created_at < ${len(args)}")
+        args.append(limit)
+        rows = await conn.fetch(
+            f"""
+            SELECT * FROM messa_email_messages
+            WHERE {' AND '.join(conditions)}
+            ORDER BY created_at DESC LIMIT ${len(args)}
+            """,
+            *args,
+        )
+        return _rows(rows)

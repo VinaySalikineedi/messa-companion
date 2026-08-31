@@ -25,6 +25,14 @@
 -- ON CONFLICT DO NOTHING insert to recognize a redelivery and skip
 -- re-processing it (no second agent turn, no second SMS about the same
 -- email) instead of trying to de-duplicate after the fact.
+--
+-- LEGACY as of migrations/014_messa_email_messages.sql: that migration's
+-- messa_email_messages table (its own message_id UNIQUE constraint) is now
+-- the dedup source server.py's webhook actually uses, and stores the full
+-- inbound+outbound thread besides. This table is left in place untouched
+-- (additive-only migration philosophy -- never renamed/dropped) but nothing
+-- writes to it anymore; db.record_inbound_personal_email still exists and
+-- still works, it's just unused in the live code path.
 
 ALTER TABLE users ADD COLUMN IF NOT EXISTS messa_email_local_part VARCHAR(64);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_users_messa_email_local_part
