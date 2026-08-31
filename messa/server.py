@@ -598,6 +598,8 @@ async def personal_email_inbound_webhook(
 
     to_address = (payload.get("to") or "").strip()
     from_address = (payload.get("from") or "").strip()
+    if "<" in to_address and ">" in to_address:
+        to_address = to_address.split("<", 1)[1].split(">", 1)[0].strip()
     if not to_address or not from_address:
         return JSONResponse({"status": "ignored (no to/from)"})
 
