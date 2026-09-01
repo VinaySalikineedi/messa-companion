@@ -34,6 +34,7 @@ import asyncio
 import base64
 import json
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
@@ -47,6 +48,7 @@ from .agents.registry import build_orchestrator
 from .approval import AutoApproveGate, DenyApprovalGate
 from .channels import browserbase, sendblue
 from .channels.sendblue import SendblueError
+from .landing_page import render_landing_page
 from .live_view_page import render_live_view_page
 from .tools import email_tools
 from .tools.routines_tools import compute_next_run
@@ -74,6 +76,37 @@ def _approval_gate():
 
 
 @app.get("/")
+async def landing_page() -> HTMLResponse:
+    """The public marketing page at textmessa.com -- customer-facing, built
+    to convert someone into actually texting the number. See
+    messa/landing_page.py for the render logic (the phone number, domain,
+    and year are the only parts that vary by deployment -- everything else
+    is the static file at messa/assets/landing/index.html) and its own
+    module docstring for why this is a plain HTML file + string
+    substitution rather than an f-string page like live_view_page.py's.
+
+    `GET /` used to be this app's own health check (a bare `{"status":
+    "ok"}` JSON body) -- moved to /health below rather than dropped, since
+    nothing before this route existed depended on the root path
+    specifically returning JSON (Sendblue's webhook hits its own URL, not
+    this one; grepped the rest of this project to confirm before making
+    the swap)."""
+    return HTMLResponse(render_landing_page())
+
+
+@app.get("/og-image.png")
+async def landing_og_image() -> FileResponse:
+    """The link-preview image the landing page's og:image/twitter:image meta
+    tags point at -- a static asset (messa/assets/landing/og-image.png),
+    not templated like the page itself: it deliberately carries no phone
+    number baked into the picture (see that PNG's own generation notes in
+    README.md) since this file has no way to keep pixels in sync with
+    config.SENDBLUE_NUMBER the way the HTML page's text can."""
+    path = Path(__file__).parent / "assets" / "landing" / "og-image.png"
+    return FileResponse(path, media_type="image/png")
+
+
+@app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok", "service": "messa-sendblue-webhook"}
 

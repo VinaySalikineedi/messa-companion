@@ -4390,3 +4390,164 @@ caveat in this project); and the exact rendering/spacing of a `\n`-joined
 second reveal message (the email + live-view-link line) on a real
 iMessage/SMS thread -- confirmed correct as Python string content in
 tests, not visually confirmed on a phone screen.
+
+## The public landing page (`GET /`)
+
+The ask: a customer-facing marketing page at textmessa.com -- what Messa
+is, the six agents/specialists behind her, what she actually does, and the
+phone number to text her -- built to convert, using the exact hosting
+approach specified: served directly from this FastAPI app, no second
+hosting service. Sent while the person driving this was going to sleep,
+with explicit instructions to make reasonable assumptions, build the whole
+thing, and surface open questions afterward rather than block on them --
+this section is that surfacing.
+
+**Where everything lives:**
+- `messa/assets/landing/index.html` -- the entire page: HTML, CSS, and JS
+  in one file (~700 lines), no build step, no framework. Content is
+  grounded in what's actually shipped in this codebase (the six subagents'
+  real descriptions from `agents/registry.py`, the actual 7am/8pm briefing
+  times from `config.DEFAULT_BRIEFINGS`, the real approval-gated-action and
+  live-view behaviors) -- nothing on the page claims a capability that
+  doesn't exist.
+- `messa/assets/landing/og-image.png` -- the link-preview card used by
+  `og:image`/`twitter:image`. Generated once during this phase (Playwright
+  screenshotting a small standalone HTML source, not part of the app's
+  runtime) and committed as a static PNG -- deliberately carries NO phone
+  number in the actual pixels, only brand + tagline, since a baked image
+  has no way to stay in sync with `config.SENDBLUE_NUMBER` the way the
+  page's own text can (see `landing_page.py`'s docstring for the same
+  reasoning applied to why the page itself is templated rather than fully
+  static).
+- `messa/landing_page.py` -- `render_landing_page()`: loads the template
+  file once (cached in memory for the process's life -- a static file that
+  only changes via a redeploy, not at runtime) and substitutes four
+  `__TOKEN__`-style placeholders (`__PHONE_DISPLAY__`, `__SMS_HREF__`,
+  `__PRIMARY_DOMAIN__`, `__YEAR__`) via plain `.replace()`. Deliberately
+  NOT an f-string constant like `live_view_page.py`'s pages -- that
+  approach means escaping every literal `{`/`}` in the CSS/JS as `{{`/`}}`,
+  which is genuinely painful across a page this size; a handful of
+  distinctive placeholders that can't collide with real CSS/JS avoids that
+  entirely for a page that's almost entirely static content.
+- `server.py`: `GET /` now renders and returns the landing page
+  (`HTMLResponse`), `GET /og-image.png` serves the static PNG
+  (`FileResponse`, same pattern as the existing `/files/{token}` route),
+  and the app's own health check -- previously the whole body of `GET /`,
+  a bare `{"status": "ok", "service": "messa-sendblue-webhook"}` -- moved
+  to `GET /health` rather than being dropped. Grepped the rest of this
+  project first to confirm nothing else depends on `GET /` returning that
+  exact JSON shape (Sendblue's webhook hits its own separate URL); **if
+  anything OUTSIDE this repo -- an uptime monitor, a status page, a health
+  probe in HF Spaces settings -- was pointed at the bare root path
+  expecting that JSON, it needs to be repointed at `/health`.**
+
+**The phone number problem, and how it's solved:** this sandbox never had
+access to the real `SENDBLUE_NUMBER` (a secret configured on the live
+deployment, not present anywhere in this repo or its `.env.example`) --
+and asking for it wasn't an option, the whole point of this phase was to
+build without waiting on an answer. Rather than guess or hardcode a
+placeholder into the page, `landing_page.py` reads `config.SENDBLUE_NUMBER`
+at render time, the same way every other part of this app already does --
+so the page will automatically show whatever number is actually configured
+on the real deployment, correctly formatted (`_format_phone`: E.164 ->
+`+1 (555) 123-4567` for a US/Canada number, with a `sms:` link using the
+raw dialable form) the moment it's deployed, with no further edit needed.
+If the number is ever missing or unset, the page still renders (a
+"our number" fallback instead of a broken/blank CTA) rather than 500ing --
+same graceful-degradation instinct as everywhere else in this codebase.
+
+**Two real bugs caught by this page's own visual QA** (Playwright
+screenshots at desktop and mobile viewports, reviewed section by section --
+not just "does it render," actually looked at):
+1. An inline `<svg viewBox="0 0 24 24">` with no explicit CSS width/height
+   rendered at the browser's ~300x150 default instead of a sane icon size
+   -- two icons in the "why Messa" comparison section's headings ballooned
+   to fill their entire card. Fixed with an explicit size rule for that
+   specific spot, PLUS a global `svg{ width: 20px; height: 20px; }`
+   backstop so any future icon added without its own sizing rule fails
+   safe at a reasonable default instead of failing huge.
+2. The page originally had a scroll-triggered fade-in animation
+   (`IntersectionObserver`, sections starting at `opacity: 0` and revealed
+   as they entered the viewport). Full-page screenshots -- taken without
+   physically scrolling first -- showed entire sections rendering
+   completely blank, which traced back to a real risk: the animation
+   design meant content was invisible BY DEFAULT until JS actively proved
+   it should be shown, so any gap between an element existing and JS
+   marking it visible (a slow script, a race, any tool or browser quirk
+   that doesn't fire scroll/intersection events the way a normal user
+   scrolling does) could leave a section silently never appearing. For a
+   page whose whole purpose is converting a visitor, that risk wasn't
+   worth a nice-to-have animation -- removed entirely rather than
+   patched, so every section is unconditionally visible regardless of
+   whether any JS runs at all.
+
+**Explicit assumptions made, to review and correct freely:**
+- **Visual design**: a warm cream background (`#FBF8F3`) with an indigo
+  accent (`#4F46E5`), Inter for UI text and JetBrains Mono for the SMS
+  chat-bubble mockups (visually distinguishing "this is a text message"
+  from the rest of the page's typography). Entirely this session's own
+  choice -- no existing brand guide or logo was available to match against.
+- **No pricing/cost mentioned anywhere on the page.** There's no visibility
+  into the actual business model from inside this codebase, and guessing
+  a number (or even "free") felt riskier than omitting it -- every CTA
+  just says "text the number," nothing about cost.
+- **No testimonials or customer quotes.** Deliberately -- fabricating
+  quotes from invented "customers" would be dishonest marketing copy, and
+  there's no real customer feedback available yet to draw from honestly.
+  The page leans on a concrete example conversation (clearly presented as
+  an illustrative demo, not attributed to a real person) instead.
+  worth adding a real testimonials section once there's real feedback
+  to show.
+- **No Privacy Policy / Terms of Service page or link.** Neither exists
+  anywhere in this repo. The footer has a short, honest paragraph about
+  how Messa actually handles things (asks before anything that spends
+  money/schedules/shares info, anything can be paused or cancelled by
+  text) instead of a legal document this session isn't positioned to
+  draft. Worth getting real Privacy/Terms pages written before this goes
+  live at real scale, particularly given Messa handles calendar/contacts/
+  email content.
+- **The roadmap section names WhatsApp specifically** as a coming-soon
+  channel -- pulled directly from `agents/registry.py`'s own system prompt
+  ("reachable by text, email, and (soon) WhatsApp"), not invented for this
+  page. Worth confirming that's still an accurate near-term claim before
+  this ships publicly, since a marketing page committing to something
+  unshipped is a different kind of promise than an internal system prompt
+  saying the same thing.
+- **The six agents are presented under friendlier public names**
+  ("The Researcher," "Calendar & to-dos," etc.) than their internal
+  `subagent_type` strings, but the underlying descriptions are drawn
+  directly from each one's real `agents/registry.py`/`tools/*.py`
+  description -- nothing is invented capability.
+
+**Verification**: new `/tmp/test_landing_page.py` (26 checks, all
+passing) -- `_format_phone` across a real E.164 number, an 11-digit
+no-plus number, a missing number, a whitespace-only value, and a non-US
+number (confirms the honest-fallback behavior rather than mangling an
+unexpected format); `render_landing_page()` producing zero leftover
+`__TOKEN__` placeholders, the correct phone number and `sms:` link, a
+well-formed full HTML document, and the current year in the footer; the
+same render still succeeding (with its fallback copy, still zero leftover
+placeholders) when `SENDBLUE_NUMBER` is unset; a regression check that
+the specific SVG-sizing bug above stays fixed; and `server.py`'s three
+routes (`GET /` returns the landing page and NOT the old JSON body,
+`GET /health` still returns that exact original JSON shape, `GET
+/og-image.png` resolves to the real file on disk with the right media
+type). Also re-ran the full existing `/tmp` regression suite from earlier
+phases (`test_personal_inbox.py`, which itself imports `server.py`, plus
+seven others) to confirm none of this phase's changes to `server.py`'s
+imports/routes broke anything -- all still pass.
+
+**Not verified here**: what the page actually looks like once deployed --
+real fonts loading over a real network (Google Fonts, not the offline
+file:// load this sandbox's screenshots used), the real domain/HTTPS
+context, and a real phone's iMessage/SMS/RCS handling of the `sms:` link
+(desktop browsers generally do nothing useful with `sms:` links, which is
+expected -- the raw number is also shown as plain text specifically so a
+desktop visitor can still read/dial it another way). No accessibility
+audit tool (axe, Lighthouse) was run -- the page uses semantic headings,
+real `<button>`/`<a>` elements, and native `<details>` for the FAQ (no
+custom JS accordion needed), but that's manual good practice, not a
+verified audit. And this repo being updated doesn't make the page live on
+its own -- textmessa.com only starts serving it once these files are
+actually deployed (pushed to whatever's hosting the real app), which this
+session has no ability to do itself.
