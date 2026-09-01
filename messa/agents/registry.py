@@ -122,14 +122,16 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
 
     @tool
     async def save_profile_info(field: str, value: str) -> str:
-        """Save one onboarding field the user just told you: field is 'name', 'email',
-        'city', or 'connect_email'. For the optional email step, pass value='skip' if the
-        user doesn't want to share one. For connect_email, pass 'yes' or 'no'/'skip' --
-        this only advances onboarding; if they say yes, also delegate to email_agent with
-        request_email_connection in this SAME response (see the onboarding instruction
-        below), since this tool alone doesn't send anything. Also use this any time the
-        user corrects their location later (not just during onboarding) -- it re-resolves
-        their timezone from whatever they give you."""
+        """Save one onboarding field the user just told you: field is 'name', 'city', or
+        'email' -- asked in that order. For the optional email step, pass value='skip' if
+        the user doesn't want to share one (they'll just use your own Messa address for
+        anything that needs one, e.g. signups). Also use this any time the user corrects
+        their location later (not just during onboarding) -- it re-resolves their
+        timezone from whatever they give you.
+
+        Connecting Gmail is separate and NOT part of onboarding -- if the user brings it
+        up (now or any time later), delegate to email_agent with request_email_connection
+        directly; don't call this tool for that."""
         row = await db.save_profile_field(uid, field, value)
         msg = f"Saved {field}. Onboarding is now at: {row['onboarding_step']}."
         if field == "city" and value and value.strip().lower() != "skip":
@@ -262,32 +264,29 @@ _ONBOARDING_PROMPTS = {
         "their first request (or right after helping with it if they jumped straight to a "
         "task), casually ask what you should call them, then call save_profile_info('name', ...)."
     ),
-    "awaiting_email": (
-        "You know the user's name but not their email. Casually ask for it once (mention "
-        "it's optional / skippable), then call save_profile_info('email', ...) with what "
-        "they give you, or save_profile_info('email', 'skip') if they'd rather not share it."
-    ),
     "awaiting_location": (
-        "You still need the user's location so results like weather/local search -- and, "
-        "critically, timezone-correct scheduling/reminders -- are accurate. Ask for their "
-        "city AND state/country, or a zip code if they're in the US, not just a bare city "
-        "name: a name alone can be genuinely ambiguous (there's a Jacksonville in Florida, "
-        "one in North Carolina, one in Illinois -- all different timezones). Then call "
-        "save_profile_info('city', ...) with whatever they give you; if the tool result "
-        "says the timezone couldn't be confidently resolved, ask a follow-up for a zip "
-        "code or a more specific city+state before treating it as settled."
+        "You know the user's name but not their location. Ask for their city AND "
+        "state/country, or a zip code if they're in the US, not just a bare city name: a "
+        "name alone can be genuinely ambiguous (there's a Jacksonville in Florida, one in "
+        "North Carolina, one in Illinois -- all different timezones), and this is what "
+        "makes scheduling, reminders, and morning/evening briefings land at the correct "
+        "local time. Then call save_profile_info('city', ...) with whatever they give "
+        "you; if the tool result says the timezone couldn't be confidently resolved, ask "
+        "a follow-up for a zip code or a more specific city+state before treating it as "
+        "settled."
     ),
-    "awaiting_email_connect": (
-        "Last onboarding question: ask if they'd like you to handle their email for "
-        "them -- reading/searching their Gmail inbox and sending or replying on their "
-        "behalf when asked (make clear replies/sends always need their OK first). "
-        "Frame it as optional and reversible: they can always say 'connect my gmail' "
-        "or 'connect my email' later instead. If they say yes: call "
-        "save_profile_info('connect_email', 'yes') AND delegate to email_agent with "
-        "request_email_connection, IN THIS SAME RESPONSE -- that's what actually sends "
-        "them the connect link; save_profile_info alone only advances onboarding. If "
-        "they say no (or don't want to decide now), call "
-        "save_profile_info('connect_email', 'no') and move on -- nothing else to do."
+    "awaiting_email": (
+        "Last onboarding question: ask if there's a particular email they'd want on file "
+        "for creating accounts on their behalf -- make clear it's optional, and that if "
+        "they skip it you'll just use your own Messa address for that instead. Then call "
+        "save_profile_info('email', ...) with what they give you, or "
+        "save_profile_info('email', 'skip') if they'd rather not share one. Keep your own "
+        "reply here short either way -- a quick acknowledgment is enough, you don't need "
+        "to introduce yourself or your own email address here. (That introduction is "
+        "handled automatically right after this: the moment onboarding is complete, the "
+        "system sends its own follow-up message telling them what you can actually do "
+        "and what your own email address is -- don't try to write that yourself or "
+        "duplicate it, it's guaranteed to go out on its own.)"
     ),
 }
 

@@ -4187,3 +4187,206 @@ concurrent Sendblue sends at 7:00 AM against a live account; and a live
 user's `latitude`/`longitude` actually landing correctly through the full
 onboarding flow (`save_profile_field`'s city branch) against a real Neon
 database.
+
+## Onboarding: 3 questions instead of 4, ending with a deterministic reveal of what Messa actually is
+
+The ask: onboarding was asking name, then an optional email, then location,
+then a 4th mandatory "want me to connect your Gmail?" yes/no gate before it
+would ever reach `onboarding_step = 'complete'` -- four back-and-forth
+exchanges before a brand-new user saw anything beyond a form. The request
+was to cut it down to exactly 3 questions (name, city/zip, an optional
+email "for creating accounts"), and to use the moment onboarding actually
+finishes to reveal something concrete: Messa's own email address, framed as
+hers to manage and safe to hand out anywhere, plus the live-view link,
+plus a clear statement that Messa is agentic (browses, clicks, manages a
+calendar, sends email) rather than a plain question-answering chatbot --
+explicitly so a new user doesn't mentally file her as "just another AI
+chat window."
+
+**Reordered and shortened `db.ONBOARDING_STEPS`** (`db.py`): now
+`["awaiting_name", "awaiting_location", "awaiting_email", "complete"]` --
+location moved up to 2nd (right after name, ahead of the skippable email
+question) since it's the one onboarding answer that's actually
+load-bearing: timezone-correct scheduling, reminders, and the morning/
+evening briefings' weather line all depend on it, so it shouldn't wait
+behind an optional question a user might skip anyway. The old 4th step,
+`awaiting_email_connect`, is gone entirely -- `_initial_onboarding_step`
+and `save_profile_field`'s `step_for_field` map were both updated to match,
+and `save_profile_field` now rejects `field='connect_email'` outright
+(`ValueError`) rather than silently accepting it. Nothing about actually
+connecting Gmail changed: `agents/registry.py`'s system prompt already told
+Messa Gmail "can send them a connect link on request" independent of
+onboarding step, so dropping the forced question doesn't remove the
+capability -- it's just no longer a gate, and the user's own instruction to
+hint at it is now handled by the reveal message below instead of a forced
+question.
+
+**The email step's copy was reframed, not just reworded**: it now asks for
+"an email you'd want on file for creating accounts on your behalf,"
+explicitly optional, explicitly telling the user that skipping it just
+means Messa's own address gets used instead for that purpose -- a direct
+line to the reveal message that follows.
+
+**The reveal itself (`cli._onboarding_complete_messages`, called from
+`run_message`) is deterministic, code-authored text -- not something the
+model is asked to write.** This mirrors a decision this project already
+made once before, for a related reason: `run_message`'s own docstring
+documents an earlier bug where the system prompt asked Messa to write the
+deepsearch live-view link into her own acknowledgment sentence, and a real
+run trailed off mid-sentence right as the model switched into tool-call
+mode, dropping the link entirely -- not a streaming bug, genuinely the
+full, final text the model chose to generate that turn. The reveal message
+carries the same category of must-be-correct payload (Messa's actual email
+address, her actual live-view link), so it gets the same treatment: `cli.py`
+detects the onboarding_step transition to `complete` (a fresh `db.get_user_by_id`
+call right after `run_turn` finishes, cheap and only ever hit on the one
+turn that needs it -- `UserContext.onboarding_complete`, loaded at the
+START of the turn, short-circuits everything else) and sends fixed,
+pre-written text rather than trusting the model to reproduce an email
+address and a URL correctly, unprompted, right after finishing an unrelated
+tool call. `agents/registry.py`'s `awaiting_email` prompt explicitly tells
+Messa not to try writing this herself and to keep her own turn's reply
+short -- the reveal is guaranteed to follow on its own.
+
+Two short messages, not one long one (an explicit ask this phase: keep
+outbound texts concise) -- the first sets expectations ("I'm not your
+typical chatbot... I can browse the web, click through sites, manage your
+calendar and reminders, and send emails for you"), the second is the
+concrete payload: Messa's own email address, phrased as hers to manage and
+safe to hand out anywhere, a line inviting the user to say the word if they
+also want her managing their personal inbox (the specific hint asked for
+once Gmail was dropped as a forced onboarding question), and the live-view
+link, framed as where to check that inbox or watch her work. Each half
+degrades independently: no `messa_email` (migration 013 not applied) or no
+`live_view_share_url` (migration 006 not applied, or `LIVE_VIEW_BASE_URL`
+unset) just drops that clause from the second message rather than sending
+a broken one -- and if BOTH are missing, only the first message goes out,
+never a silently empty second text.
+
+## Deepsearch's acknowledgment: a standing reminder it takes a while, plus a one-time nudge that it's not just a search box
+
+The ask: whenever Messa delegates to deepsearch, remind the user this can
+take a while and that they can step away (she'll text them when it's
+done), and also remind them deepsearch isn't just for simple lookups --
+they can ask it to actually do things (log in, fill out forms, more
+involved multi-step tasks). Both needed to land without making every
+deepsearch acknowledgment noticeably longer, per the same "keep texts
+concise" constraint as the onboarding reveal above.
+
+**Both are deterministic, code-appended text in `cli.py`'s `_on_ai_message`
+closure (inside `run_message`) -- the same place, and the same reasoning,
+as the existing live-view link.** Rather than asking the system prompt to
+remember and reword a reminder on every single delegation forever (with
+all the same reliability risk documented above), the fixed reminder text
+is appended right alongside the link, guaranteed to appear, guaranteed
+short, and never at risk of ballooning turn over turn the way freely
+regenerated model text tends to.
+
+- **"This can take a few minutes -- go ahead and step away, I'll text you
+  the second it's done."** -- appended on every deepsearch delegation's
+  acknowledgment, not just the first. This is genuinely useful information
+  every time (a fresh task might take a fresh few minutes), unlike the tip
+  below.
+- **"And it's not just browsing -- I can click through logins, fill out
+  forms, and handle more involved stuff too, so feel free to ask for
+  that."** -- appended only on a user's very FIRST-EVER deepsearch
+  delegation, never again after that. Repeating an already-seen tip forever
+  is exactly the kind of thing this project already flagged as a real
+  annoyance once (see `test_link_once_per_turn.py`'s docstring: a user
+  directly reported getting the same permanent live-view link twice in one
+  exchange as "a little annoying") -- useful the first time someone sees
+  deepsearch in action, noise on the tenth.
+
+**New in `db.py`: `has_prior_deepsearch_session(user_id)`.** A deliberately
+cheap `SELECT EXISTS (...)` against `deepsearch_sessions`, not a reuse of
+the existing `list_deepsearch_sessions` (which pulls up to 20 full rows) --
+this runs inline on the hot path of every deepsearch delegation, not just
+when a user explicitly asks to see their session list, so it's sized for
+that. Called from `_on_ai_message` BEFORE the current delegation's own
+session row gets created (`build_deepsearch_subagent`'s `_run` creates it
+only once the subagent actually starts, which happens after this
+acknowledgment already streamed out), so it correctly reports "no prior
+sessions" on that very first delegation rather than counting the
+in-progress one. Same additive/no-op-safe shape as every other
+`_has_table`-gated function in this file: returns `False` (not an
+exception) pre-migration-004, which just means the first-time tip shows up
+-- harmless, since there genuinely is no prior session on a deployment that
+young either way. Resolved at most once per `run_message` call (a
+`is_first_deepsearch: bool | None` cache in the closure, `None` meaning
+"not checked yet") even when one incoming message triggers more than one
+deepsearch delegation, so a compound ask doesn't run the query twice or
+risk the tip appearing on the SECOND delegation in the same exchange just
+because the first one hadn't updated anything in the DB yet.
+
+**Deduplication within one exchange**: the existing `live_link_sent` flag
+was broadened into `deepsearch_extras_sent`, now gating the link AND both
+new lines together as one block -- a compound ask that fires two
+deepsearch delegations in the same turn (see `test_link_once_per_turn.py`)
+still only gets the link, the reminder, and the first-time tip attached to
+the FIRST delegation's acknowledgment, not repeated on the second.
+
+## Synced: `channels/resend.py`'s outbound Message-ID fix
+
+Picked up a local fix flagged at the start of this phase: after a
+successful Resend send, `send_personal_email` now overwrites its own
+locally-generated `message_id` (a UUID minted before the request ever went
+out, purely so the outbound `Message-ID` header had something to send)
+with the `id` Resend's own response actually returns, once one comes back
+-- normalized to angle-bracket form (`<...>`) if Resend didn't already
+wrap it. Previously the self-generated id was what got persisted via
+`db.log_outbound_personal_email`, regardless of whether Resend's own
+mail-sending infrastructure preserved that exact header or substituted its
+own -- meaning a reply's `In-Reply-To` could end up referencing an id that
+never actually matched what shipped, silently breaking thread continuity
+for anything sent through Messa's own address. Applied as-is; not
+independently re-verified against a live Resend send from this sandbox
+(same network restriction as everywhere else in this project).
+
+## Verification
+
+New `/tmp/test_onboarding_and_deepsearch_msg.py` (29 checks, all passing):
+`ONBOARDING_STEPS`'/`_initial_onboarding_step`'s new order;
+`save_profile_field`'s step transitions (name -> location -> email ->
+complete, including a skipped email still advancing without writing the
+literal string `'skip'` into `users.email`) and its rejection of the
+removed `connect_email` field; `has_prior_deepsearch_session` against a
+faked pool across pre-migration/brand-new-user/has-a-session states;
+`_onboarding_complete_messages` (no reveal when already complete, no
+reveal mid-onboarding, the full 2-message reveal on the actual transition
+-- using the FRESHLY fetched name rather than the turn's stale pre-load
+value, both messages' exact content checked for the email address/live
+link/"just say the word" hint, and the graceful single-message degrade
+when `messa_email`/`live_view_share_url` are both unavailable); and
+`run_message`'s deepsearch reminder logic against a fake streaming agent
+(first-ever delegation gets both the reminder and the tip, a returning
+user's delegation gets the reminder but not the tip, and a compound
+two-delegation turn gets the link/reminder exactly once across both sent
+messages, not duplicated on the second).
+
+Six existing `/tmp` test files from earlier phases needed updating rather
+than being left to bit-rot, since `run_message` now calls two functions
+(`db.get_user_by_id`, `db.has_prior_deepsearch_session`) that didn't exist
+as call sites before this phase: `test_link_once_per_turn.py`,
+`test_live_link_integration.py`, `test_live_link_no_token.py`,
+`test_live_link_zero_preamble.py`, and `test_stall_retry.py` each needed
+fakes added for those two calls (previously absent since nothing exercised
+them), all re-run and confirmed still passing -- including re-confirming
+the reminder text now actually shows up correctly alongside the live-view
+link/no-token/zero-preamble cases those tests were written to check.
+`test_onboarding_and_email_db.py` needed real updates (not just new fakes)
+since two of its parts directly asserted the OLD 5-step order and the now-
+removed `connect_email` field -- rewritten to assert the new 4-step order
+and the field's rejection instead; its unrelated parts (the Composio
+email-connection-request lifecycle: create/pending/notify/mark-connected/
+expire, migrations/012) were untouched by this phase and re-confirmed
+still passing as-is. `test_default_email_provider.py`, `test_empty_promise.py`,
+`test_executive_quality_check.py`, and `test_personal_inbox.py` were
+re-run unmodified as a broader regression check and all still pass.
+
+**Not verified here**: a live SMS exchange against a real Sendblue number
+watching the actual 2-message reveal arrive as 2 separate texts (this
+sandbox has no live Sendblue account, consistent with every other such
+caveat in this project); and the exact rendering/spacing of a `\n`-joined
+second reveal message (the email + live-view-link line) on a real
+iMessage/SMS thread -- confirmed correct as Python string content in
+tests, not visually confirmed on a phone screen.

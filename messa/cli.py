@@ -240,6 +240,60 @@ def last_ai_text(messages: list) -> str:
     return ""
 
 
+async def _onboarding_complete_messages(user: config.UserContext) -> list[str]:
+    """Fires exactly once per user, the turn onboarding_step first reaches
+    "complete" (right after they answer the last onboarding question,
+    awaiting_email, via save_profile_info) -- checked and composed here in
+    code rather than left to the model for the same reason run_message
+    stopped trusting the model to write the deepsearch live-view link
+    itself (see that function's own docstring): this message carries
+    Messa's actual email address and live-view link, and asking a model to
+    faithfully reproduce both, verbatim, in the same response as an
+    unrelated tool call, is exactly the "mostly works" reliability this
+    project has already been burned by once. agents/registry.py's
+    awaiting_email prompt tells Messa not to try writing this herself.
+
+    Returns [] if onboarding wasn't the thing that just completed on this
+    call (the common case, checked cheaply since UserContext.onboarding_complete
+    -- loaded at the START of this turn -- already being True short-circuits
+    before any DB call), or the message(s) to send/persist otherwise. Two
+    short messages rather than one long one (see run_message's docstring on
+    keeping texts scannable): the first sets expectations about what Messa
+    actually is, the second is the concrete email/link payload -- each
+    reads fine as its own text, and skipping the second entirely (older
+    deployment, migrations 006/013 not applied) still leaves the first
+    intact rather than silently dropping the whole reveal."""
+    if user.onboarding_complete:
+        return []
+    fresh = await db.get_user_by_id(user.user_id)
+    if not fresh or fresh.get("onboarding_step") != "complete":
+        return []
+
+    name = fresh.get("name")
+    greeting = f"You're all set, {name}!" if name else "You're all set!"
+    messages = [
+        f"{greeting} Quick thing about me -- I'm not your typical chatbot. I can browse "
+        "the web, click through sites, manage your calendar and reminders, and send "
+        "emails for you -- basically get things done, not just answer questions. Just "
+        "tell me what you need."
+    ]
+
+    reveal_parts = []
+    if user.messa_email:
+        reveal_parts.append(
+            f"Here's my own email: {user.messa_email} -- it's mine to manage, so feel "
+            "free to hand it out anywhere (signups, forms, whatever) and I'll take care "
+            "of what lands there, looping you in before anything that needs your OK. I "
+            "can manage your personal inbox too, just say the word."
+        )
+    if user.live_view_share_url:
+        reveal_parts.append(f"Check that inbox, or watch me work, anytime here: {user.live_view_share_url}")
+    if reveal_parts:
+        messages.append("\n".join(reveal_parts))
+
+    return messages
+
+
 async def run_message(user: config.UserContext, agent, text: str, send=None) -> str:
     """One full, stateless turn for `user`: loads recent DB history for
     context, runs it, persists both sides, returns the final reply text.
@@ -286,7 +340,19 @@ async def run_message(user: config.UserContext, agent, text: str, send=None) -> 
     whenever a message carries a deepsearch delegation (`delegating_to`,
     fired even when the model said nothing at all), and the link is
     appended deterministically below, guaranteed correct and complete
-    regardless of what the model's own text looks like."""
+    regardless of what the model's own text looks like.
+
+    Two more deterministic, code-authored additions live in this same
+    function, same reasoning as the link above: the short "this can take a
+    few minutes, I'll text you when it's done" (plus, on a user's first-ever
+    deepsearch, a one-time "I can do more than just browse" tip) appended
+    right alongside it in _on_ai_message, and the onboarding-complete reveal
+    (Messa's own email + live-view link, sent once right after the user
+    answers the last onboarding question) via _onboarding_complete_messages
+    above. Both are kept short and fixed on purpose -- an explicit ask was
+    to keep outbound texts concise, and fixed strings are the only way to
+    guarantee that stays true forever rather than drifting longer over time
+    the way freely-generated model text tends to."""
     # 12 rather than 20: measured against the real system prompt + tool
     # schemas (~2,000 tokens fixed, every turn, regardless of history), 20
     # short SMS-length messages only added another ~600-800 tokens -- not
@@ -309,19 +375,25 @@ async def run_message(user: config.UserContext, agent, text: str, send=None) -> 
     # that run_turn can also retry a dropped delegation once (see its
     # docstring), the *same* logical attempt can produce a second
     # acknowledgment moments after the first. Either way, repeating the
-    # exact same permanent link twice in one exchange reads as spammy
-    # rather than helpful -- it's still right there in the first message.
-    # Reported directly: "it happened twice and was a little annoying."
-    live_link_sent = False
+    # exact same permanent link (or the reminder/tip lines below) twice in
+    # one exchange reads as spammy rather than helpful -- it's still right
+    # there in the first message. Reported directly (of the link, before
+    # the reminder/tip existed): "it happened twice and was a little
+    # annoying."
+    deepsearch_extras_sent = False
+    # Resolved at most once per call, only if a deepsearch delegation
+    # actually happens -- None means "not checked yet" (distinct from
+    # False, a real answer), so the has_prior_deepsearch_session query
+    # never runs on a turn that doesn't need it.
+    is_first_deepsearch: bool | None = None
 
     async def _on_ai_message(msg_text: str, delegating_to: str | None = None) -> None:
-        nonlocal live_link_sent
-        share_url = user.live_view_share_url
-        if delegating_to == "deepsearch":
-            if share_url and not live_link_sent and share_url not in msg_text:
-                link_line = f"Watch it live: {share_url}"
-                msg_text = f"{msg_text.rstrip()} {link_line}" if msg_text.strip() else link_line
-                live_link_sent = True
+        nonlocal deepsearch_extras_sent, is_first_deepsearch
+        if delegating_to == "deepsearch" and not deepsearch_extras_sent:
+            share_url = user.live_view_share_url
+            extra_lines: list[str] = []
+            if share_url and share_url not in msg_text:
+                extra_lines.append(f"Watch it live: {share_url}")
             elif not share_url:
                 # Confirmed (by direct integration test against the real
                 # deepagents/create_deep_agent harness) that `delegating_to`
@@ -350,6 +422,35 @@ async def run_message(user: config.UserContext, agent, text: str, send=None) -> 
                         else "both look set -- check live_view_share_url's own logic."
                     )
                 )
+            # These two are deterministic and code-authored for the same
+            # reason the link is (see this function's own docstring): a
+            # user's explicit ask was "remind users this'll take a while,
+            # they can sit back, and that deepsearch can do more than just
+            # browsing" -- baking that into the system prompt would mean
+            # trusting the model to remember and reword it correctly on
+            # every single delegation, forever. Appending fixed text here
+            # instead guarantees it's always said, always this short, and
+            # never balloons turn over turn the way model-authored
+            # boilerplate tends to.
+            extra_lines.append(
+                "This can take a few minutes -- go ahead and step away, I'll text you "
+                "the second it's done."
+            )
+            if is_first_deepsearch is None:
+                is_first_deepsearch = not await db.has_prior_deepsearch_session(user.user_id)
+            if is_first_deepsearch:
+                # Shown once, on this user's very first-ever deepsearch
+                # delegation only (not every single time) -- the same
+                # "repeating this reads as spammy" reasoning as the link
+                # above, just on a longer timescale: useful the first time
+                # someone sees deepsearch in action, noise on the tenth.
+                extra_lines.append(
+                    "And it's not just browsing -- I can click through logins, fill out "
+                    "forms, and handle more involved stuff too, so feel free to ask for that."
+                )
+            extra_block = "\n".join(extra_lines)
+            msg_text = f"{msg_text.rstrip()} {extra_block}" if msg_text.strip() else extra_block
+            deepsearch_extras_sent = True
         if not msg_text:
             return  # nothing to say and no link to attach -- e.g. a silent, non-deepsearch delegation
         sent_texts.append(msg_text)
@@ -358,6 +459,17 @@ async def run_message(user: config.UserContext, agent, text: str, send=None) -> 
             await send(msg_text)
 
     final = await run_turn(agent, history, on_ai_message=_on_ai_message)
+
+    # Deterministic, one-time onboarding-complete reveal -- see
+    # _onboarding_complete_messages' own docstring for why this isn't left
+    # to the model. Sent (and persisted) as its own follow-up, after
+    # whatever the model itself said this turn (typically a short
+    # acknowledgment of the just-answered email question).
+    for onboarding_msg in await _onboarding_complete_messages(user):
+        sent_texts.append(onboarding_msg)
+        await db.append_message(user.user_id, "assistant", onboarding_msg, channel=user.channel)
+        if send:
+            await send(onboarding_msg)
 
     if sent_texts:
         return sent_texts[-1]

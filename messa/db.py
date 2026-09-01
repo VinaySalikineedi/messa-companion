@@ -96,13 +96,28 @@ def _parse_dt(value: Any, user_tz: str | None = None) -> datetime | None:
 # ---------------------------------------------------------------------------
 
 ONBOARDING_STEPS = [
-    "awaiting_name", "awaiting_email", "awaiting_location", "awaiting_email_connect", "complete",
+    "awaiting_name", "awaiting_location", "awaiting_email", "complete",
 ]
+# Order is name -> city/zip -> email (deliberately in this order, not the
+# original name -> email -> city): location is the one onboarding answer
+# that's actually load-bearing (it drives timezone-correct scheduling/
+# reminders/weather), so it comes right after name rather than after the
+# skippable email question. There used to be a 4th step here,
+# "awaiting_email_connect" (an explicit "want me to connect your Gmail?"
+# yes/no gate before onboarding could reach "complete") -- removed by
+# request: it added a full extra back-and-forth before the user ever saw
+# what Messa actually is (see cli.py's onboarding-complete reveal message,
+# sent the moment this reaches "complete"), for a capability Messa can
+# already offer conversationally any time ("connect my gmail") -- see
+# agents/registry.py's `known_str` ("Gmail is NOT connected yet ... can
+# send them a connect link on request"), which was true before this change
+# and still is. Nothing about actually connecting Gmail changed -- only
+# that it's no longer a gate onboarding has to pass through first.
 
 
 def _initial_onboarding_step(name: str | None) -> str:
     """Where a brand-new user's onboarding starts, given what we already know."""
-    return "awaiting_email" if name else "awaiting_name"
+    return "awaiting_location" if name else "awaiting_name"
 
 
 async def get_or_create_user(
@@ -384,12 +399,12 @@ async def list_calendar_events_for_range(user_id: int, start: datetime, end: dat
 
 
 async def save_profile_field(user_id: int, field: str, value: str) -> dict[str, Any]:
-    """Save one onboarding field (name/email/city/connect_email) and advance
-    onboarding_step.
+    """Save one onboarding field (name/city/email) and advance onboarding_step.
 
-    `value` may be the literal string 'skip' for the optional email step, or
-    'no'/'skip' for connect_email -- both still advance onboarding without
-    writing anything.
+    `value` may be the literal string 'skip' for the optional email step --
+    still advances onboarding without writing anything (Messa's own address
+    covers signups/accounts either way, see cli.py's onboarding-complete
+    reveal message).
 
     For `field == "city"`, this also resolves and stores the user's real
     timezone (via timeutil.resolve_timezone) instead of leaving it on
@@ -400,25 +415,18 @@ async def save_profile_field(user_id: int, field: str, value: str) -> dict[str, 
     was unambiguous; when it's False, the caller should ask the user for a
     zip code or "city, state" instead of trusting a guess.
 
-    `field == "connect_email"` is the odd one out: unlike the other three,
-    its answer ('yes'/'no') doesn't get written to a column of its own --
-    it exists purely to advance onboarding past the opt-in question. The
-    real users.email_connected flag (migrations/012_email_connection.sql)
-    is only ever set once Composio actually confirms an active connection
-    (see mark_email_connected, polled by server.py's
-    _production_email_connection_poll_loop) -- saying 'yes' here just means
-    "go ahead and send me a connect link," handled by the caller
-    (agents/registry.py) delegating to email_agent's request_email_connection
-    tool in the same turn, not by this function.
+    Connecting Gmail is NOT one of these fields (there used to be a fourth
+    'connect_email' field/onboarding step for that -- removed, see
+    ONBOARDING_STEPS' comment above): it's handled entirely conversationally
+    now, any time the user asks, via email_agent's request_email_connection
+    tool -- no onboarding_step bookkeeping involved.
     """
-    if field not in ("name", "email", "city", "connect_email"):
+    if field not in ("name", "email", "city"):
         raise ValueError(f"Unknown profile field: {field}")
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        if field == "connect_email":
-            pass  # no column of its own -- see this function's docstring
-        elif field == "email" and not await _has_column(conn, "users", "email"):
+        if field == "email" and not await _has_column(conn, "users", "email"):
             # Migration 003 not applied yet -- skip storing, still advance.
             pass
         elif value and value.strip().lower() != "skip":
@@ -428,9 +436,8 @@ async def save_profile_field(user_id: int, field: str, value: str) -> dict[str, 
         current_step = row["onboarding_step"]
         step_for_field = {
             "name": "awaiting_name",
-            "email": "awaiting_email",
             "city": "awaiting_location",
-            "connect_email": "awaiting_email_connect",
+            "email": "awaiting_email",
         }[field]
         if current_step == step_for_field:
             next_step = ONBOARDING_STEPS[ONBOARDING_STEPS.index(step_for_field) + 1]
@@ -1335,6 +1342,29 @@ async def create_deepsearch_session(user_id: int, title: str, messages_json: str
         return dict(row)
 
 
+async def has_prior_deepsearch_session(user_id: int) -> bool:
+    """Cheap existence check -- true if this user has EVER had a deepsearch
+    session (any status), false for a brand-new user's very first one.
+
+    Used by cli.py's run_message to gate a one-time "I can do more than
+    just browsing" tip onto the acknowledgment right before the FIRST-ever
+    deepsearch delegation, so it doesn't repeat on every single browsing
+    task after that -- deliberately a lightweight EXISTS query rather than
+    reusing list_deepsearch_sessions (which pulls up to 20 full rows), since
+    this runs inline on the hot path of every deepsearch delegation, not
+    just when the user explicitly asks to see their session list. Called
+    BEFORE the current delegation's own session row is created (see
+    build_deepsearch_subagent's _run), so it correctly reports False on that
+    very first delegation, not True."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "deepsearch_sessions"):
+            return False
+        return bool(
+            await conn.fetchval("SELECT EXISTS (SELECT 1 FROM deepsearch_sessions WHERE user_id = $1)", user_id)
+        )
+
+
 async def get_deepsearch_session(user_id: int, session_id: int) -> dict[str, Any] | None:
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -1757,30 +1787,70 @@ async def record_inbound_personal_email(
 # ---------------------------------------------------------------------------
 
 def _compute_thread_id(message_id: str, in_reply_to: str | None, references: str | None) -> str:
-    """The standard convention: the FIRST entry in a message's References
-    header is the root message's own Message-ID, so that's the thread_id --
-    every reply in a well-behaved chain carries the same first entry
-    (References only ever grows by appending, never reordering), so this is
-    a pure function of a message's own headers with no DB lookup needed:
-    every message in a chain resolves to the same thread_id regardless of
-    what order we happen to see them in.
-
-    Falls back to In-Reply-To (a reply whose client only set that header,
-    not References -- less common but real) if References is empty, and
-    finally to the message's own message_id if neither is present, meaning
-    it's starting a new thread.
-
-    Known limitation, not fixed here: a mail client/list server that strips
-    References entirely (some do) makes that reply look like a new thread
-    rather than continuing the old one. Not building a subject-line
-    fallback preemptively -- add one later if this turns out to matter in
-    practice."""
     refs = (references or "").split()
     if refs:
         return refs[0]
     if in_reply_to and in_reply_to.strip():
         return in_reply_to.strip()
     return message_id
+
+
+def _clean_subject(subject: str | None) -> str:
+    if not subject:
+        return ""
+    cleaned = subject.strip()
+    while True:
+        lower = cleaned.lower()
+        if lower.startswith("re:"):
+            cleaned = cleaned[3:].strip()
+        elif lower.startswith("fwd:"):
+            cleaned = cleaned[4:].strip()
+        else:
+            break
+    return cleaned.lower()
+
+
+async def _resolve_thread_id(
+    conn: asyncpg.Connection,
+    user_id: int,
+    message_id: str,
+    in_reply_to: str | None,
+    references: str | None,
+    subject: str | None,
+    counterpart_address: str,
+) -> str:
+    """Computes the thread_id via header inspection (_compute_thread_id),
+    and if no existing row in messa_email_messages matches that thread_id directly,
+    falls back to matching by normalized subject + counterpart address to handle
+    cases where mail providers (e.g. Resend / SES) transform outbound Message-IDs."""
+    primary_thread_id = _compute_thread_id(message_id, in_reply_to, references)
+    
+    # 1. Check if primary_thread_id already matches an existing thread
+    existing = await conn.fetchval(
+        "SELECT thread_id FROM messa_email_messages WHERE user_id = $1 AND (thread_id = $2 OR message_id = $2) LIMIT 1",
+        user_id, primary_thread_id,
+    )
+    if existing:
+        return existing
+
+    # 2. Subject + counterpart fallback matching
+    cleaned = _clean_subject(subject)
+    if cleaned and counterpart_address:
+        counterpart_pattern = f"%{counterpart_address.strip().lower()}%"
+        fallback_thread = await conn.fetchval(
+            """
+            SELECT thread_id FROM messa_email_messages
+            WHERE user_id = $1
+              AND (LOWER(from_address) LIKE $2 OR LOWER(to_address) LIKE $2)
+              AND LOWER(REGEXP_REPLACE(subject, '^(re|fwd):\\s*', '', 'gi')) = $3
+            ORDER BY id DESC LIMIT 1
+            """,
+            user_id, counterpart_pattern, cleaned,
+        )
+        if fallback_thread:
+            return fallback_thread
+
+    return primary_thread_id
 
 
 def _generate_message_id(domain: str) -> str:
@@ -1833,7 +1903,9 @@ async def log_inbound_personal_email(
         real_message_id = message_id.strip() if message_id and message_id.strip() else _generate_message_id(
             to_address.split("@", 1)[-1] or config.TEXTMESSA_EMAIL_DOMAIN
         )
-        thread_id = _compute_thread_id(real_message_id, in_reply_to, references)
+        thread_id = await _resolve_thread_id(
+            conn, user_id, real_message_id, in_reply_to, references, subject, from_address
+        )
         has_attachment_col = await _has_column(conn, "messa_email_messages", "attachment_filename")
         if has_attachment_col:
             row = await conn.fetchrow(
@@ -1903,7 +1975,9 @@ async def log_outbound_personal_email(
         if not await _has_table(conn, "messa_email_messages"):
             return None
         has_attachment_col = await _has_column(conn, "messa_email_messages", "attachment_filename")
-        thread_id = _compute_thread_id(message_id, in_reply_to, references)
+        thread_id = await _resolve_thread_id(
+            conn, user_id, message_id, in_reply_to, references, subject, to_address
+        )
         if has_attachment_col:
             row = await conn.fetchrow(
                 """
