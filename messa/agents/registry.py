@@ -47,6 +47,8 @@ from langchain_core.tools import BaseTool, tool
 
 from .. import config, db, timeutil
 from ..approval import ApprovalGate, CLIApprovalGate
+from ..channels import sendblue
+from ..channels.sendblue import SendblueError
 from ..tools.deepsearch_tools import build_deepsearch_subagent
 from ..tools.common import trace_all
 from ..tools.document_tools import DOCUMENT_SYSTEM_PROMPT, build_document_tools
@@ -208,10 +210,47 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
             return f"No saved contact matching '{name}'."
         return "\n".join(_format_contact_line(r) for r in rows)
 
+    @tool
+    async def send_pdf_over_text(file_path: str, caption: str | None = None) -> str:
+        """Text a PDF to the user as an MMS/iMessage attachment on their
+        own thread with you -- the SMS/iMessage counterpart to
+        personal_inbox_agent's attachment_path (that one emails a PDF,
+        this one texts it). Pass EXACTLY the file path document_agent's
+        generate_pdf returned, never a path you invented yourself. This is
+        a direct tool (not a delegation) and goes straight to the user's
+        own number -- it does NOT need confirmation, same as any other
+        message you send them directly.
+
+        caption: optional short message to send alongside the attachment
+        (defaults to a plain line saying here's the PDF). file_path must
+        be under the outbound-text size limit -- if it's too large, the
+        error tells you so; offer to email it instead (personal_inbox_agent
+        has a much higher attachment limit)."""
+        if not (config.SENDBLUE_API_KEY and config.SENDBLUE_API_SECRET and config.SENDBLUE_NUMBER):
+            return "Texting isn't configured on this deployment yet."
+        try:
+            resolved = config.resolve_output_file(file_path, max_bytes=config.MAX_SMS_ATTACHMENT_BYTES)
+        except ValueError as e:
+            return f"Couldn't send that file over text: {e}"
+        token = await db.create_document_share(uid, str(resolved), resolved.name)
+        if not token:
+            return (
+                "Texting a file isn't set up on this deployment yet "
+                "(run migrations/018_generated_document_shares.sql)."
+            )
+        media_url = f"{config.LIVE_VIEW_BASE_URL}/files/{token}"
+        try:
+            await sendblue.send_message(
+                user.phone_number, caption or "Here's the PDF you asked for.", media_url=media_url,
+            )
+        except SendblueError as e:
+            return f"Couldn't send that over text: {e}"
+        return f"Sent {resolved.name} to {user.phone_number} as a text attachment."
+
     raw_tools: list[BaseTool] = [
         confirm_pending_action, reject_pending_action, list_pending_actions,
         track_project, list_active_projects, save_profile_info, set_default_email_provider,
-        list_deepsearch_sessions, find_contact,
+        list_deepsearch_sessions, find_contact, send_pdf_over_text,
         *build_web_search_tools(),
     ]
     return trace_all(raw_tools, ORCHESTRATOR_LABEL)
@@ -334,16 +373,26 @@ def _build_system_prompt(user: config.UserContext) -> str:
         "if Gmail needs to be connected first, in which case offer to connect it (email_agent's "
         "request_email_connection) before trying again. Connecting Gmail does NOT change the "
         "default on its own -- only this explicit request does.\n\n"
-        "Documents and email: when the user wants something generated AND sent/attached (\"make "
-        "me a PDF of this and email it to me\"), delegate to document_agent first, get the "
-        "exact file path back from its reply, then delegate to personal_inbox_agent with that "
-        "same path relayed verbatim in the description (e.g. \"attach /outputs/quote.pdf and "
-        "send it to jane@example.com\") so it can pass it as attachment_path -- never invent or "
-        "paraphrase the path yourself. This only works for personal_inbox_agent (Messa's own "
-        "email) -- email_agent (Gmail) doesn't support attachments in this build, so if the "
-        "user's default/named inbox is Gmail and they want a document attached, tell them "
-        "plainly that attachments only work from their Messa address right now and offer to "
-        "send it from there instead.\n\n"
+        "Documents, email, and text: when the user wants something generated AND sent/attached "
+        "(\"make me a PDF of this and email it to me\", \"...and text it to me\"), delegate to "
+        "document_agent first, get the exact file path back from its reply, then either "
+        "delegate to personal_inbox_agent with that same path relayed verbatim in the "
+        "description (e.g. \"attach /outputs/quote.pdf and send it to jane@example.com\") so "
+        "it can pass it as attachment_path -- or, if they want it TEXTED instead of emailed, "
+        "call your own send_pdf_over_text(file_path) directly with that exact path (no "
+        "delegation needed, it goes straight to their own number) -- never invent or paraphrase "
+        "the path yourself either way. Email attachments only work for personal_inbox_agent "
+        "(Messa's own email) -- email_agent (Gmail) doesn't support attachments in this build, "
+        "so if the user's default/named inbox is Gmail and they want a document emailed with an "
+        "attachment, tell them plainly that attachments only work from their Messa address "
+        "right now (or offer to text it instead) rather than sending it without the file.\n\n"
+        "Reading PDFs the user sends YOU: if the user texts you a PDF, or a PDF arrives "
+        "attached to an email in your own inbox, its extracted text is already included right "
+        f"in the message that told you about it (capped at {config.MAX_PDF_READ_PAGES} pages "
+        "-- a note says so if it was cut off) -- you don't need to fetch or open anything "
+        "yourself, just read and use it like any other text in that message. If it says the PDF "
+        "couldn't be read (too large, corrupted, scanned/image-only, or password-protected), "
+        "tell the user plainly rather than guessing at what it might have said.\n\n"
         "Contacts: when the user names someone by name for an email or text ('email Sam about "
         "the invoice', 'text John I'm running late') without also giving you their actual "
         "address/number, call find_contact(name) FIRST to resolve it before delegating -- don't "

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
@@ -270,6 +271,36 @@ MAX_EMAIL_ATTACHMENT_BYTES = int(
     os.environ.get("MESSA_MAX_EMAIL_ATTACHMENT_BYTES", str(25 * 1024 * 1024))
 )
 
+# Same idea, sized for an outbound MMS/iMessage attachment instead
+# (tools sending via channels/sendblue.py's media_url -- see
+# db.create_document_share / server.py's GET /files/{token}). Deliberately
+# much smaller than MAX_EMAIL_ATTACHMENT_BYTES: unlike email, an MMS
+# recipient on the SMS/RCS fallback (not iMessage over data) is often
+# behind a real carrier size cap of just a few MB, and Sendblue's own CDN
+# re-hosting doesn't change what the receiving carrier will actually
+# deliver. 8MB comfortably covers a real generated PDF (mostly text) while
+# staying well under typical carrier MMS ceilings.
+MAX_SMS_ATTACHMENT_BYTES = int(
+    os.environ.get("MESSA_MAX_SMS_ATTACHMENT_BYTES", str(8 * 1024 * 1024))
+)
+
+# ---- PDF reading (NOT generation -- document_tools.py's generate_pdf stays
+# unlimited) ----
+# Applies everywhere Messa reads text out of an existing PDF someone sent
+# her: a PDF texted to her (server.py's sendblue_webhook -> pdf_reader.py),
+# a PDF attached to inbound mail on her own address (server.py's
+# personal_email_inbound_webhook -> pdf_reader.py). Explicit product
+# requirement: "keep a pdf limit to only read (not write), which can be
+# easily modified by a variable when needed" -- this is that variable.
+MAX_PDF_READ_PAGES = int(os.environ.get("MESSA_MAX_PDF_READ_PAGES", "10"))
+
+# A separate cap on the raw file size before any parsing is even attempted
+# -- a hostile or just enormous PDF shouldn't be downloaded/decoded at all,
+# regardless of how many pages MAX_PDF_READ_PAGES would eventually stop at.
+# Sized a bit under MAX_EMAIL_ATTACHMENT_BYTES: reading in is cheaper to
+# cap tightly than sending out is to cap loosely.
+MAX_PDF_READ_BYTES = int(os.environ.get("MESSA_MAX_PDF_READ_BYTES", str(20 * 1024 * 1024)))
+
 # Shared secret the Cloudflare Worker sends as the X-Messa-Webhook-Secret
 # header on every inbound-email POST -- same role as SENDBLUE_WEBHOOK_SECRET
 # below, and same tradeoff: unset means the endpoint accepts any request
@@ -363,6 +394,43 @@ DEFAULT_TIMEZONE = os.environ.get("MESSA_DEFAULT_TIMEZONE", "America/New_York")
 RECURSION_LIMIT = int(os.environ.get("MESSA_RECURSION_LIMIT", "100"))
 SESSIONS_DIR = os.environ.get("MESSA_SESSIONS_DIR", "sessions")
 OUTPUTS_DIR = os.environ.get("MESSA_OUTPUTS_DIR", "outputs")
+
+
+def resolve_output_file(path: str, *, max_bytes: int | None = None) -> Path:
+    """Resolve and validate a path a tool/model reported as a file it
+    generated -- exists, is a real file, and lives inside OUTPUTS_DIR (so a
+    model-invented or path-traversal path can never make a caller read an
+    arbitrary file off the server), optionally under a raw-byte size cap.
+    Raises ValueError with a clear, specific reason on any failure rather
+    than letting a confusing lower-level exception (FileNotFoundError, a
+    PermissionError from escaping the output dir, etc.) surface instead.
+
+    Factored out of channels/resend.py's original _validate_attachment_path
+    (which now just calls this) so the same security-critical check backs
+    every outbound-attachment path in the project, not just email's --
+    tools/personal_inbox_tools.py's send_email/reply_to_email (via
+    channels/resend.py) and agents/registry.py's send_pdf_over_text
+    (outbound SMS/iMessage attachment) both go through this one
+    implementation instead of duplicating the directory-traversal defense."""
+    outputs_dir = Path(OUTPUTS_DIR).resolve()
+    try:
+        resolved = Path(path).resolve()
+    except OSError as e:
+        raise ValueError(f"Couldn't resolve path {path!r}: {e}") from e
+    if not resolved.is_relative_to(outputs_dir):
+        raise ValueError(
+            f"Path {path!r} isn't inside the outputs directory -- only a file a tool actually "
+            "produced can be used here."
+        )
+    if not resolved.is_file():
+        raise ValueError(f"File not found: {path!r}.")
+    if max_bytes is not None:
+        size = resolved.stat().st_size
+        if size > max_bytes:
+            limit_mb = max_bytes / (1024 * 1024)
+            actual_mb = size / (1024 * 1024)
+            raise ValueError(f"File is too large ({actual_mb:.1f}MB, limit is {limit_mb:.0f}MB).")
+    return resolved
 
 # Deepsearch (the browsing/research subagent, formerly called
 # "browser_agent"): domains it is allowed to navigate to. Empty = no restriction.

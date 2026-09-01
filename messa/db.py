@@ -1686,6 +1686,7 @@ async def log_inbound_personal_email(
     in_reply_to: str | None = None,
     references: str | None = None,
     raw_json: str | None = None,
+    attachment_filename: str | None = None,
 ) -> dict[str, Any] | None:
     """Durable write + dedup in one step: ON CONFLICT (message_id) DO
     NOTHING means a redelivered webhook (see migrations/014's docstring)
@@ -1698,6 +1699,15 @@ async def log_inbound_personal_email(
     every such message needs its own value or the second one would
     silently collide and look like a duplicate of the first.
 
+    `attachment_filename` (migrations/016_messa_email_attachment.sql):
+    previously written only by log_outbound_personal_email below -- now
+    also set here when server.py's webhook found a PDF attachment on the
+    inbound message (see cloudflare/personal-email-worker/worker.js's
+    pdf_attachments forwarding + pdf_reader.py), so the paperclip note in
+    _format_message_line/the live-view Emails page shows up for inbound
+    mail too, not just outbound. None (unchanged default) for a plain
+    email with nothing attached.
+
     Returns the inserted row (including its computed thread_id) for a
     genuinely new message; None for a duplicate, or if migration 014 hasn't
     been applied yet."""
@@ -1709,18 +1719,36 @@ async def log_inbound_personal_email(
             to_address.split("@", 1)[-1] or config.TEXTMESSA_EMAIL_DOMAIN
         )
         thread_id = _compute_thread_id(real_message_id, in_reply_to, references)
-        row = await conn.fetchrow(
-            """
-            INSERT INTO messa_email_messages
-                (user_id, direction, thread_id, message_id, in_reply_to, references_header,
-                 from_address, to_address, subject, body_text, raw_json)
-            VALUES ($1, 'inbound', $2, $3, $4, $5, $6, $7, $8, $9, $10)
-            ON CONFLICT (message_id) DO NOTHING
-            RETURNING *
-            """,
-            user_id, thread_id, real_message_id, in_reply_to, references,
-            from_address, to_address, subject, body_text, raw_json,
-        )
+        has_attachment_col = await _has_column(conn, "messa_email_messages", "attachment_filename")
+        if has_attachment_col:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO messa_email_messages
+                    (user_id, direction, thread_id, message_id, in_reply_to, references_header,
+                     from_address, to_address, subject, body_text, raw_json, attachment_filename)
+                VALUES ($1, 'inbound', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                ON CONFLICT (message_id) DO NOTHING
+                RETURNING *
+                """,
+                user_id, thread_id, real_message_id, in_reply_to, references,
+                from_address, to_address, subject, body_text, raw_json, attachment_filename,
+            )
+        else:
+            # migration 016 not applied yet -- degrade gracefully rather
+            # than erroring: the email itself is still worth logging even
+            # if we can't note that it had an attachment.
+            row = await conn.fetchrow(
+                """
+                INSERT INTO messa_email_messages
+                    (user_id, direction, thread_id, message_id, in_reply_to, references_header,
+                     from_address, to_address, subject, body_text, raw_json)
+                VALUES ($1, 'inbound', $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                ON CONFLICT (message_id) DO NOTHING
+                RETURNING *
+                """,
+                user_id, thread_id, real_message_id, in_reply_to, references,
+                from_address, to_address, subject, body_text, raw_json,
+            )
         return dict(row) if row else None
 
 
@@ -1984,3 +2012,45 @@ async def list_email_threads(
             *args,
         )
         return _rows(rows)
+
+
+# ---------------------------------------------------------------------------
+# Generated-document shares (migrations/018_generated_document_shares.sql):
+# a public, unguessable-token URL for a file Messa generated, so it can be
+# attached to an outbound TEXT message via Sendblue's media_url (which
+# needs a URL it can fetch, not raw bytes -- see agents/registry.py's
+# send_pdf_over_text and server.py's GET /files/{token}).
+# ---------------------------------------------------------------------------
+
+async def create_document_share(user_id: int, file_path: str, filename: str) -> str | None:
+    """Mints a fresh unguessable token for `file_path` and records it.
+    Same token-generation approach as get_or_create_live_share_token
+    (secrets.token_urlsafe) -- not sequential/enumerable. Returns None
+    (no-op) if migration 018 hasn't been applied yet, same pattern as
+    every other optional-table function in this module."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "generated_document_shares"):
+            return None
+        token = secrets.token_urlsafe(24)
+        await conn.execute(
+            "INSERT INTO generated_document_shares (user_id, token, file_path, filename) "
+            "VALUES ($1, $2, $3, $4)",
+            user_id, token, file_path, filename,
+        )
+        return token
+
+
+async def get_document_share_by_token(token: str) -> dict[str, Any] | None:
+    """Looked up by server.py's public GET /files/{token} route -- that
+    route re-validates file_path against config.OUTPUTS_DIR itself before
+    serving anything (see config.resolve_output_file), this function is
+    just the lookup."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "generated_document_shares"):
+            return None
+        row = await conn.fetchrow(
+            "SELECT * FROM generated_document_shares WHERE token = $1", token,
+        )
+        return dict(row) if row else None

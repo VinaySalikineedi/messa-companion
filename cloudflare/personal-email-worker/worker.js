@@ -22,11 +22,26 @@
 //      a catch-all routing rule pointed at this Worker.
 import PostalMime from "postal-mime";
 
+// Hard ceiling on a single attachment this Worker will even bother
+// forwarding -- separate from (and smaller than) messa/config.py's own
+// MAX_PDF_READ_BYTES, which is the real limit server.py enforces
+// independently. This one exists purely so a huge attachment doesn't
+// inflate the JSON payload this Worker POSTs with something that's going
+// to get rejected server-side anyway. Compared against the base64 STRING
+// length (roughly 4/3 of the raw byte count) since attachmentEncoding:
+// "base64" below means that's the form attachment.content already arrives
+// in -- no manual ArrayBuffer->base64 conversion needed.
+const MAX_FORWARDED_ATTACHMENT_BASE64_CHARS = 20 * 1024 * 1024;
+
 export default {
   async email(message, env, ctx) {
     let parsed;
     try {
-      parsed = await PostalMime.parse(message.raw);
+      // attachmentEncoding: "base64" -- PostalMime hands back each
+      // attachment's `content` as a ready-to-forward base64 string
+      // instead of the default ArrayBuffer, since that's exactly the
+      // shape the JSON payload below needs anyway.
+      parsed = await PostalMime.parse(message.raw, { attachmentEncoding: "base64" });
     } catch (err) {
       // A message we can't even parse isn't something Messa can act on --
       // reject rather than forwarding garbage (Cloudflare returns this as
@@ -41,6 +56,24 @@ export default {
       ? parsed.references.join(" ")
       : parsed.references || null;
 
+    // Forward only PDF-shaped attachments (by mimeType or filename
+    // extension) and only ones under the size ceiling above -- messa/
+    // server.py's personal_email_inbound_webhook (see messa/pdf_reader.py)
+    // extracts text from whichever one arrives first; everything else
+    // (photos, other file types, oversized PDFs) is just dropped here,
+    // same as it always was before this existed.
+    const pdfAttachments = (parsed.attachments || [])
+      .filter((a) => {
+        const name = (a.filename || "").toLowerCase();
+        const type = (a.mimeType || "").toLowerCase();
+        return type === "application/pdf" || name.endsWith(".pdf");
+      })
+      .filter((a) => typeof a.content === "string" && a.content.length <= MAX_FORWARDED_ATTACHMENT_BASE64_CHARS)
+      .map((a) => ({
+        filename: a.filename || "attachment.pdf",
+        content_base64: a.content,
+      }));
+
     const payload = {
       to: message.to,
       from: message.from,
@@ -49,6 +82,7 @@ export default {
       message_id: parsed.messageId || null,
       in_reply_to: parsed.inReplyTo || null,
       references,
+      pdf_attachments: pdfAttachments,
     };
 
     let response;

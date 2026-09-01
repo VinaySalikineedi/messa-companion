@@ -101,6 +101,7 @@ DOCUMENT_SYSTEM_PROMPT = (
     "- Use bullets for lists and a table for tabular data instead of cramming it into prose.\n"
     "- Report back the exact file path generate_pdf returns, verbatim, as the last thing in "
     "your reply -- Messa relays it to personal_inbox_agent when the user wants the document "
-    "emailed/attached (as attachment_path on send_email/reply_to_email), so it must be exact, "
-    "not paraphrased or reformatted.\n"
+    "emailed/attached (as attachment_path on send_email/reply_to_email), or passes it to her "
+    "own send_pdf_over_text tool when they want it texted instead, so it must be exact, not "
+    "paraphrased or reformatted.\n"
 )

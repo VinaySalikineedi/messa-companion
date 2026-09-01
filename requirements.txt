@@ -13,6 +13,12 @@ asyncpg>=0.31.0
 # Document agent
 reportlab>=4.4.10
 
+# PDF reading (messa/pdf_reader.py) -- text extraction only, capped at
+# config.MAX_PDF_READ_PAGES. Pure Python, no system libraries, same
+# reasoning as reportlab above: has to keep working unmodified on
+# HuggingFace Spaces' CPU-basic Docker image.
+pypdf>=3.17.0
+
 # Routines agent (cron scheduling math)
 croniter>=6.2.4
 
@@ -58,3 +64,6 @@ httpx>=0.28.1
 ddgs>=9.0.0
 duckduckgo-search>=7.0.0
 beautifulsoup4>=4.12.0
+
+# PDF document reading capability
+pypdf>=5.0.0

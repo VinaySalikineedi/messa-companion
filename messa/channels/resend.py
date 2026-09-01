@@ -64,33 +64,14 @@ class ResendError(RuntimeError):
 
 def _validate_attachment_path(attachment_path: str) -> Path:
     """Resolves and checks an attachment path before anything gets read off
-    disk -- exists, is a plain file, lives inside config.OUTPUTS_DIR (never
-    trust a path a model produced to be exactly what it claims), and is
-    under the raw-byte size cap. Raises ResendError with a clear, specific
-    reason on any failure rather than letting a confusing lower-level
-    exception (FileNotFoundError, a PermissionError from escaping the
-    output dir, etc.) surface instead."""
-    outputs_dir = Path(config.OUTPUTS_DIR).resolve()
+    disk. Thin wrapper around config.resolve_output_file (the shared
+    implementation -- see its docstring) that just re-raises as ResendError
+    instead of ValueError, so existing callers of this module see the same
+    exception type they always have."""
     try:
-        resolved = Path(attachment_path).resolve()
-    except OSError as e:
-        raise ResendError(f"Couldn't resolve attachment path {attachment_path!r}: {e}") from e
-    if not resolved.is_relative_to(outputs_dir):
-        raise ResendError(
-            f"Attachment path {attachment_path!r} isn't inside the outputs directory -- "
-            "only a file generate_pdf actually produced can be attached."
-        )
-    if not resolved.is_file():
-        raise ResendError(f"Attachment file not found: {attachment_path!r}.")
-    size = resolved.stat().st_size
-    if size > config.MAX_EMAIL_ATTACHMENT_BYTES:
-        limit_mb = config.MAX_EMAIL_ATTACHMENT_BYTES / (1024 * 1024)
-        actual_mb = size / (1024 * 1024)
-        raise ResendError(
-            f"Attachment is too large ({actual_mb:.1f}MB, limit is {limit_mb:.0f}MB) -- "
-            "try a shorter document."
-        )
-    return resolved
+        return config.resolve_output_file(attachment_path, max_bytes=config.MAX_EMAIL_ATTACHMENT_BYTES)
+    except ValueError as e:
+        raise ResendError(str(e)) from e
 
 
 async def send_email(

@@ -3823,3 +3823,196 @@ a live rendered browser DOM (`test_dashboard_toggle.py` covers the
 schedule card's markup rendering, not a real click on the new buttons),
 and a real end-to-end "email Sam" request against a live model actually
 calling `find_contact` unprompted in the middle of a real conversation.
+
+## PDF support, round two: reading a PDF someone sends Messa, and texting one back out
+
+The earlier PDF-attachment phase only ever covered outbound email
+(`document_agent` -> `personal_inbox_agent`'s `attachment_path` ->
+`channels/resend.py`). This phase closes the other three PDF gaps
+explicitly asked for: (1) a PDF texted to Messa over SMS/iMessage, (2) a
+PDF attached to inbound mail on her own address, and (3) Messa texting a
+PDF back out, not just emailing one. All three share one new module,
+`messa/pdf_reader.py`, and one new config knob, `config.MAX_PDF_READ_PAGES`
+(default 10) -- explicitly "easily modified by a variable when needed," per
+the ask, following the exact same `os.environ.get(...)` pattern every other
+tunable in this project already uses. It applies ONLY to reading: generating
+a PDF (`document_tools.py`'s `generate_pdf`) stays unlimited, unchanged.
+`config.MAX_PDF_READ_BYTES` (default 20MB) caps the raw file size before
+any parsing is even attempted, on top of the page cap.
+
+**`messa/pdf_reader.py`: one extraction function, used by every inbound-PDF
+path.** `extract_pdf_text(data: bytes, *, max_pages=None) ->
+(text, pages_read, truncated)` opens the bytes with `pypdf` (pure Python,
+no system libraries -- same reasoning `document_tools.py` already documents
+for choosing `reportlab` over a `weasyprint`/HTML pipeline: this has to
+keep working unmodified on HuggingFace Spaces' CPU-basic Docker image),
+makes one cheap attempt at an empty-password decrypt (some "encrypted"
+PDFs are just that, not actually protected), reads up to the page limit,
+and joins each page's extracted text. `truncated` is `True` whenever the
+real PDF had more pages than the limit allowed -- both callers below fold
+that into a note so "read the first 10 pages of a 40-page PDF" is never
+silently presented as "read the whole document." A `PdfReadFailure`
+(never a raw `pypdf` exception) covers every failure mode in one place: a
+corrupt file, a real password, or a scanned/image-only PDF with no
+extractable text at all (OCR is out of scope).
+
+**Sub-request 1: texting Messa a PDF.** Sendblue's inbound webhook already
+carries `media_url` (a CDN link to any MMS/iMessage attachment) alongside
+`content` -- confirmed against Sendblue's own docs, since this project has
+no live account to test the real payload shape against. Previously,
+`sendblue_webhook` silently dropped any message where `content` was empty,
+which meant a captionless "just the PDF, no text" MMS was never even
+accepted. It now accepts the webhook when EITHER `content` or `media_url`
+is present, and `_process_inbound` gained a `media_url` parameter: a new
+`_maybe_read_inbound_pdf(media_url)` downloads the attachment and, ONLY if
+it actually looks like a PDF (`Content-Type` header or the `%PDF-` magic
+bytes -- an ordinary photo MMS just flows through completely unchanged, no
+PDF note appended, exactly like before this shipped), runs it through
+`pdf_reader.extract_pdf_text` and returns a ready-to-inject text block
+(success with the extracted text, "too large," or "couldn't be read").
+That block gets appended to whatever caption text came with the message
+before the normal turn runs; if there's still nothing to act on (a
+captionless non-PDF attachment), the function returns early without ever
+calling `run_message` -- the same "silently ignored" behavior a captionless
+photo MMS already had, now reachable via a different code path instead of
+being blocked at the webhook's own door. Messa's own system prompt tells
+her the extracted text is already sitting right in the message that told
+her a PDF arrived -- she doesn't fetch or open anything herself.
+
+**Sub-request 2: a PDF attached to inbound mail on Messa's own address.**
+`cloudflare/personal-email-worker/worker.js` already parses full MIME via
+`postal-mime`; it now calls `PostalMime.parse(message.raw, {attachmentEncoding:
+"base64"})` (letting the library hand back attachment content as a
+ready-to-forward base64 string instead of the default `ArrayBuffer`,
+rather than hand-rolling that conversion), filters `parsed.attachments` down
+to PDF-shaped ones (by `mimeType` or a `.pdf` filename) under a
+15MB-base64-chars ceiling (`MAX_FORWARDED_ATTACHMENT_BASE64_CHARS` -- a
+separate, Worker-side-only cap purely so a huge attachment doesn't inflate
+the JSON payload with something that's going to get rejected server-side
+anyway), and adds a `pdf_attachments: [{filename, content_base64}, ...]`
+array to the JSON payload it already POSTs to
+`/webhooks/personal-email/inbound`. Server-side, that route decodes and
+extracts text from the FIRST PDF attachment (matches the "she should be
+able to read it" scope this shipped for -- a message with several PDFs
+isn't the common case), builds a `pdf_note` string the same shape as the
+SMS path's, and -- critically -- never persists the raw base64 blob: the
+JSON stored in `raw_json` is sanitized down to just the filename before
+the `INSERT`, so a large attachment never bloats that column. The extracted
+text itself isn't persisted anywhere either; it's handed straight to
+`_process_inbound_personal_email` as a new `pdf_note` parameter and folded
+into the synthetic prompt Messa sees for that inbound email, the same
+"available in the moment, not retrievable from history later" tradeoff the
+SMS path makes. `attachment_filename` (`migrations/016`'s column,
+previously written only by outbound sends) is now also set on the inbound
+row when a PDF was found, guarded by the same `_has_column` check
+`log_outbound_personal_email` already used -- so the paperclip note in
+`_format_message_line`/the live-view Emails page now shows up for inbound
+mail too.
+
+**Sub-request 3: Messa texting a PDF back out.** Sendblue's `media_url`
+has to be a URL its own servers can fetch -- not raw bytes, unlike outbound
+email, where `channels/resend.py` just base64-encodes the file straight
+into the request. That's the one new piece of infrastructure this needed:
+`migrations/018_generated_document_shares.sql` (a `generated_document_shares`
+table -- `user_id, token UNIQUE, file_path, filename`), `db.create_document_share`
+/ `get_document_share_by_token`, and a new public `GET /files/{token}`
+route in `server.py`. The token is generated the same way as
+`users.live_share_token` (`secrets.token_urlsafe(24)` -- unguessable, not
+enumerable), and the route re-validates `file_path` against
+`config.OUTPUTS_DIR` again at SERVE time, not just trusting it was valid
+when the share row was created -- same defense-in-depth posture as the
+existing email-attachment path, so even a stale row can never serve a file
+that's since moved outside the outputs directory; an unknown token or a
+vanished file both 404, never a 500 that might leak a path. The actual
+send is a new orchestrator-level DIRECT tool,
+`agents/registry.py`'s `send_pdf_over_text(file_path, caption=None)`
+(same shape as the just-added `find_contact` tool) -- it validates the
+path, mints a share token, builds the `/files/{token}` URL from
+`config.LIVE_VIEW_BASE_URL`, and calls `channels/sendblue.py`'s
+`send_message(..., media_url=...)` directly, mirroring how
+`personal_inbox_tools.py`'s email tools call `channels/resend.py` directly
+rather than going through the generic per-turn `send` callback
+(`_sms_send_factory` in `server.py`) -- threading a new attachment
+parameter through that generic machinery would have been architecturally
+heavier than needed for what's fundamentally a one-off direct send to the
+user's own number. It goes straight to the user's own phone number, not a
+third party, so -- like any other message Messa sends the user directly --
+it needs no confirmation step.
+
+**A new shared path-validation function, `config.resolve_output_file`.**
+`channels/resend.py`'s `_validate_attachment_path` (exists, is a real
+file, lives inside `config.OUTPUTS_DIR`, under a size cap -- the same
+directory-traversal defense this project has used since the first
+PDF-attachment phase) was private to that one module. It's now factored
+into `config.resolve_output_file(path, *, max_bytes=None) -> Path`
+(raising `ValueError`), with `resend.py`'s function reduced to a thin
+wrapper that just re-raises as `ResendError` so existing callers see the
+same exception type they always have. `send_pdf_over_text` above uses the
+shared function directly (with the new, smaller
+`config.MAX_SMS_ATTACHMENT_BYTES` cap -- default 8MB, deliberately much
+tighter than email's 25MB: an MMS recipient on the SMS/RCS carrier
+fallback, not iMessage over data, is often behind a real carrier size
+ceiling of just a few MB, and Sendblue's own CDN re-hosting doesn't change
+what the receiving carrier will actually deliver) -- so the one
+security-critical "is this path actually safe to read" check now backs
+every outbound-attachment path in the project, not just email's.
+
+**New dependency:** `pypdf` (added to `requirements.txt`) -- chosen over
+`pdfplumber` (the other library the request suggested) for the same "pure
+Python, no system libraries" reasoning `reportlab` was already chosen for:
+`pdfplumber` pulls in `pdfminer.six`, a heavier dependency for text
+extraction this simple.
+
+**Not extended to Gmail:** all three sub-requests above are scoped to
+Messa's own channel/address only -- SMS/iMessage via Sendblue and Messa's
+own email via `personal_inbox_agent` -- consistent with the earlier
+PDF-attachment phase's explicit scoping (confirmed via `AskUserQuestion` at
+the time) that excluded `email_tools.py`'s Gmail-via-Composio path from
+attachment support. That same boundary applies here: nothing in this phase
+touches Gmail.
+
+**Verification:** a new `/tmp/test_pdf_support.py` (7 parts, all passing,
+alongside a full clean re-run of the untouched-but-signature-adjacent
+suites -- `test_personal_inbox.py`, `test_email_attachment_and_display_name.py`,
+`test_default_email_provider.py`, `test_email_subagent.py`,
+`test_dashboard_toggle.py`, `test_executive_quality_check.py`,
+`test_executive_tools_direct.py`, `test_emails_dashboard_route.py`,
+`test_reminder_autodelete_and_contacts.py` -- all still green, including
+`test_personal_inbox.py`'s own fake DB, updated for `log_inbound_personal_email`'s
+new `attachment_filename` parameter and a new inbound-with-attachment
+INSERT-shape branch it hadn't modeled before): `pdf_reader.extract_pdf_text`
+against real `reportlab`-generated PDFs (page-cap truncation, a custom
+`max_pages` override, garbage/empty bytes raising `PdfReadFailure` cleanly);
+`config.resolve_output_file` (a real file inside `OUTPUTS_DIR`, a
+`/etc/passwd`-style escape, a `../` traversal attempt, a missing file, an
+oversized file); `db.create_document_share`/`get_document_share_by_token`
+round-tripping through a fake connection (plus the pre-migration-018
+no-op path); `send_pdf_over_text` end to end against faked `sendblue.send_message`
+and `db.create_document_share` (a successful send, a path outside
+`OUTPUTS_DIR`, Sendblue not configured, and a `SendblueError` from the
+send itself all reported plainly rather than raised); `GET /files/{token}`
+via `TestClient` (a valid share serves the real bytes, an unknown token
+404s, a share pointing at a since-vanished file 404s rather than 500ing);
+`_process_inbound`'s new `media_url` handling via a faked `httpx.AsyncClient`
+(a plain text message is unaffected; a captionless PDF MMS still reaches
+`run_message`, not silently dropped; a captioned PDF keeps both the
+caption and the extracted text; a captionless non-PDF/photo MMS is still
+silently ignored, no `run_message` call at all; a captioned photo still
+delivers just the caption; an oversized or corrupt PDF attachment produces
+a clear note instead of crashing); and `personal_email_inbound_webhook`'s
+`pdf_attachments` handling via `TestClient` (a plain email logs with no
+`attachment_filename`; a real PDF attachment gets extracted and its text
+relayed as `pdf_note` while the base64 blob itself never lands in
+`raw_json`; a corrupt attachment still 200s with a plain failure note
+instead of a 500; an unknown recipient is unaffected).
+
+**Not verified here**, same caveat as every other phase in this project: a
+real Sendblue account actually delivering an MMS with `media_url` pointing
+at this project's own `/files/{token}` route (the mechanism -- an external
+URL Sendblue's servers fetch -- is confirmed against Sendblue's own docs,
+not against a live send); a real inbound MMS webhook payload's exact
+`media_url` field shape (confirmed via Sendblue's docs, not a live
+account); and the Cloudflare Worker's `postal-mime` attachment parsing
+against a real inbound email carrying an actual PDF (`node --check` only
+confirms the JS is syntactically valid, not that a live Cloudflare Email
+Routing delivery round-trips a real attachment correctly end to end).
