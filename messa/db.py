@@ -148,17 +148,49 @@ async def get_user_by_id(user_id: int) -> dict[str, Any] | None:
         return dict(row) if row else None
 
 
-async def update_user_timezone(user_id: int, timezone_name: str, confirmed: bool = True) -> dict[str, Any] | None:
+async def update_user_timezone(
+    user_id: int,
+    timezone_name: str,
+    confirmed: bool = True,
+    latitude: float | None = None,
+    longitude: float | None = None,
+) -> dict[str, Any] | None:
     """Overwrite a user's stored timezone -- the one place, other than
     account creation, that users.timezone is ever written. `confirmed`
     tracks whether this came from an actually-resolved city/zip (see
     timeutil.resolve_timezone) as opposed to still being the
     config.DEFAULT_TIMEZONE placeholder. Additive/no-op-safe: if
     migrations/007_timezone_confirmed.sql hasn't been applied yet, still
-    updates the timezone itself, just without the confirmed flag."""
+    updates the timezone itself, just without the confirmed flag.
+
+    `latitude`/`longitude` (migrations/019_user_coordinates.sql, optional):
+    the SAME resolution's coordinates, written in this one UPDATE alongside
+    the timezone rather than a separate call -- both callers below always
+    have both at once (they come from the same timeutil.resolve_timezone
+    result). Guarded by its own _has_column check, independent of the
+    timezone_confirmed one, so this degrades gracefully on a deployment
+    that has 007 but not yet 019: the timezone still gets updated, just
+    without coordinates. None (the default) leaves latitude/longitude
+    untouched -- only ensure_timezone_resolved/save_profile_field's city
+    branch ever pass real values here."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        if await _has_column(conn, "users", "timezone_confirmed"):
+        has_confirmed_col = await _has_column(conn, "users", "timezone_confirmed")
+        has_coords_col = latitude is not None and longitude is not None and await _has_column(
+            conn, "users", "latitude"
+        )
+        if has_coords_col and has_confirmed_col:
+            row = await conn.fetchrow(
+                "UPDATE users SET timezone = $2, timezone_confirmed = $3, latitude = $4, longitude = $5 "
+                "WHERE id = $1 RETURNING *",
+                user_id, timezone_name, confirmed, latitude, longitude,
+            )
+        elif has_coords_col:
+            row = await conn.fetchrow(
+                "UPDATE users SET timezone = $2, latitude = $3, longitude = $4 WHERE id = $1 RETURNING *",
+                user_id, timezone_name, latitude, longitude,
+            )
+        elif has_confirmed_col:
             row = await conn.fetchrow(
                 "UPDATE users SET timezone = $2, timezone_confirmed = $3 WHERE id = $1 RETURNING *",
                 user_id, timezone_name, confirmed,
@@ -185,7 +217,10 @@ async def ensure_timezone_resolved(user_row: dict[str, Any]) -> dict[str, Any]:
     resolution = await timeutil.resolve_timezone(user_row["city"])
     if resolution is None:
         return user_row
-    updated = await update_user_timezone(user_row["id"], resolution.timezone, confirmed=resolution.confident)
+    updated = await update_user_timezone(
+        user_row["id"], resolution.timezone, confirmed=resolution.confident,
+        latitude=resolution.latitude, longitude=resolution.longitude,
+    )
     return updated or user_row
 
 
@@ -405,7 +440,10 @@ async def save_profile_field(user_id: int, field: str, value: str) -> dict[str, 
     if field == "city" and value and value.strip().lower() != "skip":
         resolution = await timeutil.resolve_timezone(value.strip())
         if resolution is not None:
-            updated = await update_user_timezone(user_id, resolution.timezone, confirmed=resolution.confident)
+            updated = await update_user_timezone(
+                user_id, resolution.timezone, confirmed=resolution.confident,
+                latitude=resolution.latitude, longitude=resolution.longitude,
+            )
             if updated:
                 row = updated
     return dict(row)
@@ -885,20 +923,97 @@ async def get_due_cron_jobs(now: datetime | None = None) -> list[dict[str, Any]]
         return _rows(rows)
 
 
-async def get_due_cron_jobs_for_delivery(now: datetime | None = None) -> list[dict[str, Any]]:
+async def get_due_cron_jobs_for_delivery(
+    now: datetime | None = None, exclude_kinds: tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
     """Same as get_due_cron_jobs, but joined with users for the phone_number
-    a production re-invocation needs -- used by server.py's real poller."""
+    a production re-invocation needs -- used by server.py's real cron
+    poller, which re-invokes Messa's full LLM turn for whatever this
+    returns.
+
+    `exclude_kinds` (added alongside messa/briefings.py): server.py's
+    _production_cron_loop passes config.DEFAULT_BRIEFINGS' keys here so the
+    two system-provisioned briefing jobs -- now rendered deterministically
+    and delivered in parallel by the separate _production_briefing_loop/
+    get_due_briefing_jobs_for_delivery below -- are never ALSO picked up
+    and re-run through a full (sequential, per-job) LLM turn by this
+    function's caller. None (the default, unchanged from before this
+    param existed) excludes nothing, for any other caller. Pre-migration-011
+    (no `kind` column), every job is still untagged (kind IS NULL) and this
+    filter is simply never true, so nothing is excluded -- safe no-op."""
     now = now or datetime.now(timezone.utc)
     pool = await get_pool()
     async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            """
-            SELECT c.*, u.phone_number
-            FROM cron_jobs c JOIN users u ON u.id = c.user_id
-            WHERE c.status = 'active' AND c.next_run_at <= $1
-            """,
-            now,
-        )
+        if exclude_kinds and await _has_column(conn, "cron_jobs", "kind"):
+            rows = await conn.fetch(
+                """
+                SELECT c.*, u.phone_number
+                FROM cron_jobs c JOIN users u ON u.id = c.user_id
+                WHERE c.status = 'active' AND c.next_run_at <= $1
+                  AND (c.kind IS NULL OR NOT (c.kind = ANY($2::text[])))
+                """,
+                now, list(exclude_kinds),
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT c.*, u.phone_number
+                FROM cron_jobs c JOIN users u ON u.id = c.user_id
+                WHERE c.status = 'active' AND c.next_run_at <= $1
+                """,
+                now,
+            )
+        return _rows(rows)
+
+
+async def get_due_briefing_jobs_for_delivery(now: datetime | None = None) -> list[dict[str, Any]]:
+    """Same join as get_due_cron_jobs_for_delivery, scoped to just the two
+    system-provisioned briefing kinds (config.DEFAULT_BRIEFINGS) and with
+    the extra user profile fields messa/briefings.py's deterministic
+    template renderer needs -- name (for the greeting) and latitude/
+    longitude (migrations/019_user_coordinates.sql, for weather.py) --
+    that an arbitrary user-created automation never required (it only ever
+    needed phone_number, to re-invoke Messa with its saved prompt).
+
+    Used by server.py's _production_briefing_loop, which renders and sends
+    these itself (template-based, fanned out in parallel via asyncio.gather)
+    instead of letting _production_cron_loop's per-job sequential LLM turn
+    handle them -- see that function's own exclude_kinds param for the
+    other half of that split.
+
+    Returns [] (not an error) pre-migration-011 (no `kind` column at all,
+    so a briefing job can't be identified as one) -- _production_cron_loop
+    then still picks these rows up as ordinary untagged jobs, exactly the
+    behavior this whole feature had before kind-tagging existed. Coordinates
+    come back as None pre-migration-019 (guarded independently), same
+    "degrade the optional part, not the whole query" pattern used
+    throughout this module -- weather.py's caller already treats a missing
+    latitude/longitude as "no weather line," so this needs no special
+    handling here."""
+    now = now or datetime.now(timezone.utc)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_column(conn, "cron_jobs", "kind"):
+            return []
+        kinds = list(config.DEFAULT_BRIEFINGS.keys())
+        if await _has_column(conn, "users", "latitude"):
+            rows = await conn.fetch(
+                """
+                SELECT c.*, u.phone_number, u.name AS user_name, u.latitude, u.longitude
+                FROM cron_jobs c JOIN users u ON u.id = c.user_id
+                WHERE c.status = 'active' AND c.next_run_at <= $1 AND c.kind = ANY($2::text[])
+                """,
+                now, kinds,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT c.*, u.phone_number, u.name AS user_name
+                FROM cron_jobs c JOIN users u ON u.id = c.user_id
+                WHERE c.status = 'active' AND c.next_run_at <= $1 AND c.kind = ANY($2::text[])
+                """,
+                now, kinds,
+            )
         return _rows(rows)
 
 

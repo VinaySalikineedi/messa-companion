@@ -42,7 +42,7 @@ import httpx
 from fastapi import BackgroundTasks, FastAPI, Header, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
-from . import background, cli, config, console, db, live_activity, pdf_reader
+from . import background, briefings, cli, config, console, db, live_activity, pdf_reader
 from .agents.registry import build_orchestrator
 from .approval import AutoApproveGate, DenyApprovalGate
 from .channels import browserbase, sendblue
@@ -60,6 +60,13 @@ _bg_tasks: list[asyncio.Task] = []
 # is only surfaced to Messa's system prompt as the channel string in case a
 # future prompt tweak wants to tell them apart (e.g. media support differs).
 _CHANNEL_BY_SERVICE = {"imessage": "imessage", "sms": "sms", "rcs": "rcs"}
+
+# The two system-provisioned briefing kinds (config.DEFAULT_BRIEFINGS) --
+# handled by their own deterministic, parallel-fanned-out delivery path
+# (briefings.py + _production_briefing_loop below) instead of
+# _production_cron_loop's per-job LLM turn. Derived from DEFAULT_BRIEFINGS'
+# own keys (not hardcoded separately) so the two lists can never drift.
+BRIEFING_KINDS = tuple(config.DEFAULT_BRIEFINGS.keys())
 
 
 def _approval_gate():
@@ -1044,11 +1051,22 @@ async def _production_cron_loop() -> None:
     the job's saved prompt_or_task, using the same load_user_context/
     build_orchestrator/run_message path a live inbound text would use, and
     delivers whatever Messa produces via Sendblue -- so a recurring
-    automation (a daily briefing, a weekly check-in) actually happens
-    instead of only ever being provably schedulable."""
+    automation (a weekly check-in, anything else a user asked Messa to set
+    up via routines_agent) actually happens instead of only ever being
+    provably schedulable.
+
+    exclude_kinds=BRIEFING_KINDS: the two system-provisioned morning/
+    evening briefings (config.DEFAULT_BRIEFINGS) no longer come through
+    here at all -- see briefings.py's module docstring for why (template-
+    rendered, no model call, fanned out in parallel by the separate
+    _production_briefing_loop below instead of one-at-a-time in this
+    for-loop). Everything else -- any automation a user actually asked
+    Messa to create -- is genuinely arbitrary, model-authored text with no
+    fixed shape, so it keeps going through a real LLM turn here,
+    unchanged."""
     while True:
         try:
-            due = await db.get_due_cron_jobs_for_delivery()
+            due = await db.get_due_cron_jobs_for_delivery(exclude_kinds=BRIEFING_KINDS)
             for job in due:
                 phone = job["phone_number"]
                 try:
@@ -1065,6 +1083,52 @@ async def _production_cron_loop() -> None:
                 await db.reschedule_cron_job(job["id"], next_run)
         except Exception as e:  # noqa: BLE001
             console.system(f"[cron poller error] {e}")
+        await asyncio.sleep(background.POLL_INTERVAL_SECONDS)
+
+
+async def _send_one_briefing(job: dict[str, Any]) -> None:
+    """Render + send + reschedule ONE due briefing job -- factored out so
+    _production_briefing_loop can run a whole due batch through
+    asyncio.gather (one user's slow/failed render or send never blocks or
+    breaks another's) instead of the old one-at-a-time for-loop this
+    replaces. Any failure (a bad render, Sendblue down) is caught and
+    logged here, same as _production_cron_loop's per-job try/except --
+    still reschedules the job for its next run either way, so a transient
+    failure doesn't turn into a permanently stuck briefing."""
+    try:
+        text = await briefings.render_briefing(job)
+        if text:
+            await sendblue.send_message(job["phone_number"], text)
+    except Exception as e:  # noqa: BLE001
+        console.system(f"[briefing delivery failed] job=#{job['id']} kind={job.get('kind')}: {e}")
+    next_run = compute_next_run(job["cron_expression"], job["user_timezone"])
+    await db.reschedule_cron_job(job["id"], next_run)
+
+
+async def _production_briefing_loop() -> None:
+    """The parallel, no-LLM-call counterpart to _production_cron_loop,
+    scoped to just the two system-provisioned briefing kinds -- see
+    briefings.py's module docstring for the full "why": these were
+    previously just ordinary cron_jobs rows handled by
+    _production_cron_loop's for-loop, meaning every user's briefing was a
+    full, separate Messa LLM turn, run ONE AT A TIME even though the
+    underlying data (calendar/tasks/reminders/weather) needed no judgment
+    to assemble.
+
+    asyncio.gather over every due job here means a whole batch (everyone
+    whose 7:00 AM local time just ticked over) renders and sends
+    concurrently instead of serially -- the actual fix for "messa is going
+    sequentially over each user." return_exceptions=True so one job's
+    unexpected exception (already caught and logged inside
+    _send_one_briefing, but belt-and-suspenders here too) can never cancel
+    the rest of the batch."""
+    while True:
+        try:
+            due = await db.get_due_briefing_jobs_for_delivery()
+            if due:
+                await asyncio.gather(*(_send_one_briefing(job) for job in due), return_exceptions=True)
+        except Exception as e:  # noqa: BLE001
+            console.system(f"[briefing poller error] {e}")
         await asyncio.sleep(background.POLL_INTERVAL_SECONDS)
 
 
@@ -1167,10 +1231,13 @@ async def _startup() -> None:
     _bg_tasks = [
         asyncio.create_task(_production_reminder_loop()),
         asyncio.create_task(_production_cron_loop()),
+        asyncio.create_task(_production_briefing_loop()),
         asyncio.create_task(_production_deepsearch_pause_loop()),
         asyncio.create_task(_production_email_connection_poll_loop()),
     ]
-    console.system("Started production reminder/cron/deepsearch-pause/email-connection delivery pollers.")
+    console.system(
+        "Started production reminder/cron/briefing/deepsearch-pause/email-connection delivery pollers."
+    )
 
 
 @app.on_event("shutdown")

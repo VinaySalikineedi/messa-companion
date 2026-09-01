@@ -742,6 +742,23 @@ LEGACY_BRIEFING_MATCH_KEYWORDS: dict[str, tuple[str, ...]] = {
     "evening_briefing": ("evening brief",),
 }
 
+# ---- Weather (messa/weather.py) ----
+# Open-Meteo's forecast API -- same provider timeutil.py's geocoding
+# already uses (free, keyless, 10,000 calls/day on the non-commercial free
+# tier -- comfortably enough for two briefings/day/user at any realistic
+# user count), so this project has exactly one third-party weather
+# dependency to reason about instead of two. Explicit product decision: no
+# fallback provider -- if this call fails or returns something implausible,
+# messa/weather.py returns None and the caller (briefings.py) drops the
+# weather line entirely rather than show a wrong or stale number.
+WEATHER_FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+WEATHER_TIMEOUT_SECONDS = float(os.environ.get("MESSA_WEATHER_TIMEOUT_SECONDS", "8"))
+WEATHER_TEMPERATURE_UNIT = os.environ.get("MESSA_WEATHER_TEMPERATURE_UNIT", "fahrenheit")  # or "celsius"
+# How many days out to request in one call -- 2 covers both briefings from a
+# single fetch (today for the morning briefing, tomorrow for the evening
+# briefing's "quick look at tomorrow").
+WEATHER_FORECAST_DAYS = int(os.environ.get("MESSA_WEATHER_FORECAST_DAYS", "2"))
+
 
 @dataclass
 class UserContext:

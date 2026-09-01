@@ -32,7 +32,13 @@ anchor, since none of them had one before.
 Geocoding: Open-Meteo's free, keyless geocoding API
 (https://geocoding-api.open-meteo.com/v1/search) resolves both city names
 and US zip codes to an IANA timezone directly, no separate lat/lon->tz
-lookup needed. Verified live (three manual fetches during development --
+lookup needed. Its response already carries latitude/longitude on every
+result too -- TimezoneResolution now captures those alongside the
+timezone (db.update_user_timezone persists them to users.latitude/
+longitude, migrations/019_user_coordinates.sql) so messa/weather.py's
+forecast lookup for a briefing never needs to re-geocode a location it's
+already resolved once. Verified live (three manual fetches during
+development --
 see the README) including a real disambiguation hazard: a bare city name
 with no state ("Jacksonville") returns results in three different US
 timezones, and even "City, State" can include a low-population outlier
@@ -70,6 +76,14 @@ class TimezoneResolution:
     timezone: str
     resolved_name: str  # human-readable, e.g. "Jacksonville, Florida, US"
     confident: bool  # False when the top candidates disagree on timezone
+    # Open-Meteo's geocoding response already carries these on every result
+    # -- previously discarded once a timezone was picked. Now captured too
+    # (messa/weather.py -> a briefing's weather line needs coordinates, not
+    # just a zone name) so a location only ever needs resolving once. None
+    # only if the top candidate is somehow missing them (hasn't been
+    # observed in practice, but callers must not assume they're present).
+    latitude: float | None = None
+    longitude: float | None = None
 
 
 async def resolve_timezone(location: str) -> Optional[TimezoneResolution]:
@@ -129,7 +143,10 @@ def _pick_resolution(results: list[dict[str, Any]]) -> Optional[TimezoneResoluti
     name_parts = [p for p in (top.get("name"), top.get("admin1"), top.get("country")) if p]
     resolved_name = ", ".join(name_parts) if name_parts else tz_name
 
-    return TimezoneResolution(timezone=tz_name, resolved_name=resolved_name, confident=confident)
+    return TimezoneResolution(
+        timezone=tz_name, resolved_name=resolved_name, confident=confident,
+        latitude=top.get("latitude"), longitude=top.get("longitude"),
+    )
 
 
 def to_local_aware(raw: Any, user_tz: str) -> Optional[datetime]:

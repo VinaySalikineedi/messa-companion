@@ -4016,3 +4016,174 @@ account); and the Cloudflare Worker's `postal-mime` attachment parsing
 against a real inbound email carrying an actual PDF (`node --check` only
 confirms the JS is syntactically valid, not that a live Cloudflare Email
 Routing delivery round-trips a real attachment correctly end to end).
+
+## Morning/evening briefings: from a sequential LLM turn per user to a deterministic, parallel-rendered template
+
+Direct product feedback: a morning/evening briefing was just another
+`cron_jobs` row (`config.DEFAULT_BRIEFINGS`) whose saved `prompt_or_task`
+got handed to a full Messa LLM turn every time it fired
+(`server.py`'s `_production_cron_loop`) -- meaning every due user's
+briefing was a real model round-trip, run ONE AT A TIME in a `for job in
+due:` loop, even though the underlying content (calendar events, tasks
+due, reminders, weather) needed no judgment to assemble and read
+essentially the same shape every time. This phase replaces that with a
+deterministic template renderer that fetches one user's data in parallel
+(`asyncio.gather`) and a new delivery loop that fans an entire due batch
+out concurrently (a second `asyncio.gather`, over every due user) -- no
+model call anywhere in the path. Any OTHER recurring automation a user
+actually asks Messa to set up (`routines_agent`'s
+`propose_create_recurring_cron`) is untouched: that's genuinely arbitrary,
+model-authored text with no fixed shape, so it still goes through a real
+LLM turn exactly as before.
+
+**The split, precisely.** `messa/db.py`'s `get_due_cron_jobs_for_delivery`
+gained an `exclude_kinds` param; `server.py`'s `_production_cron_loop` now
+passes `BRIEFING_KINDS` (a new module constant, `tuple(config.DEFAULT_BRIEFINGS.keys())`
+-- derived from the existing config, not a second hardcoded list that
+could drift) so the two system-provisioned briefing kinds never reach its
+per-job LLM path at all. A new `db.get_due_briefing_jobs_for_delivery`
+handles just those two kinds, joined with the extra user profile fields
+the deterministic renderer needs (name, latitude/longitude) that an
+arbitrary automation never required (it only ever needed `phone_number`).
+A new `server.py` loop, `_production_briefing_loop` (added to `_startup`'s
+`_bg_tasks` alongside the existing reminder/cron/deepsearch-pause/email-
+connection pollers, same polling cadence), fetches the due batch and runs
+`asyncio.gather` over a new `_send_one_briefing(job)` per job -- render,
+send via Sendblue, and reschedule via `compute_next_run`/
+`db.reschedule_cron_job`, all still per-job try/except'd exactly like the
+old loop, but no longer serialized behind each other.
+
+**`messa/briefings.py` -- the deterministic renderer.** `render_morning_briefing`/
+`render_evening_briefing` each take one job row and fetch everything for
+the relevant local day(s) in parallel: `db.list_calendar_events_for_range`,
+`db.list_tasks`, `db.list_reminders`, and `messa/weather.py`'s forecast
+call (see below). Morning covers today: events, tasks due today or
+overdue, and reminders set for today. Evening recaps today (tasks marked
+done today, today's events) and previews tomorrow (tomorrow's weather/
+events/reminders, plus anything due tomorrow or still overdue) -- the same
+semantics the old LLM prompt described in English, just computed
+deterministically instead of interpreted by a model each time. Per
+explicit product decision (the earlier LLM prompt's "reminders" was
+actually never mentioned, but the new request calling out "calendar
+events, reminders, tasks and weather" explicitly added it): reminders
+shown are scoped to just that day (today for morning, tomorrow for
+evening) rather than every pending reminder regardless of date, keeping
+the message short even when several are queued out. An empty day still
+renders a short, warm fallback line ("Nothing on deck today..." /
+"Quiet day...") rather than nothing -- explicit product decision to keep
+`render_briefing` NEVER crash or blank out: any single missing piece
+(most commonly weather) is just dropped from that day's text, never
+blocks the rest. Plain text throughout, matching the same no-markdown/
+no-bullets SMS convention `agents/registry.py`'s own system prompt already
+enforces for a live model turn on this channel.
+
+**`messa/weather.py` -- the one new external dependency, chosen to add
+zero NEW third-party surface.** `timeutil.py`'s existing city/zip geocoding
+already calls Open-Meteo's free, keyless API
+(`https://geocoding-api.open-meteo.com/v1/search`) -- this reuses the SAME
+provider's forecast endpoint (`https://api.open-meteo.com/v1/forecast`,
+also free and keyless: confirmed via Open-Meteo's own site during this
+phase at up to 10,000 calls/day on the non-commercial free tier,
+comfortably enough for two briefings/day/user at any realistic user
+count), so the project has exactly one weather-adjacent dependency to
+reason about, not two. Requests just the `daily` block
+(`weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max`)
+for `config.WEATHER_FORECAST_DAYS` (2, covering both briefings from one
+fetch) days, in Fahrenheit (`config.WEATHER_TEMPERATURE_UNIT`) and in the
+LOCATION's own local calendar (Open-Meteo's `timezone` param) so "today"
+never straddles a UTC day boundary depending on what hour this happens to
+run. A small WMO-code table (`open-meteo.com/en/docs`' own documented
+subset, extended with the standard remaining codes -- 56/57 freezing
+drizzle, 66/67 freezing rain, 77 snow grains, 85/86 snow showers -- for
+full coverage) turns `weather_code` into a short phrase like "partly
+cloudy"; `DayWeather.one_liner()` renders "78°/61°F, partly cloudy" (or
+"...,20% rain" when Open-Meteo's own rain-chance clears a 10% floor --
+skipping that clause on a near-certain-dry day keeps it shorter).
+
+Explicit product decision, asked for directly ("if our weather is
+unreliable its better to drop it"): there is no fallback weather provider
+and no partial/best-guess result. `get_daily_weather` returns `None` --
+never a raw exception, never a partial list -- on ANY network failure,
+timeout, malformed/misaligned response shape, OR an implausible reading on
+ANY requested day (`_is_plausible`: outside a generous real-world
+temperature range, or a low reported above its own high) -- one bad day in
+the response taints the whole thing, since both days came from the same
+call and a broken response isn't more trustworthy for today just because
+tomorrow's the one that looked wrong. `briefings.py`'s renderer treats
+`None` exactly the same as "no coordinates on file at all" (a user who
+hasn't given a resolvable city yet): the weather line is silently
+dropped, the rest of the briefing renders normally.
+
+**Coordinates: captured once, at the exact place a location is already
+being resolved.** `timeutil.py`'s Open-Meteo geocoding response already
+carries `latitude`/`longitude` on every result -- previously discarded the
+moment a timezone was picked. `TimezoneResolution` now carries them too;
+`db.update_user_timezone` gained matching `latitude`/`longitude` params
+(written in the SAME `UPDATE` as the timezone, guarded by its own
+independent `_has_column` check so a deployment with migration 007 but
+not yet 019 still updates the timezone, just without coordinates); both
+existing call sites (`db.ensure_timezone_resolved`,
+`db.save_profile_field`'s city-save branch) now pass them through. New
+additive `migrations/019_user_coordinates.sql`
+(`users.latitude`/`users.longitude`, both `DOUBLE PRECISION`, nullable --
+`NULL` for anyone who hasn't given a resolvable city yet, or skipped that
+onboarding step). No separate geocoding round-trip happens at
+briefing-render time -- by the time a briefing fires, the coordinates (if
+resolvable at all) were already saved the moment the user gave Messa
+their city.
+
+**Not extended:** briefing SEND TIMES are unchanged -- still
+`config.DEFAULT_BRIEFINGS`' fixed 7:00 AM / 8:00 PM local cron expressions,
+same per-user timezone-aware scheduling `db.ensure_default_briefings`
+already provisioned; this phase only changed how a due job gets turned
+into text and how a due BATCH gets delivered, not when any individual
+user's briefing fires. A user can still cancel/pause their own briefing
+via the existing cron-job tools exactly as before (that mechanism didn't
+change).
+
+**Verification:** a new `/tmp/test_briefings.py` (4 parts, all passing,
+alongside a full clean re-run of `test_timeutil.py` and the whole
+previously-existing suite -- nothing regressed): `messa/weather.py`'s WMO
+description table, `DayWeather.one_liner`'s rain-clause threshold, and
+`get_daily_weather`'s parsing/rejection logic against a faked `httpx`
+client (a good 2-day response, a network exception, a response missing
+its `daily` key, an implausible reading on one day tainting the whole
+result, mismatched array lengths, and a non-2xx status -- all correctly
+returning `None`); `get_due_cron_jobs_for_delivery`'s new `exclude_kinds`
+param and the new `get_due_briefing_jobs_for_delivery` against a fake
+connection (including the pre-migration-011/pre-migration-019 degrade
+paths, and confirming a not-yet-due job is correctly excluded);
+`update_user_timezone`'s new coordinate params across all four
+has-confirmed-column/has-coords-column combinations; `render_morning_briefing`/
+`render_evening_briefing` against faked `db.*`/`weather.*` calls (a normal
+day's greeting/weather/events/overdue-task-labeling/reminders, weather
+dropped when coordinates are missing, weather dropped when
+`weather.get_daily_weather` itself returns `None`, the empty-day and
+quiet-evening fallback text, a nameless user getting a plain greeting
+instead of "Morning, None!", and `render_briefing`'s dispatch including an
+unrecognized-kind `None` return); and `server.py`'s `_send_one_briefing`
+(render+send+reschedule, a `None` render sending nothing but still
+rescheduling, and a Sendblue delivery failure still rescheduling rather
+than getting the job stuck) plus confirming both new/changed background
+loops actually call the right `db.*` function with the right arguments.
+One real bug this test-writing caught before shipping: the first draft of
+`render_evening_briefing`'s quiet-day fallback checked the SAME "tomorrow"
+bucket that weather also got appended to, so a user with nothing planned
+but a valid weather reading would never see the "nothing on the calendar"
+line at all -- fixed by tracking schedule content (events/due tasks)
+separately from the weather line for exactly that fallback check, while
+still showing weather on an otherwise-quiet day (it's useful information
+on its own).
+
+**Not verified here**, same caveat as every other phase in this project:
+this sandbox's own outbound network is restricted to a small package-
+registry allowlist (a live call to `api.open-meteo.com/v1/forecast` from
+here returned a `403` from the sandbox's own egress proxy, not from
+Open-Meteo -- the same restriction `timeutil.py`'s geocoding tests already
+document), so the real forecast endpoint's exact response shape is
+confirmed against Open-Meteo's own published docs (fetched during this
+phase) rather than a live call from this environment; a real batch of
+concurrent Sendblue sends at 7:00 AM against a live account; and a live
+user's `latitude`/`longitude` actually landing correctly through the full
+onboarding flow (`save_profile_field`'s city branch) against a real Neon
+database.
