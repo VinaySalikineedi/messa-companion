@@ -4728,35 +4728,39 @@ whenever `search_integration_tools` actually needs it.
 nothing at all, independent of whether the deepsearch fallback then
 manages to handle the request anyway.
 
-**Not verified here** (same honest caveat as `email_tools.py`'s own,
-which this module deliberately mirrors): `client.tools.get(search=...,
-user_id=..., limit=...)` -- Composio's tool-search API this whole feature
-is built on -- is NOT exercised against a real Composio account from this
-sandbox (no `COMPOSIO_API_KEY`, no network to Composio here). Composio's
-own docs describe it but mark it "(experimental)," and the exact shape of
-what one result item looks like (attribute names for slug/toolkit/
-description) is inferred from those docs, not confirmed against a real
-response -- `_extract_tool_fields` is written defensively (tries several
-plausible shapes: a plain dict, an attribute object, a nested toolkit
-object) for exactly that reason. This is the one piece of this feature
-most worth a real supervised smoke-test against a live Composio account
-before trusting it broadly in production -- everything downstream of a
-successful search (connection-status checks, `.link()`, `.execute()`) is
+**Update: now verified against a real Composio account.** The first real
+production run (fetching r/jacksonville's top Reddit posts, documented in
+its own section below) exercised `client.tools.get(search=..., user_id=...,
+limit=...)` live and surfaced two real gaps this module's original
+defensive-but-unverified code didn't handle: (1) a live result item is
+OpenAI-style **function-wrapped** -- the actual slug/description/toolkit
+live under `item.function.*`, not directly on `item` -- `_extract_tool_fields`
+now unwraps that first, falling back to the bare item for any other shape;
+(2) `client.connected_accounts.list(...)` does **not** accept a
+`toolkit_slugs` filter kwarg the way the original code assumed --
+`_connected_toolkits_sync` now fetches every one of this user's active
+connections unfiltered and matches toolkit slugs client-side instead. Both
+fixes came from the user's own local testing and were synced back into
+this codebase (tests updated to match, see Verification below). Everything
+downstream of a successful search (connection-status checks, `.link()`, `.execute()`) is
 the same call shape `email_tools.py` already has verified and running in
 production.
 
-**Verification**: new `/tmp/test_integration_tools.py` (27 checks) --
-`tools/common.py`'s new `destructive_check` parameter in isolation first
-(a dynamically-gated call skips/hits the approval gate correctly; the old
-static `destructive=` behavior is provably untouched when the parameter
-is omitted); the new `db.py` functions against a fake Postgres pool,
-migration-missing no-ops included; per-toolkit auth-config caching
-(create-once, reuse-by-name, and -- new vs. Gmail's single cache -- two
-different toolkits never share or clobber each other's config);
-`search_integration_tools` against a hand-built fake Composio client
-mirroring `email_tools.py`'s own verified SDK shapes (mixed dict/object
-search results, connected-vs-not marking, the zero-results ->
-logged-and-fall-back-to-deepsearch path); `connect_integration_app`
+**Verification**: `/tmp/test_integration_tools.py` (43 checks, updated
+after the live-account sync above) -- `tools/common.py`'s new
+`destructive_check` parameter in isolation first (a dynamically-gated call
+skips/hits the approval gate correctly; the old static `destructive=`
+behavior is provably untouched when the parameter is omitted); the new
+`db.py` functions against a fake Postgres pool, migration-missing no-ops
+included; per-toolkit auth-config caching (create-once, reuse-by-name, and
+-- new vs. Gmail's single cache -- two different toolkits never share or
+clobber each other's config); `search_integration_tools` against a
+hand-built fake Composio client covering THREE result shapes now -- a
+plain dict, a bare attribute-object, and the real OpenAI-style
+function-wrapped shape confirmed live (`item.function.slug/description/
+toolkit`) -- plus connected-vs-not marking against the corrected
+(unfiltered, client-side-matched) `connected_accounts.list` fake, and the
+zero-results -> logged-and-fall-back-to-deepsearch path; `connect_integration_app`
 (`.link()` not the deprecated `.initiate()`, SMS for a real channel with
 the link deliberately NOT echoed in the tool's own return text, the CLI
 channel showing the link directly, an already-connected app getting a
@@ -4771,3 +4775,220 @@ changes -- all passed except the two pre-existing, unrelated issues noted
 above (`test_dashboard_route.py`'s stale hardcoded week, and
 `test_toolnode_concurrency.py`, a standalone LangGraph API probe that
 doesn't even import this app).
+
+## Site credentials: Messa can generate, store, and reuse passwords for accounts she creates (`messa/credentials.py`, `migrations/021_site_credentials.sql`)
+
+A real gap in the Dynamic Integration Engine's fallback path, surfaced by
+your own question right after that shipped: when deepsearch creates a
+brand-new account on a site Composio doesn't support (no API, just a
+browser filling in a signup form), nothing was generating or keeping the
+password -- so Messa could sign up for something on your behalf and then
+have no way to log back in later. Three options were on the table --
+never store passwords at all (text it once, then forget it), store it
+plaintext, or store it encrypted so Messa can log back in autonomously.
+**Your call: store encrypted, Messa can log back in.** That's what's
+built here.
+
+**The flow.** Two new tools on `BrowserToolProvider` (`tools/
+deepsearch_tools.py`), wired onto both the top-level deepsearch agent and
+every per-tab `delegate_website_task` sub-worker, alongside the existing
+`request_human_help` -- same non-`trace_tool`, manually-gated wiring
+pattern this file already uses for its own directly-added tools, not the
+`@tool`-decorator pattern most other subagents' tools use:
+
+- `generate_account_credential(site_name, username=None)` -- for signing
+  **up**. Gated by the same `ApprovalGate.confirm(...)` mechanism
+  `send_email` already uses (consistent, not a new mechanism). Once
+  approved: generates a strong random password (`credentials.
+  generate_strong_password`, via Python's `secrets` module, never
+  `random`), encrypts it (`credentials.encrypt_secret`, Fernet), and
+  stores it via `db.save_site_credential`. Returns the plaintext password
+  to the model **exactly once**, with an explicit instruction baked into
+  both the tool's own docstring and its returned string not to repeat it
+  in any later summary or reply -- the model needs it once, to type into
+  the form; nothing downstream should ever see it again. Defaults the
+  username to the user's own Messa email (`messa_email`, threaded through
+  `BrowserToolProvider.__init__` from `user.messa_email` at the top level
+  and passed down to every sub-worker) rather than inventing one, since
+  that's an inbox Messa can already read on the user's behalf --
+  verification emails and future correspondence from the new account
+  reach her automatically. `db.save_site_credential`'s INSERT is `ON
+  CONFLICT (user_id, site_name) DO NOTHING`: a second signup attempt for a
+  site that already has a stored credential returns `None`, and the tool
+  reports "already has a stored credential, use get_account_credential
+  instead" rather than silently regenerating a password and desyncing it
+  from whatever the real site still has -- which would have locked Messa
+  out of an account she'd already created.
+- `get_account_credential(site_name)` -- for logging back **in**. The
+  system prompt (both `DEEPSEARCH_SYSTEM_PROMPT` and
+  `_SUBAGENT_SYSTEM_PROMPT`) now tells the model to try this FIRST on any
+  login wall, before falling back to `request_human_help` -- Messa may
+  have already created this exact account on an earlier task. Decrypts
+  and returns the stored password (same "do not repeat it" instruction),
+  or a plain "nothing stored" message pointing at
+  `generate_account_credential` (new account) or `request_human_help`
+  (existing account Messa never had the password for) if there's nothing
+  to find. A successful fetch calls `db.mark_site_credential_used`
+  (best-effort, never raises) so `site_credentials.last_used_at` reflects
+  real usage.
+
+**Encryption, deliberately its own small module.** `messa/credentials.py`
+is new and standalone -- not folded into `db.py`, matching this
+codebase's existing convention that `db.py` is pure DB access with no
+business logic and no dependencies beyond `asyncpg`. Encryption is
+application-level (Fernet, via the `cryptography` package -- already a
+transitive dependency everywhere this project has run, now listed
+explicitly in `requirements.txt` since it's called directly), not
+database-level (no pgcrypto): the encryption key
+(`MESSA_CREDENTIALS_ENCRYPTION_KEY`, see `.env.example` for how to
+generate one) is never anywhere the database itself could leak it from.
+`db.py`'s own `site_credentials` functions never see a plaintext
+password -- only the already-encrypted token, both going in and coming
+out. Left unset, both tools refuse plainly (`credentials.
+CredentialsNotConfigured`) instead of ever generating a real password
+with nowhere safe to put it; nothing else in the app is affected.
+Generated passwords deliberately exclude visually-ambiguous characters
+(0/O, 1/l/I) and the handful of punctuation marks most likely to trip up
+naive form-parsing or URL-embedding on a real signup form (quotes,
+backslash, whitespace) -- still 86 characters of alphabet, strong entropy
+at the default 20-character length, while reducing the odds a generated
+password breaks the very form it's meant to be typed into.
+
+**Database** (`migrations/021_site_credentials.sql`): one additive table,
+`site_credentials` (`user_id`, `site_name`, `site_url`, `username`,
+`encrypted_password`, timestamps), `UNIQUE(user_id, site_name)` --
+applied and re-applied against local Postgres to confirm both success and
+idempotency (`CREATE TABLE`/`CREATE INDEX IF NOT EXISTS`, matching this
+project's standard migration shape).
+
+**Not verified here** (consistent with every other such caveat already in
+this README): this hasn't been exercised against a real Browserbase +
+Playwright MCP session actually filling in a real signup form end to end
+-- no live Browserbase/Composio account is reachable from this sandbox.
+What's actually tested is everything up to and after that one step:
+approval gating, password generation/encryption/storage, the
+already-exists anti-overwrite path, decrypt-and-return on login, and
+graceful failure with no encryption key configured. The one thing worth
+watching on a first real supervised run is simpler than it sounds --
+confirming the model actually fills the form with the returned
+username/password rather than paraphrasing or mistyping either, since
+Playwright MCP's `browser_type` takes the literal string it's given.
+
+**Verification**: new `/tmp/test_site_credentials.py` (57 checks) --
+`credentials.py` directly, with a real (freshly generated, not
+environment-provided) Fernet key: encrypt/decrypt round-trip, generated-
+password character-class coverage and non-determinism, custom lengths, a
+too-short length raising `ValueError`, decrypting under a rotated key
+raising `ValueError` (not silently returning garbage), and both functions
+raising `CredentialsNotConfigured` cleanly when the key is missing or
+malformed. `db.py`'s five new functions against a fake Postgres pool,
+including the `ON CONFLICT DO NOTHING` anti-overwrite guarantee proven
+directly (a conflicting second save returns `None` and leaves the
+original row untouched) and the migration-not-applied-yet no-op path for
+all five. `BrowserToolProvider`'s two new methods constructed directly
+via `__new__` (no MCP/browser state needed, same pattern already used for
+`request_human_help`'s own tests) -- no user session, no username
+available, approval denied, the happy path (right approval-gate args,
+password never equal to what's stored encrypted, decrypting the stored
+value matches what the model was shown), an explicit username override,
+the already-exists path leaving the original credential intact,
+not-found and successful-fetch paths for `get_account_credential`, the
+key-rotation failure path falling back to `request_human_help`, and
+graceful failure end-to-end with no encryption key configured at all.
+Migration 021 applied and re-applied against local Postgres (success +
+idempotency). Also re-ran the same 29-file non-browser-dependent
+regression suite used for the Dynamic Integration Engine -- zero
+regressions; the same two pre-existing, unrelated issues as before are
+still the only other non-passes (`test_dashboard_route.py`'s stale
+hardcoded week, `test_toolnode_concurrency.py`'s standalone LangGraph API
+probe that doesn't import this app).
+
+## Fixing real integration-search friction: a Reddit lookup that took 15+ search calls (`tools/integration_tools.py`)
+
+A real production run (`error.txt`, fetching r/jacksonville's top Reddit
+posts) eventually succeeded, but took over a dozen `search_integration_tools`
+calls to get there -- the model tried `"reddit hot posts subreddit list"`,
+then bare `"reddit"`, then several other phrasings, mostly getting either
+zero results or a top-5 dominated by unrelated toolkits (`DIFFBOT`,
+`RAWG`) before stumbling onto `"reddit get hot listing"`, which happened
+to match. You proposed a 3-part fix (raise the result limit 5->15/20,
+strip "filler words" like "subreddit"/"hot" from queries before sending
+them, and tell the model to always use short 1-2 word queries) and asked
+whether it was the right call before building it.
+
+**Checked against the actual transcript first, and two of the three
+didn't hold up.** Tracing every query in `error.txt`: query length wasn't
+the deciding factor at all -- `"reddit get hot listing"` (4 words) and
+`"reddit post retrieve listing front page"` (6 words) both matched
+perfectly, while bare `"reddit"` (1 word) returned mostly noise and
+`"subreddit posts fetch retrieve"` (4 words) returned nothing. What
+seems to actually matter is semantic closeness to the real action's own
+description text, which isn't something a fixed stopword list or a
+"keep it short" prompt rule can reliably produce -- and stripping words
+like "subreddit"/"hot" specifically would have been actively harmful
+here, since those are exactly the words that helped the queries that
+*did* work. Also checked: our own `_search_sync` passes `limit` straight
+into Composio's server-side `tools.get(..., limit=...)` call -- there's
+no local fetch-more-then-truncate happening, so the "`REDDIT_GET` was
+item #6, chopped off by our cap" mechanism in the original diagnosis
+isn't what's actually happening; the noise is in Composio's own ranking
+for an unscoped query, not a client-side artifact.
+
+**What actually fixes it, found by checking Composio's docs and the
+installed SDK's source (`composio==0.21.0`) directly rather than
+guessing:** `client.tools.get(...)` supports a `toolkits=[...]`
+parameter, combinable with `search=`, that scopes a search to one
+specific app's own action set instead of ranking across all 1,400+
+toolkits Composio supports. Composio's own docs recommend exactly this
+pattern once the target app is known -- and in the Reddit transcript, the
+model already knew it was Reddit on nearly every call; it just had no way
+to tell the search "only look inside Reddit." Implemented as a new
+optional `toolkit` parameter on `search_integration_tools(query,
+toolkit=None)`, threaded through to `toolkits=[toolkit.lower()]` in the
+Composio call when given. Both `build_integration_tools`'s tool docstring
+and `build_integration_system_prompt` now tell the model to pass it
+whenever the app is already known (the common case -- the user usually
+names the app), leaving an unscoped search as the fallback for genuine
+discovery.
+
+**The three actual changes**, replacing the original 3-part proposal:
+1. `search_integration_tools(query, toolkit=None)` -- scopes via
+   `toolkits=[...]` when given. The real fix; generalizes to all 1,400+
+   apps rather than being Reddit-specific, unlike a hand-tuned stopword
+   list would have been.
+2. `INTEGRATION_SEARCH_RESULT_LIMIT` raised 5 -> 8 (not 15-20) -- a cheap
+   secondary safety margin for the cases that stay unscoped, deliberately
+   kept modest since scoping does the real work and a much bigger limit
+   mostly just adds token cost from irrelevant results.
+3. The zero-results message no longer asserts "this most likely isn't an
+   app Composio supports yet" -- that was demonstrably wrong in this very
+   transcript (Reddit IS supported and was already connected; the query
+   just didn't match). It now says results might be missing because of
+   phrasing/scope, not just because the app is unsupported, and tells the
+   model to retry before concluding otherwise.
+
+**Also fixed in this pass, discovered while re-syncing your own local
+edits to this file** (made from a real Composio account, ahead of this
+fix): `client.tools.get(search=...)` result items turned out to be
+OpenAI-style function-wrapped (`item.function.slug/description/toolkit`,
+not directly on `item`), and `connected_accounts.list(...)` does not
+accept a `toolkit_slugs` filter kwarg the way the original code assumed.
+Both were synced from your local file into this codebase and are covered
+by the module's own updated docstring above.
+
+**Not verified here** (same caveat as always): `toolkits=[...]` is
+confirmed as a real, documented, source-verified SDK parameter, but its
+actual effect on ranking quality against a live account (does it fully
+eliminate cross-toolkit noise the way the docs imply?) hasn't been
+re-exercised against a real Reddit-style lookup from this sandbox -- worth
+watching on the next real multi-app request that hits `integrations_agent`.
+
+**Verification**: `/tmp/test_integration_tools.py` extended with 8 new
+checks -- `toolkit=` correctly becomes a lowercased `toolkits=[...]` list
+sent to Composio, and is omitted entirely when not passed; the raised
+default limit (8) is what actually reaches the Composio call; the
+reworded zero-results message no longer contains the old overconfident
+"isn't supported" claim and does tell the model to retry, both for an
+unscoped and a toolkit-scoped zero-result search. Full 29-file
+non-browser-dependent regression suite re-run -- zero regressions, same
+two pre-existing unrelated issues as every prior pass.

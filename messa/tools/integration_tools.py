@@ -39,18 +39,39 @@ tools/email_tools.py was (0.21.0 / composio-client 1.43.0 at the time that
 file was written) for the calls this file SHARES with it --
 `Composio(api_key=...)`, `client.tools.execute(...)`,
 `client.connected_accounts.link(...)`/`.get(...)`/`.list(...)`,
-`client.auth_configs.list/create(...)`. The one call this file uses that
-email_tools.py does NOT -- `client.tools.get(user_id=..., search=...,
-limit=...)`, Composio's own tool-search API -- is NOT independently
-verified against a live account from this sandbox (no COMPOSIO_API_KEY,
-no network to Composio here); Composio's own docs describe it, but mark it
-"(experimental)", and the exact shape of what it returns per result
-(attribute names for slug/toolkit/description) is inferred from those
-docs, not confirmed against a real response. _extract_tool_fields below is
-written defensively (tries several plausible shapes) for exactly that
-reason -- flagged here and in the README as the one piece of this feature
-worth a real smoke-test against a live Composio account before trusting
-it fully in production.
+`client.auth_configs.list/create(...)`. `client.tools.get(user_id=...,
+search=..., limit=...)` -- Composio's tool-search API -- WAS since
+independently confirmed against a live account (see the Reddit
+integration's first real production run, documented in README): the
+actual result shape is OpenAI-style function-wrapped items (each result's
+real slug/description/toolkit live under `item.function.*`, not directly
+on `item`) -- `_extract_tool_fields` below unwraps that first, falling
+back to the item itself for any other shape. Also confirmed live:
+`connected_accounts.list` does NOT accept a `toolkit_slugs` filter kwarg
+the way an earlier version of this file assumed -- `_connected_toolkits_sync`
+now fetches all of this user's active connections unfiltered and matches
+toolkit slugs client-side instead.
+
+That same production run also surfaced a real search-QUALITY gap, not
+just a shape bug: an unscoped, single-word search ("reddit") ranked
+several unrelated toolkits' actions (whose own descriptions merely
+mention "Reddit") ahead of the actual Reddit action the model needed,
+costing over a dozen search_integration_tools round trips before landing
+on a phrasing that happened to match. The fix isn't cleverer query
+phrasing -- the transcript shows phrasing length/style wasn't actually
+the deciding factor (semantic closeness to the real action's own wording
+was, which is unpredictable to hand-tune for) -- it's that Composio's own
+`tools.get` already supports a `toolkits=[...]` filter, confirmed against
+both Composio's own docs and the installed SDK's source, that scopes a
+search to one specific app's action set instead of ranking across all
+1,400+ toolkits at once. search_integration_tools now exposes this as an
+optional `toolkit` parameter -- pass it whenever the app is already known
+(the common case: the user usually names the app), leaving an unscoped
+search as the fallback for genuine discovery rather than the default
+path. INTEGRATION_SEARCH_RESULT_LIMIT was also bumped 5 -> 8 as a cheap
+secondary safety margin, deliberately not raised further since scoping
+does the real work and a much bigger limit mostly just adds token cost
+from irrelevant results on the (now less common) unscoped search.
 
 Auth-config scope, one real difference from Gmail worth knowing: Gmail's
 _get_or_create_gmail_auth_config_id scopes the OAuth consent to exactly
@@ -211,9 +232,19 @@ def build_integration_tools(
 ) -> list[BaseTool]:
     composio_user_id = _composio_user_id(user)
 
-    def _search_sync(query: str) -> list[Any]:
+    def _search_sync(query: str, toolkit: str | None) -> list[Any]:
         client = _get_client()
         kwargs: dict = {"user_id": composio_user_id, "search": query, "limit": config.INTEGRATION_SEARCH_RESULT_LIMIT}
+        if toolkit:
+            # Scopes the search server-side to just this one app's action
+            # set instead of ranking across all 1,400+ toolkits at once --
+            # confirmed as a real, documented Composio SDK parameter
+            # (`toolkits=[...]`, combinable with `search=`), not inferred.
+            # This is the actual fix for the failure mode a real production
+            # run hit: an unscoped query like "reddit" ranked unrelated
+            # toolkits' actions (which merely mention "Reddit" in their own
+            # descriptions) ahead of the real Reddit action -- see README.
+            kwargs["toolkits"] = [toolkit.lower()]
         result = client.tools.get(**kwargs)
         # Composio's own examples show tools.get returning either a plain
         # list or a wrapper with an .items/.tools attribute depending on
@@ -244,14 +275,25 @@ def build_integration_tools(
         return connected
 
     @tool
-    async def search_integration_tools(query: str) -> str:
-        """Search for a tool/action across every app Composio supports
+    async def search_integration_tools(query: str, toolkit: str | None = None) -> str:
+        """Search for a tool/action across the apps Composio supports
         (1,400+ toolkits: Todoist, Slack, Notion, GitHub, Instagram, and
         more) that could satisfy something the user asked for that none of
         Messa's OWN native subagents cover -- e.g. "add a task to my
         Todoist", "post this in our #general Slack channel". Read-only,
         no side effects -- safe to call just to check what's available or
         whether an app is already connected.
+
+        toolkit: if you already know which app this is for (the user named
+        it, e.g. "Reddit", "Slack", "Todoist" -- or an earlier search
+        result already told you), PASS IT HERE (lowercase, e.g. 'reddit').
+        This scopes the search to just that app's own actions instead of
+        ranking across every app Composio supports, which matters more
+        than how you phrase the query -- an unscoped search for a generic
+        word like a bare app name can rank unrelated apps' actions (that
+        merely mention that word in their own description) ahead of the
+        real one. Only leave this unset when you genuinely don't know the
+        app yet and are searching to find out.
 
         Returns a short list of candidate tool slugs with descriptions,
         each marked as either already connected (pass its exact slug to
@@ -260,13 +302,16 @@ def build_integration_tools(
         connect link -- don't do this automatically on every search, only
         when the user actually wants to use that app).
 
-        If nothing matches at all, this almost certainly isn't an app
-        Composio supports -- tell the user plainly, mention you can try to
-        do it via web browser automation instead (delegate to deepsearch
-        for that), and this gets logged so the team knows there's demand
-        for it."""
+        If nothing matches at all, that MIGHT mean this isn't an app
+        Composio supports -- but it can also just mean this phrasing or
+        toolkit scope didn't hit. If you're confident the app should exist
+        (e.g. it's already connected, or a broader unscoped search found
+        it under a different toolkit name), try again before concluding
+        it's unsupported. If you're still getting nothing, tell the user
+        plainly and offer web browser automation instead (delegate to
+        deepsearch for that)."""
         try:
-            results = await asyncio.to_thread(_search_sync, query)
+            results = await asyncio.to_thread(_search_sync, query, toolkit)
         except _NotConfigured as e:
             return str(e)
         except Exception as e:  # noqa: BLE001 - surfaced to the model, not raised
@@ -274,11 +319,15 @@ def build_integration_tools(
 
         if not results:
             await db.log_unsupported_integration_request(user.user_id, query[:128], query)
+            scope_note = f" (scoped to toolkit {toolkit!r})" if toolkit else ""
             return (
-                f"No Composio-supported app/tool matched {query!r}. This most likely isn't an "
-                "app Composio supports yet -- tell the user plainly, and offer to try it via "
-                "browser automation instead (delegate to deepsearch for that). This request has "
-                "been logged for the product team."
+                f"No candidate tool matched {query!r}{scope_note}. This might mean the app isn't "
+                "supported by Composio yet, OR that this query/toolkit scope just didn't match --  "
+                "if you're fairly sure the app exists (the user named it, or it showed up in an "
+                "earlier search), try again with a different phrasing or without the toolkit "
+                "filter before concluding it's unsupported. If you're still getting nothing after "
+                "that, tell the user plainly and offer browser automation instead (delegate to "
+                "deepsearch for that). This request has been logged for the product team either way."
             )
 
         parsed = [_extract_tool_fields(r) for r in results]
@@ -422,8 +471,16 @@ def build_integration_system_prompt(user: config.UserContext) -> str:
         "Messa delegates to you when a request needs an app she doesn't already have a "
         "dedicated tool for (NOT for email -- that's always email_agent/personal_inbox_agent, "
         "never this).\n"
-        "- search_integration_tools(query) first, always -- read-only, tells you what's "
-        "available and whether it's already connected. Don't guess a slug without searching.\n"
+        "- search_integration_tools(query, toolkit=None) first, always -- read-only, tells you "
+        "what's available and whether it's already connected. Don't guess a slug without "
+        "searching.\n"
+        "- If you already know which app this is for (the user named it -- 'Reddit', 'Slack', "
+        "'Todoist' -- or an earlier search already told you), ALWAYS pass toolkit='<app>' "
+        "(lowercase). This scopes the search to just that app's own actions instead of ranking "
+        "across every app Composio supports, and matters far more than how you phrase the query "
+        "-- an unscoped search for a bare app name can rank OTHER apps' actions (that merely "
+        "mention that word in their own description) ahead of the one you actually want. Only "
+        "search unscoped when you genuinely don't know the app yet.\n"
         "- If the app isn't connected yet: tell the user, and only call "
         "connect_integration_app(toolkit_slug) if they actually want to connect it right now -- "
         "don't send a connect link unprompted just because a search turned one up.\n"
@@ -431,9 +488,10 @@ def build_integration_system_prompt(user: config.UserContext) -> str:
         "slug and expected arguments search_integration_tools showed you. Read-only actions run "
         "immediately; anything that changes state will prompt the user for confirmation "
         "automatically -- you don't need to ask yourself first.\n"
-        "- If search_integration_tools finds nothing at all, that app almost certainly isn't "
-        "supported -- report that plainly back to Messa (she can offer browser automation via "
-        "deepsearch instead) rather than pretending it worked.\n"
+        "- If search_integration_tools finds nothing, that MIGHT mean the app isn't supported -- "
+        "but it can also just mean this phrasing or toolkit scope didn't hit. If you're fairly "
+        "confident the app should exist, try again (a different phrasing, or without the "
+        "toolkit filter) before concluding it's unsupported and reporting that back to Messa.\n"
         "Be concise in what you report back -- Messa relays your summary as a text message, not "
         "your raw tool output.\n"
     )
