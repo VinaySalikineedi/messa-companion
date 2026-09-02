@@ -4992,3 +4992,94 @@ reworded zero-results message no longer contains the old overconfident
 unscoped and a toolkit-scoped zero-result search. Full 29-file
 non-browser-dependent regression suite re-run -- zero regressions, same
 two pre-existing unrelated issues as every prior pass.
+
+## Orchestrator routing: fixing Google-Calendar-misrouted-to-reminders and Reddit-scraped-instead-of-Composio (`docs/orchestrator_routing_spec.md`)
+
+You wrote up a spec proposing three routing fixes and asked whether it was
+good before building it. Two of its three tiers were already substantially
+in place; the one genuinely new piece (Google Calendar) needed a different
+implementation than what was proposed, so here's what actually shipped and
+why.
+
+**Tier 2 (apps/platforms -> `integrations_agent` first) and Tier 3
+(explicit web search -> `web_search`/`deepsearch` directly) were already
+implemented** -- Messa's system prompt already said "Other apps (Todoist,
+Slack, Notion, GitHub, ...): delegate to integrations_agent" with a
+deepsearch fallback, and already had `web_search`/`fetch_page_text` as
+direct tools reserved for plain lookups vs. deepsearch for anything
+needing real page interaction. What was missing was Reddit specifically
+named as an example (the actual app that caused the friction the spec was
+reacting to) -- added to both Messa's own routing paragraph ("delegate to
+integrations_agent FIRST... e.g. 'check Reddit'") and
+`integrations_agent`'s own system prompt.
+
+**Tier 1 (Google Calendar) was NOT built the way the spec proposed, and
+here's the reasoning.** The spec's plan was to add `GOOGLECALENDAR_*`
+tools directly onto `executive_assistant`, justified as "matching how
+`email_agent` handles both internal Messa email and Gmail." That
+justification doesn't hold up against the actual codebase: `email_agent`
+and `personal_inbox_agent` are two SEPARATE subagents for two separate
+inboxes (see `registry.py`'s own module docstring) -- there's no existing
+"one agent handles both" precedent to match. More importantly,
+`executive_assistant`'s calendar (`calendar_events`) is a purely
+internal, DB-backed table with zero OAuth or sync of any kind today.
+Bolting Composio's real `GOOGLECALENDAR_*` actions directly onto that
+subagent, with no reconciliation between the two, would have produced two
+unconnected "calendars" answering to the same subagent -- a real
+architecture regression the spec didn't design for (no migration, no
+sync/reconciliation plan, nothing).
+
+Checked Composio's docs and confirmed `googlecalendar` is a real,
+well-supported toolkit (49 actions: create/list/update/delete events,
+free-busy, etc.) -- which means `integrations_agent` **already handles
+Google Calendar generically today**, the same way it handles any other
+Composio toolkit, with zero new code needed (and, as of the fix right
+above this one, it can now scope the search to `toolkit='googlecalendar'`
+directly). The actual bug the spec was reacting to -- a Google Calendar
+connect request landing on `executive_assistant`'s reminder tools instead
+-- is a routing/prompt problem, not a missing-tools problem. Fixed as
+such:
+- Messa's own system prompt now has a dedicated paragraph: a request to
+  CONNECT, sync, or manage a REAL Google Calendar goes to
+  `integrations_agent` (Composio's `googlecalendar` toolkit), explicitly
+  NOT `executive_assistant` -- with instruction to ask, not guess, when
+  it's ambiguous which "calendar" the user means.
+- `executive_assistant`'s own system prompt and its subagent `description`
+  (what Messa reads when deciding where to delegate) now both explicitly
+  disclaim being a real connected calendar, and say to tell the user
+  plainly rather than creating an internal event that only looks like it
+  connected something.
+- `integrations_agent`'s own system prompt now names Google Calendar as a
+  covered example, explicit about it being a real external calendar, not
+  the same thing as `executive_assistant`'s internal one.
+
+Net effect: no new tools, no new migration, no duplicate calendar system
+-- just closing the actual gap (routing clarity) with the same
+generic-Composio-integration mechanism already built and tested for every
+other app, which is also exactly the design principle
+`tools/integration_tools.py` was built around in the first place (one
+generic engine, not a hand-maintained tools module per app).
+
+**Not verified here**: like every prompt-only change in this project,
+there's no way to test "the model actually routes correctly" without a
+live run against a real account -- worth watching the next real Google
+Calendar or Reddit-shaped request that reaches Messa in production.
+
+**Verification**: new `/tmp/test_routing_boundaries.py` (18 checks) --
+since this is a prompt/routing-only change with no new business logic,
+these check that the actual guidance text landed in the right places
+(not that the model obeys it, which needs a live run): Messa's own prompt
+names Reddit and Google Calendar as `integrations_agent` examples, marks
+`executive_assistant`'s calendar as internal, carries the dedicated
+Google Calendar routing paragraph (right subagent, right toolkit slug,
+told to ask when ambiguous); `executive_assistant`'s own prompt AND its
+subagent description both carry the "not a real connected calendar, say
+so plainly" disclaimer; `integrations_agent`'s own prompt names both apps
+and clarifies the boundary. Also re-ran `test_email_subagent.py`,
+`test_executive_tools_direct.py`, and `test_executive_quality_check.py`
+specifically (the tests that actually exercise
+`executive_assistant`'s/`email_agent`'s real behavior, not just prompt
+text) to confirm the calendar-boundary prompt addition didn't change any
+existing behavior, plus the full 29-file non-browser-dependent regression
+suite -- zero regressions, same two pre-existing unrelated issues as
+every prior pass.

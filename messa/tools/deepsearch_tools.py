@@ -122,7 +122,7 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.errors import GraphRecursionError
 
-from .. import config, console, db, live_activity
+from .. import config, console, credentials, db, live_activity
 from ..approval import ApprovalGate
 from ..channels import browserbase
 from ..channels.browserbase import BrowserbaseError
@@ -581,9 +581,18 @@ class BrowserToolProvider:
         *,
         server_url: str | None = None,
         model: BaseChatModel | None = None,
+        messa_email: str | None = None,
     ):
         self._approval_gate = approval_gate
         self._user_id = user_id
+        # For generate_account_credential's default username -- the same
+        # "hand this out anywhere, I'll manage what comes back" address
+        # already used for onboarding/personal-inbox signups (see
+        # tools/personal_inbox_tools.py's own docstring). None if
+        # migration 013 hasn't run or provisioning hasn't happened yet;
+        # generate_account_credential requires an explicit username in
+        # that case rather than guessing one.
+        self._messa_email = messa_email
         # For db.create_human_help_request -- lets a human-help request row
         # be traced back to the deepsearch_sessions row it happened during.
         # None is fine (session tracking is itself optional, see
@@ -787,16 +796,7 @@ class BrowserToolProvider:
                         context_id = await browserbase.create_context()
                         await db.save_browserbase_context_id(self._user_id, context_id)
 
-                try:
-                    session = await browserbase.create_session(context_id)
-                except Exception as sess_err:
-                    if context_id:
-                        console.system("Deepsearch: saved context expired or invalid -- provisioning fresh Browserbase context...")
-                        context_id = await browserbase.create_context()
-                        await db.save_browserbase_context_id(self._user_id, context_id)
-                        session = await browserbase.create_session(context_id)
-                    else:
-                        raise sess_err
+                session = await browserbase.create_session(context_id)
                 self._bb_session_id = session["id"]
                 connect_url = session["connectUrl"]
                 console.system(f"Deepsearch: opened Browserbase session {self._bb_session_id}.")
@@ -882,6 +882,18 @@ class BrowserToolProvider:
                 name="request_human_help",
                 description=(self._request_human_help.__doc__ or "").strip(),
             ))
+            # Same reasoning as request_human_help just above -- a signup or
+            # login form can turn up on any tab, top-level or sub-worker.
+            self.tools.append(StructuredTool.from_function(
+                coroutine=self._generate_account_credential,
+                name="generate_account_credential",
+                description=(self._generate_account_credential.__doc__ or "").strip(),
+            ))
+            self.tools.append(StructuredTool.from_function(
+                coroutine=self._get_account_credential,
+                name="get_account_credential",
+                description=(self._get_account_credential.__doc__ or "").strip(),
+            ))
             # delegate_website_task is deliberately owning-provider-only --
             # _owns_server is the actual enforcement (not just leaving it
             # off a sub-worker's tool list), so there is no path to
@@ -925,10 +937,7 @@ class BrowserToolProvider:
         if self._cursor_move_task is not None and not self._cursor_move_task.done():
             self._cursor_move_task.cancel()
         if self._session_cm is not None:
-            try:
-                await self._session_cm.__aexit__(exc_type, exc, tb)
-            except Exception as cm_err:  # noqa: BLE001
-                console.tool_error(LABEL, "session_cleanup_suppressed", str(cm_err))
+            await self._session_cm.__aexit__(exc_type, exc, tb)
         if not self._owns_server:
             # A sub-worker only closes its OWN client connection -- the
             # shared server process and the Browserbase session both belong
@@ -1260,6 +1269,112 @@ class BrowserToolProvider:
             # actually stopped waiting.
             self._live_clear_waiting()
 
+    # Docstring below IS the tool description sent to the model -- see
+    # request_human_help's own comment above for why implementation notes
+    # live here as a plain comment instead. Manually gated (self._approval_gate
+    # .confirm(...) called directly below) rather than going through
+    # tools/common.py's trace_tool, matching how every other tool this file
+    # adds directly to self.tools (request_human_help, delegate_website_task)
+    # is wired -- none of them go through trace_tool, they're all plain
+    # StructuredTools with whatever gating/checks they need inline.
+    async def _generate_account_credential(self, site_name: str, username: str | None = None) -> str:
+        """Model-facing tool: call this when a task requires CREATING a
+        brand-new account on a site (not logging into one that already
+        exists -- for that, use get_account_credential first). Generates a
+        strong random password, stores it securely, and returns it to you
+        ONCE so you can fill the signup form right now.
+
+        site_name: a short, consistent slug for this site (e.g. 'airbnb',
+        'united-mileageplus') -- use the same one later with
+        get_account_credential to log back in.
+
+        username: what to sign up with -- defaults to the user's own Messa
+        email address if you don't pass one (recommended for most sites:
+        it's an inbox Messa can read on the user's behalf, so verification
+        emails and future correspondence from this account reach her
+        automatically). Only pass your own value if the user asked for a
+        specific username/email instead.
+
+        CRITICAL: do not repeat the password this returns anywhere in your
+        own reply or summary back to Messa/the user -- it's already stored
+        securely. Just confirm the account was created."""
+        if self._user_id is None:
+            return "ERROR: generate_account_credential isn't available outside a real user session."
+        resolved_username = username or self._messa_email
+        if not resolved_username:
+            return (
+                "ERROR: no username to sign up with -- the user has no Messa email address "
+                "provisioned yet, and none was given. Pass an explicit username, or ask the "
+                "user what address/username to use."
+            )
+
+        if self._approval_gate is not None:
+            allowed = await self._approval_gate.confirm(
+                LABEL, "generate_account_credential", {"site_name": site_name, "username": resolved_username},
+            )
+        else:
+            allowed = False
+        if not allowed:
+            msg = "BLOCKED: user declined to create a new account for this site."
+            console.tool_result(LABEL, "generate_account_credential", msg)
+            return msg
+
+        password = credentials.generate_strong_password()
+        try:
+            encrypted = credentials.encrypt_secret(password)
+        except credentials.CredentialsNotConfigured as e:
+            return str(e)
+
+        saved = await db.save_site_credential(self._user_id, site_name, resolved_username, encrypted)
+        if saved is None:
+            return (
+                f"'{site_name}' already has a stored credential -- an account may already exist. "
+                "Use get_account_credential instead of creating a new one, or pick a different "
+                "site_name if this is genuinely a separate account."
+            )
+        console.system(f"Deepsearch: generated and stored a new credential for site {site_name!r}.")
+        return (
+            f"Generated and securely stored a new password for {site_name!r}. Use these EXACTLY "
+            f"ONCE to fill the signup form -- username: {resolved_username}, password: {password}. "
+            "Do NOT repeat this password in your own summary/report -- just confirm the account "
+            "was created."
+        )
+
+    async def _get_account_credential(self, site_name: str) -> str:
+        """Model-facing tool: call this BEFORE assuming a login wall needs
+        request_human_help, if this might be an account Messa already
+        created (via generate_account_credential) on an earlier task.
+        Returns the stored username and password to fill the login form --
+        or a plain 'nothing stored' message if there isn't one, in which
+        case this is either a NEW account (use generate_account_credential)
+        or an existing account whose password Messa never had in the first
+        place (use request_human_help instead).
+
+        CRITICAL: do not repeat the password this returns anywhere in your
+        own reply or summary back to Messa/the user -- just confirm you
+        logged in."""
+        if self._user_id is None:
+            return "ERROR: get_account_credential isn't available outside a real user session."
+        row = await db.get_site_credential(self._user_id, site_name)
+        if row is None:
+            return (
+                f"No stored credential for {site_name!r}. If you're signing up for the first "
+                "time, use generate_account_credential. If this is an existing account Messa "
+                "doesn't have the password for, use request_human_help instead."
+            )
+        try:
+            password = credentials.decrypt_secret(row["encrypted_password"])
+        except credentials.CredentialsNotConfigured as e:
+            return str(e)
+        except ValueError as e:
+            return f"{e} Use request_human_help instead for this login."
+        await db.mark_site_credential_used(self._user_id, site_name)
+        return (
+            f"Stored credential for {site_name!r} -- username: {row['username']}, "
+            f"password: {password}. Use these to fill the login form now. Do NOT repeat the "
+            "password in your own summary/report -- just confirm you logged in."
+        )
+
     # Docstring below IS the tool description sent to the model on every
     # single call -- see the StructuredTool.from_function registration a
     # few lines down (description=(self._delegate_website_task.__doc__ or
@@ -1325,6 +1440,7 @@ class BrowserToolProvider:
                     self._approval_gate, user_id=self._user_id,
                     deepsearch_session_id=self._deepsearch_session_id,
                     server_url=self._server_url, model=self._model,
+                    messa_email=self._messa_email,
                 ) as worker:
                     if self._user_id is not None:
                         live_activity.set_tab(self._user_id, worker._tab_id, url)
@@ -1538,8 +1654,13 @@ _SUBAGENT_SYSTEM_PROMPT = (
     "- If a tool result starts with 'BLOCKED:' or 'ERROR', don't retry the same action -- take "
     "a fresh snapshot or try a different approach.\n"
     "- Hit a login wall, CAPTCHA, 2FA/one-time-code prompt, or any other block a real human "
-    "would need to clear? Call request_human_help with a short reason instead of guessing "
-    "credentials or retrying the same form.\n"
+    "would need to clear? First check get_account_credential(site_name) -- Messa may have "
+    "already created this exact account for the user on an earlier task. Only call "
+    "request_human_help if that comes back empty.\n"
+    "- Need to CREATE a brand-new account (not log into one that exists)? Use "
+    "generate_account_credential(site_name) for the password -- never invent one yourself. "
+    "Use its returned username/password to fill the form immediately, then never repeat the "
+    "password again in anything you say.\n"
     "- As soon as the goal is done, stop and reply with a clear, complete summary -- this goes "
     "straight back to whoever delegated this to you. You have a small, fixed step budget; "
     "don't spend it wandering.\n"
@@ -1571,8 +1692,14 @@ DEEPSEARCH_SYSTEM_PROMPT = (
     "- If a tool result starts with 'BLOCKED:' or 'ERROR', don't retry the same action -- take "
     "a fresh snapshot or try a different approach.\n"
     "- Hit a login wall, CAPTCHA, 2FA/one-time-code prompt, or any other block a real human "
-    "would need to clear? Call request_human_help with a short reason instead of guessing "
-    "credentials or retrying the same form -- see its own description for what happens next.\n"
+    "would need to clear? First check get_account_credential(site_name) -- Messa may have "
+    "already created this exact account for the user on an earlier task. Only call "
+    "request_human_help (with a short reason) if that comes back empty -- see its own "
+    "description for what happens next.\n"
+    "- Need to CREATE a brand-new account (not log into one that exists)? Use "
+    "generate_account_credential(site_name) for the password -- never invent one yourself. "
+    "Use its returned username/password to fill the form immediately, then never repeat the "
+    "password again in anything you say.\n"
     "- A request with SEVERAL INDEPENDENT websites or LEGS (e.g. comparing a price across "
     "three sites; flights + hotels + a rental car) should be decomposed and delegated -- one "
     "delegate_website_task call per site/leg, ALL IN THE SAME TURN, not worked through serially "
@@ -1672,6 +1799,7 @@ def build_deepsearch_subagent(
         live_view_url = None
         async with BrowserToolProvider(
             approval_gate, user_id=user.user_id, deepsearch_session_id=session_id, model=model,
+            messa_email=user.messa_email,
         ) as provider:
             live_view_url = provider.live_view_url
             if live_view_url:

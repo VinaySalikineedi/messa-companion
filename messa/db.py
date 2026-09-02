@@ -1799,6 +1799,99 @@ async def expire_app_connection_request(request_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Site credentials (migrations/021_site_credentials.sql) -- accounts
+# deepsearch creates on the user's behalf on sites Composio doesn't
+# support. Every function here stores/returns encrypted_password EXACTLY
+# as given -- encryption/decryption itself lives in credentials.py, never
+# here, so this file never sees a plaintext password (see that migration's
+# own header for the full reasoning).
+# ---------------------------------------------------------------------------
+
+async def save_site_credential(
+    user_id: int, site_name: str, username: str, encrypted_password: str, site_url: str | None = None
+) -> dict[str, Any] | None:
+    """INSERT ... ON CONFLICT DO NOTHING -- deliberately never UPDATEs an
+    existing row. A second call for a site that already has a stored
+    credential returns None (not the existing row, not an error) so the
+    caller (tools/deepsearch_tools.py's generate_account_credential) can
+    tell 'already had one, didn't touch it' apart from 'just created it' --
+    overwriting here would desync the stored password from whatever the
+    real site still has, effectively locking Messa out of an account she
+    already created."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "site_credentials"):
+            return None
+        row = await conn.fetchrow(
+            """
+            INSERT INTO site_credentials (user_id, site_name, site_url, username, encrypted_password)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (user_id, site_name) DO NOTHING
+            RETURNING *
+            """,
+            user_id, site_name, site_url, username, encrypted_password,
+        )
+        return dict(row) if row else None
+
+
+async def get_site_credential(user_id: int, site_name: str) -> dict[str, Any] | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "site_credentials"):
+            return None
+        row = await conn.fetchrow(
+            "SELECT * FROM site_credentials WHERE user_id = $1 AND site_name = $2",
+            user_id, site_name,
+        )
+        return dict(row) if row else None
+
+
+async def list_site_credentials(user_id: int) -> list[dict[str, Any]]:
+    """Site names + usernames only in spirit (callers decide what to show
+    the user -- this returns full rows, encrypted_password included, since
+    db.py itself has no opinion on decryption); used for "what accounts
+    have you set up for me" -- never for guessing which credential to use
+    without the user naming (or the model already knowing) the site."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "site_credentials"):
+            return []
+        rows = await conn.fetch(
+            "SELECT * FROM site_credentials WHERE user_id = $1 ORDER BY created_at DESC", user_id,
+        )
+        return _rows(rows)
+
+
+async def delete_site_credential(user_id: int, site_name: str) -> bool:
+    """Explicit user control ("forget my password for X") -- does NOT
+    delete or otherwise affect the account on the real site, only Messa's
+    own stored copy. Returns whether a row was actually deleted."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "site_credentials"):
+            return False
+        result = await conn.execute(
+            "DELETE FROM site_credentials WHERE user_id = $1 AND site_name = $2", user_id, site_name,
+        )
+        return result.endswith(" 1")
+
+
+async def mark_site_credential_used(user_id: int, site_name: str) -> None:
+    """Best-effort bookkeeping (last_used_at) -- called after
+    get_account_credential successfully hands a stored credential back for
+    a login. Never raises; a failure here shouldn't block the login
+    itself."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "site_credentials"):
+            return
+        await conn.execute(
+            "UPDATE site_credentials SET last_used_at = NOW() WHERE user_id = $1 AND site_name = $2",
+            user_id, site_name,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Default email provider (migrations/015_default_email_provider.sql) -- which
 # inbox Messa treats as the default for a generic "send/check my email"
 # request that doesn't name one: 'messa' (their own Messa-owned address,

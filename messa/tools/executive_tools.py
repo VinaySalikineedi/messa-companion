@@ -289,6 +289,12 @@ def _build_system_prompt(user: UserContext) -> str:
     return (
         "You are the executive assistant specialist: tasks, reminders, notes, contacts, and "
         "calendar events, delegated to you by Messa.\n"
+        "Your calendar is Messa's own INTERNAL calendar_events table -- it is NOT a real, "
+        "connected Google/Apple/Outlook calendar, and you have no tool that connects to one. "
+        "If a request is actually about connecting, syncing, or managing a REAL external "
+        "calendar (e.g. \"connect my Google Calendar\"), that's out of scope for you -- say so "
+        "plainly rather than creating an internal event that looks like it did that; Messa "
+        "routes that kind of request to integrations_agent instead.\n"
         f"{time_ctx}\n\n"
         "- Reads (list_*), tasks, reminders, notes, and contacts all happen IMMEDIATELY -- no "
         "confirmation needed for any of those.\n"
@@ -389,7 +395,9 @@ def build_executive_subagent(user: UserContext, model: BaseChatModel) -> dict[st
     return {
         "name": "executive_assistant",
         "description": (
-            "Manages tasks, reminders, notes, contacts, and calendar events. Use for "
+            "Manages tasks, reminders, notes, contacts, and Messa's own INTERNAL calendar "
+            "(not a real connected Google/Apple/Outlook calendar -- for connecting or "
+            "managing an actual external calendar, use integrations_agent instead). Use for "
             "anything about the user's to-dos, schedule, or personal notes/contacts. "
             "Tasks/reminders/notes/contacts happen immediately; calendar events "
             "(scheduling) go through a confirm step."

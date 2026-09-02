@@ -256,10 +256,24 @@ EMAIL_CONNECTION_REQUEST_EXPIRES_HOURS = int(
 # per call -- kept small on purpose (this is the whole point of the
 # feature: inject a handful of matching tool schemas, not a whole
 # toolkit's worth) but Composio's own tools.get(search=...) is documented
-# as "(experimental)", so this stays a knob rather than a hardcoded 2-3 in
+# as "(experimental)", so this stays a knob rather than a hardcoded value in
 # case real usage shows the default needs tuning.
+#
+# Raised from 5 to 8 after a real production run (fetching Reddit posts,
+# see README) showed 5 was occasionally too tight for a query that hadn't
+# been scoped to a specific toolkit yet -- an UNSCOPED single-word query
+# like "reddit" can rank several other toolkits' actions (whose
+# descriptions merely mention "Reddit") ahead of the one actually wanted.
+# The real fix for that is scoping the search with search_integration_tools'
+# new `toolkit` parameter once the app is known (see that tool's own
+# docstring) -- this bump is just a modest, cheap safety margin on top,
+# not a substitute for scoping. Deliberately NOT raised further (e.g. to
+# 15-20): once a search is toolkit-scoped there are usually only a
+# handful of real candidates anyway, and a much larger limit mostly just
+# adds token cost from irrelevant results on the (increasingly rare)
+# unscoped search.
 INTEGRATION_SEARCH_RESULT_LIMIT = int(
-    os.environ.get("MESSA_INTEGRATION_SEARCH_RESULT_LIMIT", "5")
+    os.environ.get("MESSA_INTEGRATION_SEARCH_RESULT_LIMIT", "8")
 )
 
 # Same role as EMAIL_CONNECTION_POLL_INTERVAL_SECONDS/_REQUEST_EXPIRES_HOURS
@@ -299,6 +313,24 @@ INTEGRATION_WRITE_ACTION_KEYWORDS = (
     "SHARE", "UPLOAD", "MOVE", "REPLY", "COMMENT", "ASSIGN", "CLOSE",
     "MERGE", "APPROVE", "REJECT", "SUBMIT", "SCHEDULE",
 )
+
+# ---- Site credentials (messa/credentials.py, migrations/021_site_credentials.sql)
+# ---- account passwords Messa creates/stores for sites outside Composio's
+# catalog (see tools/deepsearch_tools.py's generate_account_credential/
+# get_account_credential). Optional until you're ready to turn this on:
+# with CREDENTIALS_ENCRYPTION_KEY unset, both tools refuse plainly instead
+# of ever generating a password with nothing safe to encrypt it with.
+#
+# Generate one with:
+#   python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# Treat it exactly like a database password -- anyone with this key AND a
+# copy of the site_credentials table can decrypt every stored password.
+# Losing it means every already-stored credential becomes permanently
+# unrecoverable (the accounts still exist on their real sites -- only
+# Messa's own copy of the password is lost); rotating it requires
+# decrypting everything under the old key and re-encrypting under the new
+# one first (no built-in migration tool for that in this build).
+CREDENTIALS_ENCRYPTION_KEY = os.environ.get("MESSA_CREDENTIALS_ENCRYPTION_KEY")
 
 # ---- Messa's own personal-inbox email (separate from the Gmail block above)
 # ----
