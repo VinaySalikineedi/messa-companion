@@ -1798,6 +1798,44 @@ async def expire_app_connection_request(request_id: int) -> None:
         )
 
 
+async def get_active_connected_toolkits(user_id: int) -> list[str]:
+    """Toolkit slugs this user has an 'active' app_connection_requests row
+    for (e.g. ['reddit', 'todoist']) -- a cheap, LOCAL-ONLY read used to
+    give integrations_agent's own subagent description a per-turn hint of
+    what's likely already connected (see docs/dynamic_connected_apps_spec.md
+    and registry.py's _integrations_agent_description), without adding a
+    live Composio API round trip to every single turn the way querying
+    connected_accounts.list directly would.
+
+    Deliberately advisory, not authoritative -- two real gaps, both
+    accepted on purpose: (1) this only reflects apps connected THROUGH
+    Messa's own connect_integration_app flow -- an app connected some
+    other way (directly in Composio's dashboard, say) won't show up here;
+    (2) nothing currently flips a row back out of 'active' if the user
+    later revokes the connection outside Messa, so this can drift stale
+    over time in the 'shows connected when it no longer is' direction.
+    Neither gap matters much in practice because nothing safety-relevant
+    reads this: it's a text hint informing what Messa says about what's
+    connected, and the ACTUAL execution path (search_integration_tools)
+    always re-checks Composio's connected_accounts live before treating
+    anything as connected -- see integration_tools.py's own module
+    docstring for why that live check is deliberately not cached at all,
+    let alone here."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "app_connection_requests"):
+            return []
+        rows = await conn.fetch(
+            """
+            SELECT DISTINCT toolkit_slug FROM app_connection_requests
+            WHERE user_id = $1 AND status = 'active'
+            ORDER BY toolkit_slug
+            """,
+            user_id,
+        )
+        return [r["toolkit_slug"] for r in rows]
+
+
 # ---------------------------------------------------------------------------
 # Site credentials (migrations/021_site_credentials.sql) -- accounts
 # deepsearch creates on the user's behalf on sites Composio doesn't

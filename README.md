@@ -5083,3 +5083,84 @@ text) to confirm the calendar-boundary prompt addition didn't change any
 existing behavior, plus the full 29-file non-browser-dependent regression
 suite -- zero regressions, same two pre-existing unrelated issues as
 every prior pass.
+
+## Dynamic per-turn connected-apps hint + universal connection routing (`docs/dynamic_connected_apps_spec.md`)
+
+You wrote a follow-up spec asking for `integrations_agent`'s subagent
+description to dynamically list the user's currently-connected apps every
+turn, a universal "connect/link/authorize/sync ANY app" routing rule, and
+a negative boundary telling deepsearch not to reach for apps
+`integrations_agent` already covers. Implemented all three, with one
+deliberate change to how Part 1 actually fetches the connected-apps list.
+
+**Part 1, implemented with a local DB read instead of a live Composio
+call.** The spec's own example called `_connected_toolkits_sync` (or a DB
+equivalent) "on every turn." Traced where `build_orchestrator` actually
+runs: `server.py`'s webhook handlers call it fresh for EVERY incoming
+message (confirmed directly in the code, not assumed) -- so whatever this
+does runs on literally every turn Messa handles, not just ones about an
+app. `_connected_toolkits_sync` hits Composio's live API; adding that
+call to every single turn would add real network latency to every
+message, including ones with nothing to do with an integration -- and it
+would also contradict a decision this codebase already made and
+documented in `migrations/020_dynamic_integrations.sql`'s own header:
+connection status is deliberately checked live only when actually needed
+(`search_integration_tools`), not cached anywhere else, specifically to
+avoid this kind of cost.
+
+Used a cheap alternative instead: new `db.get_active_connected_toolkits(user_id)`
+reads `app_connection_requests` (already-existing local Postgres table,
+no new migration needed) for this user's `status = 'active'` rows -- a
+single indexed local query, not a network round trip. It's honestly
+advisory, not authoritative, and says so in its own docstring: it only
+reflects apps connected THROUGH Messa's `connect_integration_app` flow
+(an app connected some other way won't show up), and nothing currently
+flips a row back out of 'active' if a connection gets revoked outside
+Messa, so it can drift stale in the "shows connected when it's not"
+direction over time. Neither gap matters much here because nothing
+safety-relevant reads this value -- it only shapes what Messa's
+description-level context says is *probably* connected; the actual
+execution path (`search_integration_tools`) always re-checks Composio's
+`connected_accounts.list` live before treating anything as truly
+connected, completely unchanged by this feature.
+
+`registry.py`'s new `_integrations_agent_description(connected_slugs)` is
+a small pure function (deliberately factored out of `build_orchestrator`
+for testability without spinning up a real agent) that builds the
+description text, appending "Currently connected for this user: reddit,
+todoist." only when the list is non-empty. `build_orchestrator` calls
+`db.get_active_connected_toolkits` once per turn and wraps it in a
+try/except that logs and falls back to an empty list on failure -- a
+hint that fails open, never something that can take a whole turn down.
+
+**Part 2 (universal connection rule) and Part 3 (deepsearch's negative
+boundary) built as specified**, both cheap, low-risk prompt additions:
+Messa's system prompt now has an explicit paragraph -- ANY request to
+connect/link/authorize/sync ANY app, named elsewhere in the prompt or
+not, routes to `integrations_agent` immediately, same as a request to use
+one. `deepsearch`'s own subagent `description` (in
+`tools/deepsearch_tools.py`) now explicitly says not to use it for
+apps/platforms `integrations_agent` can reach via Composio, only once
+`integrations_agent` itself has reported the app/action unsupported.
+
+**Not verified here**: same caveat as every prompt-only change in this
+project -- there's no way to test "the model actually behaves this way"
+without a live run. What IS verified is that all the actual guidance text
+landed correctly and that the local DB read is wired correctly and fails
+safe.
+
+**Verification**: new `/tmp/test_dynamic_connected_apps.py` (24 checks)
+-- `db.get_active_connected_toolkits` against a fake Postgres pool
+(only-this-user's-active-rows filtering, empty-list and
+migration-not-applied no-op paths); `_integrations_agent_description` as
+a pure function (empty vs. populated connected-list rendering, email
+still excluded); Messa's system prompt carries the universal
+connect/link/authorize/sync rule and applies it even to unnamed apps;
+`deepsearch`'s subagent description carries the negative boundary and
+still allows the fallback once `integrations_agent` reports unsupported;
+and `build_orchestrator` end-to-end with a trivial fake model -- confirms
+`get_active_connected_toolkits` is actually called with the real
+`user_id` (not a stub that's wired to nothing), and that
+`build_orchestrator` still succeeds even when that call raises. Full
+30-file non-browser-dependent regression suite re-run -- zero
+regressions, same two pre-existing unrelated issues as every prior pass.

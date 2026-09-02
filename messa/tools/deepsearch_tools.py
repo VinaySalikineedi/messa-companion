@@ -1915,7 +1915,12 @@ def build_deepsearch_subagent(
             "closes its own browser per request. Long research tasks may hit a step limit "
             "before finishing -- when that happens the reply says so and gives a session id; "
             "include \"session #<id>\" in a follow-up delegation's description to resume "
-            "exactly where it left off instead of starting over."
+            "exactly where it left off instead of starting over.\n"
+            "Do NOT use for 3rd-party apps/platforms (Reddit, Slack, Todoist, Notion, Google "
+            "Calendar, and more) that integrations_agent can reach via Composio's authenticated "
+            "API -- that's faster and more reliable than browsing the site by hand. Only use "
+            "for one of these once integrations_agent itself has reported the app or action "
+            "isn't supported there."
         ),
         "runnable": RunnableLambda(_run),
     }

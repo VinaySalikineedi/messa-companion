@@ -45,7 +45,7 @@ from typing import Any
 from deepagents import GeneralPurposeSubagentProfile, HarnessProfile, create_deep_agent, register_harness_profile
 from langchain_core.tools import BaseTool, tool
 
-from .. import config, db, timeutil
+from .. import config, console, db, timeutil
 from ..approval import ApprovalGate, CLIApprovalGate
 from ..channels import sendblue
 from ..channels.sendblue import SendblueError
@@ -259,6 +259,32 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
     return trace_all(raw_tools, ORCHESTRATOR_LABEL)
 
 
+def _integrations_agent_description(connected_slugs: list[str]) -> str:
+    """Builds integrations_agent's subagent `description` -- what Messa's
+    OWN context sees on every turn when deciding whether to delegate here,
+    per docs/dynamic_connected_apps_spec.md. `connected_slugs` comes from
+    db.get_active_connected_toolkits (a cheap LOCAL Postgres read, not a
+    live Composio call -- see that function's own docstring for why: this
+    runs on every single turn via build_orchestrator, so anything here
+    that hit Composio's API directly would add real latency to every
+    message Messa handles, not just ones about an app). Deliberately kept
+    a pure function, separate from build_orchestrator, so it's testable
+    without spinning up a real agent."""
+    connected_str = (
+        f" Currently connected for this user: {', '.join(connected_slugs)}."
+        if connected_slugs else ""
+    )
+    return (
+        "Reaches any of Composio's 1,400+ other app integrations (Reddit, Todoist, Slack, "
+        "Notion, GitHub, Instagram, Google Calendar, and more) that none of Messa's other "
+        "subagents already cover -- NOT for email (that's always email_agent/"
+        "personal_inbox_agent)." + connected_str + " Use this whenever the user names an "
+        "app/service outside Messa's native capabilities and wants Messa to do something in "
+        "it, OR asks to connect/link/authorize/sync one -- ALWAYS check here first, before "
+        "deepsearch, for anything app-shaped."
+    )
+
+
 _ONBOARDING_PROMPTS = {
     "awaiting_name": (
         "This is a brand-new user and you don't know their name yet. Before diving into "
@@ -419,6 +445,11 @@ def _build_system_prompt(user: config.UserContext) -> str:
         "the site by hand. If it reports the app isn't supported at all (nothing Composio "
         "offers matches), that's your cue to offer deepsearch instead -- tell the user you'll "
         "do it by browsing the site directly, then delegate there.\n\n"
+        "Universal app-connection rule: ANY request to connect, link, authorize, or sync ANY "
+        "app or 3rd-party service -- named above or not -- goes to integrations_agent "
+        "immediately, the same as a request to USE one. Don't try to guess whether Composio "
+        "supports it yourself; let integrations_agent's own search tell you, and only fall "
+        "back to deepsearch if it reports nothing matches.\n\n"
         "Google Calendar specifically: a request to CONNECT, sync, or manage the user's real "
         "Google Calendar goes to integrations_agent (Composio's 'googlecalendar' toolkit), NOT "
         "executive_assistant -- executive_assistant's calendar is Messa's own internal one and "
@@ -509,6 +540,16 @@ async def build_orchestrator(
         config.SUBAGENT_MODEL_NAME,
         effective_context_tokens=config.SUBAGENT_EFFECTIVE_CONTEXT_TOKENS,
     )
+    # A cheap LOCAL DB read (not a Composio API call -- see
+    # db.get_active_connected_toolkits' own docstring for why that
+    # distinction matters here specifically: this runs on every turn).
+    # Never fatal to a turn if it fails -- worst case, the description
+    # just omits the connected-apps hint this once.
+    try:
+        connected_slugs = await db.get_active_connected_toolkits(user.user_id)
+    except Exception as e:  # noqa: BLE001 - a hint, not load-bearing
+        console.system(f"get_active_connected_toolkits failed (non-fatal): {e}")
+        connected_slugs = []
 
     subagents = [
         build_deepsearch_subagent(user, subagent_model, approval_gate),
@@ -544,13 +585,7 @@ async def build_orchestrator(
         },
         {
             "name": "integrations_agent",
-            "description": (
-                "Reaches any of Composio's 1,400+ other app integrations (Todoist, Slack, "
-                "Notion, GitHub, Instagram, and more) that none of Messa's other subagents "
-                "already cover -- NOT for email (that's always email_agent/"
-                "personal_inbox_agent). Use this whenever the user names an app/service "
-                "outside Messa's native capabilities and wants Messa to do something in it."
-            ),
+            "description": _integrations_agent_description(connected_slugs),
             "system_prompt": build_integration_system_prompt(user),
             "tools": build_integration_tools(user, approval_gate),
             "model": subagent_model,
