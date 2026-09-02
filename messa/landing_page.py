@@ -43,8 +43,10 @@ def _format_phone(raw: str | None) -> tuple[str, str]:
     """(display, sms_href) for whatever's in config.SENDBLUE_NUMBER.
 
     Sendblue numbers are provisioned as E.164 (e.g. "+15551234567") --
-    formatted here as "+1 (555) 123-4567" for a 10 or 11-digit US/Canada
-    number, since that's overwhelmingly what this'll be given Sendblue's
+    formatted here as "+1 (555) 123 4567" for a 10 or 11-digit US/Canada
+    number (a space, not a hyphen, separates the last block -- the landing
+    page's copy avoids dashes entirely, by request), since that's
+    overwhelmingly what this'll be given Sendblue's
     own coverage. Anything that doesn't match that shape (a different
     country code, or just a format we didn't anticipate) falls back to
     displaying the configured value exactly as-is rather than mangling it
@@ -65,7 +67,7 @@ def _format_phone(raw: str | None) -> tuple[str, str]:
     digits = re.sub(r"\D", "", raw)
     ten = digits[1:] if len(digits) == 11 and digits.startswith("1") else digits
     if len(ten) == 10:
-        display = f"+1 ({ten[0:3]}) {ten[3:6]}-{ten[6:]}"
+        display = f"+1 ({ten[0:3]}) {ten[3:6]} {ten[6:]}"
     else:
         display = raw
     sms_target = raw if raw.startswith("+") else (f"+{digits}" if digits else raw)
