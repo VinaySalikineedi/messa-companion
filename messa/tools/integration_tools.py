@@ -159,20 +159,23 @@ def _extract_tool_fields(item: Any) -> dict[str, str | None]:
     """Defensive extraction across a couple of plausible shapes for one
     tools.get(search=...) result item -- see this module's own docstring
     for why this is written defensively rather than assuming one exact
-    shape. Handles both an object with attributes and a plain dict."""
-    def _get(key: str) -> str | None:
-        if isinstance(item, dict):
-            return item.get(key)
-        return getattr(item, key, None)
+    shape. Handles OpenAI-style function dicts/objects, attributes, or plain dicts."""
+    def _get(obj: Any, key: str) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(key)
+        return getattr(obj, key, None)
 
-    slug = _get("slug") or _get("name") or _get("action") or ""
-    description = _get("description") or _get("summary") or ""
-    toolkit = _get("toolkit_slug") or _get("toolkit") or _get("app") or _get("appName")
+    func = _get(item, "function")
+    target = func if func is not None else item
+
+    slug = _get(target, "slug") or _get(target, "name") or _get(target, "action") or ""
+    description = _get(target, "description") or _get(target, "summary") or ""
+    toolkit = _get(target, "toolkit_slug") or _get(target, "toolkit") or _get(target, "app") or _get(target, "appName")
     if isinstance(toolkit, dict):
         toolkit = toolkit.get("slug") or toolkit.get("name")
     elif toolkit is not None and not isinstance(toolkit, str):
         toolkit = getattr(toolkit, "slug", None) or getattr(toolkit, "name", None)
-    return {"slug": str(slug), "description": str(description), "toolkit": toolkit}
+    return {"slug": str(slug or ""), "description": str(description or ""), "toolkit": toolkit}
 
 
 async def get_connection_status(connected_account_id: str) -> str | None:
@@ -223,14 +226,21 @@ def build_integration_tools(
     def _connected_toolkits_sync(toolkit_slugs: list[str]) -> set[str]:
         client = _get_client()
         result = client.connected_accounts.list(
-            user_ids=[composio_user_id], toolkit_slugs=toolkit_slugs, statuses=["ACTIVE"],
+            user_ids=[composio_user_id], statuses=["ACTIVE"],
         )
         items = getattr(result, "items", result)
         connected: set[str] = set()
         for account in items:
-            slug = getattr(account, "toolkit_slug", None) or getattr(account, "toolkit", None)
-            if isinstance(slug, str):
-                connected.add(slug.lower())
+            toolkit = getattr(account, "toolkit", None)
+            if isinstance(toolkit, str):
+                connected.add(toolkit.lower())
+            elif toolkit is not None:
+                slug = getattr(toolkit, "slug", None) or getattr(toolkit, "name", None)
+                if isinstance(slug, str):
+                    connected.add(slug.lower())
+            raw_slug = getattr(account, "toolkit_slug", None) or getattr(account, "appName", None)
+            if isinstance(raw_slug, str):
+                connected.add(raw_slug.lower())
         return connected
 
     @tool
