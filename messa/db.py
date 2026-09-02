@@ -1639,6 +1639,54 @@ async def expire_email_connection_request(request_id: int) -> None:
         )
 
 
+async def get_active_email_connection(user_id: int) -> dict[str, Any] | None:
+    """The user's currently-ACTIVE email_connection_requests row (the one
+    carrying the real connected_account_id Composio needs to actually
+    disconnect it), or None if they have none right now -- used by
+    tools/email_tools.py's new disconnect_email tool and
+    request_email_connection's new switch_account param (migrations/
+    022_disconnect_integrations.sql). Most-recently-resolved first in the
+    (should never happen, but a defensive tie-break) case of more than
+    one somehow being ACTIVE at once."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "email_connection_requests"):
+            return None
+        row = await conn.fetchrow(
+            """
+            SELECT * FROM email_connection_requests
+            WHERE user_id = $1 AND status = 'active'
+            ORDER BY resolved_at DESC NULLS LAST, requested_at DESC
+            LIMIT 1
+            """,
+            user_id,
+        )
+        return dict(row) if row else None
+
+
+async def mark_email_disconnected(request_id: int, user_id: int) -> None:
+    """The disconnect-side mirror of mark_email_connected -- resolves the
+    request row (status='disconnected', migrations/
+    022_disconnect_integrations.sql) AND flips users.email_connected back
+    to FALSE in the same transaction, so the two can't drift apart, same
+    reasoning as mark_email_connected's own docstring. Called only after
+    Composio's own connected_accounts.delete call has already succeeded
+    (see tools/email_tools.py's disconnect_email) -- this is just the
+    local bookkeeping catching up to what Composio already did."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            if await _has_table(conn, "email_connection_requests"):
+                await conn.execute(
+                    "UPDATE email_connection_requests SET status = 'disconnected', resolved_at = NOW() WHERE id = $1",
+                    request_id,
+                )
+            if await _has_column(conn, "users", "email_connected"):
+                await conn.execute(
+                    "UPDATE users SET email_connected = FALSE WHERE id = $1", user_id,
+                )
+
+
 # ---------------------------------------------------------------------------
 # Dynamic Integration Engine (migrations/020_dynamic_integrations.sql) --
 # see that migration's own header comment for the shape/reasoning. Three
@@ -1899,6 +1947,54 @@ async def get_active_connected_toolkits(user_id: int) -> list[str]:
             user_id,
         )
         return [r["toolkit_slug"] for r in rows]
+
+
+async def get_active_app_connection(user_id: int, toolkit_slug: str) -> dict[str, Any] | None:
+    """The user's currently-ACTIVE app_connection_requests row for this ONE
+    toolkit (carrying the real connected_account_id Composio needs to
+    actually disconnect it) -- the generic-path mirror of
+    get_active_email_connection above. Filtered by toolkit_slug (unlike
+    that Gmail-only function) because this table covers every connected
+    app for a user, not just one. Used by tools/integration_tools.py's new
+    disconnect_integration_app tool and connect_integration_app's new
+    switch_account param (migrations/022_disconnect_integrations.sql).
+    Most-recently-resolved first as a defensive tie-break in the (should
+    never happen) case of more than one somehow being ACTIVE at once for
+    the same toolkit."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "app_connection_requests"):
+            return None
+        row = await conn.fetchrow(
+            """
+            SELECT * FROM app_connection_requests
+            WHERE user_id = $1 AND toolkit_slug = $2 AND status = 'active'
+            ORDER BY resolved_at DESC NULLS LAST, requested_at DESC
+            LIMIT 1
+            """,
+            user_id, toolkit_slug,
+        )
+        return dict(row) if row else None
+
+
+async def disconnect_app_connection(request_id: int) -> None:
+    """The disconnect-side mirror of mark_app_connected -- resolves the
+    request row to status='disconnected' (migrations/
+    022_disconnect_integrations.sql). Unlike mark_email_disconnected,
+    there's no per-app users.<x>_connected cache to flip here, same reason
+    mark_app_connected's own docstring gives for the connect side (1,400+
+    toolkits, unbounded). Called only after Composio's own
+    connected_accounts.delete call has already succeeded (see
+    tools/integration_tools.py's disconnect_integration_app) -- this is
+    just the local bookkeeping catching up to what Composio already did."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "app_connection_requests"):
+            return
+        await conn.execute(
+            "UPDATE app_connection_requests SET status = 'disconnected', resolved_at = NOW() WHERE id = $1",
+            request_id,
+        )
 
 
 # ---------------------------------------------------------------------------

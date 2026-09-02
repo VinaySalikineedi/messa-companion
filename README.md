@@ -5416,3 +5416,136 @@ confirmation that the model actually follows the new routing prose
 correctly (same caveat as every other prompt-only change in this
 project), and the entire deferred multi-account design (SDK-source-level
 only, no live Composio account available from this sandbox).
+
+## Disconnecting and switching a connected app's account: fixing a real Messa hallucination
+
+**The bug**: a user asked to switch their connected Google Calendar to a
+different Google account. There is no settings/integrations page anywhere
+in this product for a user to manage their own connections -- but Messa
+confidently told them to go find one and disconnect it themselves before
+she could help, then wait for them to confirm before sending a fresh link.
+That's a fabricated instruction pointing at a page that doesn't exist, the
+same class of confidently-wrong-answer failure this project has hit
+before (see the primary-app-preference section above) -- just in a new
+place. The user's own proposed fix was fundamentally right: Composio can
+actually disconnect a connected account server-side, so Messa should just
+do that herself, immediately, over text.
+
+**Verified against the actual installed SDK first** (`composio==0.21.0`/
+`composio_client==1.43.0`, not docs paraphrase -- same discipline as every
+other Composio claim in this project): `client.connected_accounts.delete
+(nanoid, revoke_on_delete=True|False)` is real. `nanoid` is the
+`connected_account_id` (the same id this project already stores per
+connection row). `revoke_on_delete=False` (the default) only removes
+Composio's own record -- the upstream OAuth grant on Google's/etc.'s side
+is untouched, so the app would still show as authorized in the user's
+Google account. `revoke_on_delete=True` actually starts revoking that
+upstream grant too, but as an ASYNC background job with no documented way
+to poll or confirm completion from code -- only visible via Composio's own
+dashboard. This matters directly: every new tool below always passes
+`revoke_on_delete=True` (the user asked to disconnect, so the fuller
+cleanup is the right default), but is deliberately worded to never claim
+the revocation itself is confirmed done -- only that it's "in progress" --
+specifically to avoid recreating the exact bug this feature exists to fix
+by trading one false claim ("go disconnect it yourself") for another
+("it's fully revoked").
+
+**What shipped**, mirrored across both connection paths in this codebase
+(the generic Composio path, `integration_tools.py`, and Gmail's separate
+dedicated path, `email_tools.py` -- see that file's own module docstring
+for why Gmail has always been kept architecturally separate):
+
+- `migrations/022_disconnect_integrations.sql`: adds a `'disconnected'`
+  status value to both `app_connection_status` and `email_connection_status`
+  enums, distinct from the existing `'expired'` -- `'expired'` already
+  means "a pending link timed out, or Composio reported a terminal failure
+  before the user ever finished connecting," a genuinely earlier and
+  different lifecycle event from "a previously-ACTIVE, working connection
+  was deliberately disconnected." Same `ADD VALUE IF NOT EXISTS`,
+  safe-to-re-run pattern as migration 009's identical use on a different
+  enum.
+- `db.py`: `get_active_email_connection(user_id)` / `mark_email_disconnected
+  (request_id, user_id)` for Gmail's own table (the latter, like
+  `mark_email_connected`, flips `users.email_connected` back to `FALSE` in
+  the same transaction so the two can't drift apart); `get_active_app_
+  connection(user_id, toolkit_slug)` / `disconnect_app_connection(request_id)`
+  for the generic `app_connection_requests` table, filtered by toolkit
+  slug since (unlike Gmail's table) it holds every connected app for a
+  user, not just one -- and, unlike `mark_app_connected`, there's no
+  per-app `users.<x>_connected` cache to flip on the disconnect side
+  either, same reason as the connect side (1,400+ toolkits, unbounded).
+- `email_tools.py`: new `disconnect_email()` tool (disconnect with no
+  reconnect); `request_email_connection` gains a `switch_account: bool =
+  False` param -- when `True`, it looks up the user's current active
+  connection, calls `connected_accounts.delete(..., revoke_on_delete=True)`
+  on it, marks it disconnected locally, and only THEN generates and texts
+  a fresh connect link (has to happen in that order -- Composio's own
+  `ComposioMultipleConnectedAccountsError` is scoped to `(user_id,
+  auth_config_id)`, and Gmail's `auth_config_id` is the same one every
+  time, so a stale connection still on file would make the fresh `.link()`
+  call fail the same way a plain reconnect already does). A plain connect
+  attempt that hits that same "already connected" error (i.e.
+  `switch_account` was left `False`) no longer dead-ends -- it now tells
+  the model to call `request_email_connection(switch_account=True)`
+  instead of just reporting the app is already set up with no path
+  forward.
+- `integration_tools.py`: the exact same shape --
+  `disconnect_integration_app(toolkit_slug)` and `connect_integration_app`'s
+  new `switch_account` param, generalized to any of the 1,400+ toolkits
+  this file already handles generically.
+- `common.py`'s existing `destructive_check` mechanism (built for
+  `execute_integration_tool`'s dynamic per-slug gating) turned out to fit
+  this perfectly with no changes needed: `disconnect_email`/
+  `disconnect_integration_app` are always destructive (they only ever
+  disconnect something), while `request_email_connection`/
+  `connect_integration_app` are destructive ONLY on the `switch_account=
+  True` branch -- a plain first-time connect still needs no confirmation,
+  exactly as before this feature existed.
+- `registry.py`: a new "Switching or disconnecting a connected app"
+  paragraph in the orchestrator's own system prompt, directly answering
+  the reported bug -- states plainly that there is no settings/
+  integrations page and Messa should never say there is or tell the user
+  to do it themselves first; names the real tool calls for both switching
+  and plain disconnecting; repeats the "revocation in progress, never
+  confirmed complete" wording; and adds one more thing the original
+  proposal didn't cover but the reported conversation's own transcript
+  flagged as a real, useful heads-up -- warning the user before
+  disconnecting a CALENDAR specifically if Messa knows of upcoming events
+  that live only on the account being disconnected, since they won't
+  carry over automatically. `integrations_agent`'s and `email_agent`'s own
+  system prompts (`build_integration_system_prompt` / `email_tools.py`'s
+  `_build_system_prompt`) each got the matching addition too, since
+  they're the subagents that actually call these tools and need to know
+  they exist.
+
+**Verification**: new `/tmp/test_disconnect_switch.py` (57 checks) --
+`db.py`'s four new functions against a fake pool (found/not-found,
+toolkit-filtering so two different apps' rows for the same user never
+cross-contaminate, transaction behavior, pre-migration no-ops);
+`switch_account=True` against a fake Composio client proving the delete
+call fires with `revoke_on_delete=True` on the correct OLD
+`connected_account_id` BEFORE the new link is generated, that switching
+with nothing currently connected just skips the delete and still
+connects, and that a plain (non-switch) already-connected attempt now
+points at `switch_account=True` instead of dead-ending; both disconnect
+tools with nothing connected (plain message, zero Composio calls) and
+with something connected (real delete call, local row flipped,
+"disconnected... in progress" wording verified NOT to also claim
+"fully revoked"/"confirmed"); the new destructive-gating split (plain
+connect ungated, `switch_account=True` and both disconnect tools gated,
+denied by default with no gate configured); and the new prompt paragraphs
+in the orchestrator, `integrations_agent`, and `email_agent`. Re-ran the
+full non-browser-dependent regression suite -- zero regressions,
+including the two suites most likely to catch a mistake here
+(`test_integration_tools.py`, `test_email_oauth_tools.py`) and every
+other previously-passing file; same pre-existing unrelated failures as
+always (`test_active_tab_live_view.py`, `test_dashboard_route.py`,
+`test_toolnode_concurrency.py`, plus `test_mcp_concurrency.py`/
+`test_mcp_multitab.py`, both a pre-existing "Chromium refuses to launch
+as root without `--no-sandbox`" sandbox limitation unrelated to any
+change in this round). Not verified: live-LLM confirmation the model
+actually follows the new routing prose (same standing caveat as every
+other prompt-only change in this project), and no live Composio account
+was available in this sandbox to confirm `revoke_on_delete=True`'s
+real-world timing end-to-end -- the async/unpollable behavior is taken
+from the SDK source, not observed live.

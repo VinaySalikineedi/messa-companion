@@ -89,7 +89,7 @@ called out again in the README.
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import Any, Callable
 
 from langchain_core.tools import BaseTool, tool
 
@@ -387,7 +387,7 @@ def build_integration_tools(
         return "\n".join(lines)
 
     @tool
-    async def connect_integration_app(toolkit_slug: str) -> str:
+    async def connect_integration_app(toolkit_slug: str, switch_account: bool = False) -> str:
         """Generate a fresh OAuth connect link for the given app (e.g.
         'todoist', 'slack', 'notion' -- use the toolkit name search_
         integration_tools showed as NOT CONNECTED) and send it to the user
@@ -395,11 +395,43 @@ def build_integration_tools(
         the link yourself -- it's sent automatically; this tool's return
         value tells you what to say instead. Only call this when the user
         actually wants to connect that app, not automatically after every
-        search."""
+        search.
+
+        switch_account: set True when the user explicitly wants to
+        DISCONNECT the app's current connection and connect a different
+        account instead (e.g. "switch my Google Calendar to a different
+        Google account", "use my other Todoist"). This actually disconnects
+        the old connected account first (real, immediate: Composio's own
+        connected_accounts.delete, not a manual step for the user) and then
+        sends a fresh connect link, so the OAuth screen lets them pick a
+        different account. There is no dashboard/settings page for the user
+        to do this themselves -- this tool IS the disconnect. Leave this
+        False for a normal first-time connect; if that raises "already
+        connected" and the user didn't ask to switch, just tell them it's
+        already set up rather than calling this again."""
         try:
             client = _get_client()
         except _NotConfigured as e:
             return str(e)
+
+        if switch_account:
+            existing = await db.get_active_app_connection(user.user_id, toolkit_slug)
+            if existing and existing.get("connected_account_id"):
+
+                def _delete_sync():
+                    client.connected_accounts.delete(
+                        existing["connected_account_id"], revoke_on_delete=True,
+                    )
+
+                try:
+                    await asyncio.to_thread(_delete_sync)
+                except Exception as e:  # noqa: BLE001 - surfaced to the model, not raised
+                    return (
+                        f"Couldn't disconnect the current {toolkit_slug} connection to switch "
+                        f"accounts: {e}. Tell the user it didn't work and to try again shortly -- "
+                        "don't tell them to do it manually anywhere, there's no such page."
+                    )
+                await db.disconnect_app_connection(existing["id"])
 
         def _start_link():
             auth_config_id = _get_or_create_auth_config_id(client, toolkit_slug)
@@ -415,8 +447,11 @@ def build_integration_tools(
             connection_request = await asyncio.to_thread(_start_link)
         except composio_exceptions.ComposioMultipleConnectedAccountsError:
             return (
-                f"The user's {toolkit_slug} is already connected -- no need to send another "
-                "link. Just let them know it's already set up."
+                f"The user's {toolkit_slug} is already connected. If they want to switch to a "
+                f"different account, call connect_integration_app('{toolkit_slug}', "
+                "switch_account=True) -- that disconnects the current one and sends a fresh link "
+                "immediately, no manual step needed anywhere. Otherwise just let them know it's "
+                "already set up."
             )
         except Exception as e:  # noqa: BLE001 - surfaced to the model, not raised
             return f"Couldn't start the {toolkit_slug} connection: {e}"
@@ -447,6 +482,62 @@ def build_integration_tools(
             "message -- don't repeat the URL yourself. Just tell them to check their messages, "
             "and that you'll let them know once it's connected."
         )
+
+    @tool
+    async def disconnect_integration_app(toolkit_slug: str) -> str:
+        """Disconnect the user's currently-connected account for this app
+        (e.g. 'googlecalendar', 'todoist') WITHOUT connecting a new one --
+        for when the user just wants it off, not switched. (For "switch to
+        a different account", prefer connect_integration_app(toolkit_slug,
+        switch_account=True) instead -- one call, disconnect + fresh link
+        together.) There's no dashboard/settings page for the user to do
+        this themselves; this tool IS the disconnect, right now.
+
+        Tells Composio to revoke the underlying OAuth grant too, but that
+        revocation runs as Composio's own background job with no way for
+        Messa to confirm it finished -- so say the disconnection is done
+        (Messa's own side, and future requests, immediately stop using it),
+        and that revoking the app's own access is in progress, not confirmed
+        complete on the spot."""
+        try:
+            client = _get_client()
+        except _NotConfigured as e:
+            return str(e)
+
+        existing = await db.get_active_app_connection(user.user_id, toolkit_slug)
+        if not existing or not existing.get("connected_account_id"):
+            return f"The user's {toolkit_slug} isn't currently connected -- nothing to disconnect."
+
+        def _delete_sync():
+            client.connected_accounts.delete(
+                existing["connected_account_id"], revoke_on_delete=True,
+            )
+
+        try:
+            await asyncio.to_thread(_delete_sync)
+        except Exception as e:  # noqa: BLE001 - surfaced to the model, not raised
+            return f"Couldn't disconnect {toolkit_slug}: {e}. Tell the user it didn't work and to try again shortly."
+
+        await db.disconnect_app_connection(existing["id"])
+        return (
+            f"Done -- the user's {toolkit_slug} is disconnected on Messa's side; she won't use it "
+            "for anything going forward. Revoking the app's own access on Google's/etc.'s side is "
+            "in progress in the background (not something you can confirm finished right now) -- "
+            "tell them it's disconnected, and that fully revoking access may take a short moment "
+            "on the provider's end if they check there."
+        )
+
+    def _is_switch_account_call(*args: Any, **kwargs: Any) -> bool:
+        """connect_integration_app is only destructive on the branch that
+        actually disconnects an existing account first -- a normal
+        first-time connect (switch_account left False/default) still needs
+        no confirmation, same as before this feature existed."""
+        if "switch_account" in kwargs:
+            return bool(kwargs["switch_account"])
+        return len(args) > 1 and bool(args[1])
+
+    def _always_destructive(*args: Any, **kwargs: Any) -> bool:
+        return True
 
     def _is_write_action(*args: Any, **kwargs: Any) -> bool:
         slug = (kwargs.get("slug") or (args[0] if args else "")) or ""
@@ -487,17 +578,32 @@ def build_integration_tools(
         return str(result)
 
     raw_tools: list[BaseTool] = [
-        search_integration_tools, connect_integration_app, execute_integration_tool,
+        search_integration_tools, connect_integration_app, disconnect_integration_app,
+        execute_integration_tool,
     ]
+
+    def _destructive_check_for(name: str) -> Callable[..., bool] | None:
+        # connect_integration_app isn't gated on a plain first-time connect
+        # -- same as email_tools.py's request_email_connection: generating/
+        # sending a connect link changes nothing on the user's behalf, so
+        # there's nothing to confirm. It IS gated the one time it's actually
+        # destructive: switch_account=True, which disconnects a real,
+        # currently-working connection before reconnecting. disconnect_
+        # integration_app is always destructive -- it only ever disconnects.
+        # execute_integration_tool's actual write-shaped calls need approval,
+        # decided dynamically per slug.
+        if name == "execute_integration_tool":
+            return _is_write_action
+        if name == "connect_integration_app":
+            return _is_switch_account_call
+        if name == "disconnect_integration_app":
+            return _always_destructive
+        return None
+
     return [
         trace_tool(
             t, LABEL,
-            # connect_integration_app isn't gated -- same as email_tools.py's
-            # request_email_connection: generating/sending a connect link
-            # changes nothing on the user's behalf, so there's nothing to
-            # confirm. Only execute_integration_tool's actual write-shaped
-            # calls need approval, decided dynamically per slug below.
-            destructive_check=_is_write_action if t.name == "execute_integration_tool" else None,
+            destructive_check=_destructive_check_for(t.name),
             approval_gate=approval_gate,
         )
         for t in raw_tools
@@ -527,6 +633,17 @@ def build_integration_system_prompt(user: config.UserContext) -> str:
         "- If the app isn't connected yet: tell the user, and only call "
         "connect_integration_app(toolkit_slug) if they actually want to connect it right now -- "
         "don't send a connect link unprompted just because a search turned one up.\n"
+        "- If the app IS already connected and the user wants a DIFFERENT account instead "
+        "('switch my Google Calendar to my other account', 'use my other Todoist'), call "
+        "connect_integration_app(toolkit_slug, switch_account=True) -- it disconnects the "
+        "current account and sends a fresh link in one step. There is no settings/integrations "
+        "page for the user to disconnect it themselves first; never say there is or ask them to "
+        "do that -- this tool call IS the disconnect.\n"
+        "- If the user just wants an app disconnected with no intent to reconnect ('disconnect "
+        "my Todoist', 'stop using my Slack'), call disconnect_integration_app(toolkit_slug). "
+        "Either way, be accurate about what happened: the disconnect on Messa's own side is "
+        "immediate and confirmed; revoking the app's own access is a background job you can't "
+        "confirm finished on the spot, so say revocation is in progress, not that it's done.\n"
         "- execute_integration_tool(slug, arguments) to actually run something, using the exact "
         "slug and expected arguments search_integration_tools showed you. Read-only actions run "
         "immediately; anything that changes state will prompt the user for confirmation "

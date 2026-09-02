@@ -254,16 +254,47 @@ def build_email_tools(user: config.UserContext, approval_gate: ApprovalGate | No
         return str(result)
 
     @tool
-    async def request_email_connection() -> str:
+    async def request_email_connection(switch_account: bool = False) -> str:
         """Generate a fresh Gmail OAuth connect link for this user and send it to them
         directly as its own text message right now. Call this when the user says
         something like 'connect my email/gmail', or during onboarding when they say yes
         to Messa managing their email. Do NOT try to relay the link yourself -- it's sent
-        automatically; this tool's return value tells you what to say instead."""
+        automatically; this tool's return value tells you what to say instead.
+
+        switch_account: set True when the user explicitly wants to DISCONNECT
+        their currently-connected Gmail and connect a different Google
+        account instead (e.g. "switch my Gmail to my other account"). This
+        actually disconnects the current one first (real, immediate:
+        Composio's own connected_accounts.delete, not a manual step for the
+        user) and then sends a fresh connect link, so the Google sign-in
+        screen lets them pick a different account. There is no dashboard/
+        settings page for the user to do this themselves -- this tool IS the
+        disconnect. Leave this False for a normal first-time connect; if
+        that raises "already connected" and the user didn't ask to switch,
+        just tell them it's already set up rather than calling this again."""
         try:
             client = _get_client()
         except _NotConfigured as e:
             return str(e)
+
+        if switch_account:
+            existing = await db.get_active_email_connection(user.user_id)
+            if existing and existing.get("connected_account_id"):
+
+                def _delete_sync():
+                    client.connected_accounts.delete(
+                        existing["connected_account_id"], revoke_on_delete=True,
+                    )
+
+                try:
+                    await asyncio.to_thread(_delete_sync)
+                except Exception as e:  # noqa: BLE001 - surfaced to the model, not raised
+                    return (
+                        f"Couldn't disconnect the current Gmail connection to switch accounts: "
+                        f"{e}. Tell the user it didn't work and to try again shortly -- don't "
+                        "tell them to do it manually anywhere, there's no such page."
+                    )
+                await db.mark_email_disconnected(existing["id"], user.user_id)
 
         def _start_link():
             auth_config_id = _get_or_create_gmail_auth_config_id(client)
@@ -279,8 +310,10 @@ def build_email_tools(user: config.UserContext, approval_gate: ApprovalGate | No
             connection_request = await asyncio.to_thread(_start_link)
         except composio_exceptions.ComposioMultipleConnectedAccountsError:
             return (
-                "The user's Gmail is already connected -- there's no need to send another "
-                "link. Just let them know it's already set up."
+                "The user's Gmail is already connected. If they want to switch to a "
+                "different Google account, call request_email_connection(switch_account=True) "
+                "-- that disconnects the current one and sends a fresh link immediately, no "
+                "manual step needed anywhere. Otherwise just let them know it's already set up."
             )
         except Exception as e:  # noqa: BLE001 - surfaced to the model, not raised
             return f"Couldn't start the Gmail connection: {e}"
@@ -342,12 +375,81 @@ def build_email_tools(user: config.UserContext, approval_gate: ApprovalGate | No
             )
         return "Gmail isn't connected yet -- offer to send a connect link with request_email_connection."
 
+    @tool
+    async def disconnect_email() -> str:
+        """Disconnect the user's currently-connected Gmail WITHOUT connecting
+        a new one -- for when the user just wants it off, not switched. (For
+        "switch to a different Google account", prefer
+        request_email_connection(switch_account=True) instead -- one call,
+        disconnect + fresh link together.) There's no dashboard/settings page
+        for the user to do this themselves; this tool IS the disconnect,
+        right now.
+
+        Tells Composio to revoke the underlying OAuth grant too, but that
+        revocation runs as Composio's own background job with no way for
+        Messa to confirm it finished -- so say the disconnection is done
+        (Messa's own side, and future requests, immediately stop using it),
+        and that revoking the app's own access is in progress, not confirmed
+        complete on the spot."""
+        try:
+            client = _get_client()
+        except _NotConfigured as e:
+            return str(e)
+
+        existing = await db.get_active_email_connection(user.user_id)
+        if not existing or not existing.get("connected_account_id"):
+            return "The user's Gmail isn't currently connected -- nothing to disconnect."
+
+        def _delete_sync():
+            client.connected_accounts.delete(
+                existing["connected_account_id"], revoke_on_delete=True,
+            )
+
+        try:
+            await asyncio.to_thread(_delete_sync)
+        except Exception as e:  # noqa: BLE001 - surfaced to the model, not raised
+            return f"Couldn't disconnect Gmail: {e}. Tell the user it didn't work and to try again shortly."
+
+        await db.mark_email_disconnected(existing["id"], user.user_id)
+        return (
+            "Done -- the user's Gmail is disconnected on Messa's side; she won't use it for "
+            "anything going forward. Revoking access on Google's side is in progress in the "
+            "background (not something you can confirm finished right now) -- tell them it's "
+            "disconnected, and that fully revoking access may take a short moment on Google's "
+            "end if they check there."
+        )
+
+    def _is_switch_account_call(*args: Any, **kwargs: Any) -> bool:
+        """request_email_connection is only destructive on the branch that
+        actually disconnects the current Gmail first -- a normal first-time
+        connect (switch_account left False/default) still needs no
+        confirmation, same as before this feature existed."""
+        if "switch_account" in kwargs:
+            return bool(kwargs["switch_account"])
+        return len(args) > 0 and bool(args[0])
+
+    def _always_destructive(*args: Any, **kwargs: Any) -> bool:
+        return True
+
     raw_tools: list[BaseTool] = [
         list_recent_emails, get_email, send_email, reply_to_email,
-        request_email_connection, check_email_connection_status,
+        request_email_connection, check_email_connection_status, disconnect_email,
     ]
+
+    def _destructive_check_for(name: str):
+        if name == "request_email_connection":
+            return _is_switch_account_call
+        if name == "disconnect_email":
+            return _always_destructive
+        return None
+
     return [
-        trace_tool(t, LABEL, destructive=t.name in _DESTRUCTIVE, approval_gate=approval_gate)
+        trace_tool(
+            t, LABEL,
+            destructive=t.name in _DESTRUCTIVE,
+            destructive_check=_destructive_check_for(t.name),
+            approval_gate=approval_gate,
+        )
         for t in raw_tools
     ]
 
@@ -392,6 +494,15 @@ def _build_system_prompt(user: config.UserContext) -> str:
         "during onboarding, once they've said yes to Messa handling their email). It sends the "
         "connect link itself, as its own text -- never try to type out the URL yourself, and "
         "don't wait around for them to finish; just tell Messa you've sent it.\n"
+        "- If the user wants to switch to a DIFFERENT Google account ('switch my gmail to my "
+        "other account'), call request_email_connection(switch_account=True) -- it disconnects "
+        "the current one and sends a fresh link in one step. If they just want Gmail "
+        "disconnected with no reconnect, call disconnect_email() instead. There is no settings/"
+        "integrations page for the user to do either of these themselves -- never say there is "
+        "or tell them to do it manually; these tool calls ARE the disconnect, right now. Both "
+        "confirm the disconnect on Messa's own side immediately, but the underlying Google-side "
+        "revocation runs in the background -- say revocation is in progress, never that it's "
+        "confirmed complete.\n"
         "- If a tool returns 'Email agent isn't configured yet', tell Messa so it can relay "
         "that the email channel needs setup, instead of pretending the action happened.\n"
         "- You have a small, bounded number of steps for this delegation -- if a call fails, "
