@@ -787,7 +787,16 @@ class BrowserToolProvider:
                         context_id = await browserbase.create_context()
                         await db.save_browserbase_context_id(self._user_id, context_id)
 
-                session = await browserbase.create_session(context_id)
+                try:
+                    session = await browserbase.create_session(context_id)
+                except Exception as sess_err:
+                    if context_id:
+                        console.system("Deepsearch: saved context expired or invalid -- provisioning fresh Browserbase context...")
+                        context_id = await browserbase.create_context()
+                        await db.save_browserbase_context_id(self._user_id, context_id)
+                        session = await browserbase.create_session(context_id)
+                    else:
+                        raise sess_err
                 self._bb_session_id = session["id"]
                 connect_url = session["connectUrl"]
                 console.system(f"Deepsearch: opened Browserbase session {self._bb_session_id}.")
@@ -916,7 +925,10 @@ class BrowserToolProvider:
         if self._cursor_move_task is not None and not self._cursor_move_task.done():
             self._cursor_move_task.cancel()
         if self._session_cm is not None:
-            await self._session_cm.__aexit__(exc_type, exc, tb)
+            try:
+                await self._session_cm.__aexit__(exc_type, exc, tb)
+            except Exception as cm_err:  # noqa: BLE001
+                console.tool_error(LABEL, "session_cleanup_suppressed", str(cm_err))
         if not self._owns_server:
             # A sub-worker only closes its OWN client connection -- the
             # shared server process and the Browserbase session both belong
