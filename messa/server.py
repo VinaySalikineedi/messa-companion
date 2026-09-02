@@ -50,7 +50,7 @@ from .channels import browserbase, sendblue
 from .channels.sendblue import SendblueError
 from .landing_page import render_landing_page
 from .live_view_page import render_live_view_page
-from .tools import email_tools
+from .tools import email_tools, integration_tools
 from .tools.routines_tools import compute_next_run
 
 app = FastAPI(title="Messa Sendblue webhook")
@@ -1258,6 +1258,49 @@ async def _production_email_connection_poll_loop() -> None:
         await asyncio.sleep(config.EMAIL_CONNECTION_POLL_INTERVAL_SECONDS)
 
 
+async def _production_app_connection_poll_loop() -> None:
+    """Generalized twin of _production_email_connection_poll_loop right
+    above, for any Composio toolkit connected via
+    tools/integration_tools.py's connect_integration_app instead of Gmail
+    specifically -- see migrations/020_dynamic_integrations.sql's header
+    and db.py's app_connection_requests functions for the full shape.
+    Deliberately its own separate loop rather than folding this into the
+    Gmail one: keeps the two connection systems fully independent (a bug
+    in one can't stall the other), same reasoning as every other pair of
+    parallel poll loops in this file."""
+    while True:
+        try:
+            await db.expire_stale_app_connection_requests()
+            pending = await db.get_pending_app_connection_requests()
+            for req in pending:
+                if not req.get("connected_account_id"):
+                    continue
+                status = await integration_tools.get_connection_status(req["connected_account_id"])
+                toolkit_slug = req["toolkit_slug"]
+                if status == "ACTIVE":
+                    await db.mark_app_connected(req["id"])
+                    try:
+                        await sendblue.send_message(
+                            req["phone_number"],
+                            f"Your {toolkit_slug} is connected! Just ask and I can use it now.",
+                        )
+                    except SendblueError as e:
+                        console.system(f"[app connection notify failed] request=#{req['id']}: {e}")
+                elif status in ("FAILED", "EXPIRED", "REVOKED"):
+                    await db.expire_app_connection_request(req["id"])
+                    try:
+                        await sendblue.send_message(
+                            req["phone_number"],
+                            f"That {toolkit_slug} connection didn't go through -- want me to send a new link?",
+                        )
+                    except SendblueError as e:
+                        console.system(f"[app connection notify failed] request=#{req['id']}: {e}")
+                # Any other status (INITIALIZING, etc.) -- still in progress, check again next cycle.
+        except Exception as e:  # noqa: BLE001 - a background loop must never die silently mid-process
+            console.system(f"[app connection poller error] {e}")
+        await asyncio.sleep(config.APP_CONNECTION_POLL_INTERVAL_SECONDS)
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     global _bg_tasks
@@ -1267,9 +1310,11 @@ async def _startup() -> None:
         asyncio.create_task(_production_briefing_loop()),
         asyncio.create_task(_production_deepsearch_pause_loop()),
         asyncio.create_task(_production_email_connection_poll_loop()),
+        asyncio.create_task(_production_app_connection_poll_loop()),
     ]
     console.system(
-        "Started production reminder/cron/briefing/deepsearch-pause/email-connection delivery pollers."
+        "Started production reminder/cron/briefing/deepsearch-pause/email-connection/"
+        "app-connection delivery pollers."
     )
 
 

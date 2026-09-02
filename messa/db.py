@@ -1640,6 +1640,165 @@ async def expire_email_connection_request(request_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Dynamic Integration Engine (migrations/020_dynamic_integrations.sql) --
+# see that migration's own header comment for the shape/reasoning. Three
+# groups below, same additive/no-op-safe pattern as everything else in this
+# file: every function here does nothing (returns None/[]/False) rather
+# than raising if migration 020 hasn't been applied yet.
+# ---------------------------------------------------------------------------
+
+async def get_app_preference(user_id: int, app_category: str) -> str | None:
+    """The user's preferred app for a category (e.g. 'tasks' -> 'todoist'),
+    or None if they've never set one -- tools/integration_tools.py falls
+    back to just asking/using whatever single connected app matches in
+    that case, only consulting this when more than one connected app could
+    plausibly serve the same request."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_app_preferences"):
+            return None
+        return await conn.fetchval(
+            "SELECT preferred_app FROM user_app_preferences WHERE user_id = $1 AND app_category = $2",
+            user_id, app_category,
+        )
+
+
+async def set_app_preference(user_id: int, app_category: str, preferred_app: str) -> dict[str, Any] | None:
+    """Upsert -- always at the user's own explicit request ('use Todoist
+    for my tasks by default'), same one-writer-only pattern as
+    set_default_email_provider above."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_app_preferences"):
+            return None
+        row = await conn.fetchrow(
+            """
+            INSERT INTO user_app_preferences (user_id, app_category, preferred_app)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (user_id, app_category) DO UPDATE SET preferred_app = $3, updated_at = NOW()
+            RETURNING *
+            """,
+            user_id, app_category, preferred_app,
+        )
+        return dict(row)
+
+
+async def log_unsupported_integration_request(user_id: int, requested_app_name: str, raw_user_prompt: str) -> None:
+    """Fire-and-forget product-roadmap signal: called whenever
+    search_integration_tools finds no Composio toolkit at all matching the
+    query, independent of whether the deepsearch/Browserbase fallback then
+    manages to handle the request anyway -- the point is "users want X",
+    not "we couldn't help them right now". Best-effort: swallows its own
+    failure (never lets a logging problem break the actual request the
+    user is waiting on) beyond the standard no-op-if-migration-missing
+    guard every other function here already gets."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "unsupported_integration_requests"):
+            return
+        await conn.execute(
+            """
+            INSERT INTO unsupported_integration_requests (user_id, requested_app_name, raw_user_prompt)
+            VALUES ($1, $2, $3)
+            """,
+            user_id, requested_app_name[:128], raw_user_prompt,
+        )
+
+
+# --- app_connection_requests: same decoupled propose-now/notify-later shape
+# as email_connection_requests above, generalized to any Composio toolkit.
+# See migrations/020_dynamic_integrations.sql's header and server.py's
+# _production_app_connection_poll_loop for the full flow. ---
+
+async def create_app_connection_request(
+    user_id: int, toolkit_slug: str, connected_account_id: str | None
+) -> dict[str, Any] | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "app_connection_requests"):
+            return None
+        row = await conn.fetchrow(
+            """
+            INSERT INTO app_connection_requests (user_id, toolkit_slug, connected_account_id)
+            VALUES ($1, $2, $3) RETURNING *
+            """,
+            user_id, toolkit_slug, connected_account_id,
+        )
+        return dict(row)
+
+
+async def get_pending_app_connection_requests() -> list[dict[str, Any]]:
+    """All still-'pending' rows across every user, joined with phone_number
+    -- what _production_app_connection_poll_loop polls. Excludes rows older
+    than config.APP_CONNECTION_REQUEST_EXPIRES_HOURS; the loop expires
+    those separately (see expire_stale_app_connection_requests)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "app_connection_requests"):
+            return []
+        rows = await conn.fetch(
+            """
+            SELECT a.*, u.phone_number
+            FROM app_connection_requests a JOIN users u ON u.id = a.user_id
+            WHERE a.status = 'pending'
+            AND a.requested_at > NOW() - ($1 || ' hours')::interval
+            """,
+            str(config.APP_CONNECTION_REQUEST_EXPIRES_HOURS),
+        )
+        return _rows(rows)
+
+
+async def expire_stale_app_connection_requests() -> list[dict[str, Any]]:
+    """Silently expires (no notification -- the user can just ask again)
+    any 'pending' row older than the configured window."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "app_connection_requests"):
+            return []
+        rows = await conn.fetch(
+            """
+            UPDATE app_connection_requests
+            SET status = 'expired', resolved_at = NOW()
+            WHERE status = 'pending' AND requested_at <= NOW() - ($1 || ' hours')::interval
+            RETURNING *
+            """,
+            str(config.APP_CONNECTION_REQUEST_EXPIRES_HOURS),
+        )
+        return _rows(rows)
+
+
+async def mark_app_connected(request_id: int) -> None:
+    """Called once Composio confirms the connection is ACTIVE. Unlike
+    mark_email_connected, there's no per-app users.<x>_connected cache to
+    flip here -- see migrations/020's header for why (1,400+ toolkits,
+    unbounded); a connected app's live status is checked directly against
+    Composio (search_integration_tools) when it's actually needed instead."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "app_connection_requests"):
+            return
+        await conn.execute(
+            "UPDATE app_connection_requests SET status = 'active', resolved_at = NOW() WHERE id = $1",
+            request_id,
+        )
+
+
+async def expire_app_connection_request(request_id: int) -> None:
+    """Called when Composio reports a terminal failure (FAILED/EXPIRED/
+    REVOKED) for a request still marked 'pending' -- distinct from the
+    silent age-based expiry above, this one's worth telling the user about
+    (see _production_app_connection_poll_loop)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "app_connection_requests"):
+            return
+        await conn.execute(
+            "UPDATE app_connection_requests SET status = 'expired', resolved_at = NOW() WHERE id = $1",
+            request_id,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Default email provider (migrations/015_default_email_provider.sql) -- which
 # inbox Messa treats as the default for a generic "send/check my email"
 # request that doesn't name one: 'messa' (their own Messa-owned address,

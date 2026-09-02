@@ -54,6 +54,7 @@ from ..tools.common import trace_all
 from ..tools.document_tools import DOCUMENT_SYSTEM_PROMPT, build_document_tools
 from ..tools.email_tools import build_email_subagent
 from ..tools.executive_tools import _format_contact_line, build_executive_subagent
+from ..tools.integration_tools import build_integration_system_prompt, build_integration_tools
 from ..tools.personal_inbox_tools import build_personal_inbox_system_prompt, build_personal_inbox_tools
 from ..tools.routines_tools import ROUTINES_SYSTEM_PROMPT, build_routines_tools
 from ..tools.web_search_tools import build_web_search_tools
@@ -358,7 +359,8 @@ def _build_system_prompt(user: config.UserContext) -> str:
         "reminders, notes, contacts, calendar), email_agent (the user's own Gmail), "
         "personal_inbox_agent (the user's own Messa-owned email address -- a different "
         "inbox from their Gmail), document_agent (generates PDFs), routines_agent "
-        "(recurring automations).\n\n"
+        "(recurring automations), integrations_agent (any other app -- Todoist, Slack, "
+        "Notion, GitHub, and 1,400+ more).\n\n"
         "Email routing -- there are two separate inboxes, and you decide which one handles "
         "each request: personal_inbox_agent (their own address on your domain) and email_agent "
         "(their connected Gmail, once set up). For a GENERIC request that doesn't name an inbox "
@@ -407,6 +409,11 @@ def _build_system_prompt(user: config.UserContext) -> str:
         "flow, a form, a login, a cart, or JS-rendered content a plain fetch won't show. If "
         "web_search/fetch_page_text come back empty or error out, delegate to deepsearch "
         "instead of giving up.\n\n"
+        "Other apps (Todoist, Slack, Notion, GitHub, and everything else outside your other "
+        "subagents -- never email, that always goes to email_agent/personal_inbox_agent): "
+        "delegate to integrations_agent. If it reports the app isn't supported at all "
+        "(nothing Composio offers matches), that's your cue to offer deepsearch instead -- "
+        "tell the user you'll do it by browsing the site directly, then delegate there.\n\n"
         f"{known_str}"
         f"{time_str}"
         f"{onboarding_str}"
@@ -522,6 +529,19 @@ async def build_orchestrator(
             ),
             "system_prompt": ROUTINES_SYSTEM_PROMPT,
             "tools": build_routines_tools(user),
+            "model": subagent_model,
+        },
+        {
+            "name": "integrations_agent",
+            "description": (
+                "Reaches any of Composio's 1,400+ other app integrations (Todoist, Slack, "
+                "Notion, GitHub, Instagram, and more) that none of Messa's other subagents "
+                "already cover -- NOT for email (that's always email_agent/"
+                "personal_inbox_agent). Use this whenever the user names an app/service "
+                "outside Messa's native capabilities and wants Messa to do something in it."
+            ),
+            "system_prompt": build_integration_system_prompt(user),
+            "tools": build_integration_tools(user, approval_gate),
             "model": subagent_model,
         },
     ]

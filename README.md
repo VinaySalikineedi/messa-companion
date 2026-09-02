@@ -4551,3 +4551,223 @@ verified audit. And this repo being updated doesn't make the page live on
 its own -- textmessa.com only starts serving it once these files are
 actually deployed (pushed to whatever's hosting the real app), which this
 session has no ability to do itself.
+
+## Synced: `db.py`'s cron-status + email-threading fix
+
+Picked up a local `db.py` fix flagged after the landing-page phase, in two
+parts:
+
+1. **`create_cron_job`/the routines-backfill insert now write `status`
+   explicitly** (`'active'::cron_job_status`) instead of relying on the
+   column's own `DEFAULT 'active'` firing. Applied as-is -- this session's
+   own `neon-schema.sql` reference copy shows that default already in
+   place, but the actual deployed database is the real source of truth
+   here, not that local reference file, so if the live schema had drifted
+   from it this closes that gap without needing to know why.
+2. **Email threading gained a fallback path.** `_compute_thread_id`
+   (header-only: first `References` entry, else `In-Reply-To`, else the
+   message's own id) is now wrapped by a new `_resolve_thread_id`, which
+   only falls back to a second lookup when the header-computed id doesn't
+   already match an existing thread: normalized subject (repeated
+   `Re:`/`Fwd:` prefixes stripped, case-folded) plus a match on the
+   counterpart's address among that user's own prior messages, most
+   recent first. This covers a real gap the header-only version had --
+   a provider (Resend, SES, etc.) that rewrites or drops the threading
+   headers on send made a genuine reply look like a brand-new thread.
+
+Applied to this session's copy as-is (not redesigned). One thing worth
+knowing about the fallback: the SQL-side `REGEXP_REPLACE(subject,
+'^(re|fwd):\s*', '', 'gi')` strips one leading `Re:`/`Fwd:`, while a
+subject with several stacked prefixes (`Re: Re: hello`, which some mail
+clients do produce) would need more than one pass to fully normalize --
+not something this sync changed or verified against a real doubly-prefixed
+subject line, flagging it here rather than silently assuming it's fine.
+
+**Verification**: extended `/tmp/test_personal_inbox.py`'s fake-Postgres
+connection to answer both of `_resolve_thread_id`'s new queries (direct
+thread/message-id match, and the subject+counterpart fallback, matched
+against the same `db._clean_subject` the real fallback path uses) and
+re-ran it -- all prior checks plus the existing thread-log coverage still
+pass. Also re-ran `test_briefings.py` and `test_default_briefings.py`
+(both exercise `INSERT INTO cron_jobs`) to confirm the new inline `status`
+literal doesn't disturb either fake's argument-position assumptions --
+both still pass. Swept the rest of the `/tmp` regression suite too;
+everything passed except one pre-existing, unrelated flaky test
+(`test_dashboard_route.py` hardcodes a specific week's dates rather than
+computing them relative to "today," so it starts failing on its own once
+enough real time has passed -- not something this `db.py` sync touched or
+introduced).
+
+## The Dynamic Integration Engine (`tools/integration_tools.py`, `integrations_agent`)
+
+Implements `docs/dynamic_tool_injection_spec.md` (the design doc worked out
+and revised together before building this): Messa can now discover,
+connect to, and use any of Composio's 1,400+ app toolkits (Todoist, Slack,
+Notion, GitHub, Instagram, and more) per-user, without a hand-written
+`tools/*.py` module per app the way `tools/email_tools.py` exists for
+Gmail specifically. Gmail stays exactly as it was -- by explicit design,
+this is additive, not a replacement.
+
+**Discovery, not injection.** The spec's original design described a
+pre-turn classifier: look at the raw message, guess 1-2 matching tools,
+inject their schemas into that turn's prompt before the model ever sees
+it. Built differently, after discussion: three small, always-on tools on a
+new `integrations_agent` subagent, and the MODEL decides when to reach for
+them -- the same pattern this codebase already uses everywhere else
+(deepsearch delegation, `request_human_help`, `save_profile_info`), rather
+than a new non-model decision point that could misclassify. `deepagents`'
+own delegation model (the `task` tool) already only surfaces each
+subagent's short name+description to Messa's own context (~30-50 tokens);
+the actual tool schemas only load during the one turn something's
+delegated to `integrations_agent`. So this is, if anything, cheaper on
+Messa's own per-turn token budget than the original design would have
+been, not more expensive -- putting the same tools directly on the
+orchestrator instead (the alternative considered) would have cost that
+~300-600 tokens on every single turn, need it or not.
+
+**Three tools, not the spec's original two:**
+- `search_integration_tools(query)` -- read-only. Calls Composio's
+  `tools.get(search=query, user_id=..., limit=...)`, marks each candidate
+  CONNECTED or NOT CONNECTED (cross-checked live against
+  `connected_accounts.list(...)`, nothing cached per-app -- see below for
+  why), and if literally nothing matches, logs the query to
+  `unsupported_integration_requests` (real product-roadmap signal, not a
+  guess) and tells the model to offer deepsearch/browser-automation
+  instead. Never sends anything on its own.
+- `connect_integration_app(toolkit_slug)` -- generates a fresh OAuth link
+  and texts it directly, right now, exactly like `email_tools.py`'s
+  `request_email_connection` (proven, already-shipped pattern -- see "Why
+  a third tool" below). Not gated by approval, same reasoning as Gmail's
+  equivalent: generating/sending a link changes nothing on the user's
+  behalf.
+- `execute_integration_tool(slug, arguments)` -- the generic executor
+  (`tools.execute(slug=..., arguments=..., user_id=...)`). Gating is
+  **dynamic per call**, not fixed at registration time like every other
+  destructive tool in this app: a keyword heuristic against Composio's own
+  consistent `TOOLKIT_VERB_NOUN` slug naming
+  (`config.INTEGRATION_WRITE_ACTION_KEYWORDS` -- CREATE/UPDATE/DELETE/
+  POST/SEND/... vs. a LIST/GET/FETCH/SEARCH read) decides, per call,
+  whether THIS invocation needs confirmation. Required a small, additive
+  change to the shared `tools/common.py:trace_tool` helper every subagent
+  uses -- a new optional `destructive_check` callback that, when given,
+  overrides the static `destructive=` flag for that one call. Every other
+  tool in the app that doesn't pass it behaves byte-for-byte as before
+  (covered by its own regression check, see Verification).
+
+**Why a third tool, not the spec's original two ("search" +
+"execute").** The spec's search tool was meant to also hand back a
+deterministic OAuth link inline when an app wasn't connected. Tracing that
+through: the link would still have to travel subagent-report ->
+orchestrator's-own-reply-to-user, a second model hop with exactly the
+paraphrase/drop risk this codebase has already hit and fixed twice
+(deepsearch's live-view link, the onboarding email reveal) -- and fixing
+it properly would have meant inventing new plumbing (a per-turn mutable
+"link sink" threaded through `build_orchestrator`) that doesn't exist
+anywhere in this codebase yet. Then `tools/email_tools.py` turned out to
+already solve this exact problem, differently and proven:
+`request_email_connection` sends the link **directly**, itself, as its
+own SMS, and only tells the model what to *say* about it afterward -- no
+model hop ever carries the actual URL. `connect_integration_app` is that
+same function, generalized to any toolkit. One more small tool schema
+(~100-150 tokens, and only loaded during an `integrations_agent`
+delegation to begin with) bought a pattern already tested in production,
+instead of new, unproven machinery.
+
+**Approval gating, and a real characteristic worth knowing.** Every
+write-shaped `execute_integration_tool` call goes through the exact same
+`ApprovalGate` mechanism `send_email`/`reply_to_email` already use --
+consistent, not a new mechanism. Worth knowing explicitly, since the
+spec's phrasing ("sends SMS confirmation") could imply more than this
+delivers: in production today, `server.py`'s `_approval_gate()` installs
+either `AutoApproveGate` (if `MESSA_SMS_AUTO_APPROVE_DESTRUCTIVE` is set)
+or `DenyApprovalGate` (the default) -- a blanket policy switch, not a
+live "ask this one specific time over SMS, wait for a reply" round trip.
+That per-action conversational confirm-and-wait experience genuinely does
+exist elsewhere in this app (`pending_actions`/`confirm_pending_action`,
+currently scoped to calendar-event scheduling only, by an explicit
+documented product decision in `db.py`) -- but reusing it here would have
+meant running an external Composio network call inside
+`confirm_pending_action`'s own Postgres transaction, which every existing
+use of that mechanism is a pure local DB write and deliberately isn't
+built for. Given this is exactly the same characteristic
+`send_email`/`reply_to_email` already ship with today, this build matched
+that existing precedent rather than extending `pending_actions` into new,
+riskier territory. Building the fuller "propose an integration write, ask
+over SMS, wait for the next reply, then execute" experience generically
+is a real, separate, larger follow-up if wanted.
+
+**Auth scope, one real difference from Gmail worth a second look.**
+Gmail's auth config is scoped (via `tool_access_config.
+tools_for_connected_account_creation`) to exactly the four actions
+`email_tools.py` calls, because that whole action set is known in
+advance. Here, the whole point is not knowing in advance which of a
+toolkit's actions a user will end up using -- so
+`_get_or_create_auth_config_id` omits that restriction and lets Composio
+grant its own default scope for the toolkit instead. A real, deliberate
+trade of "minimum necessary scope" for "works generically across 1,400+
+toolkits without a hand-maintained action list per app" -- worth
+reviewing again before this goes to real users broadly.
+
+**Database** (`migrations/020_dynamic_integrations.sql`): three additive
+tables. `user_app_preferences` (per-user default app per category, e.g.
+'tasks' -> 'todoist' -- not yet written to by anything; the search/execute
+tools don't currently need to disambiguate between two connected apps in
+the same category, so this is scaffolding for that case rather than
+exercised today). `app_connection_requests` -- same decoupled propose-now/
+notify-later shape as `email_connection_requests`
+(`migrations/012_email_connection.sql`), generalized to any toolkit;
+`server.py`'s new `_production_app_connection_poll_loop` (registered
+alongside the other five background pollers at startup) polls Composio
+and sends exactly one confirmation text once a connection goes ACTIVE,
+mirroring `_production_email_connection_poll_loop` almost exactly. No
+per-app cached boolean the way `users.email_connected` exists for Gmail
+specifically -- would mean one new column per toolkit, unbounded;
+connection status is instead checked live via `connected_accounts.list`
+whenever `search_integration_tools` actually needs it.
+`unsupported_integration_requests` -- logged whenever a search matches
+nothing at all, independent of whether the deepsearch fallback then
+manages to handle the request anyway.
+
+**Not verified here** (same honest caveat as `email_tools.py`'s own,
+which this module deliberately mirrors): `client.tools.get(search=...,
+user_id=..., limit=...)` -- Composio's tool-search API this whole feature
+is built on -- is NOT exercised against a real Composio account from this
+sandbox (no `COMPOSIO_API_KEY`, no network to Composio here). Composio's
+own docs describe it but mark it "(experimental)," and the exact shape of
+what one result item looks like (attribute names for slug/toolkit/
+description) is inferred from those docs, not confirmed against a real
+response -- `_extract_tool_fields` is written defensively (tries several
+plausible shapes: a plain dict, an attribute object, a nested toolkit
+object) for exactly that reason. This is the one piece of this feature
+most worth a real supervised smoke-test against a live Composio account
+before trusting it broadly in production -- everything downstream of a
+successful search (connection-status checks, `.link()`, `.execute()`) is
+the same call shape `email_tools.py` already has verified and running in
+production.
+
+**Verification**: new `/tmp/test_integration_tools.py` (27 checks) --
+`tools/common.py`'s new `destructive_check` parameter in isolation first
+(a dynamically-gated call skips/hits the approval gate correctly; the old
+static `destructive=` behavior is provably untouched when the parameter
+is omitted); the new `db.py` functions against a fake Postgres pool,
+migration-missing no-ops included; per-toolkit auth-config caching
+(create-once, reuse-by-name, and -- new vs. Gmail's single cache -- two
+different toolkits never share or clobber each other's config);
+`search_integration_tools` against a hand-built fake Composio client
+mirroring `email_tools.py`'s own verified SDK shapes (mixed dict/object
+search results, connected-vs-not marking, the zero-results ->
+logged-and-fall-back-to-deepsearch path); `connect_integration_app`
+(`.link()` not the deprecated `.initiate()`, SMS for a real channel with
+the link deliberately NOT echoed in the tool's own return text, the CLI
+channel showing the link directly, an already-connected app getting a
+friendly message with no duplicate DB row); `execute_integration_tool`'s
+dynamic gating actually reaching the real Composio call correctly (a READ
+slug runs with no approval gate present at all; a WRITE slug is BLOCKED
+by default and only runs once approved); and graceful degradation with no
+`COMPOSIO_API_KEY` configured, for all three tools. Also re-ran the
+broader non-browser-dependent regression suite (29 other `/tmp/test_*.py`
+files) to confirm zero regressions from `common.py`'s and `server.py`'s
+changes -- all passed except the two pre-existing, unrelated issues noted
+above (`test_dashboard_route.py`'s stale hardcoded week, and
+`test_toolnode_concurrency.py`, a standalone LangGraph API probe that
+doesn't even import this app).

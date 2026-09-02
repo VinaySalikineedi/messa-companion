@@ -246,6 +246,60 @@ EMAIL_CONNECTION_REQUEST_EXPIRES_HOURS = int(
     os.environ.get("MESSA_EMAIL_CONNECTION_REQUEST_EXPIRES_HOURS", "24")
 )
 
+# ---- Dynamic Integration Engine (tools/integration_tools.py, migrations/
+# 020_dynamic_integrations.sql) -- Composio's 1,400+ app catalog, generic
+# and per-user, on top of (not replacing) the Gmail-specific block above.
+# Reuses COMPOSIO_API_KEY/COMPOSIO_TOOLKIT_VERSION as-is; everything below
+# is new and specific to the generic path.
+
+# How many candidate tools search_integration_tools hands back to the model
+# per call -- kept small on purpose (this is the whole point of the
+# feature: inject a handful of matching tool schemas, not a whole
+# toolkit's worth) but Composio's own tools.get(search=...) is documented
+# as "(experimental)", so this stays a knob rather than a hardcoded 2-3 in
+# case real usage shows the default needs tuning.
+INTEGRATION_SEARCH_RESULT_LIMIT = int(
+    os.environ.get("MESSA_INTEGRATION_SEARCH_RESULT_LIMIT", "5")
+)
+
+# Same role as EMAIL_CONNECTION_POLL_INTERVAL_SECONDS/_REQUEST_EXPIRES_HOURS
+# above, generalized to any toolkit instead of just Gmail -- see
+# server.py's _production_app_connection_poll_loop and
+# db.py's app_connection_requests functions.
+APP_CONNECTION_POLL_INTERVAL_SECONDS = int(
+    os.environ.get("MESSA_APP_CONNECTION_POLL_INTERVAL_SECONDS", "20")
+)
+APP_CONNECTION_REQUEST_EXPIRES_HOURS = int(
+    os.environ.get("MESSA_APP_CONNECTION_REQUEST_EXPIRES_HOURS", "24")
+)
+
+# Deliberately its own setting, not a reuse of COMPOSIO_GMAIL_CALLBACK_URL --
+# that one's name is specific to the Gmail flow it was written for, and
+# leaving them separate means either can be set (or left unset, same
+# graceful "Composio shows its own generic page" degrade as Gmail's) without
+# implying anything about the other.
+COMPOSIO_CALLBACK_URL = os.environ.get("COMPOSIO_CALLBACK_URL")
+
+# Composio action slugs are consistently named TOOLKIT_VERB_NOUN (e.g.
+# SLACK_POST_MESSAGE, NOTION_DELETE_PAGE, TODOIST_CREATE_TASK,
+# GMAIL_SEND_EMAIL -- see toolkits.composio.dev). execute_integration_tool
+# treats a slug as a write/state-changing action -- and therefore routes it
+# through the same ApprovalGate mechanism send_email/reply_to_email already
+# use -- if any of these verbs appears in it. A slug matching none of these
+# (e.g. a *_LIST_*/*_GET_*/*_FETCH_*/*_SEARCH_* read) executes immediately.
+# Deliberately a keyword heuristic over Composio's own naming convention
+# rather than a hand-maintained per-toolkit table (1,400+ toolkits, growing
+# continuously) -- err on the side of gating: a slug this misses as
+# "destructive" just means an unnecessary confirmation prompt, not a
+# skipped one, since anything genuinely unrecognized... see
+# tools/integration_tools.py's own docstring for the exact fallback rule.
+INTEGRATION_WRITE_ACTION_KEYWORDS = (
+    "CREATE", "UPDATE", "DELETE", "REMOVE", "POST", "SEND", "PUBLISH",
+    "TRANSFER", "PAY", "INVITE", "ADD", "EDIT", "ARCHIVE", "CANCEL",
+    "SHARE", "UPLOAD", "MOVE", "REPLY", "COMMENT", "ASSIGN", "CLOSE",
+    "MERGE", "APPROVE", "REJECT", "SUBMIT", "SCHEDULE",
+)
+
 # ---- Messa's own personal-inbox email (separate from the Gmail block above)
 # ----
 # <local-part>@TEXTMESSA_EMAIL_DOMAIN is an address Messa owns outright for

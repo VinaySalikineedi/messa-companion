@@ -48,8 +48,21 @@ def trace_tool(
     *,
     destructive: bool = False,
     approval_gate: ApprovalGate | None = None,
+    destructive_check: Callable[..., bool] | None = None,
 ) -> BaseTool:
-    """Wrap a tool with tracing, error handling, and optional confirmation."""
+    """Wrap a tool with tracing, error handling, and optional confirmation.
+
+    destructive_check: for the rare tool where "is this call destructive"
+    can't be known until you see the ARGUMENTS (e.g.
+    tools/integration_tools.py's execute_integration_tool -- one tool that
+    can run anything from a read-only Composio action to an irreversible
+    one, depending on which `slug` it's called with this time). When given,
+    it's called with this invocation's own (*args, **kwargs) and its
+    return value decides gating for THIS call, overriding the static
+    `destructive` flag. Every other tool in this app has a fixed, known-at-
+    registration-time destructiveness (send_email is always destructive,
+    list_recent_emails never is) and just uses the plain `destructive` bool
+    as before -- this parameter changes nothing for them."""
 
     name = original.name
     is_async_native = original.coroutine is not None
@@ -66,7 +79,8 @@ def trace_tool(
         display_args = kwargs if kwargs else {"args": args}
         console.tool_call(label, name, display_args)
 
-        if destructive:
+        is_destructive_this_call = destructive_check(*args, **kwargs) if destructive_check else destructive
+        if is_destructive_this_call:
             gate = approval_gate or _NO_APPROVAL_GATE
             allowed = await gate.confirm(label, name, display_args)
             if not allowed:
