@@ -5164,3 +5164,100 @@ and `build_orchestrator` end-to-end with a trivial fake model -- confirms
 `build_orchestrator` still succeeds even when that call raises. Full
 30-file non-browser-dependent regression suite re-run -- zero
 regressions, same two pre-existing unrelated issues as every prior pass.
+
+## The missing verification-code bug: PostalMime's own html-fallback doesn't fire when a stub text/plain part exists (`cloudflare/personal-email-worker/worker.js`)
+
+You reported never getting a code Messa's inbox was supposed to receive
+from an account-creation email, and proposed a fix: if the webhook's
+`body-plain` is empty, fall back to extracting text from `body-html`.
+
+Those exact field names (`body-plain`/`body-html`) are Mailgun's inbound
+webhook convention. This codebase doesn't use Mailgun -- it uses
+Cloudflare Email Routing + the `postal-mime` npm library
+(`cloudflare/personal-email-worker/worker.js`), which has neither field.
+I also found, researching `postal-mime@2.2.6`'s actual source, that it
+already does its own html->text fallback internally whenever a message
+has no `text/plain` part at all -- so the literal proposal, even ported to
+the right field names, looked like it would likely be a no-op for the
+general case. I said so and asked you what actually happened before
+building anything, rather than ship a fix I had real doubts about.
+
+**What actually happened, confirmed against the real data, not a
+hypothesis:** you sent screenshots of Messa's own live-view Emails page
+showing the actual email -- "Welcome to Uber" from
+`ib_bounces-vinay=textmessa.com@ibt.uber.com`, Sep 2 8:45 AM. Two things
+stood out immediately: it had no list-view preview snippet (your other two
+emails both did), and its opened view showed nothing below the header
+card. I couldn't reach your database directly to confirm this (this
+sandbox's network doesn't reach your Neon host, and the bridge to run
+commands on your computer was down at the time), so instead I called your
+own already-deployed `/live/{token}/emails?q=uber` endpoint -- the same
+JSON API the live-view page itself polls -- using the link you sent. It
+returned this, unedited:
+
+```json
+{"id":18,"thread_id":"<d9882b19-f510-4e1f-81b7-4b0bec1ca30a@mail.uber.com>",
+ "from_address":"ib_bounces-vinay=textmessa.com@ibt.uber.com",
+ "subject":"Welcome to Uber","snippet":"","body":"","time":"Sep 2, 8:45 AM"}
+```
+
+`body` (== `messa_email_messages.body_text`) was a genuinely empty string.
+Tracing that back through `server.py`'s webhook handler confirmed it was
+already empty at the moment the webhook received it
+(`payload.get("text") or ""`) -- meaning `worker.js`'s own forwarded
+`text` field was empty, meaning `postal-mime`'s `.text` came back empty
+for this message. Not garbled, not truncated, not mis-relayed by the
+model -- there was never any body text for Messa to read or relay in the
+first place.
+
+**Why `postal-mime`'s own fallback didn't save this one:** its internal
+html->text derivation only fires when a message has NO `text/plain` part
+at all. A very common pattern among bulk/transactional senders (Uber's
+account-creation mail plainly among them) is to include a `text/plain`
+alternative that's a near-empty stub -- a single space, a placeholder line
+-- purely for spam-score hygiene, on the assumption every real client will
+render the `html` part instead. Because a `text/plain` part technically
+exists, `postal-mime` never reaches its own fallback branch, and `.text`
+comes back blank even though `.html` has the entire real message,
+verification code included.
+
+**The fix**, in `worker.js` itself (not a server.py/Mailgun-shaped
+change): a new `htmlToPlainText(html)` helper (regex-based -- Workers have
+no DOM) plus a check right where the payload is built -- whenever
+`parsed.text` is empty or whitespace-only AND `parsed.html` exists, use
+`htmlToPlainText(parsed.html)` instead of forwarding the stub. This is
+narrower and more targeted than "always convert html ourselves": a
+message with genuine text/plain content is forwarded exactly as before,
+untouched; only the specific empty-stub case is caught. The converter
+strips `<script>`/`<style>`/comments first, turns block-level tags
+(`<p>`, `<div>`, `<li>`, `<br>`, ...) into line breaks so a code sitting
+alone in its own `<div>` stays on its own line, keeps link destinations
+visible (`text (url)`, not just the text), and decodes the small set of
+entities (`&nbsp;`, `&amp;`, `&lt;`, `&gt;`, `&quot;`, `&#39;`, numeric
+entities) most likely to appear right next to a code or link. Logs when
+the fallback actually fires (`fallbackTextLength`), so a future Cloudflare
+Worker log will show directly whether this path is being used, instead of
+needing another round of forensics like this one.
+
+**Verification**: `/tmp/test_html_fallback.mjs` (18 checks) extracts the
+actual shipped `htmlToPlainText` function straight out of `worker.js`'s
+source (not a reimplementation) and exercises it directly: a
+reconstruction of the real bug (a 4-digit code inside nested `<div>`s,
+alongside a `<script>`, an HTML comment, a link, and a list) confirms the
+code, the link text, and its destination all survive, while script/comment
+content never leaks in and no stray tags remain; entity decoding
+(`&nbsp;`, `&amp;`, `&quot;`, `&#39;`) is checked individually; empty/null/
+whitespace-only html all safely produce empty text without throwing. The
+fallback-selection logic itself is tested separately from the converter:
+the exact stub-text/plain-plus-real-html scenario correctly triggers the
+fallback and recovers the code; a message with no text AND no html stays
+empty exactly as before (no regression, no crash); and -- the case I was
+most careful to guard against -- a message with genuinely good text/plain
+content is left completely untouched, confirming this fix can only ever
+help, never override real text with a possibly-lossier html conversion.
+`node --check` confirms the modified `worker.js` still parses as valid
+JS. Not independently re-verified against a real Cloudflare Worker
+deployment or a live inbound email (would need `wrangler deploy` and a
+real test send, neither available from this sandbox) -- worth one
+supervised real test send before fully trusting it unattended, same
+caveat as this project's other Cloudflare-Worker-side changes.

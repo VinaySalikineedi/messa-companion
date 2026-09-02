@@ -33,6 +33,62 @@ import PostalMime from "postal-mime";
 // in -- no manual ArrayBuffer->base64 conversion needed.
 const MAX_FORWARDED_ATTACHMENT_BASE64_CHARS = 20 * 1024 * 1024;
 
+// Fallback HTML->text conversion, used ONLY when PostalMime's own `.text`
+// comes back empty/whitespace-only despite the message having an `.html`
+// part. This is NOT working around a general gap in PostalMime -- its own
+// parser (src/text-format.js) already derives `.text` from `.html`
+// whenever a message has no text/plain part at all, and that path works
+// fine for most HTML-only mail.
+//
+// The real, confirmed-by-evidence gap is narrower: a message that DOES
+// carry a text/plain alternative, but where that part is a near-empty
+// "stub" (a single space, a placeholder line, or literally nothing) --
+// a common pattern from bulk/transactional senders who include it purely
+// for spam-score hygiene, expecting every real client to render the html
+// part instead. Because a text/plain part technically exists, PostalMime
+// has no reason to fall back to its own html-derived text, and `.text`
+// ends up empty even though `.html` has the entire real message (this is
+// exactly what happened to the actual "Welcome to Uber" email that
+// triggered this fix: messa_email_messages.body_text and the JSON this
+// Worker forwarded were BOTH confirmed empty strings, even though the
+// message plainly had visible content). So: whenever OUR OWN check of
+// parsed.text finds it blank, we do the same kind of conversion
+// PostalMime would have done for us, using whatever's in parsed.html --
+// regardless of which branch inside PostalMime produced the empty
+// result. Deliberately simple/regex-based (this Worker has no DOM), same
+// spirit as PostalMime's own text-format.js: strip script/style content
+// first (never want their text leaking in), turn common block-level tags
+// into line breaks so paragraphs/list items don't run together, keep link
+// destinations visible (a bare "click here" is useless once the <a> tag
+// is gone), decode the handful of HTML entities actually likely to appear
+// in a verification code/OTP email, then strip whatever tags remain.
+function htmlToPlainText(html) {
+  if (!html) return "";
+  let text = html;
+  text = text.replace(/<(script|style)[^>]*>[\s\S]*?<\/\1>/gi, " ");
+  text = text.replace(/<!--[\s\S]*?-->/g, " ");
+  text = text.replace(/<a\b[^>]*href=["']([^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi, (_, href, inner) => {
+    const label = inner.replace(/<[^>]+>/g, " ").trim();
+    return href && href !== label ? `${label} (${href})` : label;
+  });
+  text = text.replace(/<li[^>]*>/gi, "\n* ");
+  text = text.replace(/<\/(p|div|tr|table|h[1-6])>/gi, "\n");
+  text = text.replace(/<br\s*\/?>/gi, "\n");
+  text = text.replace(/<[^>]+>/g, "");
+  const entities = {
+    "&nbsp;": " ", "&amp;": "&", "&lt;": "<", "&gt;": ">",
+    "&quot;": '"', "&#39;": "'", "&apos;": "'",
+  };
+  text = text.replace(/&nbsp;|&amp;|&lt;|&gt;|&quot;|&#39;|&apos;/g, (m) => entities[m]);
+  text = text.replace(/&#(\d+);/g, (_, code) => String.fromCharCode(parseInt(code, 10)));
+  // Collapse repeated blank lines/trailing spaces left behind by the tag
+  // stripping above, but keep real paragraph breaks (a 4-digit code alone
+  // on its own line is exactly the shape we most need to preserve).
+  text = text.split("\n").map((line) => line.replace(/[ \t]+/g, " ").trim()).join("\n");
+  text = text.replace(/\n{3,}/g, "\n\n").trim();
+  return text;
+}
+
 export default {
   async email(message, env, ctx) {
     let parsed;
@@ -74,11 +130,29 @@ export default {
         content_base64: a.content,
       }));
 
+    // See htmlToPlainText's own comment above: PostalMime's `.text` can
+    // come back blank even for a message that plainly has real content,
+    // when a near-empty text/plain "stub" part sits alongside a real html
+    // part. Whenever that's what happened here, fall back to converting
+    // parsed.html ourselves rather than forwarding the stub as-is.
+    let text = parsed.text || "";
+    let usedHtmlFallback = false;
+    if (!text.trim() && parsed.html) {
+      text = htmlToPlainText(parsed.html);
+      usedHtmlFallback = true;
+    }
+    if (usedHtmlFallback) {
+      console.log(
+        "postal-mime's .text was empty/whitespace-only; used the html->text fallback instead",
+        { fallbackTextLength: text.length }
+      );
+    }
+
     const payload = {
       to: message.to,
       from: message.from,
       subject: parsed.subject || "",
-      text: parsed.text || "",
+      text,
       message_id: parsed.messageId || null,
       in_reply_to: parsed.inReplyTo || null,
       references,
