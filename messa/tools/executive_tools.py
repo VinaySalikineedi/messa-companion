@@ -295,6 +295,13 @@ def _build_system_prompt(user: UserContext) -> str:
         "calendar (e.g. \"connect my Google Calendar\"), that's out of scope for you -- say so "
         "plainly rather than creating an internal event that looks like it did that; Messa "
         "routes that kind of request to integrations_agent instead.\n"
+        "Same for tasks: your create_task/list_tasks/etc. are Messa's own INTERNAL task list, "
+        "not a real connected Todoist/Asana/ClickUp. Messa only delegates a generic task "
+        "request to you when her own primary-app preference for tasks says to (see her own "
+        "system prompt) -- but if you're ever asked to connect, sync, or manage a REAL "
+        "external task app, that's equally out of scope for you: say so plainly rather than "
+        "writing a native task that isn't where the user is actually looking; Messa routes "
+        "that to integrations_agent instead.\n"
         f"{time_ctx}\n\n"
         "- Reads (list_*), tasks, reminders, notes, and contacts all happen IMMEDIATELY -- no "
         "confirmation needed for any of those.\n"
@@ -396,9 +403,11 @@ def build_executive_subagent(user: UserContext, model: BaseChatModel) -> dict[st
         "name": "executive_assistant",
         "description": (
             "Manages tasks, reminders, notes, contacts, and Messa's own INTERNAL calendar "
-            "(not a real connected Google/Apple/Outlook calendar -- for connecting or "
-            "managing an actual external calendar, use integrations_agent instead). Use for "
-            "anything about the user's to-dos, schedule, or personal notes/contacts. "
+            "and task list (neither is a real connected app -- Google/Apple/Outlook calendar, "
+            "Todoist/Asana/ClickUp -- for connecting or managing one of those, use "
+            "integrations_agent instead). Use for anything about the user's to-dos, schedule, "
+            "or personal notes/contacts THAT Messa's own primary-app preference says belongs "
+            "here (Messa checks that before delegating, not this description). "
             "Tasks/reminders/notes/contacts happen immediately; calendar events "
             "(scheduling) go through a confirm step."
         ),

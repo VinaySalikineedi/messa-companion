@@ -100,6 +100,46 @@ from .common import trace_tool
 
 LABEL = "integrations_agent"
 
+# ---------------------------------------------------------------------------
+# Primary-app preference system: which connected toolkits actually COMPETE
+# with one of Messa's own native tools for the same job, and what job. A
+# toolkit not listed here (Reddit, Slack, Notion, GitHub, ...) never enters
+# any primary/conflict logic at all -- connecting it behaves exactly as
+# before this feature existed. Deliberately just data (not, say, a live
+# Composio category lookup): the set of toolkits that plausibly conflict
+# with Messa's native calendar/tasks/email is small, known, and rarely
+# changes, so a live/dynamic classification would be real complexity (and
+# a real per-turn cost) for no actual benefit over a short, hand-maintained
+# map -- same "static beats dynamic when the underlying set barely moves"
+# reasoning already used for _TOOLKIT_APP_CATEGORY's own callers below and
+# for the auto-set/ask-on-conflict flow in server.py's connection poll
+# loops. 'reminders' deliberately has no entry/category here: there's no
+# mainstream Composio app that's a drop-in equivalent for Messa's own
+# lightweight SMS reminders (a Todoist/Asana "task" is a genuinely
+# different concept from a scheduled nudge), so reminders stay native-only
+# -- nothing to route between.
+TOOLKIT_APP_CATEGORY: dict[str, str] = {
+    "gmail": "email",
+    "outlook": "email",
+    "outlookmail": "email",
+    "googlecalendar": "calendar",
+    "outlookcalendar": "calendar",
+    "todoist": "tasks",
+    "asana": "tasks",
+    "clickup": "tasks",
+}
+
+
+def app_category_for_toolkit(toolkit_slug: str) -> str | None:
+    """'email'/'calendar'/'tasks' if this toolkit slug competes with one of
+    Messa's own native tools, else None (the common case -- most of
+    Composio's 1,400+ toolkits have no native equivalent to conflict
+    with). Case-insensitive since toolkit slugs arrive from a few
+    different places (Composio's own API, this project's own DB rows) with
+    inconsistent casing in practice."""
+    return TOOLKIT_APP_CATEGORY.get((toolkit_slug or "").strip().lower())
+
+
 # In-process memoization, one auth config id per toolkit -- same reasoning
 # as email_tools.py's single _gmail_auth_config_id_cache, just keyed by
 # toolkit now that there's more than one possible toolkit. Nothing needs to

@@ -1208,6 +1208,63 @@ async def _production_deepsearch_pause_loop() -> None:
         await asyncio.sleep(config.DEEPSEARCH_HUMAN_HELP_POLL_INTERVAL_SECONDS)
 
 
+async def _connection_confirmation_message(user_id: int, toolkit_slug: str, display_name: str) -> str:
+    """The one-shot confirmation text sent the moment EITHER connection
+    poll loop below sees a connection go ACTIVE -- shared so the primary-
+    app preference logic (auto-set-on-first-connect, ask-on-conflict) lives
+    in exactly one place rather than being duplicated across the Gmail-
+    specific and generic loops. `toolkit_slug` is the value stored in
+    app_categories.TOOLKIT_APP_CATEGORY / passed to db.set_app_preference
+    ('gmail' for the Gmail-specific loop, whatever
+    app_connection_requests.toolkit_slug holds for the generic one);
+    `display_name` is just what the message calls it out loud (kept
+    separate since the generic loop's existing wording capitalizes/spells
+    toolkit slugs as-is, e.g. "todoist", while Gmail's existing wording
+    always said "Gmail").
+
+    Three outcomes, per the approved plan's exact heuristic ("auto-set
+    first, ask on real conflict"):
+      1. This toolkit has no app_category at all (most of Composio's
+         1,400+ toolkits) -- completely unchanged behavior, the plain
+         "connected!" message every toolkit already got before this
+         feature existed.
+      2. Nothing is primary for this category yet (still on Messa's own
+         native default) -- auto-promote this toolkit to primary right
+         now (db.set_app_preference) and say so; zero friction, matches
+         the stated "they connected it because they want to use it"
+         heuristic.
+      3. A DIFFERENT app is already primary for this category -- do NOT
+         silently override it. Fold a plain-language question into this
+         same one-shot text instead of inventing a new interaction
+         mechanism; the user's reply on their next turn is just a normal
+         Messa turn, resolved via the model calling set_app_preference
+         itself once it understands the answer (no special reply-parsing
+         needed here).
+      (Reconnecting/re-authing the SAME app that's already primary for its
+      category falls out of case 3's own equality check -- current ==
+      toolkit_slug -- and gets the plain case-1-style message, no question
+      asked about a choice that's already made.)
+    """
+    category = integration_tools.app_category_for_toolkit(toolkit_slug)
+    if category is None:
+        return f"Your {display_name} is connected! Just ask and I can use it now."
+
+    current = await db.get_app_preference(user_id, category)
+    if current is None or current == "messa":
+        await db.set_app_preference(user_id, category, toolkit_slug)
+        return (
+            f"Your {display_name} is connected and set as your primary {category} -- I'll check "
+            f"it first for anything {category}-related from now on. Say \"use my own {category} "
+            "instead\" anytime to switch back."
+        )
+    if current == toolkit_slug:
+        return f"Your {display_name} is connected! Just ask and I can use it now."
+    return (
+        f"Your {display_name} is connected! {current} is your primary {category} right now -- "
+        f"want me to switch to {display_name}, or keep {current}?"
+    )
+
+
 async def _production_email_connection_poll_loop() -> None:
     """Notifies a user once their Gmail connection actually goes live (see
     tools/email_tools.py's request_email_connection and
@@ -1237,10 +1294,12 @@ async def _production_email_connection_poll_loop() -> None:
                 if status == "ACTIVE":
                     await db.mark_email_connected(req["id"], req["user_id"])
                     try:
-                        await sendblue.send_message(
-                            req["phone_number"],
-                            "Your Gmail is connected! I can check and send email for you now.",
-                        )
+                        text = await _connection_confirmation_message(req["user_id"], "gmail", "Gmail")
+                    except Exception as e:  # noqa: BLE001 - the connection itself succeeded either way; fall back to the plain confirmation rather than lose the notification entirely
+                        console.system(f"[email connection preference lookup failed] request=#{req['id']}: {e}")
+                        text = "Your Gmail is connected! I can check and send email for you now."
+                    try:
+                        await sendblue.send_message(req["phone_number"], text)
                     except SendblueError as e:
                         console.system(f"[email connection notify failed] request=#{req['id']}: {e}")
                 elif status in ("FAILED", "EXPIRED", "REVOKED"):
@@ -1280,10 +1339,12 @@ async def _production_app_connection_poll_loop() -> None:
                 if status == "ACTIVE":
                     await db.mark_app_connected(req["id"])
                     try:
-                        await sendblue.send_message(
-                            req["phone_number"],
-                            f"Your {toolkit_slug} is connected! Just ask and I can use it now.",
-                        )
+                        text = await _connection_confirmation_message(req["user_id"], toolkit_slug, toolkit_slug)
+                    except Exception as e:  # noqa: BLE001 - the connection itself succeeded either way; fall back to the plain confirmation rather than lose the notification entirely
+                        console.system(f"[app connection preference lookup failed] request=#{req['id']}: {e}")
+                        text = f"Your {toolkit_slug} is connected! Just ask and I can use it now."
+                    try:
+                        await sendblue.send_message(req["phone_number"], text)
                     except SendblueError as e:
                         console.system(f"[app connection notify failed] request=#{req['id']}: {e}")
                 elif status in ("FAILED", "EXPIRED", "REVOKED"):

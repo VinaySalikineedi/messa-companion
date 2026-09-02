@@ -5261,3 +5261,158 @@ deployment or a live inbound email (would need `wrangler deploy` and a
 real test send, neither available from this sandbox) -- worth one
 supervised real test send before fully trusting it unattended, same
 caveat as this project's other Cloudflare-Worker-side changes.
+
+## The primary-app preference system: resolving native-vs-connected conflicts across email/calendar/tasks
+
+You reported real user frustration: Messa has her own native calendar,
+tasks, and email, and separately a user can connect real apps (Gmail,
+Google Calendar, Outlook, Todoist, ...) that do the SAME job -- but a
+generic request ("what's on my schedule") always went to Messa's own
+native tool regardless of what was connected, so a user with Google
+Calendar connected still got "nothing scheduled" from Messa's empty
+internal calendar. You asked for a primary-app system: connect a
+conflicting app and either ask which one should be primary or
+auto-promote it (your instinct: "usually user connected it as they use it
+primarily"), changeable anytime, plus a look into multiple accounts of one
+app (e.g. two Gmail accounts) if feasible. Given the size, this went
+through plan mode first -- full design at
+`/root/.claude/plans/glowing-forging-pumpkin.md` -- with three explicit
+decisions confirmed with you before building: auto-set-on-first-connect +
+ask-only-on-real-conflict (your own proposed heuristic); unifying email's
+existing preference mechanism into the same generic system rather than
+running two different-shaped mechanisms side by side; and scoping
+multi-account support to a documented follow-up rather than this round.
+
+**A real discovery before writing any code:** `migrations/
+020_dynamic_integrations.sql` already created a generic
+`user_app_preferences` table (user_id, app_category, preferred_app) with
+matching `db.get_app_preference`/`db.set_app_preference` functions --
+built ahead of time during earlier work on the Dynamic Integration Engine,
+but never actually called from anywhere. This feature finishes wiring
+that dead infrastructure in rather than building new storage.
+
+**Category map.** New `TOOLKIT_APP_CATEGORY` in `tools/integration_tools.py`
+(`app_category_for_toolkit(slug)`): `gmail`/`outlook`/`outlookmail` ->
+`email`, `googlecalendar`/`outlookcalendar` -> `calendar`,
+`todoist`/`asana`/`clickup` -> `tasks`. A toolkit not in this map (Reddit,
+Slack, Notion, ...) never enters any of the logic below -- connecting it
+behaves exactly as it always did. Reminders were deliberately left OUT of
+the map entirely: there's no mainstream Composio app that's a real
+equivalent for Messa's own lightweight SMS reminders, so reminders stay
+native-only, nothing to route between.
+
+**Unifying email's preference into the generic store.**
+`db.get_app_preference(user_id, 'email')` now reads through to the
+existing `users.default_email_provider` column (migrations/
+015_default_email_provider.sql) whenever `user_app_preferences` has no
+row yet -- zero-downtime, no backfill migration needed, every existing
+user's current Gmail-vs-Messa choice is preserved automatically.
+`db.set_app_preference` writes through to `set_default_email_provider` to
+keep that column in sync too, but ONLY when the new value is one the
+column's own ENUM actually accepts (`messa`/`gmail`) -- a future
+`outlook` connection just skips that write-through cleanly (the generic
+table is authoritative for it regardless; the legacy column was never
+going to be able to say "outlook" anyway).
+
+**One unified tool, replacing the old email-only one.**
+`agents/registry.py`'s `set_default_email_provider` tool is gone,
+replaced by `set_app_preference(category, app)` -- validates category is
+`email`/`calendar`/`tasks` and that `app` is actually connected (Gmail
+checked via `user.email_connected` specifically, since its connection
+state lives in its own dedicated column/table, predating the generic
+Dynamic Integration Engine -- NOT in `get_active_connected_toolkits`, a
+distinction the old tool always had to make for Gmail and this one still
+does). New `list_my_connected_apps()` closes a real gap -- until now
+nothing let the model reliably answer "what's connected" or "what's
+primary right now" without guessing from scattered context.
+
+**Auto-set-on-first-connect, ask-on-real-conflict** (your approved
+heuristic, exactly): both connection poll loops in `server.py`
+(Gmail-specific and generic) now run every `ACTIVE` connection through a
+new shared `_connection_confirmation_message(user_id, toolkit_slug,
+display_name)`. No category (most of Composio's 1,400+ toolkits) -> the
+exact same plain "connected!" text as before, nothing changed. Nothing
+primary yet for that category -> auto-promotes this toolkit and says so
+("...set as your primary calendar... say 'use my own calendar instead'
+anytime to switch back"). A DIFFERENT app already primary -> does NOT
+silently override it; folds a plain-language question into the same
+one-shot text ("Outlook's connected! Gmail's your primary email right
+now -- want me to switch, or keep Gmail?"), resolved on the user's next
+ordinary reply via the model calling `set_app_preference` itself -- no new
+reply-parsing mechanism needed. Reconnecting the app that's already
+primary just gets the plain confirmation. Wrapped in a try/except that
+falls back to the old plain message on any failure -- confirmed for real
+in this sandbox: `test_email_connection_poll_loop.py`'s run genuinely hit
+a real (expected, sandboxed) DB connection failure on this new lookup and
+gracefully fell back rather than losing the connection notification.
+
+**Wiring the preference into actual routing**, not just storing a value
+-- this is the part that fixes the reported behavior. The orchestrator's
+"Known about this user" block (previously email-only) generalizes into a
+loop over all three categories via a new `_category_known_line` helper,
+including the stale-connection safety net email already had (if the
+stored primary is no longer actually connected, say so and fall back to
+native) now covering calendar/tasks too -- directly prevents the
+"confidently wrong" failure mode you described. New "Calendar routing"
+and "Tasks routing" paragraphs reuse the exact structure the existing
+"Email routing" paragraph already had (trust the stored primary for a
+generic request, respect an explicitly-named app regardless, route
+changes to `set_app_preference`) rather than inventing new shape. The old
+"Google Calendar specifically" paragraph, which only ever asked
+per-turn with no memory, is now a short cross-reference note -- the
+actual routing logic lives in "Calendar routing" once, not duplicated.
+`executive_tools.py` gets a parallel tasks disclaimer next to its
+existing calendar one (say so plainly rather than writing a native task
+when a connected task app is primary). `_integrations_agent_description`'s
+old hardcoded "NOT for email" line is now conditional on whether email's
+actual primary is still native -- it was flatly contradicting the new
+routing the moment Gmail/Outlook became primary.
+
+**Deferred, not built this round (per your own confirmed choice):**
+multiple accounts of one app (e.g. two Gmail accounts). Confirmed
+technically feasible against Composio's real SDK source (not docs
+paraphrase, `composio==0.21.0`/`composio_client==1.43.0` installed source
+inspected directly): two `auth_config_id`s for the same toolkit slug (or
+`allow_multiple=True` on one) each get their own connected account under
+one Messa `user_id`; `tools.execute(..., connected_account_id=...)`
+targets a specific one deterministically. One real gap: Composio's API
+does NOT hand back the real linked email/username for OAuth2 toolkits for
+disambiguation -- only a settable `alias` and an auto-generated
+`word_id` -- so a real implementation would need one extra call through
+the new connection specifically (e.g. Gmail's own profile action) right
+after it goes active, to learn and store the real address as a
+human-friendly label. Full design notes are in the plan file for when
+this gets picked up.
+
+**Verification**: new `/tmp/test_app_preferences.py` (59 checks) --
+`db.get_app_preference`'s legacy-column fallback (a real row wins
+outright; no row + email falls back to the column; a real row overrides
+even a disagreeing column value; missing table/column combinations don't
+crash); `db.set_app_preference`'s write-through (fires for `gmail`, skips
+cleanly for `outlook`, never attempted for non-email categories or when
+the migration is missing); the category map including case-insensitivity;
+`set_app_preference`/`list_my_connected_apps` end-to-end against the real
+`build_orchestrator_tools` closure (invalid category, connected-check
+including Gmail's own special-cased path, successful switches, the
+Gmail-not-connected rejection); `_build_system_prompt`'s generalized
+known-state block and the new Calendar/Tasks routing paragraphs,
+including the stale-connection fallback for all three categories; the
+conditional `_integrations_agent_description`; and all four branches of
+`_connection_confirmation_message`. Two pre-existing tests needed
+updating to match this round's intentional, approved design changes (not
+regressions): `/tmp/test_default_email_provider.py` (its old
+tool-presence/wording assertions were checking behavior this round
+deliberately replaced -- trimmed to what's still genuinely this file's
+own scope, 15 checks, full tool-level coverage now lives in
+`test_app_preferences.py`) and `/tmp/test_routing_boundaries.py` (updated
+its Google-Calendar-paragraph assertions to match the new "Calendar
+routing" paragraph it now lives in, 18 checks). Re-ran the full
+non-browser-dependent regression suite -- zero real regressions; the
+same pre-existing, unrelated issues as every prior pass
+(`test_active_tab_live_view.py`'s stale function reference,
+`test_dashboard_route.py`'s stale hardcoded week, `test_toolnode_
+concurrency.py`'s standalone LangGraph API probe). Not verified: live-LLM
+confirmation that the model actually follows the new routing prose
+correctly (same caveat as every other prompt-only change in this
+project), and the entire deferred multi-account design (SDK-source-level
+only, no live Composio account available from this sandbox).

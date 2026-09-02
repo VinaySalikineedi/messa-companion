@@ -16,15 +16,25 @@ has no field for that, it just inherits the ambient one (see
 tools/executive_tools.py's/tools/email_tools.py's build_*_subagent
 docstrings).
 
-Email routing: there are two separate subagents for two separate inboxes
-(personal_inbox_agent -- the user's own address on Messa's own domain --
-and email_agent -- their connected Gmail), and which one handles a GENERIC
-"send/check my email" request is a per-user preference
-(users.default_email_provider, migrations/015_default_email_provider.sql)
-that Messa's own system prompt reads and routes on -- see
-`_build_system_prompt`'s "Email routing" paragraph below, and
-`set_default_email_provider` above, the only thing that ever changes it
-(always at the user's explicit request; connecting Gmail does not).
+Email/calendar/tasks routing -- the primary-app preference system: each of
+these three categories has both a native Messa tool and one or more
+connectable real apps that can conflict with it (personal_inbox_agent vs.
+email_agent/integrations_agent for email; executive_assistant vs.
+integrations_agent for calendar and for tasks). Which one handles a
+GENERIC request that doesn't name an app is a per-user, per-category
+preference (`user_app_preferences`, migrations/020_dynamic_integrations.sql
+-- email's own dedicated `users.default_email_provider` column from the
+earlier migrations/015_default_email_provider.sql still exists and is kept
+in sync as a legacy mirror, see db.get_app_preference/set_app_preference's
+own docstrings for exactly how) that Messa's own system prompt reads and
+routes on -- see `_build_system_prompt`'s "Email routing"/"Calendar
+routing"/"Tasks routing" paragraphs and its "Known about this user" block
+below, and `set_app_preference` above, the only thing that ever changes it
+at the user's own explicit request. Connecting an app does NOT change it
+by itself UNLESS nothing was already set for that category, in which case
+server.py's connection-confirmation flow auto-promotes it once (see
+`_connection_confirmation_message`) -- never overriding an existing choice,
+only ever filling an unset one.
 
 Confirming or rejecting a *proposed* action (see db.py's pending_actions
 gate) is deliberately kept OFF every subagent and given to Messa directly --
@@ -54,7 +64,7 @@ from ..tools.common import trace_all
 from ..tools.document_tools import DOCUMENT_SYSTEM_PROMPT, build_document_tools
 from ..tools.email_tools import build_email_subagent
 from ..tools.executive_tools import _format_contact_line, build_executive_subagent
-from ..tools.integration_tools import build_integration_system_prompt, build_integration_tools
+from ..tools.integration_tools import app_category_for_toolkit, build_integration_system_prompt, build_integration_tools
 from ..tools.personal_inbox_tools import build_personal_inbox_system_prompt, build_personal_inbox_tools
 from ..tools.routines_tools import ROUTINES_SYSTEM_PROMPT, build_routines_tools
 from ..tools.web_search_tools import build_web_search_tools
@@ -148,36 +158,103 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
                 )
         return msg
 
+    async def _is_app_connected(app: str) -> bool:
+        """'messa' (native) is always considered connected -- it's the
+        built-in option, never something the user connects. Gmail is
+        checked via user.email_connected specifically, NOT
+        get_active_connected_toolkits: Gmail's connection state lives in
+        its own dedicated users.email_connected column/email_connection_requests
+        table (email_tools.py's own OAuth flow, predates the generic
+        Dynamic Integration Engine), not app_connection_requests -- the
+        same distinction set_default_email_provider always had to make,
+        just generalized here rather than dropped."""
+        if app == "messa":
+            return True
+        if app == "gmail":
+            return bool(user.email_connected)
+        connected = await db.get_active_connected_toolkits(uid)
+        return app in connected
+
     @tool
-    async def set_default_email_provider(provider: str) -> str:
-        """Set which inbox you use by default for a GENERIC 'send/check my email'
-        request that doesn't name one -- 'messa' (the user's own address on your
-        domain, personal_inbox_agent) or 'gmail' (their connected Gmail, email_agent).
-        Call this only when the user explicitly asks to change it (e.g. 'use my gmail
-        as default from now on', 'switch back to my messa email', 'make gmail my main
-        email') -- never on your own judgment, and connecting Gmail does NOT change
-        this by itself. Switching to 'gmail' requires it to already be connected: if
-        it isn't, this tells you so instead of changing anything -- offer to connect
-        it first (delegate to email_agent with request_email_connection), then call
-        this again once they confirm it's active."""
-        normalized = (provider or "").strip().lower()
-        if normalized not in ("messa", "gmail"):
-            return "provider must be exactly 'messa' or 'gmail'."
-        if normalized == "gmail" and not user.email_connected:
+    async def set_app_preference(category: str, app: str) -> str:
+        """Set which app is PRIMARY for a category, for any generic request
+        that doesn't name one specifically. category: 'email', 'calendar',
+        or 'tasks'. app: 'messa' (Messa's own native tool for that
+        category -- executive_assistant for calendar/tasks,
+        personal_inbox_agent for email) or a connected toolkit slug (e.g.
+        'gmail', 'googlecalendar', 'todoist'). See 'Known about this user'
+        above for what's currently primary in each category before calling
+        this.
+
+        Call this ONLY at the user's own explicit request ('use my gmail as
+        my main email', 'make Google Calendar my primary calendar', 'switch
+        tasks back to your own list', 'use Todoist by default') -- never on
+        your own judgment, and connecting an app does NOT change this by
+        itself (see server.py's connection-confirmation flow -- it only
+        auto-promotes an app to primary when NOTHING was already set for
+        that category; once something IS set, only this tool changes it).
+
+        Switching to anything other than 'messa' requires that app to
+        already be connected: if it isn't, this tells you so instead of
+        changing anything -- offer to connect it first (delegate to
+        integrations_agent, or email_agent's request_email_connection for
+        Gmail specifically), then call this again once the user confirms
+        it's active."""
+        normalized_category = (category or "").strip().lower()
+        if normalized_category not in ("email", "calendar", "tasks"):
+            return "category must be exactly 'email', 'calendar', or 'tasks'."
+        normalized_app = (app or "").strip().lower()
+        if not normalized_app:
+            return "app must be 'messa' or a connected toolkit slug (e.g. 'gmail', 'todoist')."
+        if not await _is_app_connected(normalized_app):
             return (
-                "Can't switch the default to Gmail yet -- it isn't connected. Offer to connect "
-                "it (delegate to email_agent with request_email_connection), then call this "
-                "again once the user confirms it's active."
+                f"Can't switch {normalized_category}'s primary to {app!r} yet -- it isn't "
+                "connected. Offer to connect it first (integrations_agent, or email_agent's "
+                "request_email_connection for Gmail specifically), then call this again once "
+                "the user confirms it's active."
             )
-        row = await db.set_default_email_provider(uid, normalized)
+        row = await db.set_app_preference(uid, normalized_category, normalized_app)
         if row is None:
             return (
-                "Default-email preference isn't set up on this deployment yet (run "
-                "migrations/015_default_email_provider.sql) -- for now, the user's own Messa "
-                "address is used for any unnamed 'send/check my email' request."
+                "App-preference tracking isn't set up on this deployment yet (run "
+                "migrations/020_dynamic_integrations.sql) -- for now, Messa's own native tool "
+                f"is used for any unnamed {normalized_category} request."
             )
-        label = "their own Messa address" if normalized == "messa" else "their connected Gmail"
-        return f"Default email is now {label}. Use it for any generic send/check-email request that doesn't name an inbox."
+        label = "Messa's own native tool" if normalized_app == "messa" else normalized_app
+        return (
+            f"Primary {normalized_category} is now {label}. Use it for any generic "
+            f"{normalized_category} request that doesn't name an app."
+        )
+
+    @tool
+    async def list_my_connected_apps() -> str:
+        """List every third-party app connected for this user, grouped by
+        whether it competes with one of Messa's own native tools
+        (email/calendar/tasks) or not, and which one is currently PRIMARY
+        in each of those three categories. Call this when the user asks
+        what's connected, or what their default/primary app is for
+        something, instead of guessing or re-deriving it from scattered
+        earlier context -- this is the authoritative, current answer."""
+        connected = set(await db.get_active_connected_toolkits(uid))
+        if user.email_connected:
+            connected.add("gmail")
+        lines = []
+        for cat in ("email", "calendar", "tasks"):
+            apps_in_cat = sorted(
+                slug for slug in connected if app_category_for_toolkit(slug) == cat
+            )
+            primary = (await db.get_app_preference(uid, cat)) or "messa"
+            if apps_in_cat:
+                lines.append(f"{cat}: connected -- {', '.join(apps_in_cat)}. Primary: {primary}.")
+            else:
+                lines.append(f"{cat}: nothing connected yet. Primary: messa (Messa's own native tool).")
+        other = sorted(slug for slug in connected if app_category_for_toolkit(slug) is None)
+        if other:
+            lines.append(
+                "Also connected (no native Messa equivalent, so no primary concept applies): "
+                + ", ".join(other) + "."
+            )
+        return "\n".join(lines)
 
     @tool
     async def list_deepsearch_sessions(status: str | None = None) -> str:
@@ -252,14 +329,15 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
 
     raw_tools: list[BaseTool] = [
         confirm_pending_action, reject_pending_action, list_pending_actions,
-        track_project, list_active_projects, save_profile_info, set_default_email_provider,
+        track_project, list_active_projects, save_profile_info,
+        set_app_preference, list_my_connected_apps,
         list_deepsearch_sessions, find_contact, send_pdf_over_text,
         *build_web_search_tools(),
     ]
     return trace_all(raw_tools, ORCHESTRATOR_LABEL)
 
 
-def _integrations_agent_description(connected_slugs: list[str]) -> str:
+def _integrations_agent_description(connected_slugs: list[str], email_primary: str = "messa") -> str:
     """Builds integrations_agent's subagent `description` -- what Messa's
     OWN context sees on every turn when deciding whether to delegate here,
     per docs/dynamic_connected_apps_spec.md. `connected_slugs` comes from
@@ -269,19 +347,34 @@ def _integrations_agent_description(connected_slugs: list[str]) -> str:
     that hit Composio's API directly would add real latency to every
     message Messa handles, not just ones about an app). Deliberately kept
     a pure function, separate from build_orchestrator, so it's testable
-    without spinning up a real agent."""
+    without spinning up a real agent.
+
+    `email_primary` (added for the primary-app preference system, default
+    'messa' so every existing caller/test keeps its old behavior unless it
+    explicitly passes something else): the old hardcoded "NOT for email"
+    line was only ever true while personal_inbox_agent/email_agent were
+    the sole possible email handlers -- now that a generic email request
+    can ALSO resolve to integrations_agent (Gmail/Outlook as primary, see
+    _build_system_prompt's "Email routing" paragraph), a flatly hardcoded
+    exclusion here would directly contradict that routing instead of just
+    being a redundant reminder of it."""
     connected_str = (
         f" Currently connected for this user: {', '.join(connected_slugs)}."
         if connected_slugs else ""
     )
+    email_note = (
+        "NOT for email (that's always email_agent/personal_inbox_agent)"
+        if email_primary == "messa"
+        else "including email when it's the user's current primary (see 'Known about this "
+        "user' above) -- otherwise still email_agent/personal_inbox_agent"
+    )
     return (
         "Reaches any of Composio's 1,400+ other app integrations (Reddit, Todoist, Slack, "
         "Notion, GitHub, Instagram, Google Calendar, and more) that none of Messa's other "
-        "subagents already cover -- NOT for email (that's always email_agent/"
-        "personal_inbox_agent)." + connected_str + " Use this whenever the user names an "
-        "app/service outside Messa's native capabilities and wants Messa to do something in "
-        "it, OR asks to connect/link/authorize/sync one -- ALWAYS check here first, before "
-        "deepsearch, for anything app-shaped."
+        f"subagents already cover -- {email_note}." + connected_str + " Use this whenever the "
+        "user names an app/service outside Messa's native capabilities and wants Messa to do "
+        "something in it, OR asks to connect/link/authorize/sync one -- ALWAYS check here "
+        "first, before deepsearch, for anything app-shaped."
     )
 
 
@@ -318,7 +411,50 @@ _ONBOARDING_PROMPTS = {
 }
 
 
-def _build_system_prompt(user: config.UserContext) -> str:
+def _category_known_line(
+    category: str, primary: str, connected_slugs: list[str], user: config.UserContext,
+) -> str:
+    """One 'Known about this user' line for a single primary-app category
+    (email/calendar/tasks) -- generalizes what used to be email-only
+    inline logic (see this function's callers) so all three categories
+    render their current state the same way: which app is primary, and --
+    the one case that actually prevents Messa from confidently getting
+    this wrong -- a clear callout when the stored primary points at
+    something that isn't connected anymore, with an explicit instruction
+    to fall back to the native tool rather than silently failing or
+    guessing. `is_connected` special-cases 'gmail': its connection state
+    lives in user.email_connected (email_tools.py's own dedicated OAuth
+    flow predates the generic Dynamic Integration Engine), not in
+    connected_slugs (db.get_active_connected_toolkits, which only reads
+    app_connection_requests)."""
+    native_labels = {
+        "email": "their own Messa address (personal_inbox_agent)",
+        "calendar": "Messa's own internal calendar (executive_assistant)",
+        "tasks": "Messa's own internal task list (executive_assistant)",
+    }
+    subagent_labels = {"email": "email_agent" if primary == "gmail" else "integrations_agent", "calendar": "integrations_agent", "tasks": "integrations_agent"}
+    native_label = native_labels[category]
+
+    if primary == "messa":
+        return f"primary {category}: {native_label}"
+
+    is_connected = (primary == "gmail" and user.email_connected) or (primary in connected_slugs)
+    if is_connected:
+        return f"primary {category}: their connected {primary} ({subagent_labels[category]})"
+    return (
+        f"primary {category} is set to {primary}, but it isn't connected right now -- treat "
+        f"{native_label} as the effective default for any unnamed {category} request until "
+        f"{primary} is reconnected, and mention that mismatch if it's relevant"
+    )
+
+
+def _build_system_prompt(
+    user: config.UserContext,
+    connected_slugs: list[str] | None = None,
+    app_preferences: dict[str, str] | None = None,
+) -> str:
+    connected_slugs = connected_slugs or []
+    app_preferences = app_preferences or {}
     known = []
     if user.name:
         known.append(f"name: {user.name}")
@@ -333,16 +469,20 @@ def _build_system_prompt(user: config.UserContext) -> str:
     )
     if user.messa_email:
         known.append(f"their own Messa email address is {user.messa_email}")
-    if user.default_email_provider == "gmail" and not user.email_connected:
-        known.append(
-            "default email is set to Gmail, but Gmail isn't connected right now -- treat "
-            "personal_inbox_agent as the effective default for any unnamed email request "
-            "until Gmail is reconnected, and mention that mismatch if it's relevant"
-        )
-    elif user.default_email_provider == "gmail":
-        known.append("default email for an unnamed 'send/check my email' request: their connected Gmail (email_agent)")
-    else:
-        known.append("default email for an unnamed 'send/check my email' request: their own Messa address (personal_inbox_agent)")
+    for category in ("email", "calendar", "tasks"):
+        # 'email' has a free, always-already-loaded fallback
+        # (UserContext.default_email_provider, populated once per turn by
+        # cli.py regardless of this call) for a caller that hasn't fetched
+        # app_preferences at all -- same "degrade to the cheap legacy
+        # source rather than silently pretend 'messa'" shape as
+        # db.get_app_preference's own column read-through. Calendar/tasks
+        # have no such legacy source, so they genuinely have nothing
+        # better than 'messa' to fall back to when the caller passes
+        # nothing here -- correct, since app_preferences omitted really
+        # does mean "preference state wasn't fetched this call."
+        default = user.default_email_provider if category == "email" else "messa"
+        primary = app_preferences.get(category) or default
+        known.append(_category_known_line(category, primary, connected_slugs, user))
     known_str = ("Known about this user so far -- " + ", ".join(known) + ".\n\n") if known else ""
 
     # Neither Messa's nor any subagent's system prompt used to state the
@@ -392,15 +532,40 @@ def _build_system_prompt(user: config.UserContext) -> str:
         "each request: personal_inbox_agent (their own address on your domain) and email_agent "
         "(their connected Gmail, once set up). For a GENERIC request that doesn't name an inbox "
         "('send an email to X', 'check my email', 'any new messages?'), delegate to whichever "
-        "one is their current default (see 'Known about this user' above) -- don't ask which "
-        "inbox every time, that default exists so you don't have to. If they explicitly name "
+        "one is their current primary email (see 'Known about this user' above) -- don't ask "
+        "which inbox every time, that's exactly what a primary is for. If they explicitly name "
         "one ('my gmail', 'my real/personal email' -> email_agent; 'my messa email', 'the "
         "address you gave me', 'the textmessa one' -> personal_inbox_agent), use that one "
-        "regardless of the default. If they ask to change the default ('use my gmail from now "
-        "on', 'switch back to messa email'), call set_default_email_provider -- it'll tell you "
-        "if Gmail needs to be connected first, in which case offer to connect it (email_agent's "
-        "request_email_connection) before trying again. Connecting Gmail does NOT change the "
-        "default on its own -- only this explicit request does.\n\n"
+        "regardless of the primary. If they ask to change it ('use my gmail from now on', "
+        "'switch back to messa email'), call set_app_preference('email', 'gmail'|'messa') -- "
+        "it'll tell you if Gmail needs to be connected first, in which case offer to connect it "
+        "(email_agent's request_email_connection) before trying again. Connecting Gmail does NOT "
+        "change the primary on its own -- only this explicit request does (or, the very first "
+        "time it's connected with nothing else set yet, an automatic one-time promotion -- see "
+        "'Known about this user' for whatever it currently is, that's always the live answer).\n\n"
+        "Calendar routing -- same shape as email routing, just one option instead of two named "
+        "inboxes: executive_assistant (Messa's own internal calendar) or integrations_agent "
+        "(a real connected calendar, e.g. Google Calendar via Composio's 'googlecalendar' "
+        "toolkit). For a GENERIC schedule request that doesn't name one ('what's on my "
+        "schedule', 'add this to my calendar', 'am I free Thursday'), delegate to whichever is "
+        "the current primary calendar (see 'Known about this user' above) -- don't ask every "
+        "time, don't default to executive_assistant just because it's native, trust the stored "
+        "primary. If they explicitly name one ('my Google Calendar', 'my real calendar' -> "
+        "integrations_agent; 'your calendar', 'the one you keep' -> executive_assistant), use "
+        "that one regardless of the primary. A request to CONNECT, sync, or manage a real "
+        "calendar always goes to integrations_agent, never executive_assistant -- it has no "
+        "connection to a real Google/Apple/Outlook calendar and no tool that would create one. "
+        "If they ask to change the primary ('make Google Calendar my primary', 'use your own "
+        "calendar instead'), call set_app_preference('calendar', <toolkit>|'messa').\n\n"
+        "Tasks routing -- same shape again: executive_assistant (Messa's own internal task "
+        "list) or integrations_agent (a connected task app, e.g. Todoist/Asana). A GENERIC "
+        "request that doesn't name one ('add a task', 'what's on my to-do list') goes to the "
+        "current primary for tasks (see 'Known about this user' above); an explicitly-named "
+        "app ('add this to Todoist', 'your own task list') always overrides it regardless of "
+        "the primary. Change it the same way: set_app_preference('tasks', <toolkit>|'messa'). "
+        "Reminders are NOT part of this -- they stay Messa's own native tool "
+        "(executive_assistant) always; there's no connected-app equivalent for a scheduled "
+        "SMS nudge, so nothing to route between.\n\n"
         "Documents, email, and text: when the user wants something generated AND sent/attached "
         "(\"make me a PDF of this and email it to me\", \"...and text it to me\"), delegate to "
         "document_agent first, get the exact file path back from its reply, then either "
@@ -450,12 +615,10 @@ def _build_system_prompt(user: config.UserContext) -> str:
         "immediately, the same as a request to USE one. Don't try to guess whether Composio "
         "supports it yourself; let integrations_agent's own search tell you, and only fall "
         "back to deepsearch if it reports nothing matches.\n\n"
-        "Google Calendar specifically: a request to CONNECT, sync, or manage the user's real "
-        "Google Calendar goes to integrations_agent (Composio's 'googlecalendar' toolkit), NOT "
-        "executive_assistant -- executive_assistant's calendar is Messa's own internal one and "
-        "has no connection to a real Google/Apple/Outlook calendar. Don't conflate the two: if "
-        "the user's intent is ambiguous ('add this to my calendar' from someone with Google "
-        "Calendar connected), ask which one they mean rather than guessing.\n\n"
+        "(Google Calendar's own connect/sync/manage routing and generic-request primary "
+        "handling are both covered above, under 'Calendar routing' -- this note is just a "
+        "reminder they're the same rule, not a separate one: never let executive_assistant's "
+        "internal calendar_events table be confused for a real connected calendar.)\n\n"
         f"{known_str}"
         f"{time_str}"
         f"{onboarding_str}"
@@ -551,6 +714,23 @@ async def build_orchestrator(
         console.system(f"get_active_connected_toolkits failed (non-fatal): {e}")
         connected_slugs = []
 
+    # Primary-app preferences (email/calendar/tasks) -- same "cheap local
+    # read, never fatal to a turn" shape as connected_slugs just above.
+    # 'email' is included even though UserContext.default_email_provider
+    # already gives a free zero-query fallback -- db.get_app_preference's
+    # own read-through-to-that-column logic (see its docstring) means this
+    # always resolves correctly even before any user_app_preferences row
+    # exists, and routing every category through the same call here keeps
+    # _build_system_prompt's own logic uniform across all three instead of
+    # special-casing email.
+    app_preferences: dict[str, str] = {}
+    for _category in ("email", "calendar", "tasks"):
+        try:
+            app_preferences[_category] = (await db.get_app_preference(user.user_id, _category)) or "messa"
+        except Exception as e:  # noqa: BLE001 - a hint, not load-bearing, same as connected_slugs above
+            console.system(f"get_app_preference({_category!r}) failed (non-fatal): {e}")
+            app_preferences[_category] = "messa"
+
     subagents = [
         build_deepsearch_subagent(user, subagent_model, approval_gate),
         build_executive_subagent(user, subagent_model),
@@ -585,7 +765,7 @@ async def build_orchestrator(
         },
         {
             "name": "integrations_agent",
-            "description": _integrations_agent_description(connected_slugs),
+            "description": _integrations_agent_description(connected_slugs, app_preferences.get("email", "messa")),
             "system_prompt": build_integration_system_prompt(user),
             "tools": build_integration_tools(user, approval_gate),
             "model": subagent_model,
@@ -595,7 +775,7 @@ async def build_orchestrator(
     agent = create_deep_agent(
         model=model,
         tools=build_orchestrator_tools(user),
-        system_prompt=_build_system_prompt(user),
+        system_prompt=_build_system_prompt(user, connected_slugs, app_preferences),
         subagents=subagents,
     )
     return agent

@@ -20,7 +20,7 @@ from zoneinfo import ZoneInfo
 import asyncpg
 from croniter import croniter
 
-from . import config, timeutil
+from . import config, console, timeutil
 
 _pool: Optional[asyncpg.Pool] = None
 
@@ -1648,25 +1648,82 @@ async def expire_email_connection_request(request_id: int) -> None:
 # ---------------------------------------------------------------------------
 
 async def get_app_preference(user_id: int, app_category: str) -> str | None:
-    """The user's preferred app for a category (e.g. 'tasks' -> 'todoist'),
-    or None if they've never set one -- tools/integration_tools.py falls
-    back to just asking/using whatever single connected app matches in
-    that case, only consulting this when more than one connected app could
-    plausibly serve the same request."""
+    """The user's preferred app for a category ('email', 'calendar', or
+    'tasks' as of the primary-app preference system -- see
+    agents/registry.py's set_app_preference/list_my_connected_apps tools
+    and its "Known about this user" prompt block for how this actually
+    drives routing), or None if they've never set one (meaning: still on
+    Messa's own native tool for that category) -- callers treat None as
+    'messa', same as this always meant for email before this function had
+    any callers.
+
+    Category 'email' specifically has a legacy fallback: migrations/
+    015_default_email_provider.sql shipped BEFORE this generic table did,
+    as its own dedicated users.default_email_provider enum column ('messa'/
+    'gmail'), and every existing user already has a real choice recorded
+    there. Rather than a one-time backfill migration (extra deploy step,
+    extra thing that can go wrong), this reads through to that column
+    whenever 'email' has no row here yet -- zero-downtime, and every
+    existing user's current choice is preserved automatically. Once
+    set_app_preference (below) is ever called for 'email', a real row
+    exists here and this fallback no longer matters for that user; the
+    column itself is still kept in sync too (see set_app_preference), so
+    the other, older code paths that still read
+    UserContext.default_email_provider directly (a cheap per-turn read
+    with no query at all -- see cli.py's load path) keep working
+    unchanged."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        if not await _has_table(conn, "user_app_preferences"):
-            return None
-        return await conn.fetchval(
-            "SELECT preferred_app FROM user_app_preferences WHERE user_id = $1 AND app_category = $2",
-            user_id, app_category,
-        )
+        if await _has_table(conn, "user_app_preferences"):
+            value = await conn.fetchval(
+                "SELECT preferred_app FROM user_app_preferences WHERE user_id = $1 AND app_category = $2",
+                user_id, app_category,
+            )
+            if value is not None:
+                return value
+        if app_category == "email" and await _has_column(conn, "users", "default_email_provider"):
+            value = await conn.fetchval(
+                "SELECT default_email_provider FROM users WHERE id = $1", user_id,
+            )
+            # The column's own DEFAULT is 'messa' -- every user has SOME
+            # value here once the column exists, so a non-null result is
+            # always meaningful, never itself a "not set" signal.
+            return value
+        return None
+
+
+# Categories whose legacy value must round-trip through
+# users.default_email_provider's own ENUM ('messa'/'gmail' only, enforced
+# at the DB level) -- see get_app_preference's docstring. A category with
+# no such column (calendar, tasks), or an 'email' value the enum doesn't
+# recognize (e.g. a future 'outlook' connection), simply isn't written
+# through -- user_app_preferences is ALREADY the source of truth for those
+# the moment a real row exists, the column is only ever a legacy mirror for
+# the two values it understands.
+_EMAIL_PROVIDER_ENUM_VALUES = {"messa", "gmail"}
 
 
 async def set_app_preference(user_id: int, app_category: str, preferred_app: str) -> dict[str, Any] | None:
     """Upsert -- always at the user's own explicit request ('use Todoist
-    for my tasks by default'), same one-writer-only pattern as
-    set_default_email_provider above."""
+    for my tasks by default', 'make Google Calendar my primary calendar',
+    'use my gmail as my main email') via agents/registry.py's
+    set_app_preference tool, or the connect-time auto-promote/ask-on-
+    conflict flow in server.py's connection poll loops (see
+    _production_email_connection_poll_loop/_production_app_connection_poll_loop) --
+    never anything else, same one-writer-only-at-explicit-request shape as
+    the original set_default_email_provider always had.
+
+    For app_category == 'email' specifically, this ALSO writes through to
+    the legacy users.default_email_provider column (via
+    set_default_email_provider) whenever preferred_app is a value that
+    column's ENUM actually accepts ('messa'/'gmail') -- keeps every other
+    still-existing direct read of UserContext.default_email_provider (a
+    zero-query per-turn field, see cli.py) correctly in sync, rather than
+    only correct through this table. A value the enum can't represent
+    (e.g. 'outlook') just skips that write-through -- this table alone is
+    authoritative for it, no error, nothing left inconsistent since
+    default_email_provider was never going to be able to say 'outlook'
+    anyway."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         if not await _has_table(conn, "user_app_preferences"):
@@ -1680,7 +1737,15 @@ async def set_app_preference(user_id: int, app_category: str, preferred_app: str
             """,
             user_id, app_category, preferred_app,
         )
-        return dict(row)
+        result = dict(row)
+
+    if app_category == "email" and preferred_app in _EMAIL_PROVIDER_ENUM_VALUES:
+        try:
+            await set_default_email_provider(user_id, preferred_app)
+        except Exception as e:  # noqa: BLE001 - the new table is now authoritative either way; the legacy column is a best-effort mirror
+            console.system(f"set_app_preference: legacy default_email_provider write-through failed (non-fatal): {e}")
+
+    return result
 
 
 async def log_unsupported_integration_request(user_id: int, requested_app_name: str, raw_user_prompt: str) -> None:
