@@ -14,14 +14,21 @@ fetch answers the same question in a fraction of the time and tokens --
 and, unlike deepsearch, Browserbase never bills a cent for any of it, since
 no Browserbase session is ever involved.
 
-Three tools, three tiers of the same "don't open a browser you don't need"
-idea, all exposed directly on Messa's own toolset (see agents/registry.py),
-not nested inside deepsearch -- the routing decision ("does this need a
-real browser or not") has to happen BEFORE a browser session ever opens, or
-the whole point is lost:
+Six tools, all at the same "don't open a browser you don't need" tier, all
+exposed directly on Messa's own toolset (see agents/registry.py), not
+nested inside deepsearch -- the routing decision ("does this need a real
+browser or not") has to happen BEFORE a browser session ever opens, or the
+whole point is lost. Two independent PROVIDERS sit behind the search/fetch
+job on purpose (not redundancy for its own sake) -- see tools/parallel_search.py's
+own docstring for why a single free provider having a bad day shouldn't be
+the thing that pushes a read-only question into a billed deepsearch
+delegation:
 
   - `web_search` (DuckDuckGo, via the `ddgs` package -- no API key) for a
     quick factual lookup when you don't have a URL yet.
+  - `parallel_web_search` (Parallel Search MCP -- free, no API key) -- a
+    second, independent search provider, purpose-built for AI agents. Try
+    this if web_search comes back empty/errors, or as a second opinion.
   - `wikipedia_lookup` (Wikipedia's own REST API -- no key) for anything
     that's likely to have its own encyclopedia article -- faster and more
     reliable than a generic search for that specific shape of question.
@@ -31,6 +38,10 @@ the whole point is lost:
     Jina's own infrastructure, still no browser session of ours) for a
     page `fetch_page_text` came back empty on, e.g. a modern JS-heavy
     ticket/booking site.
+  - `parallel_web_fetch` (Parallel Search MCP again -- free, no API key) --
+    a second, independent provider for the SAME job as fetch_rendered_page_text
+    (JS-rendered reads, plus PDFs). Try this if fetch_rendered_page_text
+    comes back empty/errors on a page you genuinely need to read.
 
 Messa's system prompt tells her to prefer this whole tier for a plain
 factual lookup or a read-only check (including inside an autonomous
@@ -40,10 +51,11 @@ actually requires clicking through a site, logging in, or filling out a
 form -- the one tier genuinely billed by Browserbase session time.
 
 Every tool here fails closed and cheap: a network error or empty result
-returns a short message suggesting the next tier up (fetch_rendered_page_text,
-then deepsearch) as a fallback, rather than raising and losing the turn --
-a plain HTTP fetch has no way to run the JS some pages need to render their
-content at all, and that's a real, expected limitation, not a bug.
+returns a short message suggesting the next thing to try (the other
+provider at the same tier, then deepsearch as the last resort) rather than
+raising and losing the turn -- a plain HTTP fetch has no way to run the JS
+some pages need to render their content at all, and that's a real, expected
+limitation, not a bug.
 """
 from __future__ import annotations
 
@@ -67,6 +79,8 @@ from langchain_core.tools import BaseTool, tool
 
 from .common import trace_all
 from .jina_reader import fetch_rendered_page_text as _fetch_rendered_page_text
+from .parallel_search import parallel_web_fetch as _parallel_web_fetch
+from .parallel_search import parallel_web_search as _parallel_web_search
 
 LABEL = "web_search"
 
@@ -177,6 +191,21 @@ def build_web_search_tools() -> list[BaseTool]:
         return _format_results(results)
 
     @tool
+    async def parallel_web_search(objective: str, search_queries: Optional[list[str]] = None) -> str:
+        """A second, independent web search provider (Parallel Search MCP --
+        free, no API key), purpose-built for AI agents rather than a browser
+        UI. Try this if web_search comes back empty, errors out, or you just
+        want a second opinion on results -- it's not a replacement for
+        web_search, it's a backup at the same free/no-browser tier. `objective`
+        is a plain-English description of what you're trying to find out;
+        `search_queries` (optional) lets you pass one or more specific search
+        strings instead of leaving query formulation to Parallel. Like
+        web_search, this can't interact with a page at all -- only read
+        search results; delegate to deepsearch for anything needing a click,
+        login, form, or cart."""
+        return await _parallel_web_search(objective, search_queries)
+
+    @tool
     async def fetch_page_text(url: str, max_chars: int = DEFAULT_MAX_FETCH_CHARS) -> str:
         """Fetch a URL and return its readable text content -- fast, free, and
         costs no Browserbase session time, for reading an article or page you
@@ -217,6 +246,17 @@ def build_web_search_tools() -> list[BaseTool]:
         return await _fetch_rendered_page_text(url, max_chars=max_chars)
 
     @tool
+    async def parallel_web_fetch(url: str) -> str:
+        """A second, independent provider (Parallel Search MCP -- free, no
+        API key) for the SAME job as fetch_rendered_page_text: a JS-rendered
+        page read that costs no Browserbase session time. Try this if
+        fetch_rendered_page_text comes back empty or errors out on a page
+        you genuinely need to read -- also handles PDFs. Still read-only --
+        can't click, type, scroll, or log in. If this ALSO fails, or the
+        task needs real interaction, delegate to deepsearch."""
+        return await _parallel_web_fetch(url)
+
+    @tool
     async def wikipedia_lookup(topic: str) -> str:
         """Free, instant lookup of a Wikipedia article's summary -- for a
         person, place, thing, event, or concept likely to have its own
@@ -249,5 +289,8 @@ def build_web_search_tools() -> list[BaseTool]:
             return f"ERROR looking up \"{topic}\" on Wikipedia: {e}. Try web_search instead."
         return _format_wikipedia_summary(resp.json())
 
-    raw_tools: list[BaseTool] = [web_search, fetch_page_text, fetch_rendered_page_text, wikipedia_lookup]
+    raw_tools: list[BaseTool] = [
+        web_search, parallel_web_search, fetch_page_text, fetch_rendered_page_text,
+        parallel_web_fetch, wikipedia_lookup,
+    ]
     return trace_all(raw_tools, LABEL)

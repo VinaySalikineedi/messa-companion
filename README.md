@@ -6231,3 +6231,134 @@ browser use, not eagerly on delegation start) was deliberately NOT built
 this round -- it remains the main further lever if you want the
 "combined" case to also avoid opening a session at all for delegations that
 turn out not to need the real browser after all.
+
+## Parallel Search MCP as a second backup provider, and why there's no separate "search" agent
+
+Two follow-up questions from the same conversation as the cost-tiering
+section above: whether to add Parallel Search MCP (a free MCP server you
+found) as a backup, and whether the search/fetch tools should live on a
+separate 'search' subagent rather than directly on Messa's own toolset.
+
+### Parallel Search MCP -- added as a second, independent provider
+
+`tools/parallel_search.py` (new) adds two more tools at the exact same
+"costs no Browserbase session time" tier as `jina_reader.py`:
+`parallel_web_search` (backup for `web_search`) and `parallel_web_fetch`
+(backup for `fetch_rendered_page_text` -- also handles PDFs, which Jina's
+plain-text reader doesn't specifically advertise). Both wired onto Messa's
+own toolset (`web_search_tools.py`) AND onto deepsearch's own toolset
+(`BrowserToolProvider`, same as `fetch_rendered_page_text` was) -- so a
+delegation comparing candidate pages has two independent free options, not
+one.
+
+The reasoning for a SECOND provider rather than just leaning harder on
+Jina: this whole tier exists specifically so a read-only question never has
+to escalate into a billed deepsearch session. If Jina is ever down, rate-
+limited, or fails on a particular page, the fallback today would otherwise
+be jumping straight to something that costs real money. A second,
+independent provider means that fallback is another free attempt first --
+same logic DuckDuckGo/`web_search` already had no backup for, either, until
+now.
+
+**Connection design.** Parallel's server is a hosted, remote MCP endpoint
+(`https://search.parallel.ai/mcp`) -- unlike `@playwright/mcp`, there's no
+local process to spawn. It's also stateless and shared (no per-user browser
+tab to keep alive the way Browserbase sessions are), so rather than trying
+to hold one persistent connection open across a whole orchestrator's
+lifetime (real complexity: reconnecting after a drop, coordinating a shared
+connection across concurrent users), each call opens a short-lived MCP
+session, calls the one tool it needs, and closes -- the same
+`MultiServerMCPClient`/`load_mcp_tools` mechanism `deepsearch_tools.py`
+already uses for Playwright, just scoped to one call instead of one whole
+delegation. Tool schemas are loaded live from the server on every call
+(not hand-copied), so this keeps working automatically if Parallel changes
+their tool's parameters later.
+
+**Keyless, per your answer.** `config.PARALLEL_API_KEY` defaults to unset;
+Parallel's MCP endpoint needs no account for light use, same story as Jina.
+
+### Should search tools live on a separate 'search' subagent?
+
+My recommendation: no -- keep them exactly where they are, as direct tools
+on Messa's own toolset, not wrapped in a new subagent. Here's the reasoning,
+directly against your own stated priority (Messa staying fast, since she's
+the one holding the user's turn open):
+
+Delegating to ANY subagent -- deepsearch, executive_assistant, or a new
+'search' one -- costs at least one extra real LLM round trip that calling a
+tool directly does not: the subagent has to receive the task, reason about
+which of its own tools to call, call them, then compose and return a
+summary back to Messa, who then has to read that and compose her own reply.
+Today, `web_search`/`wikipedia_lookup`/`fetch_page_text`/etc. skip all of
+that -- Messa calls the tool herself, gets the raw result straight into her
+own context, and can reply immediately. Wrapping the exact same tools in a
+'search' subagent would add that round trip to EVERY plain lookup, which is
+the opposite of what you're asking for: it would make the fast path slower
+specifically to gain... nothing here, since none of these tools need multi-
+step reasoning to use correctly (each is one call: a query in, a formatted
+result out). A subagent earns its LLM-reasoning overhead when a task
+genuinely needs multiple dependent steps and judgment calls in between (deep-
+search's own browsing loop is exactly that case) -- a single search or page
+fetch never does.
+
+The good news: what you actually described -- "Messa having the search
+tools and handing it off to deepsearch when it's a complex browsing task" --
+is already exactly today's design, and this round's changes (the cost-
+tiering work plus Parallel as a backup) made it stronger, not different in
+shape. `registry.py`'s "Speed AND cost matter" paragraph is the routing
+logic: try the free direct tools first (now six of them, two independent
+providers per job), only delegate to deepsearch once they genuinely can't
+answer it or the task needs real interaction. No new agent was needed to
+get that behavior -- it was already the point of the design from the
+previous round.
+
+If what actually prompted the "separate agent" idea is more about
+organization than runtime behavior (grouping the search-related code/prompt
+text somewhere clearly labeled "search"), that's already true structurally:
+`tools/web_search_tools.py`, `tools/jina_reader.py`, and
+`tools/parallel_search.py` are their own dedicated modules, each imported
+into both `registry.py` (Messa's own toolset) and `deepsearch_tools.py`
+(deepsearch's toolset) -- there's already a clear, single place where "all
+the search/fetch logic" lives, it's just not wrapped in an agent boundary
+that would add a real, felt delay to every quick lookup.
+
+### Verification
+
+New `/tmp/test_parallel_search_mcp.py`: `_call_parallel_tool`'s MCP client
+configuration (the right URL/timeout, the keyless-by-default behavior --
+no `x-api-key` header sent with `PARALLEL_API_KEY` unset, and the opt-in
+header once one IS set), correct routing of kwargs to the named tool,
+the "tool not found on the live server" degradation (lists what IS
+available instead of a bare failure), and a connection-failure path -- all
+with `MultiServerMCPClient`/`load_mcp_tools` faked. Both new
+`web_search_tools.py` tools proven to be thin passthroughs to the shared
+implementation. Both tools confirmed present on Messa's own toolset, and a
+source-level check that `parallel_web_fetch` is registered inside
+`BrowserToolProvider.__aenter__` unconditionally (both top-level provider
+and sub-workers), the same pattern already used for `fetch_rendered_page_text`.
+String-presence checks confirming both tools are mentioned as explicit
+BACKUPS (not primary choices) in `registry._build_system_prompt`'s real
+output and in both of `deepsearch_tools.py`'s system prompts, plus a
+token-budget check (same discipline as the existing
+`/tmp/test_presearch_guidance.py`) confirming the added guidance text
+stayed bounded rather than silently ballooning the prompt. Re-ran the full
+existing suite afterward -- zero new regressions beyond the same
+pre-existing, unrelated set documented in every earlier entry above.
+
+Not verified: exactly the same sandbox network restriction as Jina/Wikipedia
+applies here too -- this container can't reach `search.parallel.ai` at all
+to confirm the real MCP server's exact tool names and parameter schema. The
+`web_search`/`web_fetch` tool names and `objective`/`search_queries`/`url`
+parameter names used here come directly from Parallel's own published docs
+(their REST Search API's example request body, and the MCP integration
+page's own description of the `web_search` tool's arguments), but since
+`_call_parallel_tool` loads the LIVE schema from the server on every call
+(not a hand-copied one), a parameter-name mismatch would surface as a clear,
+non-crashing `ERROR` result the first time this actually runs against
+Parallel's real server, not a silent wrong answer or a crash -- still, a
+real deployed run is the first genuine confirmation that these exact names
+are right. Also not verified: real end-to-end latency for a Parallel MCP
+call (the session-init handshake plus the actual search/fetch) -- expected
+to be on the order of the existing Jina tier (low seconds), comfortably
+inside your "never leave the user on hold" bar, but not measured against
+the live service from this sandbox.

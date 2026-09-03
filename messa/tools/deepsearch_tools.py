@@ -128,6 +128,7 @@ from ..channels import browserbase
 from ..channels.browserbase import BrowserbaseError
 from ..config import UserContext
 from .jina_reader import fetch_rendered_page_text as _jina_fetch_rendered_page_text
+from .parallel_search import parallel_web_fetch as _parallel_web_fetch
 
 LABEL = "deepsearch"
 
@@ -919,6 +920,25 @@ class BrowserToolProvider:
                     "to browser_navigate + browser_snapshot on it instead."
                 ),
             ))
+            # A second, independent provider for the exact same job as
+            # fetch_rendered_page_text just above (Parallel Search MCP
+            # instead of Jina Reader) -- same reasoning as request_human_help
+            # for being given to both top-level and sub-workers: if Jina is
+            # ever down or rate-limited, this is a real fallback that's
+            # still free/no-session, not an automatic escalation straight to
+            # spending more of this session's own browser time.
+            self.tools.append(StructuredTool.from_function(
+                coroutine=_parallel_web_fetch,
+                name="parallel_web_fetch",
+                description=(
+                    "A second, independent provider for the SAME job as fetch_rendered_page_text "
+                    "(a JS-rendered page read costing NO Browserbase session time) -- try this if "
+                    "fetch_rendered_page_text comes back empty or errors out on a page you "
+                    "genuinely need to read for comparison/reconnaissance. Also handles PDFs. "
+                    "Still read-only. If this ALSO fails, fall back to browser_navigate + "
+                    "browser_snapshot instead."
+                ),
+            ))
             # delegate_website_task is deliberately owning-provider-only --
             # _owns_server is the actual enforcement (not just leaving it
             # off a sub-worker's tool list), so there is no path to
@@ -1670,9 +1690,10 @@ _SUBAGENT_SYSTEM_PROMPT = (
     "- Do exactly what the instructions ask, nothing more -- no exploring beyond this one goal, "
     "no extra things to report. A short, focused session is what's wanted here.\n"
     "- This tab's session time is genuinely billed -- before navigating anywhere, ask whether "
-    "fetch_rendered_page_text could answer it instead (comparing this site against others, "
-    "confirming a fact, checking current content). It costs no session time at all. Only use "
-    "browser_navigate once you know THIS is the page you actually need to interact with.\n"
+    "fetch_rendered_page_text (or parallel_web_fetch if that fails) could answer it instead "
+    "(comparing this site against others, confirming a fact, checking current content). Both "
+    "cost no session time at all. Only use browser_navigate once you know THIS is the page you "
+    "actually need to interact with.\n"
     "- After navigating, always call browser_snapshot to read actual page content. Prefer "
     "browser_find or browser_snapshot's `depth` argument over a full snapshot when you just "
     "need to confirm something worked.\n"
@@ -1707,12 +1728,13 @@ DEEPSEARCH_SYSTEM_PROMPT = (
     "- Money matters, not just speed: this whole session is billed by TIME held open, "
     "regardless of how much or little you actually do with it. Before calling browser_navigate "
     "on any candidate page you're not already sure you need to interact with, ask whether "
-    "fetch_rendered_page_text could answer it instead -- it runs on a separate reader service "
-    "and costs NOTHING against this session. For a task that combines reading/comparing with "
-    "acting (e.g. 'check these 3 sites and buy from whichever is cheapest'), the right shape "
-    "is: fetch_rendered_page_text every candidate FIRST, decide which one wins, THEN spend "
-    "real browser_navigate/session time only on that one -- never navigate to a page purely to "
-    "compare it against others when a fast read would tell you the same thing.\n"
+    "fetch_rendered_page_text could answer it instead (parallel_web_fetch if that one fails) -- "
+    "both run on a separate reader service and cost NOTHING against this session. For a task "
+    "that combines reading/comparing with acting (e.g. 'check these 3 sites and buy from "
+    "whichever is cheapest'), the right shape is: read every candidate FIRST with one of those "
+    "tools, decide which one wins, THEN spend real browser_navigate/session time only on that "
+    "one -- never navigate to a page purely to compare it against others when a fast read would "
+    "tell you the same thing.\n"
     "- Speed matters too -- users notice how long this takes. Prefer the cheaper tool for what "
     "you actually need right now instead of defaulting to a full browser_snapshot every time:\n"
     "  - browser_find(text=... or regex=...) locates one specific element (and its ref) "

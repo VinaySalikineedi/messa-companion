@@ -454,6 +454,27 @@ JINA_READER_BASE_URL = os.environ.get("MESSA_JINA_READER_BASE_URL", "https://r.j
 # waiting so long it stops being the "fast" tier in practice.
 JINA_READER_TIMEOUT_SECONDS = float(os.environ.get("MESSA_JINA_READER_TIMEOUT_SECONDS", "20"))
 
+# ---- Parallel Search MCP (tools/parallel_search.py) -- a second, backup
+# provider at the SAME free/fast tier as Jina Reader and DuckDuckGo, not a
+# replacement for either. A remote, hosted MCP server (no local process to
+# spawn, unlike @playwright/mcp) exposing two tools: `web_search` (an agent-
+# tuned search API, often better-ranked than plain DuckDuckGo) and
+# `web_fetch` (JS-rendered/PDF-capable page reads, the same job as Jina
+# Reader, from a different provider -- if one of the two is ever down or
+# rate-limited, the other is a real fallback). Free and keyless by default,
+# same story as Jina: the MCP endpoint itself needs no account or key for
+# light use; PARALLEL_API_KEY stays unset until real usage outgrows that.
+# See parallel_search.py's own docstring for the full design and README's
+# "Deepsearch cost tiering" section for why a SECOND provider at this tier
+# is worth having at all.
+PARALLEL_MCP_URL = os.environ.get("MESSA_PARALLEL_MCP_URL", "https://search.parallel.ai/mcp")
+PARALLEL_API_KEY = os.environ.get("MESSA_PARALLEL_API_KEY") or None
+# A remote MCP call is a real network round trip (session init + the tool
+# call itself) on top of whatever Parallel's own search/fetch takes -- sized
+# well under DEEPSEARCH's own tiers so a slow/unresponsive MCP endpoint
+# fails fast and visibly instead of quietly stalling Messa's reply.
+PARALLEL_MCP_TIMEOUT_SECONDS = float(os.environ.get("MESSA_PARALLEL_MCP_TIMEOUT_SECONDS", "15"))
+
 # ---- Live view sharing (Phase 3) ----
 # Base URL for the public /live/<token> page (see server.py + db.py's
 # live_share_token functions). Defaults to the now-permanent custom domain
