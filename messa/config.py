@@ -905,6 +905,32 @@ DEEPSEARCH_MAX_SUBAGENTS = int(os.environ.get("MESSA_DEEPSEARCH_MAX_SUBAGENTS", 
 # a multi-page exploration.
 DEEPSEARCH_SUBAGENT_MAX_STEPS = int(os.environ.get("MESSA_DEEPSEARCH_SUBAGENT_MAX_STEPS", "8"))
 
+# Second backstop under DEEPSEARCH_MAX_SESSION_SECONDS (1200s), added after a
+# real production incident: a Browserbase session that died mid-run (user
+# closed it manually; Browserbase's own timeout would do the same) kept
+# getting retried by the top-level model for 11 more full LLM turns (~330s
+# of pure OpenRouter spend) before the log cut off, because every tool
+# failure was just handed back as "try a different approach" -- there IS no
+# different approach once the session is gone, but the model had no way to
+# know that. tools/deepsearch_tools.py's guarded() now raises immediately
+# (ending the run) once EITHER of two things is true: (a) the failure is
+# specifically a confirmed-dead-session error (410/"Gone"/"session not
+# running" -- see _is_dead_browser_session_error, handled unconditionally,
+# not gated by this constant at all), or (b) this many tool calls in a row
+# have failed for ANY reason on one tab -- a broader net for a run that's
+# clearly stuck even without that exact signature. Deliberately generous
+# (6, not 2-3): a few real retries in a row is normal exploration (a
+# selector that needs adjusting, a slow page), not yet evidence of being
+# stuck -- this is a backstop for a genuinely runaway loop, not a
+# first-resort brake. Per-tab (each BrowserToolProvider/sub-worker tracks
+# its own count), so one stuck sub-worker doesn't end an otherwise-healthy
+# top-level run by itself -- see _delegate_website_task's own comment on
+# why only the dead-session case (a) propagates past a sub-worker's own
+# error handling to end the whole run, while this one (b) doesn't.
+DEEPSEARCH_MAX_CONSECUTIVE_TOOL_ERRORS = int(
+    os.environ.get("MESSA_DEEPSEARCH_MAX_CONSECUTIVE_TOOL_ERRORS", "6")
+)
+
 # Step budget for executive_assistant (tasks/reminders/notes/contacts/
 # calendar), deliberately small and separate from DEEPSEARCH_MAX_STEPS --
 # see tools/executive_tools.py's build_executive_subagent docstring. This

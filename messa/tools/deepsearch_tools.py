@@ -122,7 +122,7 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.errors import GraphRecursionError
 
-from .. import config, console, credentials, db, live_activity, usage
+from .. import config, console, credentials, db, deepsearch_control, live_activity, usage
 from ..approval import ApprovalGate
 from ..channels import browserbase
 from ..channels.browserbase import BrowserbaseError
@@ -143,6 +143,72 @@ DESTRUCTIVE_TOOLS = {
 SNAPSHOT_DEPENDENT_TOOLS = {
     "browser_click", "browser_type", "browser_hover", "browser_drag", "browser_select_option",
 }
+
+class _FatalBrowserSessionError(RuntimeError):
+    """Raised (never swallowed into a retryable error string) when a tool
+    call fails because the WHOLE Browserbase session is confirmed gone --
+    either it died mid-run (410/"Gone"/"session not running", see
+    _is_dead_browser_session_error) or it could never be opened in the
+    first place (Browserbase down/quota/auth failure inside
+    BrowserToolProvider._ensure_live_session). Every other tab sharing this
+    session (the top-level tab and every delegate_website_task sub-worker
+    alike) is equally doomed, so this is deliberately let propagate all the
+    way out of the run instead of being retried -- see guarded()'s except
+    block for where it's raised and _delegate_website_task's own comment
+    for why it's re-raised through both nesting levels there, unlike
+    _TooManyConsecutiveToolErrors below."""
+
+
+class _TooManyConsecutiveToolErrors(RuntimeError):
+    """Raised when one tab (top-level or a single sub-worker) has failed
+    config.DEEPSEARCH_MAX_CONSECUTIVE_TOOL_ERRORS tool calls in a row, for
+    ANY reason -- a broader, softer backstop than
+    _FatalBrowserSessionError's exact-signature match, for a run that's
+    clearly stuck without necessarily being a dead-session case. Unlike
+    _FatalBrowserSessionError, this is deliberately NOT re-raised past
+    _delegate_website_task's own error handling -- a single sub-worker
+    tab being stuck (a page that keeps rejecting a selector, say) says
+    nothing about whether OTHER sites/tabs are still workable, so it's
+    left to fall through to the existing generic "(errored: ...)" handling
+    there, reported back to the top-level model as one failed site among
+    however many it delegated -- exactly like any other sub-worker
+    failure already was, just capped now instead of open-ended."""
+
+
+_DEAD_SESSION_ERROR_MARKERS = ("410", "session not running")
+
+
+def _is_dead_browser_session_error(e: Exception) -> bool:
+    """True for the exact error shape a confirmed-gone Browserbase session
+    produces (see error.txt's own production trace: 'WebSocket error: ...
+    410 Gone - session not running', and the matching 'Browserbase GET
+    /sessions/.../debug failed (410): ... "Session stopped"' from the
+    separate live-view polling path) -- checked as a plain substring match
+    on str(e) rather than trying to parse a specific exception type, since
+    the 410 can surface through several different layers (the MCP client's
+    own WebSocket connect, a raw Browserbase API call) each with their own
+    exception shape. Deliberately narrow (both markers required, not just
+    "410" alone, which could coincidentally appear in an unrelated error
+    string) -- a false negative here just falls through to the softer
+    _TooManyConsecutiveToolErrors backstop instead, never a crash; a false
+    positive would end a run that might have kept working, which is the
+    worse mistake, so precision matters more than recall here."""
+    text = str(e)
+    return all(marker in text for marker in _DEAD_SESSION_ERROR_MARKERS)
+
+
+# Process-wide cache of @playwright/mcp's tool schemas -- (name,
+# description, args_schema) triples, discovered once for real (the first
+# deepsearch run in this process's lifetime) and reused by every later
+# top-level BrowserToolProvider so it can hand the model a complete,
+# correctly-typed toolset from turn one WITHOUT opening a real (billed)
+# Browserbase session just to learn what the tools are -- see
+# BrowserToolProvider._ensure_live_session's own docstring for the full
+# lazy-open design this enables. Schemas are static per @playwright/mcp
+# version, not per-session, so this is safe to reuse across every user and
+# every run for the life of the process; a fresh process (restart/deploy)
+# just repopulates it on its own first run. None until that happens.
+_CACHED_TOOL_SPECS: list[tuple[str, str, Any]] | None = None
 
 _SESSION_REF_RE = re.compile(r"session\s*#?\s*(\d+)", re.IGNORECASE)
 
@@ -584,9 +650,16 @@ class BrowserToolProvider:
         server_url: str | None = None,
         model: BaseChatModel | None = None,
         messa_email: str | None = None,
+        task_title: str | None = None,
     ):
         self._approval_gate = approval_gate
         self._user_id = user_id
+        # Owning-provider-only, for the lazy-open db.set_live_browser_active
+        # call inside _ensure_live_session (see that method) -- moved there
+        # from build_deepsearch_subagent._run's own body, since that call
+        # now needs to fire whenever the session actually opens (possibly
+        # well after __aenter__ returns), not right after __aenter__.
+        self._task_title = task_title
         # For generate_account_credential's default username -- the same
         # "hand this out anywhere, I'll manage what comes back" address
         # already used for onboarding/personal-inbox signups (see
@@ -641,6 +714,17 @@ class BrowserToolProvider:
         self._bb_session_id: str | None = None
         self.live_view_url: str | None = None
         self.tools: list[BaseTool] = []
+        # Lazy-open state (owning provider only -- see _ensure_live_session's
+        # own docstring for why a sub-worker never needs this: it's always
+        # constructed against an ALREADY-live server_url, by definition of
+        # how delegate_website_task builds one). _live_session_ready is the
+        # fast, lock-free check every guarded() call makes first; the lock
+        # itself only matters for the (normally never-hit, since a model's
+        # tool calls within one turn are dispatched by ToolNode which may
+        # run them concurrently) case of two tool calls racing to be the
+        # one that actually opens the session.
+        self._session_open_lock: asyncio.Lock | None = None
+        self._live_session_ready = False
         # Raw (unwrapped) MCP tools by name, kept for internal use only --
         # currently just browser_evaluate, called directly by
         # _move_cursor_to without going through _guard()'s approval-gating
@@ -773,23 +857,223 @@ class BrowserToolProvider:
 
     async def __aenter__(self) -> "BrowserToolProvider":
         if self._owns_server:
-            # One Browserbase Context per user, created once and reused
-            # forever -- this is what makes logins survive between tasks
-            # (and, unlike the old --user-data-dir profile directory,
-            # survives an HF Space restart too, since it isn't on the
-            # container's disk at all).
-            # This whole method used to have no top-level error handling
-            # (same as the original local-Chromium version) -- fine when the
-            # only failure mode was "npx/chromium missing," which the
-            # guarded tool-call path below already logs clearly. Now that
-            # opening a browser means two network round trips to Browserbase
-            # before anything else runs (auth, quota, an expired/malformed
-            # key, HF's own egress to api.browserbase.com being blocked --
-            # all plausible, all silent without this), a failure here needs
-            # its own clear, findable log line instead of surfacing as an
-            # unlabeled exception three layers up. Two separate try/excepts
-            # so the log line itself tells you whether it was Browserbase or
-            # the local MCP/CDP connection step that failed.
+            self._session_open_lock = asyncio.Lock()
+            global _CACHED_TOOL_SPECS
+            if _CACHED_TOOL_SPECS is not None:
+                # The common case after the first deepsearch run in this
+                # process's lifetime: build the FULL toolset right now, with
+                # NO Browserbase session open yet -- opening one is deferred
+                # to guarded()'s first real call (see _ensure_live_session's
+                # own docstring). This is the actual fix for error.txt's
+                # "browser sits open, billed, and idle through a 221s blind
+                # planning call" finding: the model can see and call every
+                # browser tool from the very first turn, but nothing is
+                # actually billed until it calls one for real.
+                self._build_tool_list(_CACHED_TOOL_SPECS)
+                console.system(
+                    f"Deepsearch: launched with {len(self.tools)} tools (top-level, browser "
+                    "opens on first real tool call)."
+                )
+                return self
+            # Cache miss -- no cached schema available yet (first run since
+            # this process started, or a fresh deploy). No shortcut
+            # possible: open for real right now, exactly like every run did
+            # before this feature existed. This one real discovery also
+            # POPULATES the cache (inside _ensure_live_session), so every
+            # later run in this process's lifetime takes the fast path
+            # above instead -- only ever the first task after a
+            # restart/deploy pays this eager-open cost.
+            await self._ensure_live_session()
+            self._build_tool_list([(t.name, t.description, t.args_schema) for t in self._raw_tools_by_name.values()])
+            console.system(
+                f"Deepsearch: launched with {len(self.tools)} tools (top-level, cache miss -- "
+                "opened eagerly)."
+            )
+            return self
+
+        # Sub-worker: always eager, by construction -- delegate_website_task
+        # never constructs one until the top-level session is already live,
+        # so there's no idle-billing window here to optimize away.
+        try:
+            raw_tools = await self._connect_and_discover()
+            self._build_tool_list([(t.name, t.description, t.args_schema) for t in raw_tools])
+            console.system(
+                f"Deepsearch: launched with {len(self.tools)} tools (sub-worker {self._tab_id})."
+            )
+        except Exception as e:  # noqa: BLE001
+            console.tool_error(LABEL, "playwright_mcp_connect", str(e))
+            raise
+        return self
+
+    def _build_tool_list(self, tool_specs: list[tuple[str, str, Any]]) -> None:
+        """Builds self.tools from (name, description, args_schema) triples --
+        shared by every path that ends up with a tool list: a sub-worker
+        (always eager -- real specs from its own just-opened connection),
+        the top-level provider on a cache miss (also real specs, from the
+        connection _ensure_live_session just opened), and the top-level
+        provider on a cache hit (CACHED specs, built here with no live
+        connection at all yet). guarded() (built by _guard) is what
+        actually triggers _ensure_live_session lazily on first real use, so
+        this method itself never needs to know or care which of the three
+        cases it's in -- it only ever writes schema-level tool objects."""
+        self.tools = [self._guard(name, description, args_schema) for name, description, args_schema in tool_specs]
+        # request_human_help isn't a wrapped MCP tool -- it's our own Python
+        # method, added directly to the model-facing toolset (unlike
+        # _move_cursor_to/_start_reading_animation, which the model never
+        # calls itself). Given to BOTH the top-level provider and every
+        # sub-worker -- a login wall can turn up on any tab, not just the
+        # first one. Its own body calls _ensure_live_session too (a no-op
+        # for a sub-worker, already-eager by construction), so it's safe to
+        # hand out here even before the top-level session is actually open.
+        self.tools.append(StructuredTool.from_function(
+            coroutine=self._request_human_help,
+            name="request_human_help",
+            description=(self._request_human_help.__doc__ or "").strip(),
+        ))
+        # Same reasoning as request_human_help just above -- a signup or
+        # login form can turn up on any tab, top-level or sub-worker. Neither
+        # of these two touches the browser at all (pure DB/credential
+        # operations), so neither needs (and neither triggers) a lazy open.
+        self.tools.append(StructuredTool.from_function(
+            coroutine=self._generate_account_credential,
+            name="generate_account_credential",
+            description=(self._generate_account_credential.__doc__ or "").strip(),
+        ))
+        self.tools.append(StructuredTool.from_function(
+            coroutine=self._get_account_credential,
+            name="get_account_credential",
+            description=(self._get_account_credential.__doc__ or "").strip(),
+        ))
+        # Given to BOTH the top-level provider and every sub-worker, same
+        # reasoning as request_human_help just above -- any tab can want a
+        # cheap read of some OTHER page before deciding whether it's worth
+        # a real browser_navigate. This is a pure function (see
+        # jina_reader.py) with no instance state of its own, so it's wired
+        # in directly rather than as a bound method like the others above.
+        # Deliberately does NOT trigger a lazy open -- its whole point is
+        # comparing candidates BEFORE spending any real browser/session time.
+        self.tools.append(StructuredTool.from_function(
+            coroutine=_jina_fetch_rendered_page_text,
+            name="fetch_rendered_page_text",
+            description=(
+                "Read a URL's rendered text WITHOUT using this browser session -- it runs "
+                "on a remote reader service, not this Browserbase session, so it costs NO "
+                "session time and doesn't touch this tab at all. Use it for reconnaissance "
+                "or comparison: checking what a candidate page currently says, or comparing "
+                "several candidate pages/sites, BEFORE deciding which one (if any) actually "
+                "needs browser_navigate and real interaction -- this is how a task that "
+                "combines reading and acting (e.g. 'find the cheapest of these and buy it') "
+                "should be done: compare with this tool first across every candidate, THEN "
+                "spend real browser/session time only on the one you're actually acting on. "
+                "Still read-only -- it can't click, type, scroll, or log in. If it comes "
+                "back empty or unhelpful for a page you genuinely need to read, fall back "
+                "to browser_navigate + browser_snapshot on it instead."
+            ),
+        ))
+        # A second, independent provider for the exact same job as
+        # fetch_rendered_page_text just above (Parallel Search MCP instead
+        # of Jina Reader) -- same reasoning as request_human_help for being
+        # given to both top-level and sub-workers: if Jina is ever down or
+        # rate-limited, this is a real fallback that's still free/no-session,
+        # not an automatic escalation straight to spending more of this
+        # session's own browser time. Also doesn't trigger a lazy open.
+        self.tools.append(StructuredTool.from_function(
+            coroutine=_parallel_web_fetch,
+            name="parallel_web_fetch",
+            description=(
+                "A second, independent provider for the SAME job as fetch_rendered_page_text "
+                "(a JS-rendered page read costing NO Browserbase session time) -- try this if "
+                "fetch_rendered_page_text comes back empty or errors out on a page you "
+                "genuinely need to read for comparison/reconnaissance. Also handles PDFs. "
+                "Still read-only. If this ALSO fails, fall back to browser_navigate + "
+                "browser_snapshot instead."
+            ),
+        ))
+        # delegate_website_task is deliberately owning-provider-only --
+        # _owns_server is the actual enforcement (not just leaving it off a
+        # sub-worker's tool list), so there is no path to recursive
+        # delegation even if this method were ever called directly. Its own
+        # body calls _ensure_live_session first thing, same as
+        # request_human_help above.
+        if self._owns_server:
+            self.tools.append(StructuredTool.from_function(
+                coroutine=self._delegate_website_task,
+                name="delegate_website_task",
+                description=(self._delegate_website_task.__doc__ or "").strip(),
+            ))
+
+    async def _connect_and_discover(self) -> list[BaseTool]:
+        """Opens a brand-new, independent MCP client connection against
+        self._server_url (already-live for a sub-worker by construction;
+        for the top-level provider, only called once its OWN Browserbase
+        session + @playwright/mcp server are already up -- see
+        _ensure_live_session and __aenter__'s cache-miss path) and
+        discovers its real tool list. This is what gives each connection
+        its own isolated tab within the shared browser context (confirmed
+        empirically, see /tmp/test_mcp_multitab.py). Populates
+        self._raw_tools_by_name and returns the raw tool list; does NOT
+        touch self.tools -- callers decide separately whether/when to build
+        the model-facing wrapped list (see _build_tool_list)."""
+        self._client = MultiServerMCPClient({
+            "playwright": {"url": self._server_url, "transport": "streamable_http"}
+        })
+        self._session_cm = self._client.session("playwright")
+        self._session = await self._session_cm.__aenter__()
+        raw_tools = await load_mcp_tools(self._session)
+        self._raw_tools_by_name = {t.name: t for t in raw_tools}
+        if not self._owns_server:
+            # Claim our OWN tab within the shared default browser context,
+            # replacing what the old --isolated flag used to guarantee (see
+            # _spawn_mcp_http_server's comment and the module docstring's
+            # "Multi-site delegation" section). Deliberately raised (not
+            # swallowed) on failure -- this is the actual isolation
+            # mechanism now, not a cosmetic nicety; a failure here must not
+            # silently fall through to this connection sharing a tab with
+            # someone else. __aenter__'s own except block reports it as a
+            # normal failed delegate_website_task result rather than
+            # crashing the run.
+            tabs_tool = self._raw_tools_by_name.get("browser_tabs")
+            if tabs_tool is not None:
+                await tabs_tool.coroutine(action="new")
+        return raw_tools
+
+    async def _ensure_live_session(self) -> None:
+        """Owning-provider-only: opens the REAL Browserbase session, spawns
+        the REAL @playwright/mcp HTTP server against it, and connects the
+        REAL MCP client -- exactly what __aenter__ used to do unconditionally
+        and immediately, before this fix. Now called lazily, from inside a
+        guarded tool call / request_human_help / delegate_website_task, the
+        FIRST time any of them is actually invoked -- so a run that spends
+        its first N seconds (or, per error.txt's real production trace,
+        221+ seconds) purely planning, with no tool call yet, no longer pays
+        for an idle, billed Browserbase session during that time.
+
+        A no-op for a sub-worker (self._owns_server is False) -- a
+        sub-worker is only ever constructed against an ALREADY-live
+        server_url (delegate_website_task never builds one until the
+        top-level session is confirmed open), so there's nothing lazy to do
+        there; this just returns immediately, making it safe to call
+        unconditionally from shared code (guarded(), request_human_help,
+        delegate_website_task) without either of them needing to branch on
+        which kind of provider they're running inside.
+
+        Idempotent and safe under concurrent callers -- top-level tool calls
+        are dispatched one at a time within a single model turn in
+        practice, but this guards with a real asyncio.Lock rather than
+        relying on that, in case ToolNode ever dispatches more than one
+        top-level call concurrently."""
+        global _CACHED_TOOL_SPECS
+        if not self._owns_server or self._live_session_ready:
+            return
+        async with self._session_open_lock:
+            if self._live_session_ready:  # re-check inside the lock
+                return
+
+            # Same two-stage error handling/cleanup this used to have
+            # directly inside __aenter__ (see git history) -- moved here
+            # unchanged, just later in wall-clock time. One Browserbase
+            # Context per user, created once and reused forever, is what
+            # makes logins survive between tasks.
             try:
                 context_id = None
                 if self._user_id is not None:
@@ -803,37 +1087,46 @@ class BrowserToolProvider:
                 connect_url = session["connectUrl"]
                 console.system(f"Deepsearch: opened Browserbase session {self._bb_session_id}.")
                 if self._user_id is not None:
-                    # Lets server.py's status route re-poll this session's
-                    # /debug endpoint later to resolve a specific tab's own
-                    # live-view url (see live_activity.set_session_id).
                     live_activity.set_session_id(self._user_id, self._bb_session_id)
             except Exception as e:  # noqa: BLE001
                 console.tool_error(LABEL, "browserbase_session_create", str(e))
                 raise
 
-            # Best-effort: not having a live-view link yet shouldn't block the run.
             try:
                 self.live_view_url = await browserbase.get_live_view_url(self._bb_session_id)
+                if self._user_id is not None and self.live_view_url:
+                    # Moved here from build_deepsearch_subagent._run, which
+                    # used to call this right after __aenter__ returned --
+                    # now that opening is lazy, the live-view dashboard
+                    # should only flip to "browser active" once a browser
+                    # genuinely is, which is exactly now.
+                    await db.set_live_browser_active(
+                        self._user_id, self.live_view_url, self._task_title or "Working on it",
+                    )
             except BrowserbaseError as e:
+                # Best-effort: not having a live-view link yet shouldn't
+                # block the run.
                 console.tool_error(LABEL, "browserbase_live_view", str(e))
 
             try:
                 self._server_url = await self._spawn_mcp_http_server(connect_url)
                 self._subagent_semaphore = asyncio.Semaphore(config.DEEPSEARCH_MAX_SUBAGENTS)
+                raw_tools = await self._connect_and_discover()
+                if _CACHED_TOOL_SPECS is None:
+                    _CACHED_TOOL_SPECS = [(t.name, t.description, t.args_schema) for t in raw_tools]
             except Exception as e:  # noqa: BLE001
                 console.tool_error(LABEL, "browserbase_cdp_connect", str(e))
-                # __aexit__ is NOT called by `async with` when __aenter__
-                # itself raises -- without this, a Browserbase session that
-                # was created just above but never got a working CDP
-                # connection would leak (left running until it idles out on
-                # Browserbase's side, rather than released immediately).
-                # Left unfixed, repeated failed attempts would each leak
-                # another session -- on the free plan's low concurrent-
-                # session cap, that alone could make every *subsequent*
-                # attempt fail at browserbase_session_create with a
-                # quota/limit error, which would look identical to this
-                # failure from the outside. Best-effort: we're already
-                # failing, a second error here shouldn't mask the first.
+                # __aexit__ is never called for a failure here (this isn't
+                # inside an `async with` block on the caller's side) --
+                # without this, a Browserbase session that was created just
+                # above but never got a working CDP connection would leak
+                # (left running until it idles out on Browserbase's side,
+                # rather than released immediately). Left unfixed, repeated
+                # failed attempts would each leak another session -- on the
+                # free plan's low concurrent-session cap, that alone could
+                # make every *subsequent* attempt fail at
+                # browserbase_session_create with a quota/limit error, which
+                # would look identical to this failure from the outside.
                 if self._mcp_proc is not None and self._mcp_proc.returncode is None:
                     self._mcp_proc.terminate()
                 if self._bb_session_id is not None:
@@ -843,129 +1136,7 @@ class BrowserToolProvider:
                         console.tool_error(LABEL, "browserbase_release_after_failure", str(release_err))
                 raise
 
-        try:
-            # Both the owning provider (connecting to the server it just
-            # spawned above) and a sub-worker (connecting to an
-            # already-running server passed in via server_url) land here the
-            # same way -- a brand-new, independent streamable-HTTP client
-            # connection, which is what gives each one its own isolated tab
-            # within the shared browser context (confirmed empirically, see
-            # /tmp/test_mcp_multitab.py).
-            self._client = MultiServerMCPClient({
-                "playwright": {"url": self._server_url, "transport": "streamable_http"}
-            })
-            self._session_cm = self._client.session("playwright")
-            self._session = await self._session_cm.__aenter__()
-            raw_tools = await load_mcp_tools(self._session)
-            self._raw_tools_by_name = {t.name: t for t in raw_tools}
-            if not self._owns_server:
-                # Claim our OWN tab within the shared default browser
-                # context, replacing what the old --isolated flag used to
-                # guarantee (see _spawn_mcp_http_server's comment and the
-                # module docstring's "Multi-site delegation" section).
-                # Deliberately raised (not swallowed) on failure -- this is
-                # the actual isolation mechanism now, not a cosmetic
-                # nicety; a failure here must not silently fall through to
-                # this connection sharing a tab with someone else. The
-                # enclosing try/except below reports it as a normal failed
-                # delegate_website_task result rather than crashing the run.
-                tabs_tool = self._raw_tools_by_name.get("browser_tabs")
-                if tabs_tool is not None:
-                    await tabs_tool.coroutine(action="new")
-            self.tools = [self._guard(t) for t in raw_tools]
-            # request_human_help isn't a wrapped MCP tool -- it's our own
-            # Python method, added directly to the model-facing toolset
-            # (unlike _move_cursor_to/_start_reading_animation, which the
-            # model never calls itself). Given to BOTH the top-level
-            # provider and every sub-worker -- a login wall can turn up on
-            # any tab, not just the first one.
-            self.tools.append(StructuredTool.from_function(
-                coroutine=self._request_human_help,
-                name="request_human_help",
-                description=(self._request_human_help.__doc__ or "").strip(),
-            ))
-            # Same reasoning as request_human_help just above -- a signup or
-            # login form can turn up on any tab, top-level or sub-worker.
-            self.tools.append(StructuredTool.from_function(
-                coroutine=self._generate_account_credential,
-                name="generate_account_credential",
-                description=(self._generate_account_credential.__doc__ or "").strip(),
-            ))
-            self.tools.append(StructuredTool.from_function(
-                coroutine=self._get_account_credential,
-                name="get_account_credential",
-                description=(self._get_account_credential.__doc__ or "").strip(),
-            ))
-            # Given to BOTH the top-level provider and every sub-worker, same
-            # reasoning as request_human_help just above -- any tab can want a
-            # cheap read of some OTHER page before deciding whether it's worth
-            # a real browser_navigate. This is a pure function (see
-            # jina_reader.py) with no instance state of its own, so it's wired
-            # in directly rather than as a bound method like the others above.
-            self.tools.append(StructuredTool.from_function(
-                coroutine=_jina_fetch_rendered_page_text,
-                name="fetch_rendered_page_text",
-                description=(
-                    "Read a URL's rendered text WITHOUT using this browser session -- it runs "
-                    "on a remote reader service, not this Browserbase session, so it costs NO "
-                    "session time and doesn't touch this tab at all. Use it for reconnaissance "
-                    "or comparison: checking what a candidate page currently says, or comparing "
-                    "several candidate pages/sites, BEFORE deciding which one (if any) actually "
-                    "needs browser_navigate and real interaction -- this is how a task that "
-                    "combines reading and acting (e.g. 'find the cheapest of these and buy it') "
-                    "should be done: compare with this tool first across every candidate, THEN "
-                    "spend real browser/session time only on the one you're actually acting on. "
-                    "Still read-only -- it can't click, type, scroll, or log in. If it comes "
-                    "back empty or unhelpful for a page you genuinely need to read, fall back "
-                    "to browser_navigate + browser_snapshot on it instead."
-                ),
-            ))
-            # A second, independent provider for the exact same job as
-            # fetch_rendered_page_text just above (Parallel Search MCP
-            # instead of Jina Reader) -- same reasoning as request_human_help
-            # for being given to both top-level and sub-workers: if Jina is
-            # ever down or rate-limited, this is a real fallback that's
-            # still free/no-session, not an automatic escalation straight to
-            # spending more of this session's own browser time.
-            self.tools.append(StructuredTool.from_function(
-                coroutine=_parallel_web_fetch,
-                name="parallel_web_fetch",
-                description=(
-                    "A second, independent provider for the SAME job as fetch_rendered_page_text "
-                    "(a JS-rendered page read costing NO Browserbase session time) -- try this if "
-                    "fetch_rendered_page_text comes back empty or errors out on a page you "
-                    "genuinely need to read for comparison/reconnaissance. Also handles PDFs. "
-                    "Still read-only. If this ALSO fails, fall back to browser_navigate + "
-                    "browser_snapshot instead."
-                ),
-            ))
-            # delegate_website_task is deliberately owning-provider-only --
-            # _owns_server is the actual enforcement (not just leaving it
-            # off a sub-worker's tool list), so there is no path to
-            # recursive delegation even if this method were ever called
-            # directly.
-            if self._owns_server:
-                self.tools.append(StructuredTool.from_function(
-                    coroutine=self._delegate_website_task,
-                    name="delegate_website_task",
-                    description=(self._delegate_website_task.__doc__ or "").strip(),
-                ))
-            console.system(
-                f"Deepsearch: launched with {len(self.tools)} tools "
-                f"({'top-level' if self._owns_server else 'sub-worker ' + self._tab_id})."
-            )
-        except Exception as e:  # noqa: BLE001
-            console.tool_error(LABEL, "playwright_mcp_connect", str(e))
-            if self._owns_server:
-                if self._mcp_proc is not None and self._mcp_proc.returncode is None:
-                    self._mcp_proc.terminate()
-                if self._bb_session_id is not None:
-                    try:
-                        await browserbase.release_session(self._bb_session_id)
-                    except Exception as release_err:  # noqa: BLE001
-                        console.tool_error(LABEL, "browserbase_release_after_failure", str(release_err))
-            raise
-        return self
+            self._live_session_ready = True
 
     async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         # Belt-and-suspenders: guarded() already stops any in-flight reading
@@ -1006,7 +1177,17 @@ class BrowserToolProvider:
             except BrowserbaseError as e:
                 # Best-effort: the session will idle out on its own either way.
                 console.tool_error(LABEL, "browserbase_release", str(e))
-        console.system("Deepsearch: browser closed.")
+            console.system("Deepsearch: browser closed.")
+        else:
+            # The lazy-open path's success case: this run never made a
+            # single real browser tool call (e.g. it answered from
+            # fetch_rendered_page_text/parallel_web_fetch alone, or the
+            # model never got that far before finishing/erroring/being
+            # cancelled) -- so _ensure_live_session never ran and no
+            # Browserbase session was ever opened or billed. Worth its own
+            # distinct log line rather than a possibly-misleading "browser
+            # closed" for a browser that never existed.
+            console.system("Deepsearch: run finished without ever opening a browser session.")
 
     def _fire_cursor_move(self, name: str, element: str | None, target: str | None) -> None:
         """Fire-and-forget entry point for the cosmetic cursor arrow (+
@@ -1246,6 +1427,11 @@ class BrowserToolProvider:
         wrap up and report that this task needs the user's help."""
         if self._user_id is None:
             return "ERROR: request_human_help isn't available outside a real user session."
+        # No-op for a sub-worker (already eager); for the top-level provider,
+        # covers the unlikely case this is genuinely the model's first-ever
+        # action on a fresh run, before any browser_ tool call opened the
+        # session -- see _ensure_live_session's own docstring.
+        await self._ensure_live_session()
 
         console.system(f"Deepsearch: requesting human help on tab {self._tab_id} -- {reason}")
         request_row = await db.create_human_help_request(
@@ -1465,12 +1651,30 @@ class BrowserToolProvider:
         top-level agent would."""
         if not self._owns_server:
             return "ERROR: delegate_website_task cannot be called from within a sub-worker (no recursive delegation)."
-        if self._model is None or self._server_url is None:
+        if self._model is None:
             return "ERROR: delegate_website_task isn't available in this context."
+        # This is very plausibly the model's FIRST real action on a fresh
+        # run (e.g. "check the price on site A and site B" as the opening
+        # move) -- self._server_url doesn't exist yet until the top-level
+        # session actually opens, so trigger that here, same as guarded()
+        # does for a direct top-level tool call. A failure here means the
+        # WHOLE session could never be opened at all -- every other tab
+        # (the top-level's own, and any other concurrent delegation) is
+        # equally doomed, so this is treated exactly like a mid-run dead
+        # session: raised as _FatalBrowserSessionError so it propagates
+        # past this method's own error handling below (see the matching
+        # `except _FatalBrowserSessionError: raise` clauses) instead of
+        # being reported as just this one site's failure.
+        try:
+            await self._ensure_live_session()
+        except _FatalBrowserSessionError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise _FatalBrowserSessionError(str(e)) from e
         if not _domain_allowed(url):
             return f"BLOCKED: '{url}' is not in the allowed domain list."
 
-        assert self._subagent_semaphore is not None  # set alongside server_url in __aenter__
+        assert self._subagent_semaphore is not None  # set inside _ensure_live_session
         wait_start = time.monotonic()
         async with self._subagent_semaphore:
             queued_for = time.monotonic() - wait_start
@@ -1524,12 +1728,26 @@ class BrowserToolProvider:
                             summary = "(hit its step limit before finishing -- partial progress only)"
                         except asyncio.TimeoutError:
                             summary = "(hit the overall session time limit before finishing)"
+                        except _FatalBrowserSessionError:
+                            # The WHOLE shared session is gone, not just this
+                            # one site's task -- every other tab (the
+                            # top-level agent's own, and any other
+                            # concurrent sub-worker) is equally doomed, so
+                            # this must NOT be swallowed into a normal
+                            # per-site "(errored: ...)" result the way an
+                            # ordinary failure is a few lines down. Re-raise
+                            # past both this try and the outer one below so
+                            # it reaches the top-level run and ends it --
+                            # see _FatalBrowserSessionError's own docstring.
+                            raise
                         except Exception as e:  # noqa: BLE001
                             console.tool_error(LABEL, "delegate_website_task", str(e))
                             summary = f"(errored: {e})"
                     finally:
                         if self._user_id is not None:
                             live_activity.clear_tab(self._user_id, worker._tab_id)
+            except _FatalBrowserSessionError:
+                raise  # see the matching except above -- must keep propagating, not be caught here.
             except Exception as e:  # noqa: BLE001
                 # A failure opening the sub-worker's OWN tab/connection
                 # (distinct from a failure during its task, handled above) --
@@ -1542,12 +1760,35 @@ class BrowserToolProvider:
                 console.system(f"Deepsearch: sub-worker for {url} finished in {time.monotonic() - task_start:.2f}s.")
         return f"[{url}] {summary}"
 
-    def _guard(self, original: BaseTool) -> BaseTool:
-        name = original.name
+    def _guard(self, name: str, description: str, args_schema: Any) -> BaseTool:
+        """Wraps ONE raw MCP tool by name/description/schema only -- not a
+        live BaseTool instance -- so this can build a full, correctly-typed
+        StructuredTool the model can see and call immediately, even before
+        any real Browserbase session exists yet (see __aenter__'s
+        cache-hit path and _ensure_live_session below). guarded() resolves
+        the REAL underlying tool by name, fresh, on every call (via
+        self._raw_tools_by_name[name]) rather than closing over one
+        captured at wrap time -- the only way this can work whether
+        self._raw_tools_by_name was populated just now (lazy open, first
+        real call) or already, moments ago in __aenter__ (a cache-miss
+        eager open, or any sub-worker, which is always eager -- see
+        _ensure_live_session's own docstring for why only the TOP-LEVEL
+        provider is ever lazy)."""
         state = self._state
         approval_gate = self._approval_gate
 
         async def guarded(*args: Any, **kwargs: Any) -> Any:
+            # The one lazy-open trigger point: the model's first real
+            # browser tool call, whichever one it is, opens the actual
+            # Browserbase session right here -- see _ensure_live_session's
+            # own docstring for the full "why" (this is the fix for
+            # error.txt's "browser sits open and billed through a 221s
+            # blind planning call" finding). A no-op immediately once the
+            # session is already open (checked first thing inside it), so
+            # this costs nothing on the 2nd+ tool call of a run.
+            await self._ensure_live_session()
+            original = self._raw_tools_by_name[name]
+
             # A real action is about to happen -- if the "reading" scroll
             # animation is still playing from the previous browser_snapshot,
             # tell it to wind down now, before this call's own action, so
@@ -1644,6 +1885,42 @@ class BrowserToolProvider:
                 state["consecutive_errors"] += 1
                 console.tool_error(LABEL, name, str(e))
                 self._live_add_step(f"Error: {action_desc} failed ({e})")
+
+                # Fix for error.txt's real production incident: a confirmed-
+                # dead session (the user closed it, or Browserbase's own
+                # timeout fired) used to come back here as an ordinary
+                # retryable error -- "try a different approach" -- when
+                # there IS no different approach; every other tool call on
+                # this same session is doomed identically. That cost 11 more
+                # full top-level LLM turns (~330s) in the real incident,
+                # all guaranteed to fail. Raising here instead ends the run
+                # immediately (see _run's own except Exception handler,
+                # which already does the right cleanup/save-progress/report
+                # honestly -- this is the ONLY change needed to reach it).
+                if _is_dead_browser_session_error(e):
+                    console.system(
+                        f"Deepsearch: browser session is confirmed gone ({e}) -- ending this "
+                        "run now instead of retrying against a session that can never come back."
+                    )
+                    raise _FatalBrowserSessionError(str(e)) from e
+
+                # Softer, broader backstop: many failures in a row for ANY
+                # reason (not necessarily this exact dead-session shape)
+                # is still evidence of a genuinely stuck run -- see
+                # config.DEEPSEARCH_MAX_CONSECUTIVE_TOOL_ERRORS's own
+                # comment for why this is a separate, more generous check
+                # than the auth-wall nudge just below.
+                if state["consecutive_errors"] >= config.DEEPSEARCH_MAX_CONSECUTIVE_TOOL_ERRORS:
+                    console.system(
+                        f"Deepsearch: {state['consecutive_errors']} consecutive tool failures on "
+                        f"{'the top-level tab' if self._owns_server else f'tab {self._tab_id}'} "
+                        "-- ending this run now instead of continuing to retry."
+                    )
+                    raise _TooManyConsecutiveToolErrors(
+                        f"{state['consecutive_errors']} consecutive tool failures "
+                        f"(most recent: {e})"
+                    ) from e
+
                 msg = (
                     f"ERROR running '{name}': {e}. Do not retry with the exact same "
                     f"arguments. Take a fresh browser_snapshot, then try a different approach."
@@ -1667,9 +1944,9 @@ class BrowserToolProvider:
                 return msg
 
         return StructuredTool.from_function(
-            name=original.name,
-            description=original.description,
-            args_schema=original.args_schema,
+            name=name,
+            description=description,
+            args_schema=args_schema,
             coroutine=guarded,
         )
 
@@ -1690,7 +1967,7 @@ _SUBAGENT_SYSTEM_PROMPT = (
     "- Do exactly what the instructions ask, nothing more -- no exploring beyond this one goal, "
     "no extra things to report. A short, focused session is what's wanted here.\n"
     "- This tab's session time is genuinely billed -- before navigating anywhere, ask whether "
-    "parallel_web_fetch (or fetch_rendered_page_text as fallback) could answer it instead "
+    "fetch_rendered_page_text (or parallel_web_fetch if that fails) could answer it instead "
     "(comparing this site against others, confirming a fact, checking current content). Both "
     "cost no session time at all. Only use browser_navigate once you know THIS is the page you "
     "actually need to interact with.\n"
@@ -1728,8 +2005,8 @@ DEEPSEARCH_SYSTEM_PROMPT = (
     "- Money matters, not just speed: this whole session is billed by TIME held open, "
     "regardless of how much or little you actually do with it. Before calling browser_navigate "
     "on any candidate page you're not already sure you need to interact with, ask whether "
-    "parallel_web_fetch could answer it instead (falling back to fetch_rendered_page_text if "
-    "needed) -- both run on a separate reader service and cost NOTHING against this session. "
+    "fetch_rendered_page_text could answer it instead (parallel_web_fetch if that one fails) -- "
+    "both run on a separate reader service and cost NOTHING against this session. For a task "
     "that combines reading/comparing with acting (e.g. 'check these 3 sites and buy from "
     "whichever is cheapest'), the right shape is: read every candidate FIRST with one of those "
     "tools, decide which one wins, THEN spend real browser_navigate/session time only on that "
@@ -1843,142 +2120,212 @@ def build_deepsearch_subagent(
         }
         run_start = time.monotonic()
 
-        # live_view_url only gets set (and the "a browser is open right now"
-        # DB flag only gets flipped on) *after* BrowserToolProvider.__aenter__
-        # returns successfully -- so if opening the Browserbase session/CDP
-        # connection itself fails, there's nothing to clear here, and the
-        # try/finally below correctly never marks this user "live" for a
-        # browser that never actually opened.
-        #
-        # live_activity.start() is called HERE, before BrowserToolProvider
-        # even opens -- not after, like it used to be. This is the actual
-        # fix for the real "only 1 tile ever shows, no matter how many tabs
-        # are really open" bug: __aenter__ (below) creates the Browserbase
-        # session and immediately calls live_activity.set_session_id() to
-        # record bb_session_id, which server.py's _build_live_tiles needs to
-        # look up the real pages[] and build one tile per tab. start()
-        # unconditionally REPLACES this user's whole live_activity entry
-        # with a fresh dict (see its own docstring/module comment) -- when it
-        # ran AFTER __aenter__ returned, it was silently wiping the
-        # bb_session_id that set_session_id had just written moments
-        # earlier, every single time. With bb_session_id always back to None
-        # by the time anyone polled /live/<token>/status, _build_live_tiles
-        # always took its no-bb_session_id fallback path -- exactly one
-        # tile, built from the session-level live_view_url, regardless of
-        # how many tabs Browserbase actually had open. Starting it first
-        # means __aenter__'s set_session_id call (which uses
-        # _state.setdefault, not a fresh dict) lands on top of this same
-        # entry instead of being overwritten by it.
-        live_activity.start(user.user_id, task_title)
-        live_view_url = None
-        async with BrowserToolProvider(
-            approval_gate, user_id=user.user_id, deepsearch_session_id=session_id, model=model,
-            messa_email=user.messa_email,
-        ) as provider:
-            live_view_url = provider.live_view_url
-            if live_view_url:
-                await db.set_live_browser_active(user.user_id, live_view_url, task_title)
-            try:
-                _summarization = _deepsearch_summarization_middleware(model)
-                inner_agent = create_agent(
-                    model=model, tools=provider.tools, system_prompt=DEEPSEARCH_SYSTEM_PROMPT,
-                    checkpointer=checkpointer,
-                    middleware=[_summarization] if _summarization is not None else [],
-                )
-                status = "completed"
-                try:
-                    result = await asyncio.wait_for(
-                        inner_agent.ainvoke({"messages": messages}, config=run_config),
-                        timeout=config.DEEPSEARCH_MAX_SESSION_SECONDS,
-                    )
-                    final_messages = result["messages"]
-                except GraphRecursionError:
-                    status = "active"
-                    state_snapshot = await inner_agent.aget_state(run_config)
-                    final_messages = state_snapshot.values.get("messages", messages)
-                    console.system(
-                        f"Deepsearch: hit its {config.DEEPSEARCH_MAX_STEPS}-step limit -- "
-                        f"saving progress to session #{session_id} for later."
-                    )
-                except asyncio.TimeoutError:
-                    # Belt-and-suspenders session cap (config.DEEPSEARCH_MAX_SESSION_SECONDS)
-                    # -- independent of DEEPSEARCH_MAX_STEPS (a step COUNT,
-                    # not a time bound) and independent of
-                    # request_human_help's own bounded wait, this is what
-                    # actually guarantees a Browserbase session can't stay
-                    # open indefinitely even if something upstream of here
-                    # hangs. `async with` below still runs its normal
-                    # teardown on the way out of this except block, same as
-                    # any other exception.
-                    status = "active"
-                    try:
-                        state_snapshot = await inner_agent.aget_state(run_config)
-                        final_messages = state_snapshot.values.get("messages", messages)
-                    except Exception:  # noqa: BLE001
-                        final_messages = messages
-                    console.system(
-                        f"Deepsearch: hit its {config.DEEPSEARCH_MAX_SESSION_SECONDS}s overall "
-                        f"session time limit -- closing the browser and saving progress to "
-                        f"session #{session_id} for later."
-                    )
-                except Exception as e:  # noqa: BLE001
-                    status = "active"
-                    console.tool_error(LABEL, "deepsearch", str(e))
-                    try:
-                        state_snapshot = await inner_agent.aget_state(run_config)
-                        final_messages = state_snapshot.values.get("messages", messages)
-                    except Exception:
-                        final_messages = messages
-                    final_messages = [*final_messages, AIMessage(content=f"(run errored: {e})")]
-            finally:
-                # Signal "closing" *before* this `async with` block ends --
-                # the browser is still open and the DB still says a session
-                # is live (we haven't cleared it yet), but the live-view
-                # page's next poll can now proactively swap to a "Compiling
-                # your results..." screen instead of riding out whatever
-                # Browserbase's own embedded debug page renders the instant
-                # its CDP connection is torn down (a raw "Debugging
-                # connection was closed" banner) -- which happens moments
-                # from now, when `provider.__aexit__` below actually
-                # releases the Browserbase session.
-                if live_view_url:
-                    live_activity.set_closing(user.user_id)
+        # Registers THIS task (asyncio.current_task(), resolved inside
+        # register() itself) as "the deepsearch run currently in flight for
+        # this user" -- see deepsearch_control's own module docstring for
+        # why this works at all (no per-user message queue -- a later text
+        # from the same user runs as its own concurrent turn and can find
+        # this) and agents/registry.py's cancel_active_search tool +
+        # _build_system_prompt's "active search" hint for the model-driven
+        # trigger. Registered before anything that could take real time
+        # (the browser hasn't even opened yet, lazily or otherwise) so a
+        # "stop" text sent even during a long initial planning call can
+        # still find and cancel this. The whole rest of this function runs
+        # inside the try below purely so unregister() below is guaranteed
+        # to fire on every exit path, cancellation included.
+        deepsearch_control.register(user.user_id, task_title)
+        try:
+            # live_activity.start() is called HERE, before BrowserToolProvider
+            # even opens -- not after, like it used to be. This is the actual
+            # fix for the real "only 1 tile ever shows, no matter how many tabs
+            # are really open" bug: BrowserToolProvider (below) creates the
+            # Browserbase session and immediately calls live_activity.set_session_id()
+            # to record bb_session_id, which server.py's _build_live_tiles needs to
+            # look up the real pages[] and build one tile per tab. start()
+            # unconditionally REPLACES this user's whole live_activity entry
+            # with a fresh dict (see its own docstring/module comment) -- when it
+            # ran AFTER the session opened, it was silently wiping the
+            # bb_session_id that set_session_id had just written moments
+            # earlier, every single time. With bb_session_id always back to None
+            # by the time anyone polled /live/<token>/status, _build_live_tiles
+            # always took its no-bb_session_id fallback path -- exactly one
+            # tile, built from the session-level live_view_url, regardless of
+            # how many tabs Browserbase actually had open. Starting it first
+            # means the later set_session_id call (which uses
+            # _state.setdefault, not a fresh dict) lands on top of this same
+            # entry instead of being overwritten by it.
+            live_activity.start(user.user_id, task_title)
 
-        # BrowserToolProvider.__aexit__ has now released the Browserbase
-        # session -- only clear "a browser is live" state once that's
-        # actually true, mirroring the set_live_browser_active call above so
-        # it runs whether the agent finished cleanly, hit its step limit, or
-        # errored. Clearing this here (rather than in the finally above)
-        # keeps the "closing" signal up for the whole teardown window
-        # instead of flipping straight to idle before the front-end gets a
-        # chance to show the "closing" screen.
-        if live_view_url:
-            await db.clear_live_browser_active(user.user_id)
-            live_activity.clear(user.user_id)
-
-        console.system(f"Deepsearch: whole run took {time.monotonic() - run_start:.2f}s (status={status}).")
-        summary = _last_ai_text(final_messages)
-
-        if session_id:
-            await db.update_deepsearch_session(
-                session_id,
-                messages_json=json.dumps(messages_to_dict(final_messages), default=str),
-                status=status,
-                summary=summary,
-                steps_used=steps_so_far + len(final_messages),
-                live_view_url=live_view_url,
+            # Constructed as a plain variable (not inline in the `async
+            # with`) specifically so provider.live_view_url is always a
+            # valid thing to read in the outer `finally` below, whether or
+            # not __aenter__/the session ever actually opened -- see that
+            # finally's own comment. task_title is threaded through so
+            # BrowserToolProvider._ensure_live_session can call
+            # db.set_live_browser_active the moment the session actually
+            # opens (possibly well after this point now that opening is
+            # lazy -- see that method's own docstring), instead of this
+            # function doing it eagerly right after __aenter__ like before.
+            provider = BrowserToolProvider(
+                approval_gate, user_id=user.user_id, deepsearch_session_id=session_id, model=model,
+                messa_email=user.messa_email, task_title=task_title,
             )
-            if status == "active":
-                header = (
-                    f"[deepsearch session #{session_id} -- not finished, hit its step limit. "
-                    f"Say \"continue session #{session_id}\" to keep going.]\n"
-                )
-            else:
-                header = f"[deepsearch session #{session_id} -- completed]\n"
-        else:
-            header = "[deepsearch -- session tracking not enabled: run migrations/004_deepsearch_sessions.sql]\n"
+            try:
+                async with provider:
+                    try:
+                        _summarization = _deepsearch_summarization_middleware(model)
+                        inner_agent = create_agent(
+                            model=model, tools=provider.tools, system_prompt=DEEPSEARCH_SYSTEM_PROMPT,
+                            checkpointer=checkpointer,
+                            middleware=[_summarization] if _summarization is not None else [],
+                        )
+                        status = "completed"
+                        try:
+                            result = await asyncio.wait_for(
+                                inner_agent.ainvoke({"messages": messages}, config=run_config),
+                                timeout=config.DEEPSEARCH_MAX_SESSION_SECONDS,
+                            )
+                            final_messages = result["messages"]
+                        except GraphRecursionError:
+                            status = "active"
+                            state_snapshot = await inner_agent.aget_state(run_config)
+                            final_messages = state_snapshot.values.get("messages", messages)
+                            console.system(
+                                f"Deepsearch: hit its {config.DEEPSEARCH_MAX_STEPS}-step limit -- "
+                                f"saving progress to session #{session_id} for later."
+                            )
+                        except asyncio.TimeoutError:
+                            # Belt-and-suspenders session cap (config.DEEPSEARCH_MAX_SESSION_SECONDS)
+                            # -- independent of DEEPSEARCH_MAX_STEPS (a step COUNT,
+                            # not a time bound) and independent of
+                            # request_human_help's own bounded wait, this is what
+                            # actually guarantees a Browserbase session can't stay
+                            # open indefinitely even if something upstream of here
+                            # hangs. `async with` below still runs its normal
+                            # teardown on the way out of this except block, same as
+                            # any other exception.
+                            status = "active"
+                            try:
+                                state_snapshot = await inner_agent.aget_state(run_config)
+                                final_messages = state_snapshot.values.get("messages", messages)
+                            except Exception:  # noqa: BLE001
+                                final_messages = messages
+                            console.system(
+                                f"Deepsearch: hit its {config.DEEPSEARCH_MAX_SESSION_SECONDS}s overall "
+                                f"session time limit -- closing the browser and saving progress to "
+                                f"session #{session_id} for later."
+                            )
+                        except asyncio.CancelledError:
+                            # cancel_active_search (registry.py) cancelled
+                            # deepsearch_control's handle on this task --
+                            # the user asked to stop, or clearly implied
+                            # switching to something else, in a NEW message
+                            # that ran concurrently with this one (see
+                            # deepsearch_control's own module docstring for
+                            # why that's possible at all). Best-effort save
+                            # of whatever progress exists, exactly like the
+                            # timeout/step-limit cases above, but this must
+                            # re-raise at the end -- swallowing a
+                            # CancelledError would leave this task's own
+                            # cancellation silently incomplete, which is an
+                            # asyncio correctness bug, not just a style
+                            # preference. Everything after this whole
+                            # try/except (the status={status} log line, the
+                            # final db.update_deepsearch_session, the
+                            # return) is deliberately never reached on this
+                            # path -- the save below is a complete
+                            # substitute for it, not a partial one.
+                            status = "abandoned"
+                            console.system(
+                                f"Deepsearch: session #{session_id} cancelled by the user."
+                            )
+                            try:
+                                state_snapshot = await inner_agent.aget_state(run_config)
+                                final_messages = state_snapshot.values.get("messages", messages)
+                            except Exception:  # noqa: BLE001
+                                final_messages = messages
+                            if session_id:
+                                try:
+                                    await db.update_deepsearch_session(
+                                        session_id,
+                                        messages_json=json.dumps(messages_to_dict(final_messages), default=str),
+                                        status=status,
+                                        summary="(cancelled by the user)",
+                                        steps_used=steps_so_far + len(final_messages),
+                                        live_view_url=provider.live_view_url,
+                                    )
+                                except Exception:  # noqa: BLE001
+                                    pass
+                            raise
+                        except Exception as e:  # noqa: BLE001
+                            status = "active"
+                            console.tool_error(LABEL, "deepsearch", str(e))
+                            try:
+                                state_snapshot = await inner_agent.aget_state(run_config)
+                                final_messages = state_snapshot.values.get("messages", messages)
+                            except Exception:
+                                final_messages = messages
+                            final_messages = [*final_messages, AIMessage(content=f"(run errored: {e})")]
+                    finally:
+                        # Signal "closing" *before* this `async with` block ends --
+                        # the browser is still open and the DB still says a session
+                        # is live (we haven't cleared it yet), but the live-view
+                        # page's next poll can now proactively swap to a "Compiling
+                        # your results..." screen instead of riding out whatever
+                        # Browserbase's own embedded debug page renders the instant
+                        # its CDP connection is torn down (a raw "Debugging
+                        # connection was closed" banner) -- which happens moments
+                        # from now, when `provider.__aexit__` below actually
+                        # releases the Browserbase session.
+                        if provider.live_view_url:
+                            live_activity.set_closing(user.user_id)
+            finally:
+                # provider.live_view_url reflects reality now whether or not
+                # the browser ever actually opened (see
+                # BrowserToolProvider._ensure_live_session -- it's only ever
+                # set once a REAL session opens) -- unlike before this fix,
+                # when the browser opened unconditionally and eagerly, a
+                # run can now legitimately finish having never opened one at
+                # all (it answered entirely from fetch_rendered_page_text/
+                # parallel_web_fetch, or errored/got cancelled before its
+                # first real tool call). db.clear_live_browser_active stays
+                # conditional (nothing to clear if nothing was ever set
+                # live), but live_activity.clear() now runs UNCONDITIONALLY
+                # -- live_activity.start() above always creates an entry
+                # regardless of whether the browser ever opens, and it must
+                # always be cleared on the way out or it leaks forever
+                # (previously masked by the browser opening unconditionally
+                # too, so this pairing was never actually exercised as
+                # unconditional-start/conditional-clear before).
+                if provider.live_view_url:
+                    await db.clear_live_browser_active(user.user_id)
+                live_activity.clear(user.user_id)
 
-        return {"messages": [AIMessage(content=header + summary)]}
+            console.system(f"Deepsearch: whole run took {time.monotonic() - run_start:.2f}s (status={status}).")
+            summary = _last_ai_text(final_messages)
+
+            if session_id:
+                await db.update_deepsearch_session(
+                    session_id,
+                    messages_json=json.dumps(messages_to_dict(final_messages), default=str),
+                    status=status,
+                    summary=summary,
+                    steps_used=steps_so_far + len(final_messages),
+                    live_view_url=provider.live_view_url,
+                )
+                if status == "active":
+                    header = (
+                        f"[deepsearch session #{session_id} -- not finished, hit its step limit. "
+                        f"Say \"continue session #{session_id}\" to keep going.]\n"
+                    )
+                else:
+                    header = f"[deepsearch session #{session_id} -- completed]\n"
+            else:
+                header = "[deepsearch -- session tracking not enabled: run migrations/004_deepsearch_sessions.sql]\n"
+
+            return {"messages": [AIMessage(content=header + summary)]}
+        finally:
+            deepsearch_control.unregister(user.user_id)
 
     return {
         "name": "deepsearch",

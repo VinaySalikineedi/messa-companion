@@ -55,7 +55,7 @@ from typing import Any
 from deepagents import GeneralPurposeSubagentProfile, HarnessProfile, create_deep_agent, register_harness_profile
 from langchain_core.tools import BaseTool, tool
 
-from .. import config, console, db, memory, timeutil
+from .. import config, console, db, deepsearch_control, memory, timeutil
 from ..approval import ApprovalGate, CLIApprovalGate
 from ..channels import sendblue
 from ..channels.sendblue import SendblueError
@@ -354,12 +354,38 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
         lines = [r.get("memory", "") for r in results if r.get("memory")]
         return "From past conversations:\n" + "\n".join(f"- {line}" for line in lines)
 
+    @tool
+    async def cancel_active_search(reason: str | None = None) -> str:
+        """Stop a deepsearch (browsing/research) task that's currently
+        running in the background for this user RIGHT NOW -- ends it
+        immediately and releases its browser session, instead of it
+        continuing to run.
+
+        Call this ONLY when the user's message is a clear, explicit signal
+        to stop or abandon what's currently running -- either directly
+        ("stop", "cancel that", "never mind", "forget it") or by clearly
+        implying they want to do something else INSTEAD of waiting for it
+        ("actually, let's look at hotels instead", "different idea -- check
+        X for me"). Do NOT call this for an ambiguous message, a question
+        about progress ("how's it going", "any update?" -- that's
+        list_deepsearch_sessions instead), or an unrelated request that
+        could just as easily run after this one finishes -- when in doubt,
+        don't cancel; let it keep running and handle the new request
+        separately.
+
+        A no-op (not an error) if nothing is currently running -- safe to
+        call even if you're not fully sure a search is still active."""
+        cancelled = deepsearch_control.cancel(uid)
+        if not cancelled:
+            return "Nothing was currently running to cancel."
+        return "Cancelled the search that was running -- its browser session is being released now."
+
     raw_tools: list[BaseTool] = [
         confirm_pending_action, reject_pending_action, list_pending_actions,
         track_project, list_active_projects, save_profile_info,
         set_app_preference, list_my_connected_apps,
         list_deepsearch_sessions, find_contact, send_pdf_over_text,
-        recall_past_conversation,
+        recall_past_conversation, cancel_active_search,
         *build_web_search_tools(),
     ]
     return trace_all(raw_tools, ORCHESTRATOR_LABEL)
@@ -565,6 +591,27 @@ def _build_system_prompt(
             "live-view link right before the message is sent. Any URL you write will be invalid."
         )
 
+    # Only ever non-empty while a deepsearch task is genuinely still running
+    # for this user (deepsearch_control.describe returns None otherwise) --
+    # this is what lets cancel_active_search's own "only on a clear stop/
+    # pivot signal" instruction actually be judged against something real,
+    # instead of the model having to guess whether anything is even active.
+    # Computed fresh here (not carried on UserContext) since it's live
+    # in-process state, not a DB-backed field like everything else in
+    # 'Known about this user' above.
+    active_search_title = deepsearch_control.describe(user.user_id)
+    active_search_str = ""
+    if active_search_title:
+        active_search_str = (
+            f"\n\nA background search is currently running for this user right now: "
+            f"\"{active_search_title}\". If THIS message clearly asks to stop/cancel it, or "
+            "clearly implies wanting to do something else INSTEAD of waiting for it, call "
+            "cancel_active_search immediately, then respond warmly confirming you stopped it "
+            "before moving on to whatever they asked for instead. If the message is ambiguous, "
+            "just a progress check, or genuinely unrelated (could just as well run after this "
+            "one finishes), leave it running -- don't cancel on a guess."
+        )
+
     return (
         "You are Messa, a personal assistant reachable by text, email, and (soon) WhatsApp. "
         "You talk to the user directly and delegate specialized work to subagents via the "
@@ -724,6 +771,7 @@ def _build_system_prompt(
         "\"Checking flights now...\") so the user isn't staring at silence -- don't just go "
         "straight to a silent tool call."
         f"{live_view_str}"
+        f"{active_search_str}"
         "\n\n"
         "Critical: that acknowledgment and the task tool call must be in the SAME response "
         "-- there is no next turn where you get to actually make the call. If your reply "
