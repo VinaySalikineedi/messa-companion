@@ -325,7 +325,22 @@ async def get_live_status_by_token(token: str) -> dict[str, Any] | None:
     page. Returns None for an unknown/bad token (the route renders a plain
     404 for that -- distinct from a *valid* token with nothing running,
     which returns {"active": False, ...} so a wrong link never quietly
-    looks like a normal idle state)."""
+    looks like a normal idle state).
+
+    Deliberately does NOT fall back to searching message_history for a
+    user who was once texted this exact token, as a proposed fix for a
+    hallucinated-live-link bug considered doing (see cli.py's
+    _sanitize_live_view_urls for the actual fix that shipped instead).
+    That fallback would have taken `token` -- straight from the public,
+    unauthenticated URL path, with no charset restriction anywhere in the
+    route -- into a LIKE '%' || token || '%' pattern: since LIKE treats an
+    unescaped '%'/'_' inside the value as a real wildcard regardless of
+    parameterization, a request for a token containing one (e.g. a single
+    literal '%', percent-encoded as %25 in the URL) would match every row
+    and resolve to whichever user Messa most recently replied to -- handing
+    an anonymous visitor a real stranger's live browsing session. Rejected
+    on review; a dead/wrong link 404ing is the correct, safe behavior a
+    hallucinated token should have had all along, not a bug to soften."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         if not await _has_column(conn, "users", "live_share_token"):
@@ -367,7 +382,12 @@ async def get_user_by_live_token(token: str) -> dict[str, Any] | None:
     caller has to reason about fields it doesn't need. Returns None for an
     unknown token, or if migration 006 (which added live_share_token)
     hasn't been applied -- same "no dead link looks like a valid empty
-    state" reasoning as get_live_status_by_token."""
+    state" reasoning as get_live_status_by_token. Also gates the
+    /live/<token>/dashboard, /emails, and /emails/thread routes, so an
+    unknown token here means no tasks/reminders/schedule/contacts/email
+    content leaks either -- see get_live_status_by_token's own docstring
+    for the message_history-fallback approach that was considered and
+    rejected for exactly this function, for the same reason."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         if not await _has_column(conn, "users", "live_share_token"):

@@ -511,11 +511,10 @@ def _build_system_prompt(
     live_view_str = ""
     if user.live_view_share_url:
         live_view_str = (
-            " Specifically for deepsearch: your acknowledgment before delegating to it can "
-            "just be a short, natural line about what you're checking -- don't try to write "
-            "out a URL yourself. The system automatically appends the user's live-view link "
-            "to that same message right before it's sent, every single time, so you never "
-            "need to type, remember, or repeat the link -- just say what you're about to do."
+            " Specifically for deepsearch: your acknowledgment before delegating to it must "
+            "just be a short, natural line about what you're checking -- NEVER type or generate "
+            "a live-view link or URL yourself. The system automatically injects the user's authentic "
+            "live-view link right before the message is sent. Any URL you write will be invalid."
         )
 
     return (

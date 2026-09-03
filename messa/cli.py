@@ -242,6 +242,34 @@ def last_ai_text(messages: list) -> str:
     return ""
 
 
+_LIVE_VIEW_URL_RE = re.compile(r"https?://[^\s/]+/live/([A-Za-z0-9_-]+)", re.IGNORECASE)
+
+
+def _sanitize_live_view_urls(text: str, user: config.UserContext) -> str:
+    """Ensures any live-view URL in an assistant message points to this user's
+    authentic live_view_share_url, never a hallucinated/invented token
+    copied from context. If the user has no live_view_share_url, strips the
+    dead link entirely."""
+    if not text:
+        return text
+
+    real_share_url = user.live_view_share_url
+    real_token = user.live_view_token
+
+    def _replace_match(match: re.Match) -> str:
+        found_token = match.group(1)
+        if real_share_url and real_token:
+            if found_token == real_token:
+                return match.group(0)
+            return real_share_url
+        return ""
+
+    sanitized = _LIVE_VIEW_URL_RE.sub(_replace_match, text)
+    if not real_share_url:
+        sanitized = re.sub(r"Watch it live:\s*", "", sanitized, flags=re.IGNORECASE)
+    return sanitized
+
+
 async def _onboarding_complete_messages(user: config.UserContext) -> list[str]:
     """Fires exactly once per user, the turn onboarding_step first reaches
     "complete" (right after they answer the last onboarding question,
@@ -448,6 +476,7 @@ async def run_message(user: config.UserContext, agent, text: str, send=None) -> 
 
     async def _on_ai_message(msg_text: str, delegating_to: str | None = None) -> None:
         nonlocal deepsearch_extras_sent, is_first_deepsearch
+        msg_text = _sanitize_live_view_urls(msg_text, user)
         if delegating_to == "deepsearch" and not deepsearch_extras_sent:
             share_url = user.live_view_share_url
             extra_lines: list[str] = []
@@ -491,10 +520,12 @@ async def run_message(user: config.UserContext, agent, text: str, send=None) -> 
             # instead guarantees it's always said, always this short, and
             # never balloons turn over turn the way model-authored
             # boilerplate tends to.
-            extra_lines.append(
+            step_away_notice = (
                 "This can take a few minutes -- go ahead and step away, I'll text you "
                 "the second it's done."
             )
+            if "step away" not in msg_text.lower():
+                extra_lines.append(step_away_notice)
             if is_first_deepsearch is None:
                 is_first_deepsearch = not await db.has_prior_deepsearch_session(user.user_id)
             if is_first_deepsearch:
