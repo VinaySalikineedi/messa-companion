@@ -93,7 +93,7 @@ from typing import Any, Callable
 
 from langchain_core.tools import BaseTool, tool
 
-from .. import config, console, db
+from .. import config, console, db, usage
 from ..approval import ApprovalGate
 from ..channels.sendblue import SendblueError, send_message
 from .common import trace_tool
@@ -433,6 +433,19 @@ def build_integration_tools(
                     )
                 await db.disconnect_app_connection(existing["id"])
 
+        # max_connected_apps is a standing ceiling, not a daily rate --
+        # checked against Composio's own LIVE connected-accounts count
+        # (which already covers Gmail too, since it's connected through
+        # this same composio_user_id), never a cached/local number, so a
+        # stale row can't let someone slip past the cap or get wrongly
+        # blocked. Checked here, after any switch_account disconnect above
+        # already freed a slot, so a same-toolkit reconnect never counts
+        # against the user twice.
+        live_connected = await asyncio.to_thread(_connected_toolkits_sync, [])
+        cap_result = usage.check_connected_apps_cap(user, len(live_connected))
+        if not cap_result.allowed:
+            return cap_result.upgrade_message
+
         def _start_link():
             auth_config_id = _get_or_create_auth_config_id(client, toolkit_slug)
             return client.connected_accounts.link(
@@ -562,6 +575,18 @@ def build_integration_tools(
             client = _get_client()
         except _NotConfigured as e:
             return str(e)
+
+        # execute_integration_tool is one generic dispatcher for 1,400+
+        # apps' worth of actions -- there's no separate "send email" tool
+        # to tag the way email_tools.py/personal_inbox_tools.py do, so the
+        # usage-limits check has to live here, keyed on the incoming slug
+        # itself. Only a 3rd-party email SEND slug is metered; every other
+        # action (Todoist, Slack, Notion, read-only Outlook calls, ...)
+        # passes through unmetered, same as today.
+        if usage.slug_is_email_send(slug):
+            limit_result = await usage.check_and_consume(user, usage.FEATURE_OUTBOUND_EMAILS)
+            if not limit_result.allowed:
+                return limit_result.upgrade_message
 
         def _execute_sync() -> Any:
             kwargs: dict = {"slug": slug, "arguments": arguments, "user_id": composio_user_id}

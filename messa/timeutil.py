@@ -60,7 +60,7 @@ genuinely could not be end-to-end verified from within this sandbox.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone as dt_timezone
+from datetime import date, datetime, timedelta, timezone as dt_timezone
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
@@ -232,6 +232,19 @@ def format_local(dt: Optional[datetime], user_tz: str) -> str:
     tz = ZoneInfo(user_tz)
     local_dt = dt.astimezone(tz) if dt.tzinfo else dt.replace(tzinfo=dt_timezone.utc).astimezone(tz)
     return local_dt.strftime("%b %d, %Y %I:%M %p %Z")
+
+
+def local_today(user_tz: str | None) -> date:
+    """Today's date in the user's own timezone, not the server's -- what
+    "N/day" actually means for the usage-limits system (messa/plans.py,
+    messa/usage.py): a limit resets at THIS user's midnight, not an
+    arbitrary UTC cutoff that could land hours off from their own day.
+    Falls back to UTC when a timezone isn't set/confirmed yet (the same
+    fallback UserContext.timezone_confirmed already signals elsewhere) --
+    a plain, safe default rather than crashing a turn over an unresolved
+    timezone."""
+    tz = ZoneInfo(user_tz) if user_tz else dt_timezone.utc
+    return datetime.now(tz).date()
 
 
 def current_context_str(user_tz: str, confirmed: bool) -> str:

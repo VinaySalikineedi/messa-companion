@@ -61,7 +61,7 @@ from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import BaseTool, tool
 
-from .. import config, console, db
+from .. import config, console, db, usage
 from ..approval import ApprovalGate
 from ..channels.sendblue import SendblueError, send_message
 from .common import last_ai_text, trace_tool
@@ -296,6 +296,22 @@ def build_email_tools(user: config.UserContext, approval_gate: ApprovalGate | No
                     )
                 await db.mark_email_disconnected(existing["id"], user.user_id)
 
+        # max_connected_apps is a standing ceiling shared with
+        # integration_tools.py's connect_integration_app, not a separate
+        # Gmail-only cap -- Gmail is connected through this same
+        # composio_user_id, so counting Composio's own live
+        # connected_accounts here (not a cached/local number) already
+        # includes it alongside every other connected toolkit.
+        def _connected_count_sync() -> int:
+            result = client.connected_accounts.list(user_ids=[composio_user_id], statuses=["ACTIVE"])
+            items = getattr(result, "items", result)
+            return len(list(items))
+
+        live_count = await asyncio.to_thread(_connected_count_sync)
+        cap_result = usage.check_connected_apps_cap(user, live_count)
+        if not cap_result.allowed:
+            return cap_result.upgrade_message
+
         def _start_link():
             auth_config_id = _get_or_create_gmail_auth_config_id(client)
             return client.connected_accounts.link(
@@ -443,12 +459,21 @@ def build_email_tools(user: config.UserContext, approval_gate: ApprovalGate | No
             return _always_destructive
         return None
 
+    # outbound_emails is one logical usage-limits feature spanning three
+    # physical send paths (see plans.py's own comment on the field) --
+    # this is the Gmail leg of it. send_email and reply_to_email both
+    # produce a real outbound message; get/list/status/disconnect tools
+    # don't send anything and aren't tagged.
+    _OUTBOUND_EMAIL_TOOLS = {"send_email", "reply_to_email"}
+
     return [
         trace_tool(
             t, LABEL,
             destructive=t.name in _DESTRUCTIVE,
             destructive_check=_destructive_check_for(t.name),
             approval_gate=approval_gate,
+            feature="outbound_emails" if t.name in _OUTBOUND_EMAIL_TOOLS else None,
+            user=user,
         )
         for t in raw_tools
     ]

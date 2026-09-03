@@ -122,7 +122,7 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.errors import GraphRecursionError
 
-from .. import config, console, credentials, db, live_activity
+from .. import config, console, credentials, db, live_activity, usage
 from ..approval import ApprovalGate
 from ..channels import browserbase
 from ..channels.browserbase import BrowserbaseError
@@ -1725,6 +1725,20 @@ def build_deepsearch_subagent(
     the open/close-per-task and session-resumption design."""
 
     async def _run(state: dict[str, Any]) -> dict[str, Any]:
+        # One usage-limits unit per top-level browsing session opened here
+        # (session resumption included -- BrowserToolProvider's own
+        # "open/close-per-task" design means even a continuation opens a
+        # fresh Browserbase session, so it costs the same real money as a
+        # brand-new task and is metered the same way). Checked as the very
+        # first thing in this function, before the session lookup or
+        # anything else that costs a DB round trip or a model call -- a
+        # blocked request never opens a Browserbase session, never spawns
+        # the MCP server subprocess, and never runs an LLM turn, which is
+        # both the cheapest and the fastest way to enforce this.
+        limit_result = await usage.check_and_consume(user, usage.FEATURE_BROWSE_ACTIONS)
+        if not limit_result.allowed:
+            return {"messages": [AIMessage(content=limit_result.upgrade_message)]}
+
         incoming = state["messages"]
         last_text = _message_text(incoming[-1]) if incoming else ""
         match = _SESSION_REF_RE.search(last_text)

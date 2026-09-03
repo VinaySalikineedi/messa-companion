@@ -9,3 +9,6 @@ outputs/
 .playwright-mcp/
 .DS_Store
 messa/node_modules/
+Claude outputs/
+error.txt
+tests/

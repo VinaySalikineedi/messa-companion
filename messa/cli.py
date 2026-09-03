@@ -13,7 +13,7 @@ import traceback
 
 from langchain_core.messages import HumanMessage
 
-from . import background, config, console, db, session_store
+from . import background, config, console, db, session_store, usage
 from .agents.registry import build_orchestrator
 from .approval import CLIApprovalGate
 
@@ -81,6 +81,8 @@ async def _context_from_row(user_row: dict, channel: str) -> config.UserContext:
         email_connected=bool(user_row.get("email_connected", False)),
         messa_email_local_part=messa_email_local_part,
         default_email_provider=user_row.get("default_email_provider") or "messa",
+        plan_id=user_row.get("plan_id") or config.plans.DEFAULT_PLAN_ID,
+        is_admin=bool(user_row.get("is_admin", False)),
     )
 
 
@@ -294,6 +296,41 @@ async def _onboarding_complete_messages(user: config.UserContext) -> list[str]:
     return messages
 
 
+async def _send_limit_notice_once(
+    user: config.UserContext, feature: str, status: usage.LimitResult, send, marker_context: str,
+) -> str | None:
+    """Shared by run_message's pre-agent gate and its mid-turn check in
+    _on_ai_message below: claims the day's one "you're over your limit"
+    notice (usage.claim_daily_notice) and, only if THIS call actually won
+    that claim, writes a system-role backlog marker plus the user-facing
+    notice itself, sends it, and returns it. Returns None when nothing
+    should go out this time -- either someone already claimed the notice
+    for today, or the caller decides not to send one -- in which case the
+    caller drops the current message/turn silently rather than repeating
+    "you're over your limit" on every subsequent message, which would read
+    as spammy and add no new information (see usage_limits_proposal.md's
+    "chicken-and-egg problem, resolved")."""
+    if not await usage.claim_daily_notice(user, feature):
+        return None
+    notice = (
+        f"You've hit your daily limit for {feature.replace('_', ' ')} "
+        f"({status.count}/{status.limit_display}) on the {status.plan_name} plan. I'll go "
+        "quiet on this until it resets -- upgrading for a higher limit is coming soon."
+    )
+    marker = (
+        f"The user went over their daily {feature} limit {marker_context}. Messages logged "
+        "from here until the limit resets were not answered in real time -- once this "
+        "conversation resumes after the reset, treat any of their messages that follow this "
+        "marker as backlog to briefly acknowledge, not live questions to individually answer "
+        "one by one."
+    )
+    await db.append_message(user.user_id, "system", marker, channel=user.channel)
+    await db.append_message(user.user_id, "assistant", notice, channel=user.channel)
+    if send:
+        await send(notice)
+    return notice
+
+
 async def run_message(user: config.UserContext, agent, text: str, send=None) -> str:
     """One full, stateless turn for `user`: loads recent DB history for
     context, runs it, persists both sides, returns the final reply text.
@@ -363,10 +400,32 @@ async def run_message(user: config.UserContext, agent, text: str, send=None) -> 
     # this alone isn't expected to fix dropped-delegation replies -- that's
     # a structural model-behavior issue (see run_turn's retry logic above),
     # not a context-size one.
+    # Inbound message is always logged, whether or not this turn ends up
+    # producing a reply -- this table is the honest record of what
+    # actually happened (see usage_limits_proposal.md's "blocked messages
+    # aren't lost" section), and it's what let the pre-agent gate below
+    # even exist: without this line running first, a user's texts sent
+    # while over their limit would just vanish instead of showing up as
+    # backlog once the limit resets.
+    await db.append_message(user.user_id, "user", text, channel=user.channel)
+
+    # Pre-agent usage gate for number_of_texts, checked BEFORE loading
+    # history or building/running the agent at all -- a user already over
+    # today's limit costs zero model calls and zero tool calls for a reply
+    # that was never going to reach their phone anyway (see
+    # usage_limits_proposal.md's "chicken-and-egg problem, resolved").
+    if not user.is_admin:
+        texts_status = await usage.peek_usage(user, usage.FEATURE_NUMBER_OF_TEXTS)
+        if not texts_status.allowed:
+            notice = await _send_limit_notice_once(
+                user, usage.FEATURE_NUMBER_OF_TEXTS, texts_status, send,
+                marker_context="at the start of this message",
+            )
+            return notice or ""
+
     recent = await db.get_recent_messages(user.user_id, limit=12)
     history = [{"role": r["role"], "content": r["content"]} for r in recent]
     history.append({"role": "user", "content": text})
-    await db.append_message(user.user_id, "user", text, channel=user.channel)
 
     sent_texts: list[str] = []
     # Once per incoming message, not once per delegation: a compound ask
@@ -453,6 +512,26 @@ async def run_message(user: config.UserContext, agent, text: str, send=None) -> 
             deepsearch_extras_sent = True
         if not msg_text:
             return  # nothing to say and no link to attach -- e.g. a silent, non-deepsearch delegation
+
+        if not user.is_admin:
+            # The pre-agent gate in run_message only catches a user who was
+            # ALREADY over their limit before this turn started -- a turn
+            # that sends several messages in a row (an ack plus a
+            # delegation summary, say) can still cross the daily cap
+            # partway through. Same rule applies here: consume one unit
+            # for the message about to go out, and if that pushes the
+            # user over, either send today's one notice (if nobody's
+            # claimed it yet) or drop this message silently.
+            text_result = await usage.check_and_consume(user, usage.FEATURE_NUMBER_OF_TEXTS)
+            if not text_result.allowed:
+                notice = await _send_limit_notice_once(
+                    user, usage.FEATURE_NUMBER_OF_TEXTS, text_result, send,
+                    marker_context="mid-conversation",
+                )
+                if notice:
+                    sent_texts.append(notice)
+                return  # this particular message is dropped either way
+
         sent_texts.append(msg_text)
         await db.append_message(user.user_id, "assistant", msg_text, channel=user.channel)
         if send:

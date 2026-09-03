@@ -19,8 +19,9 @@ from typing import Any, Callable, Sequence
 
 from langchain_core.tools import BaseTool, StructuredTool, tool as tool_decorator
 
-from .. import console
+from .. import console, usage
 from ..approval import ApprovalGate
+from ..config import UserContext
 
 
 def last_ai_text(messages: list[Any]) -> str:
@@ -49,6 +50,8 @@ def trace_tool(
     destructive: bool = False,
     approval_gate: ApprovalGate | None = None,
     destructive_check: Callable[..., bool] | None = None,
+    feature: str | None = None,
+    user: "UserContext | None" = None,
 ) -> BaseTool:
     """Wrap a tool with tracing, error handling, and optional confirmation.
 
@@ -62,7 +65,19 @@ def trace_tool(
     `destructive` flag. Every other tool in this app has a fixed, known-at-
     registration-time destructiveness (send_email is always destructive,
     list_recent_emails never is) and just uses the plain `destructive` bool
-    as before -- this parameter changes nothing for them."""
+    as before -- this parameter changes nothing for them.
+
+    feature/user: opt in to a usage-limit check (see ../usage.py) for a
+    tool whose entire call is one costed unit -- e.g. email_tools.py's
+    send_email tagged feature="outbound_emails". Both must be given
+    together (a `feature` with no `user` can't be checked against a plan
+    and is silently ignored) since most tools aren't metered at all. This
+    runs BEFORE the destructive-approval gate below, not after: there's no
+    point prompting the user to confirm an action that's already blocked
+    by their plan. execute_integration_tool's per-slug email match is a
+    separate, narrower check inside that tool itself (its single generic
+    dispatcher covers far more than one feature), not this parameter --
+    see tools/integration_tools.py."""
 
     name = original.name
     is_async_native = original.coroutine is not None
@@ -78,6 +93,12 @@ def trace_tool(
     async def guarded(*args: Any, **kwargs: Any) -> Any:
         display_args = kwargs if kwargs else {"args": args}
         console.tool_call(label, name, display_args)
+
+        if feature and user is not None:
+            limit_result = await usage.check_and_consume(user, feature)
+            if not limit_result.allowed:
+                console.tool_result(label, name, limit_result.upgrade_message)
+                return limit_result.upgrade_message
 
         is_destructive_this_call = destructive_check(*args, **kwargs) if destructive_check else destructive
         if is_destructive_this_call:

@@ -2694,3 +2694,83 @@ async def get_document_share_by_token(token: str) -> dict[str, Any] | None:
             "SELECT * FROM generated_document_shares WHERE token = $1", token,
         )
         return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Usage limits / subscription plans (migrations/023_usage_limits.sql,
+# messa/plans.py, messa/usage.py). One row per user per feature per day;
+# `day` is the CALLER's responsibility to compute in the user's own
+# timezone (see timeutil.local_today) -- this module just stores whatever
+# date it's given.
+# ---------------------------------------------------------------------------
+
+async def check_and_increment_usage(
+    user_id: int, feature: str, day: Any, limit: int | None, amount: int = 1,
+) -> tuple[bool, int]:
+    """Atomically increments usage_daily_counts(user_id, feature, day) by
+    `amount` and reports whether the count after incrementing is still
+    within `limit` (None = always allowed -- still increments, for cost
+    visibility even on an unlimited plan/feature). One
+    INSERT ... ON CONFLICT ... RETURNING statement, so two concurrent tool
+    calls in the same turn (e.g. Messa sending two texts back to back)
+    can't both read a stale count and both slip past the cap -- Postgres
+    itself serializes the upsert.
+
+    Deliberately always increments, even on the call that pushes the count
+    past `limit`: under real concurrency, a couple of calls landing at
+    exactly the boundary could all get counted before any of them observes
+    `allowed=False`. Accepted on purpose -- this is a soft, conversational
+    daily cap, not a hard security boundary, and always incrementing keeps
+    the stored count an honest record of what actually happened rather
+    than an undercount that stops the moment the limit is hit.
+
+    Returns (True, 0) if migration 023 hasn't been applied yet to this
+    deployment, OR if anything about reaching the database itself fails
+    (pool creation, a dropped connection, ...) -- fails OPEN (nothing is
+    ever blocked) rather than a DB hiccup on this one counter table taking
+    down every metered tool call across the whole app. Logged, not
+    silent -- a real outage should be visible in the console even though
+    it doesn't block anyone."""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            if not await _has_table(conn, "usage_daily_counts"):
+                return True, 0
+            row = await conn.fetchrow(
+                """
+                INSERT INTO usage_daily_counts (user_id, feature, day, count, updated_at)
+                VALUES ($1, $2, $3, $4, NOW())
+                ON CONFLICT (user_id, feature, day)
+                DO UPDATE SET count = usage_daily_counts.count + $4, updated_at = NOW()
+                RETURNING count
+                """,
+                user_id, feature, day, amount,
+            )
+    except Exception as e:  # noqa: BLE001 - usage metering must never break a real tool call
+        console.system(f"check_and_increment_usage: DB unavailable, failing open ({feature}): {e}")
+        return True, 0
+    count_after = row["count"]
+    allowed = limit is None or count_after <= limit
+    return allowed, count_after
+
+
+async def get_usage_count(user_id: int, feature: str, day: Any) -> int:
+    """Read-only peek at today's count so far, with no increment -- used
+    for a pre-agent-run gate (cli.run_message) that needs to know "is this
+    user already over their limit" before deciding whether to even start
+    an agent loop, without itself counting as a use. Returns 0 for a
+    missing row, a missing table, or any DB-reachability failure (same
+    fail-open reasoning as check_and_increment_usage)."""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            if not await _has_table(conn, "usage_daily_counts"):
+                return 0
+            row = await conn.fetchrow(
+                "SELECT count FROM usage_daily_counts WHERE user_id = $1 AND feature = $2 AND day = $3",
+                user_id, feature, day,
+            )
+            return row["count"] if row else 0
+    except Exception as e:  # noqa: BLE001 - usage metering must never break a real tool call
+        console.system(f"get_usage_count: DB unavailable, failing open ({feature}): {e}")
+        return 0

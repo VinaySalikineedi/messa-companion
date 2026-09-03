@@ -12,6 +12,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
+from . import plans
+
 load_dotenv()
 
 
@@ -896,6 +898,20 @@ class UserContext:
     # agents/registry.py's set_default_email_provider tool; connecting
     # Gmail does NOT change this by itself.
     default_email_provider: str = "messa"
+    # From users.plan_id (migrations/023_usage_limits.sql) -- a free-text
+    # key into plans.ACTIVE_PLANS, not a Postgres ENUM (see that
+    # migration's own comment for why). Defaults to plans.DEFAULT_PLAN_ID
+    # here too, matching every other column above that mirrors its own
+    # DB-side default, so behavior is identical whether or not migration
+    # 023 has run yet. plans.get_plan() never raises on an unrecognized
+    # value -- it falls back to the default plan instead.
+    plan_id: str = plans.DEFAULT_PLAN_ID
+    # From users.is_admin (migrations/023_usage_limits.sql) -- a quiet,
+    # unadvertised bypass for the dev team's own accounts, checked in
+    # exactly one place (usage.check_and_consume) rather than scattered
+    # through every hook point. Never surfaced on the pricing page or in
+    # plans.py; set with a manual `UPDATE users SET is_admin = true`.
+    is_admin: bool = False
 
     @property
     def onboarding_complete(self) -> bool:

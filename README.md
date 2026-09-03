@@ -5549,3 +5549,159 @@ other prompt-only change in this project), and no live Composio account
 was available in this sandbox to confirm `revoke_on_delete=True`'s
 real-world timing end-to-end -- the async/unpollable behavior is taken
 from the SDK source, not observed live.
+
+## Usage limits and subscription plans
+
+A generalized, config-driven system metering four costed actions --
+outbound email, browsing sessions, outbound texts, and how many apps can
+be connected at once -- against a per-user daily/standing cap that depends
+on which plan they're on, with a quiet unadvertised admin bypass and a
+fast, no-redeploy way to change plans/prices. See
+`usage_limits_proposal.md` for the full design writeup this implements,
+including the pricing rationale; this entry covers what was actually
+built and verified.
+
+- `plans.py` (new): the single file answering "what plans exist and what
+  do they allow" -- `Plan`/`PlanLimits` dataclasses, `PLANS` (basic/pro/
+  plus/business, `None` meaning unlimited on any limit field), and
+  `MESSA_PLANS_OVERRIDE_JSON` -- an optional env var (e.g. a Hugging Face
+  Spaces variable) that replaces the whole plan set at once, parsed and
+  validated ONCE at process startup rather than per request, so a
+  malformed override fails loudly at boot instead of drifting silently or
+  crashing some unrelated request later. JSON `null` round-trips straight
+  to Python `None` for "unlimited" -- no separate sentinel to get wrong.
+- `usage.py` (new): the one module every hook point below calls into
+  instead of re-implementing plan lookup, day-bucketing, or admin bypass
+  itself -- `check_and_consume`/`peek_usage` for the three daily-rate
+  features, `check_connected_apps_cap` for the one standing-ceiling
+  feature, and `claim_daily_notice` (an atomic "am I the first caller
+  today" claim, reusing the same counting primitive rather than a second
+  mechanism) for the one-notice-per-day rule. `LimitResult.upgrade_message`
+  is model-facing text, not a fixed user-facing string, matching how
+  `trace_tool` already turns any other tool error into something the
+  model relays conversationally.
+- `db.py`: new `usage_daily_counts` table (migration
+  `023_usage_limits.sql`, plus `users.plan_id`/`users.is_admin`) and
+  `check_and_increment_usage`/`get_usage_count` -- one atomic
+  `INSERT ... ON CONFLICT ... RETURNING count` per check, so concurrent
+  tool calls in the same turn can't both slip past a cap. Both functions
+  fail OPEN (never block, log via `console.system`) on ANY database
+  problem -- a missing migration, a dropped connection, the pool itself
+  failing to establish -- not just the already-existing "table doesn't
+  exist yet" case, so a DB hiccup on this one counter table can never take
+  down every metered tool call across the app. `timeutil.local_today`
+  computes the day bucket in the user's own confirmed timezone (falling
+  back to UTC otherwise), so a "N/day" limit actually resets at that
+  user's own midnight, not an arbitrary server cutoff.
+- `users.plan_id` is a free-text key into `plans.py`, deliberately NOT an
+  extension of the pre-existing (and, it turned out, completely unused)
+  `user_tier` Postgres ENUM already in the schema -- growing an ENUM's
+  value set is a migration every time, which fights the entire point of
+  "plans are data, defined in one file." That old column/type is left
+  alone rather than repurposed.
+- Four metering hook points, chosen per-feature because outbound email in
+  particular has no single choke point to wrap:
+  - `tools/common.py`'s `trace_tool` gained optional `feature`/`user`
+    params, checked before the destructive-approval gate (no point
+    prompting for confirmation on an action that's already blocked).
+    Wired into `email_tools.py` and `personal_inbox_tools.py`'s
+    `send_email`/`reply_to_email` -- both feed the SAME `outbound_emails`
+    counter, since it's one logical limit spanning physically separate
+    send paths.
+  - `integration_tools.py`'s `execute_integration_tool` is one generic
+    dispatcher for 1,400+ apps' worth of actions, so there's no single
+    tool to tag -- the check lives inside it instead, keyed on an explicit
+    allowlist of known email-send action slugs
+    (`usage.EMAIL_SEND_ACTION_SLUGS`), matched exactly rather than by a
+    fuzzy "SEND"/"EMAIL" substring search, which would both false-count
+    unrelated actions and miss real ones given Composio's inconsistent
+    naming across toolkits. This allowlist is a starting set, not verified
+    against a live Composio catalog -- confirm/extend it against the real
+    registered slug the first time a new email-capable toolkit gets
+    connected. `GMAIL_SEND_EMAIL` is deliberately excluded: Gmail sends
+    are supposed to never reach this tool at all, per
+    `integrations_agent`'s own system prompt.
+  - `deepsearch_tools.py`'s `build_deepsearch_subagent._run` checks
+    `browse_actions` as the very first thing it does, before the session
+    lookup, before opening a Browserbase session, before any model call --
+    a blocked request costs nothing. One unit per top-level session
+    opened (session resumption included, since `BrowserToolProvider`'s
+    open/close-per-task design means even a continuation opens a fresh,
+    real-money Browserbase session), never for a delegated sub-worker tab
+    sharing an already-open session.
+  - `cli.py`'s `run_message` checks `number_of_texts` BEFORE loading
+    history or building/running the agent at all -- a user already over
+    today's limit costs zero model/tool calls for a reply that was never
+    going to reach their phone. A second check lives in `_on_ai_message`
+    (the per-outbound-message callback) for the case a turn crosses the
+    cap partway through, sending several messages in one turn. Both share
+    one new `_send_limit_notice_once` helper: it claims the day's one
+    notice (`usage.claim_daily_notice`), and only the caller that actually
+    wins that claim writes a `system`-role backlog marker into
+    `message_history` (using the pre-existing `'system'` value on the
+    `message_role` enum, previously unused) alongside the user-facing
+    notice -- so once the limit resets and this user's history is
+    reloaded, whatever they sent while blocked reads as backlog to briefly
+    acknowledge, not a stack of live questions the model feels obligated
+    to answer one by one.
+- `max_connected_apps` is a standing ceiling, not a daily rate, so it
+  needs no counter table at all -- `email_tools.py`'s
+  `request_email_connection` and `integration_tools.py`'s
+  `connect_integration_app` both check it against Composio's own LIVE
+  `connected_accounts.list` count (which already covers Gmail too, since
+  it shares the same Composio user id as every other connected toolkit),
+  never a cached/local number, right before generating a new connect link
+  -- so it can't block or admit a connection based on stale data, and a
+  `switch_account=True` reconnect (which disconnects the old one first)
+  never counts against the user twice.
+- Admin bypass: a plain `users.is_admin` boolean, deliberately separate
+  from `plan_id` and never a key in `plans.PLANS` -- checked in exactly
+  one place (`usage.check_and_consume`/`check_connected_apps_cap`) rather
+  than scattered through every hook point above, so there's one bug
+  surface for "does admin actually bypass everything." Admin usage is
+  still recorded (not skipped) for cost visibility; only the `allowed`
+  decision is forced true. Set with a manual
+  `UPDATE users SET is_admin = true WHERE phone_number = '...'` -- no
+  admin UI, nothing discoverable anywhere in the product.
+
+**Verification**: new `/tmp/test_usage_limits.py` (39 checks) -- the
+atomic increment/limit-check pair against a fake pool proving no lost
+updates under 10 concurrent "requests" for the same counter, the missing-
+table and DB-unreachable fail-open paths for both `check_and_increment_
+usage` and `get_usage_count`, `plans.py`'s override parser (`null` ->
+`None`, missing required fields, a missing default plan id, all raising
+clear `ValueError`s) and `get_plan`'s unknown-id/`None` fallback,
+`usage.py`'s admin bypass (allowed even ~50% over the Basic cap, usage
+still recorded) and confirmation that an unlimited-seeming plan
+(Business, 1000/day) still enforces its own real number rather than being
+silently infinite, `claim_daily_notice`'s exactly-once-per-day behavior,
+`check_connected_apps_cap`'s exact boundary (blocks AT the cap, allows one
+below it), the email-send slug allowlist (case-insensitive match,
+`GMAIL_SEND_EMAIL` correctly excluded, an unrelated action correctly not
+matching), and `cli._send_limit_notice_once` (exactly one system marker
+and one assistant notice written and sent on the first call, nothing on
+the second). Also fixed two other suites' Composio fakes
+(`test_disconnect_switch.py`, `test_email_oauth_tools.py`) to add the new
+`connected_accounts.list` call this feature introduces, and added the
+missing `OPENROUTER_API_KEY`/`DATABASE_URL` env defaults
+`test_web_search_tools.py` needed once `tools/common.py` started pulling
+in `config.py` transitively -- re-ran the full regression suite
+afterward; the DB-unreachable fail-open change alone fixed six
+previously-failing suites outright (they'd never needed a fake DB pool
+before this feature added a real DB call to a path they exercise for
+unrelated reasons). Remaining failures after all of the above are the
+same pre-existing, unrelated-to-this-change set as prior rounds
+(browser/CDP-dependent suites, `test_dashboard_route.py`, and
+`test_onboarding_and_deepsearch_msg.py`, which has never set its own
+`OPENROUTER_API_KEY` and would fail identically with this feature absent
+entirely). Not verified: no real Postgres/Hugging Face Spaces environment
+was available in this sandbox to confirm `MESSA_PLANS_OVERRIDE_JSON`
+actually gets picked up on a real Space restart, or that migration
+`023_usage_limits.sql` applies cleanly against a live Neon database --
+both are taken from this project's existing, already-proven migration/env
+patterns, not observed end-to-end here. Also not verified: no live LLM
+was available to confirm the model actually relays `upgrade_message`
+conversationally rather than verbatim (same standing caveat as every
+other prompt/tool-error-text change in this project), and the
+`EMAIL_SEND_ACTION_SLUGS` allowlist's exact slug strings are a best-effort
+starting set, not confirmed against a live Composio catalog.

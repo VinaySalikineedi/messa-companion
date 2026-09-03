@@ -236,8 +236,17 @@ def build_personal_inbox_tools(
     raw_tools: list[BaseTool] = [
         get_my_messa_email, send_email, reply_to_email, get_thread_history, search_my_emails,
     ]
+    # outbound_emails is one logical usage-limits feature spanning three
+    # physical send paths (see plans.py's own comment on the field) -- this
+    # is Messa's-own-address leg of it, alongside email_tools.py's Gmail
+    # leg and integration_tools.py's Composio-slug-matched leg.
+    _OUTBOUND_EMAIL_TOOLS = {"send_email", "reply_to_email"}
     return [
-        trace_tool(t, LABEL, destructive=t.name in _DESTRUCTIVE, approval_gate=approval_gate)
+        trace_tool(
+            t, LABEL, destructive=t.name in _DESTRUCTIVE, approval_gate=approval_gate,
+            feature="outbound_emails" if t.name in _OUTBOUND_EMAIL_TOOLS else None,
+            user=user,
+        )
         for t in raw_tools
     ]
 

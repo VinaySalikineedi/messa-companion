@@ -11,4 +11,5 @@ browser_profiles/
 deepsearch_profiles/
 cloudflare/personal-email-worker/node_modules/
 .wrangler/
-
+Claude outputs/
+error.txt
