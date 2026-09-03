@@ -389,36 +389,47 @@ async def run_message(user: config.UserContext, agent, text: str, send=None) -> 
     goes out (not just the final one), so this turn's own interim texts are
     correctly present in the next turn's conversation history too.
 
-    The live-view link itself is attached here in code, not by the model:
-    an earlier version had the system prompt tell Messa to write the exact
-    URL into her own acknowledgment sentence, which mostly worked but
-    failed exactly the way free-text LLM output eventually always does --
-    a real run trailed off mid-sentence ("checking a") right as the model
-    fired its tool call, before ever reaching the link. stream_mode
-    "updates" only ever hands back complete messages, never partial
-    tokens, so that wasn't a streaming/truncation bug in this code -- it
-    was genuinely the full, final `content` the model chose to generate for
-    that turn. Trusting a model to reliably finish a sentence *and*
-    reproduce a URL correctly, every single time, right before it switches
-    into tool-call mode, isn't reliable enough for something that's
-    supposed to always be there. So the model is no longer asked to write
-    the link at all (see agents/registry.py) -- run_turn instead tells us
-    whenever a message carries a deepsearch delegation (`delegating_to`,
-    fired even when the model said nothing at all), and the link is
-    appended deterministically below, guaranteed correct and complete
-    regardless of what the model's own text looks like.
+    The model is never asked to write the live-view link itself (see
+    agents/registry.py): an earlier version had the system prompt tell
+    Messa to write the exact URL into her own acknowledgment sentence,
+    which mostly worked but failed exactly the way free-text LLM output
+    eventually always does -- a real run trailed off mid-sentence
+    ("checking a") right as the model fired its tool call, before ever
+    reaching the link. stream_mode "updates" only ever hands back complete
+    messages, never partial tokens, so that wasn't a streaming/truncation
+    bug in this code -- it was genuinely the full, final `content` the
+    model chose to generate for that turn.
+
+    The link is NOT attached here in _on_ai_message either, though -- an
+    earlier version of this fix did exactly that (appended deterministically
+    to the pre-delegation acknowledgment, the same place the "this can take
+    a few minutes" notice below still lives), which fixed the reliability
+    problem above but created a timing one: the ack (and its link) goes out
+    the instant the model DECIDES to delegate, which is well before a real
+    Browserbase session exists -- deepsearch's own planning LLM calls,
+    session creation, and the CDP connect all still have to happen after
+    that text is already sent. Real runs showed the link arriving a minute
+    or two before there was anything to actually watch. It's now sent
+    separately, straight from tools/deepsearch_tools.py's
+    BrowserToolProvider._ensure_live_session, the moment the browser
+    session is genuinely live (right after db.set_live_browser_active
+    confirms it) -- guaranteed correct and complete regardless of what the
+    model's own text looks like, same as before, just arriving when it's
+    actually useful instead of arriving first.
 
     Two more deterministic, code-authored additions live in this same
-    function, same reasoning as the link above: the short "this can take a
-    few minutes, I'll text you when it's done" (plus, on a user's first-ever
-    deepsearch, a one-time "I can do more than just browse" tip) appended
-    right alongside it in _on_ai_message, and the onboarding-complete reveal
-    (Messa's own email + live-view link, sent once right after the user
-    answers the last onboarding question) via _onboarding_complete_messages
-    above. Both are kept short and fixed on purpose -- an explicit ask was
-    to keep outbound texts concise, and fixed strings are the only way to
-    guarantee that stays true forever rather than drifting longer over time
-    the way freely-generated model text tends to."""
+    function, same "don't trust free-text model output for something that
+    must always be exactly right" reasoning as the link above: the short
+    "this can take a few minutes, I'll text you when it's done" (plus, on a
+    user's first-ever deepsearch, a one-time "I can do more than just
+    browse" tip) appended in _on_ai_message, and the onboarding-complete
+    reveal (Messa's own email + live-view link, sent once right after the
+    user answers the last onboarding question) via
+    _onboarding_complete_messages above. Both are kept short and fixed on
+    purpose -- an explicit ask was to keep outbound texts concise, and
+    fixed strings are the only way to guarantee that stays true forever
+    rather than drifting longer over time the way freely-generated model
+    text tends to."""
     # 12 rather than 20: measured against the real system prompt + tool
     # schemas (~2,000 tokens fixed, every turn, regardless of history), 20
     # short SMS-length messages only added another ~600-800 tokens -- not
@@ -479,48 +490,29 @@ async def run_message(user: config.UserContext, agent, text: str, send=None) -> 
         nonlocal deepsearch_extras_sent, is_first_deepsearch
         msg_text = _sanitize_live_view_urls(msg_text, user)
         if delegating_to == "deepsearch" and not deepsearch_extras_sent:
-            share_url = user.live_view_share_url
+            # The live-view link itself is no longer attached here. It used
+            # to go out with THIS acknowledgment, the moment the model
+            # decided to delegate -- well before a real Browserbase session
+            # (or even the deepsearch subagent's own planning calls) had
+            # run, so the link routinely arrived a minute or two before
+            # there was anything to actually watch. It's now sent
+            # separately, straight from tools/deepsearch_tools.py's
+            # _ensure_live_session, the moment the browser session is
+            # genuinely live -- see that function's own comment for the
+            # full reasoning and for the "no phone_number/share_url"
+            # diagnostic that used to live here (moved there too, since
+            # that's where the send now actually happens).
             extra_lines: list[str] = []
-            if share_url and share_url not in msg_text:
-                extra_lines.append(f"Watch it live: {share_url}")
-            elif not share_url:
-                # Confirmed (by direct integration test against the real
-                # deepagents/create_deep_agent harness) that `delegating_to`
-                # detection itself is reliable, in both the "model wrote an
-                # acknowledgment" and "model went straight to the tool call
-                # with zero text" cases -- so if a deepsearch delegation
-                # ever ships with no link again, it's one of exactly two
-                # things and this line says which: either migration 006
-                # hasn't run yet against this DB (live_view_token is None --
-                # get_or_create_live_share_token returns None whenever
-                # users.live_share_token doesn't exist yet) or it has run
-                # but something about token generation/lookup itself failed
-                # silently. Previously this was a completely silent no-op,
-                # which is exactly why the last two rounds of this bug took
-                # multiple back-and-forths to even localize.
-                console.system(
-                    f"Deepsearch delegation for user #{user.user_id} has no live-view link to "
-                    f"attach -- live_view_token={user.live_view_token!r}, "
-                    f"LIVE_VIEW_BASE_URL={config.LIVE_VIEW_BASE_URL!r}. "
-                    + (
-                        "live_view_token is None: migration 006_live_view.sql likely hasn't "
-                        "run against this DB yet (or get_or_create_live_share_token failed)."
-                        if not user.live_view_token
-                        else "LIVE_VIEW_BASE_URL is empty: set MESSA_LIVE_VIEW_BASE_URL."
-                        if not config.LIVE_VIEW_BASE_URL
-                        else "both look set -- check live_view_share_url's own logic."
-                    )
-                )
             # These two are deterministic and code-authored for the same
-            # reason the link is (see this function's own docstring): a
-            # user's explicit ask was "remind users this'll take a while,
-            # they can sit back, and that deepsearch can do more than just
-            # browsing" -- baking that into the system prompt would mean
-            # trusting the model to remember and reword it correctly on
-            # every single delegation, forever. Appending fixed text here
-            # instead guarantees it's always said, always this short, and
-            # never balloons turn over turn the way model-authored
-            # boilerplate tends to.
+            # reason the link used to be (see this function's own
+            # docstring): a user's explicit ask was "remind users this'll
+            # take a while, they can sit back, and that deepsearch can do
+            # more than just browsing" -- baking that into the system
+            # prompt would mean trusting the model to remember and reword
+            # it correctly on every single delegation, forever. Appending
+            # fixed text here instead guarantees it's always said, always
+            # this short, and never balloons turn over turn the way
+            # model-authored boilerplate tends to.
             step_away_notice = (
                 "This can take a few minutes -- go ahead and step away, I'll text you "
                 "the second it's done."

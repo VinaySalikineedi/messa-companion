@@ -124,8 +124,9 @@ from langgraph.errors import GraphRecursionError
 
 from .. import config, console, credentials, db, deepsearch_control, live_activity, usage
 from ..approval import ApprovalGate
-from ..channels import browserbase
+from ..channels import browserbase, sendblue
 from ..channels.browserbase import BrowserbaseError
+from ..channels.sendblue import SendblueError
 from ..config import UserContext
 from .jina_reader import fetch_rendered_page_text as _jina_fetch_rendered_page_text
 from .parallel_search import parallel_web_fetch as _parallel_web_fetch
@@ -651,9 +652,19 @@ class BrowserToolProvider:
         model: BaseChatModel | None = None,
         messa_email: str | None = None,
         task_title: str | None = None,
+        phone_number: str | None = None,
+        live_view_share_url: str | None = None,
     ):
         self._approval_gate = approval_gate
         self._user_id = user_id
+        # Owning-provider-only, for the "browser is actually live now" SMS
+        # fired from inside _ensure_live_session -- see that method's own
+        # comment for why the link moved here instead of going out with the
+        # pre-delegation acknowledgment (cli.py). None for a sub-worker
+        # (delegate_website_task never passes these -- a sub-worker's tab
+        # opening isn't a user-facing event, only the top-level session is).
+        self._phone_number = phone_number
+        self._live_view_share_url = live_view_share_url
         # Owning-provider-only, for the lazy-open db.set_live_browser_active
         # call inside _ensure_live_session (see that method) -- moved there
         # from build_deepsearch_subagent._run's own body, since that call
@@ -725,6 +736,25 @@ class BrowserToolProvider:
         # one that actually opens the session.
         self._session_open_lock: asyncio.Lock | None = None
         self._live_session_ready = False
+        # Serializes actual tool EXECUTION on this one tab -- distinct from
+        # _session_open_lock above, which only guards session CREATION.
+        # Fix for the real production crash: "Attempted to exit cancel
+        # scope in a different task than it was entered in" (anyio), which
+        # happened when the model emitted two browser_navigate calls in the
+        # same turn and ToolNode dispatched both concurrently against this
+        # same tab's single MCP client connection -- the second navigation
+        # aborted the first (net::ERR_ABORTED) and corrupted the shared
+        # cancel scope, taking down the whole webhook turn (surfaced to the
+        # user as a generic "something went wrong"). One lock per tab
+        # instance (both the top-level tab and each sub-worker's own tab
+        # get their own) means concurrent calls on the SAME tab now queue
+        # instead of racing, while separate tabs (top-level vs. any
+        # delegate_website_task sub-worker) stay fully parallel -- this is
+        # deliberately NOT the same lock as _session_open_lock, and
+        # deliberately initialized unconditionally (unlike that one) since
+        # a sub-worker's own tab needs this exact same protection and there
+        # is no lazy-open case to special-case around here.
+        self._tool_call_lock = asyncio.Lock()
         # Raw (unwrapped) MCP tools by name, kept for internal use only --
         # currently just browser_evaluate, called directly by
         # _move_cursor_to without going through _guard()'s approval-gating
@@ -1103,6 +1133,40 @@ class BrowserToolProvider:
                     await db.set_live_browser_active(
                         self._user_id, self.live_view_url, self._task_title or "Working on it",
                     )
+                    # Fix for the "link arrives, browser doesn't open for 2
+                    # minutes" complaint: the live-view link used to go out
+                    # with cli.py's pre-delegation acknowledgment, the
+                    # moment the model DECIDED to delegate -- well before a
+                    # real Browserbase session exists (session creation,
+                    # the CDP connect, and any planning LLM calls before the
+                    # model's first real tool call all still had to happen
+                    # after that text was already sent). Sending it HERE
+                    # instead, right after db.set_live_browser_active
+                    # confirms the live view is actually resolvable, means
+                    # the text arrives exactly when there's something real
+                    # to look at. Uses the constant per-user share URL
+                    # (live_view_share_url, resolved dynamically by the
+                    # dashboard's own status endpoint), not self.live_view_url
+                    # itself -- same link cli.py used to send, just sent from
+                    # here now, at the right time, and only once per run
+                    # (this whole block only ever executes once -- see
+                    # _ensure_live_session's own docstring). Best-effort: a
+                    # failure here is logged, never lets a working browser
+                    # session go to waste over an SMS delivery hiccup.
+                    if self._phone_number and self._live_view_share_url:
+                        try:
+                            await sendblue.send_message(
+                                self._phone_number,
+                                f"Live now -- watch here: {self._live_view_share_url}",
+                            )
+                        except SendblueError as sms_err:
+                            console.tool_error(LABEL, "live_link_sms", str(sms_err))
+                    elif self._user_id is not None:
+                        console.system(
+                            f"Deepsearch: no live-link SMS sent for user #{self._user_id} -- "
+                            f"phone_number={self._phone_number!r}, "
+                            f"live_view_share_url={self._live_view_share_url!r}."
+                        )
             except BrowserbaseError as e:
                 # Best-effort: not having a live-view link yet shouldn't
                 # block the run.
@@ -1777,7 +1841,7 @@ class BrowserToolProvider:
         state = self._state
         approval_gate = self._approval_gate
 
-        async def guarded(*args: Any, **kwargs: Any) -> Any:
+        async def _do(*args: Any, **kwargs: Any) -> Any:
             # The one lazy-open trigger point: the model's first real
             # browser tool call, whichever one it is, opens the actual
             # Browserbase session right here -- see _ensure_live_session's
@@ -1942,6 +2006,21 @@ class BrowserToolProvider:
                         "instead of retrying again."
                     )
                 return msg
+
+        async def guarded(*args: Any, **kwargs: Any) -> Any:
+            # self._tool_call_lock serializes every real call on THIS tab --
+            # see its own __init__ comment for the full "why" (a production
+            # crash: two browser_navigate calls dispatched concurrently by
+            # ToolNode against the same tab raced each other and corrupted
+            # the MCP client's shared anyio cancel scope, taking down the
+            # whole webhook turn). Wrapping the entire _do() body, not just
+            # the underlying original.coroutine(...) call, is deliberate --
+            # _do() also mutates this tab's shared `state` dict (snapshot
+            # freshness, consecutive-error count) and can await the
+            # approval gate, both of which need the same serialization a
+            # concurrent second call would otherwise race.
+            async with self._tool_call_lock:
+                return await _do(*args, **kwargs)
 
         return StructuredTool.from_function(
             name=name,
@@ -2169,6 +2248,7 @@ def build_deepsearch_subagent(
             provider = BrowserToolProvider(
                 approval_gate, user_id=user.user_id, deepsearch_session_id=session_id, model=model,
                 messa_email=user.messa_email, task_title=task_title,
+                phone_number=user.phone_number, live_view_share_url=user.live_view_share_url,
             )
             try:
                 async with provider:

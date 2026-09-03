@@ -587,8 +587,9 @@ def _build_system_prompt(
         live_view_str = (
             " Specifically for deepsearch: your acknowledgment before delegating to it must "
             "just be a short, natural line about what you're checking -- NEVER type or generate "
-            "a live-view link or URL yourself. The system automatically injects the user's authentic "
-            "live-view link right before the message is sent. Any URL you write will be invalid."
+            "a live-view link or URL yourself. The system texts the user the real live-view link "
+            "separately, once the browser session is actually up and there's something to watch. "
+            "Any URL you write will be invalid."
         )
 
     # Only ever non-empty while a deepsearch task is genuinely still running
