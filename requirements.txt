@@ -71,3 +71,14 @@ httpx>=0.28.1
 ddgs>=9.0.0
 duckduckgo-search>=7.0.0
 beautifulsoup4>=4.12.0
+
+# Memory (messa/memory.py, migrations/027_memory.sql) -- Mem0 on top of
+# Postgres/pgvector. psycopg[binary,pool] (psycopg3 + its connection-pool
+# extra) is what messa/memory.py itself builds the dedicated, RLS-scoped,
+# single-connection pool with per call -- see messa/memory.py's own
+# docstring for why a fresh pool per call, not one shared/pooled
+# connection reused across users. "binary" avoids needing a C compiler/
+# build toolchain on the HF Space's CPU-basic image (same reasoning as
+# reportlab/pypdf above needing to keep working unmodified there).
+mem0ai>=2.0.20
+psycopg[binary,pool]>=3.2.0

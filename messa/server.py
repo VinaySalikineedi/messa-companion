@@ -43,7 +43,7 @@ import httpx
 from fastapi import BackgroundTasks, FastAPI, Header, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
-from . import background, briefings, cli, config, console, db, live_activity, pdf_reader, waitlist
+from . import background, briefings, cli, config, console, db, live_activity, memory, pdf_reader, waitlist
 from .agents.registry import build_orchestrator
 from .approval import AutoApproveGate, DenyApprovalGate
 from .channels import browserbase, sendblue
@@ -494,6 +494,15 @@ async def live_view_dashboard(token: str, week_offset: int = 0) -> JSONResponse:
 
     return JSONResponse({
         "name": user.get("name"),
+        # users.memory_profile (migrations/027_memory.sql) -- the same
+        # cheap digest Messa's own system prompt reads every turn (see
+        # agents/registry.py's "Known about this user" block), shown here
+        # read-only per the product decision to keep the actual memory
+        # silent/backend and just surface a copy -- editing it from this
+        # page is a noted fast-follow, not part of this round. None (and
+        # the page hides the card entirely) for a brand-new user or before
+        # migration 027/their first daily batch run.
+        "memory_profile": user.get("memory_profile"),
         "week": {
             "label": f"{days[0]['label']} – {days[6]['label']}, {week_start_utc.astimezone(tz).year}",
             "days": days,
@@ -1706,6 +1715,60 @@ async def _production_app_connection_poll_loop() -> None:
         await asyncio.sleep(config.APP_CONNECTION_POLL_INTERVAL_SECONDS)
 
 
+async def _production_memory_batch_loop() -> None:
+    """Once-a-day memory digest batch (messa/memory.py's
+    run_daily_memory_batch) for every user -- see that module's own
+    docstring for the full design. Deliberately NOT built on the existing
+    per-user cron_jobs/briefing machinery (db.ensure_default_briefings,
+    _compute_next_run_local): those exist to respect a user's own chosen
+    local delivery time (7am briefings), which doesn't apply here -- this
+    just needs to run once per UTC calendar day for every user, silently,
+    with no message sent. db.claim_daily_memory_batch_run's
+    INSERT ... ON CONFLICT DO NOTHING (migrations/027_memory.sql's
+    memory_batch_runs table) is the entire "run once a day" mechanism --
+    safe across a restart, or in principle more than one running instance,
+    with no separate locking needed. Runs on a coarser poll interval than
+    every other loop here (config.MEMORY_BATCH_POLL_INTERVAL_SECONDS,
+    default hourly) since it's only ever actually claiming+running once a
+    day; a whole day's users are processed sequentially, one Mem0 add()
+    call each -- deliberately not parallelized (unlike
+    _production_briefing_loop's asyncio.gather) since this is a background
+    job with no user waiting on it, and keeping it sequential avoids
+    opening several direct (non-pooled) Postgres connections to Neon at
+    once for a handful of users.
+
+    A single user's failure (caught inside messa/memory.py and returned as
+    a status dict, or an unexpected exception here) is logged and skipped
+    -- never aborts the rest of the day's batch."""
+    while True:
+        try:
+            today = datetime.now(timezone.utc).date()
+            if await db.claim_daily_memory_batch_run(today):
+                since = datetime.now(timezone.utc) - timedelta(days=1)
+                user_ids = await db.get_all_user_ids()
+                processed = 0
+                failed = 0
+                for user_id in user_ids:
+                    try:
+                        user = await cli.load_user_context_by_id(user_id)
+                        if user is None:
+                            continue
+                        result = await memory.run_daily_memory_batch(user, since)
+                        if result.get("status") == "failed":
+                            failed += 1
+                            console.system(f"[memory batch] user={user_id} failed: {result.get('reason')}")
+                        else:
+                            processed += 1
+                    except Exception as e:  # noqa: BLE001 - one user's failure must never abort the batch
+                        failed += 1
+                        console.system(f"[memory batch] user={user_id} unexpected error: {e}")
+                await db.complete_daily_memory_batch_run(today, processed, failed)
+                console.system(f"[memory batch] {today}: processed={processed} failed={failed}")
+        except Exception as e:  # noqa: BLE001 - a background loop must never die silently mid-process
+            console.system(f"[memory batch poller error] {e}")
+        await asyncio.sleep(config.MEMORY_BATCH_POLL_INTERVAL_SECONDS)
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     global _bg_tasks
@@ -1718,10 +1781,11 @@ async def _startup() -> None:
         asyncio.create_task(_production_deepsearch_pause_loop()),
         asyncio.create_task(_production_email_connection_poll_loop()),
         asyncio.create_task(_production_app_connection_poll_loop()),
+        asyncio.create_task(_production_memory_batch_loop()),
     ]
     console.system(
         "Started production reminder/cron/briefing/digest/broadcast/deepsearch-pause/"
-        "email-connection/app-connection delivery pollers."
+        "email-connection/app-connection/memory-batch delivery pollers."
     )
 
 

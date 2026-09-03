@@ -586,6 +586,12 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
     padding: 0.4rem 1rem 0.6rem;
   }}
   [data-style="terminal"] .dash-empty {{ font-style: normal; }}
+  .dash-profile-text {{
+    font-size: 0.85rem;
+    line-height: 1.5;
+    color: var(--text);
+    white-space: pre-wrap;
+  }}
 
   /* week schedule: one native <details> disclosure per day, time on the
      left of each event, title (+ location) on the right -- per explicit
@@ -1368,6 +1374,23 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
     return row;
   }}
 
+  function buildProfileCard(profileText) {{
+    // "What Messa's learned about you" -- a read-only copy of the same
+    // digest Messa's own system prompt reads every turn (server.py's
+    // /live/<token>/dashboard, users.memory_profile). textContent, never
+    // innerHTML: this text is derived from the user's own conversations
+    // via an LLM extraction step, not something this page should ever
+    // trust as markup. Editing from this page is a noted fast-follow, not
+    // built this round -- the product decision was "silent in the
+    // backend, show a copy" first.
+    var built = dashCard("What I've learned about you");
+    var p = document.createElement("div");
+    p.className = "dash-profile-text";
+    p.textContent = profileText;
+    built.body.appendChild(p);
+    return built.card;
+  }}
+
   function buildListCard(title, items, renderItem, emptyText) {{
     var built = dashCard(title);
     if (!items || items.length === 0) {{
@@ -1407,6 +1430,9 @@ def render_live_view_page(token: str, style: str | None = None) -> str:
     var grid = document.getElementById("dashGrid");
     if (!grid) return;
     grid.innerHTML = "";
+    if (data.memory_profile) {{
+      grid.appendChild(buildProfileCard(data.memory_profile));
+    }}
     grid.appendChild(buildScheduleCard(data.week));
     grid.appendChild(buildListCard("Tasks", data.tasks, renderTaskItem, "No tasks right now."));
     grid.appendChild(buildListCard("Reminders", data.reminders, renderReminderItem, "No reminders pending."));

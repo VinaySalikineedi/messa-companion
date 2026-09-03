@@ -191,6 +191,17 @@ async def get_all_user_phone_numbers() -> list[str]:
         return [r["phone_number"] for r in rows]
 
 
+async def get_all_user_ids() -> list[int]:
+    """Every user id -- the iteration list for the daily memory batch job
+    (messa/memory.py's run_daily_memory_batch), same "all users, unfiltered"
+    scope as get_all_user_phone_numbers above for the same reason (only 5
+    users today; narrow this later if it ever needs to)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT id FROM users")
+        return [r["id"] for r in rows]
+
+
 # ---------------------------------------------------------------------------
 # New-user cap + waitlist (migrations/025_new_user_cap_waitlist.sql,
 # messa/waitlist.py, messa/tools/admin_tools.py). Every function here is a
@@ -649,6 +660,26 @@ async def get_recent_messages(user_id: int, limit: int = 20) -> list[dict[str, A
             user_id, limit,
         )
         return list(reversed(_rows(rows)))
+
+
+async def get_messages_since(user_id: int, since: datetime) -> list[dict[str, Any]]:
+    """Every message for this user from `since` onward, oldest first -- the
+    daily memory batch job's own input (messa/memory.py's
+    run_daily_memory_batch), NOT used on the live per-turn hot path (that's
+    get_recent_messages above, unchanged). Separate function rather than
+    reusing get_recent_messages with a big limit: this needs a real time
+    window (a whole day's worth, whatever that count turns out to be), not
+    a fixed row count."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT * FROM message_history WHERE user_id = $1 AND timestamp >= $2
+            ORDER BY timestamp ASC
+            """,
+            user_id, since,
+        )
+        return _rows(rows)
 
 
 _column_cache: dict[tuple[str, str], bool] = {}
@@ -2518,6 +2549,69 @@ async def set_default_email_provider(user_id: int, provider: str) -> dict[str, A
         row = await conn.fetchrow(
             "UPDATE users SET default_email_provider = $2 WHERE id = $1 RETURNING *",
             user_id, provider,
+        )
+        return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# Memory (migrations/027_memory.sql) -- the cheap profile-digest column the
+# live per-turn hot path reads (see config.UserContext.memory_profile /
+# cli._context_from_row). The ONLY writer is messa/memory.py's daily batch
+# job, which derives the text from Mem0 (the actual episodic/semantic
+# store, RLS-scoped, never touched on the hot path -- see messa/memory.py's
+# own docstring). Same _has_column-guarded, additive-safe shape as
+# set_default_email_provider just above.
+# ---------------------------------------------------------------------------
+
+async def claim_daily_memory_batch_run(run_date) -> bool:
+    """True if THIS call is the one that gets to run today's memory batch
+    (messa/memory.py's run_daily_memory_batch) -- False if another call
+    already claimed run_date (a restart shortly after a completed run, or,
+    in principle, a second running instance). INSERT ... ON CONFLICT DO
+    NOTHING is the whole mechanism: no separate lock table, no explicit
+    row locking -- Postgres's own uniqueness constraint on run_date is
+    what prevents a double-run. Returns False (never raises) if migration
+    027 hasn't been applied yet, same as every other _has_column-guarded
+    function in this file -- the batch loop just skips a day rather than
+    crashing."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        has_table = await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'memory_batch_runs')"
+        )
+        if not has_table:
+            return False
+        result = await conn.execute(
+            "INSERT INTO memory_batch_runs (run_date) VALUES ($1) ON CONFLICT DO NOTHING", run_date,
+        )
+        return result == "INSERT 0 1"
+
+
+async def complete_daily_memory_batch_run(run_date, users_processed: int, users_failed: int) -> None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE memory_batch_runs
+            SET completed_at = NOW(), users_processed = $2, users_failed = $3
+            WHERE run_date = $1
+            """,
+            run_date, users_processed, users_failed,
+        )
+
+
+async def set_memory_profile(user_id: int, profile_text: str) -> dict[str, Any] | None:
+    """Overwrites the whole digest (not an append/merge -- the daily batch
+    job always regenerates the full digest from Mem0's current state, so
+    there's nothing to merge). Returns the updated row, or None if
+    migration 027 hasn't been applied yet."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_column(conn, "users", "memory_profile"):
+            return None
+        row = await conn.fetchrow(
+            "UPDATE users SET memory_profile = $2, memory_profile_updated_at = NOW() WHERE id = $1 RETURNING *",
+            user_id, profile_text,
         )
         return dict(row) if row else None
 

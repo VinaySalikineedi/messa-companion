@@ -6362,3 +6362,286 @@ call (the session-init handshake plus the actual search/fetch) -- expected
 to be on the order of the existing Jina tier (low seconds), comfortably
 inside your "never leave the user on hold" bar, but not measured against
 the live service from this sandbox.
+
+## Memory: Mem0 + Postgres, with Row-Level Security as a real safety backstop
+
+Before this, Messa only ever saw the last N texts of a conversation --
+after a couple of days she had no way to recall what was discussed unless
+it was saved as a project. This adds a two-tier memory: a small, always-on
+profile digest so Messa quietly personalizes without being asked, plus a
+larger day-by-day episodic archive she can search on demand -- without
+bloating the per-turn system prompt or adding latency to a live texting
+turn, which stayed the top priority throughout this feature.
+
+**The split, and why the hot path never touches Mem0:**
+
+- `users.memory_profile` (`migrations/027_memory.sql`) is a plain text
+  column, read once per turn through the app's normal `DATABASE_URL` pool
+  -- exactly like `city`/`default_email_provider`/etc. already are (see
+  `cli._context_from_row`, `config.UserContext.memory_profile`) -- and
+  rendered into `agents/registry.py`'s `_build_system_prompt`'s "Known
+  about this user" block, omitted entirely when it's `None` (a brand-new
+  user, or before their first daily batch run). This is the ONLY memory
+  state a live message ever pays for.
+- Mem0 itself (`messa/memory.py`) is touched in exactly two places:
+  `recall_past_conversation`, a new orchestrator tool (same "backup, not
+  default" tier as `web_search`/`parallel_web_search` -- see "Deepsearch
+  cost tiering" above) the model calls only when the user references
+  something from more than a few days back; and `run_daily_memory_batch`,
+  a once-a-day background job (`server.py`'s `_production_memory_batch_loop`)
+  that pulls each user's messages from the last 24h, calls Mem0's `add()`
+  once per user (Mem0's current pipeline does exactly one LLM call for
+  extraction, confirmed against its source -- not one call per fact), then
+  reads Mem0's current state back and writes a fresh digest into
+  `users.memory_profile` for the next day's cheap reads.
+- That batch loop is deliberately NOT built on the existing per-user
+  `cron_jobs`/briefing machinery (`db.ensure_default_briefings`,
+  `_compute_next_run_local`) -- those exist to respect a user's own chosen
+  local delivery time (7am briefings); the memory digest has no delivery
+  time to respect, it just needs to run once per UTC day for everyone,
+  silently. `db.claim_daily_memory_batch_run`'s `INSERT ... ON CONFLICT DO
+  NOTHING` against a new one-row-per-day `memory_batch_runs` table is the
+  entire "run once a day" mechanism -- safe across a restart, or in
+  principle more than one running instance, with no separate locking code.
+
+**The safety question, and what it turned up:** before building any of
+this, the real question was whether a shared Mem0 setup could leak one
+user's memory into another's. Auditing Mem0's own source (not docs) found
+a real, specific gap: `search()`/`get_all()` require and enforce a
+`user_id` filter, but `update()`/`delete()`/`history()` take a bare
+`memory_id` with NO `user_id` parameter and NO ownership check at all --
+Mem0 just trusts whatever `memory_id` a caller passes it. Left alone, one
+wrong `memory_id` anywhere in this app's own code (a mixed-up variable
+under concurrent async requests, say) would silently let one user's turn
+touch another user's memory.
+
+`messa/memory.py` closes that gap two ways, both implemented in
+`migrations/027_memory.sql` + `messa/memory.py`, not just documented:
+
+1. **Row-Level Security, actually enforced, not just assumed.** Every
+   single call into Mem0 runs through a dedicated, single-connection,
+   single-use `psycopg_pool.ConnectionPool` (`_run_scoped_sync` --
+   `min_size=1, max_size=1`, opened right before the call and closed right
+   after) whose one physical connection gets `SET app.current_user_id =
+   '<id>'` at creation (`configure` callback, confirmed to run exactly
+   once per physical connection, not per checkout). `mem0_memories`'
+   RLS policy checks that session variable on every row, at the database
+   level:
+   ```sql
+   USING (payload ->> 'user_id' = current_setting('app.current_user_id', true))
+   ```
+   This has to be a **direct/unpooled** Postgres connection
+   (`MESSA_MEM0_DIRECT_DATABASE_URL`), not the app's normal pooled
+   `DATABASE_URL` -- confirmed directly against `db.py`'s own comments:
+   Neon's PgBouncer transaction-pooling mode doesn't guarantee a
+   session-level `SET` survives into the next transaction on "the same"
+   client connection, which would silently break this mechanism. A direct
+   connection has one real, stable backend session for as long as it's
+   held, so the `SET` is guaranteed to still apply. This single-connection-
+   per-call design also happens to be what resolves the earlier-flagged
+   "shared Mem0 instance at scale on a 16GB CPU box" concern -- there is
+   never a shared, long-lived Mem0 instance across users or requests, by
+   construction.
+
+   **This was proven against a real Postgres instance, not just asserted**:
+   `scripts/verify_memory_rls.py` connects as a non-superuser, non-table-
+   owner role (superusers/owners silently bypass RLS, which would make a
+   test pass for the wrong reason), scopes itself to one user, and
+   directly attempts -- in raw SQL, no application code involved -- to
+   read, update, and delete another user's row by its real id, plus
+   attempts to forge an insert claiming another user's `user_id`. Run
+   against a scratch local Postgres+pgvector as part of building this
+   feature: every cross-user attempt was blocked (reads returned nothing,
+   update/delete affected 0 rows, the forged insert raised a hard
+   `RLS policy violation` error), a same-user update still worked
+   normally, and -- importantly -- a connection with `app.current_user_id`
+   never set at all saw **zero** rows rather than everything, i.e. the
+   policy fails closed, not open. Run this yourself before relying on it
+   in production (and again after any future change to the migration or
+   to `messa/memory.py`'s connection handling):
+   ```
+   python3 scripts/verify_memory_rls.py "$MESSA_MEM0_DIRECT_DATABASE_URL"
+   ```
+
+2. **A recover-don't-just-drop fallback for the three methods Mem0 itself
+   doesn't check.** For `update`/`delete`/`history`, `messa/memory.py`'s
+   `_guarded_mutation` verifies ownership itself before ever calling
+   Mem0: it reads the memory back under the caller's own scoped
+   connection first. If that comes back empty or mismatched, it doesn't
+   silently give up -- it logs a structured incident
+   (`MEMORY_INCIDENT: {...}` via `console.system`, shaped so a future
+   admin-dashboard incident feed could read these later, though that
+   dashboard is explicitly out of scope this round), re-derives `user_id`
+   **once** from the one thing genuinely trusted -- a fresh phone-number
+   lookup via `db.get_user_by_phone`, never from the `memory_id` or Mem0's
+   own metadata -- and retries exactly once. If that also doesn't check
+   out, it fails closed: tells the caller the memory wasn't found, never
+   widens the query or drops the filter.
+
+**The old `vector_memories` table** (`neon-schema.sql`) was built ahead of
+an earlier version of this plan and was never wired into any tool or
+query -- confirmed zero rows and zero references anywhere in `messa/`
+before `migrations/027_memory.sql` drops it in favor of Mem0's own
+`mem0_memories` table.
+
+**Existing users:** everything here is additive. `users.memory_profile`
+starts `NULL` for all 5 existing users and every new one; there's no
+backfill -- the daily batch job just starts building memory forward from
+whenever migration 027 is applied and the env var is set. Nothing about
+this migration or module is destructive, and the whole feature no-ops
+cleanly (`memory.NOT_CONFIGURED`) if `MESSA_MEM0_DIRECT_DATABASE_URL`
+isn't set at all.
+
+**Live-view dashboard:** a new read-only "What I've learned about you"
+card on the existing dashboard page (`live_view_page.py`'s `dashGrid`,
+`server.py`'s `/live/<token>/dashboard`), showing the same digest Messa's
+own prompt reads. Matches the product decision ("keep it silent in the
+backend, show a copy") -- editing it from this page is a noted fast-follow,
+not built this round.
+
+### Verification
+
+New `/tmp/test_memory_rls.py` (31 checks, fakes for `psycopg_pool.
+ConnectionPool`/`mem0.Memory`, same convention as this project's other
+fake-based tests): the dedicated pool is built against the direct URL
+and never the pooled `DATABASE_URL`, is always `min_size=1/max_size=1`
+and always closed after the call, `configure` issues exactly the right
+`SET` scoped to the right user; the feature-flag gate is a true no-op
+(zero pools built) when `MEM0_ENABLED` is `False`; the ownership guard
+proceeds normally on a clean match, logs one incident and retries with a
+re-derived `user_id` on a mismatch, and fails closed (the real mutation is
+NEVER called) when the retry also fails; the daily batch job skips
+cleanly with no messages in its window, reports `failed` without touching
+the profile column on an `add()` error, writes a real digest on success,
+and deliberately does NOT overwrite the profile column when Mem0 has
+nothing yet; and `registry.py`'s digest line is included/omitted
+correctly and `recall_past_conversation` is present with a description
+that frames it as on-demand, not a default.
+
+Separately, `scripts/verify_memory_rls.py` (described above) was actually
+run against a real local Postgres+pgvector instance as part of building
+this feature -- all 9 of its checks passed, twice (confirming it's also
+safe to re-run). This is the one part of this feature's verification that
+isn't just fakes: it's a real proof that the database itself, not this
+repo's application code, is what stops a cross-user leak.
+
+Re-ran the full existing `/tmp/` regression suite afterward -- see the
+next entry for the count and outcome.
+
+Not verified: the embedder. Mem0's `OpenAILLM` class auto-detects
+`OPENROUTER_API_KEY` in the environment and switches its own base URL
+(confirmed directly against Mem0's source), so the LLM side needs no new
+key or config. Its embedder class does NOT do the same auto-detection
+(also confirmed against source) -- `messa/memory.py` instead passes
+`api_key`/`openai_base_url` explicitly, pointed at OpenRouter's
+`/v1/embeddings` endpoint. This sandbox's network can't reach OpenRouter
+to confirm that endpoint actually behaves like a normal OpenAI-compatible
+embeddings API end to end; `config.MEM0_EMBEDDER_PROVIDER=fastembed`
+(local, CPU-only, no torch) is the documented fallback if it doesn't --
+also not live-verified here for the same reason `fastembed` wasn't
+earlier in this project (its one-time model download needs
+`huggingface.co`, which this sandbox's own egress blocks; the real HF
+Space has normal internet access). Also not verified: live-model behavior
+-- whether Messa actually calls `recall_past_conversation` sensibly, and
+real extraction quality from Mem0's `add()` -- same caveat already
+attached to every other prompt-only change in this project.
+
+## Per-agent OpenRouter API keys: splitting Messa's orchestrator, deepsearch, and the rest onto separate keys
+
+Before this, Messa's own orchestrator model and EVERY subagent (deepsearch,
+executive_assistant, email_agent, personal_inbox_agent, document_agent,
+routines_agent, integrations_agent, admin_agent) all defaulted to the
+exact same `OPENROUTER_API_KEY`, via one shared model instance
+(`subagent_model` in `agents/registry.py`'s `build_orchestrator`, built
+once and handed by reference to all 7-8 subagents). That meant a
+rate/concurrency ceiling on that one key or account was a single shared
+bottleneck across literally everything Messa does -- including her own
+reply to the user, which is the one thing that most needs to feel fast.
+
+There was already a partial, narrower mechanism for this --
+`SUBAGENT_API_KEY_POOL`/`MESSA_OPENROUTER_API_KEY_POOL`, which
+deepsearch's own concurrent `delegate_website_task` sub-workers round-robin
+across (`_pick_subagent_model` in `deepsearch_tools.py`). That's still
+there, unchanged -- but it only ever applied to deepsearch's own parallel
+browsing calls; it said nothing about which key Messa's orchestrator uses,
+or whether deepsearch's own TOP-LEVEL model shares a key with the other
+subagents, or any way to split the other subagents onto more than one key.
+
+**New, in `config.py`'s "Per-agent OpenRouter API keys" section**: a
+three-tier split, by traffic pattern, plus a fine-grained override on top:
+
+1. `MESSA_ORCHESTRATOR_API_KEY` -- Messa's own dedicated key. Touches
+   every single message; the one agent where "even 1 minute will look
+   sluggish" (per this project's own standing priority) applies most
+   directly.
+2. `MESSA_DEEPSEARCH_API_KEY` -- deepsearch's own top-level model. The
+   heaviest single subagent workload (long browsing runs), and already
+   has its own internal concurrency via the pool above -- complementary,
+   not redundant: this is the base key deepsearch itself uses; the pool
+   is what its own parallel sub-workers round-robin across.
+3. `MESSA_SUBAGENT_API_KEY` -- shared by the remaining subagents
+   (executive_assistant, email_agent, personal_inbox_agent, document_agent,
+   routines_agent, integrations_agent, admin_agent). These are occasional,
+   bursty, much lighter traffic than the two above, so sharing one key
+   among all of them is a reasonable default.
+4. `MESSA_AGENT_API_KEY_OVERRIDES` -- an escape hatch on top of the
+   three-tier split, for pulling one specific subagent onto its own key
+   (e.g. splitting `email_agent` off from the shared group once you have
+   a 4th or 5th key). Format: `agent_name=key,agent_name=key`, parsed by
+   `config._parse_agent_key_overrides` -- malformed entries are silently
+   ignored (never crash startup over a typo), and `config.api_key_for_agent`
+   checks this first, before falling through to the deepsearch/shared-tier
+   defaults above.
+
+All four are optional and fall back to plain `OPENROUTER_API_KEY` when
+unset -- setting none of them changes nothing about existing behavior.
+
+**The actual wiring** (`agents/registry.py`'s `build_orchestrator`): the
+orchestrator's own model is now built with
+`api_key=config.ORCHESTRATOR_API_KEY` explicitly (previously always
+implicit `OPENROUTER_API_KEY`). The single shared `subagent_model`
+instance is gone for real callers -- `_subagent_model_for(agent_name)`
+now builds a SEPARATE `ChatOpenAI` client per subagent, bound to whatever
+`config.api_key_for_agent(agent_name)` resolves for that specific name.
+Building N small clients instead of reusing one is cheap: `ChatOpenAI`
+construction makes no network call (already relied on by
+`_pick_subagent_model`'s own per-call key rotation for exactly this
+reason). The `subagent_model` parameter itself still exists and, when
+explicitly passed, is used for every subagent unchanged -- that's the
+backward-compatible path every EXISTING test in this project's suite
+already uses (they all pass a fake model for every subagent), which is
+also why none of them needed to change for this to ship safely.
+
+### Verification
+
+New `/tmp/test_agent_api_keys.py` (20 checks): `_parse_agent_key_overrides`
+parsing (valid pairs, malformed/empty entries ignored, whitespace
+tolerance); `api_key_for_agent`'s priority order (override beats
+deepsearch-specific beats shared-default) and its backward-compatible
+collapse to plain `OPENROUTER_API_KEY` when nothing is configured; and --
+the one check that actually proves the wiring, not just the resolver
+function in isolation -- a real call to `build_orchestrator` WITHOUT
+passing `subagent_model` (the actual code path `cli.py`/`server.py` use),
+with `config.build_model` itself faked to capture every call. Confirmed:
+exactly one orchestrator-model build using `ORCHESTRATOR_API_KEY`; exactly
+8 SEPARATE subagent model instances for an admin user (not one shared
+instance); exactly one of those using `DEEPSEARCH_API_KEY`; exactly one
+using a configured per-agent override; and the remaining 6 all using the
+shared `SUBAGENT_API_KEY` -- every call accounted for, no stray key.
+Re-ran the existing suite afterward (`test_agent_concurrency.py`,
+`test_subagent_pool_and_timing.py`, `test_routing_boundaries.py`,
+`test_dynamic_connected_apps.py`, `test_app_preferences.py`, and the
+broader `/tmp/` regression set) -- zero regressions; every existing test
+already injects its own fake model for every subagent, so none of them
+exercised (or were broken by) this new per-agent-key code path, which is
+exactly why the new test above was needed rather than relying on the
+existing suite alone.
+
+Not verified: real behavior under actual concurrent load against
+OpenRouter's real per-key rate/concurrency limits -- this sandbox has no
+real OpenRouter credentials to test against (same limitation as every
+other OpenRouter-facing feature in this project). Whether this actually
+removes a bottleneck depends on whether a shared-key ceiling was the real
+constraint in the first place, same caveat `SUBAGENT_API_KEY_POOL`'s own
+comment already carries -- the fix is real and correctly wired, but
+confirming it *helps* needs a real run with real separate keys.

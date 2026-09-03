@@ -91,6 +91,77 @@ SUBAGENT_API_KEY_POOL = [
     k.strip() for k in os.environ.get("MESSA_OPENROUTER_API_KEY_POOL", "").split(",") if k.strip()
 ] or [OPENROUTER_API_KEY]
 
+# ---- Per-agent OpenRouter API keys -- a DIFFERENT lever from the pool just
+# above. SUBAGENT_API_KEY_POOL spreads deepsearch's own CONCURRENT
+# delegate_website_task sub-workers across keys (see _pick_subagent_model in
+# deepsearch_tools.py) -- it says nothing about which key Messa's own
+# orchestrator uses, or whether deepsearch's TOP-LEVEL model shares a key
+# with the other 6 lighter subagents (executive_assistant, email_agent,
+# personal_inbox_agent, document_agent, routines_agent, integrations_agent,
+# admin_agent). Before this, ALL of those (orchestrator included) defaulted
+# to the exact same OPENROUTER_API_KEY, so a rate/concurrency ceiling on
+# that one key/account was a single shared bottleneck across literally
+# every agent in the app -- including Messa's own reply to the user, which
+# is the one that actually needs to feel fast.
+#
+# This splits that into three independently-configurable keys, by traffic
+# pattern (per the actual product priority -- see registry.py's "Speed
+# matters" paragraph):
+#   1. Messa's own orchestrator -- touches every single message, the most
+#      latency-sensitive agent by far.
+#   2. deepsearch -- the heaviest single subagent (long browsing runs,
+#      already has its own internal concurrency via the pool above).
+#   3. Everything else -- occasional, bursty, much lighter traffic; fine to
+#      share one key among all 6.
+# Each is optional and falls back to OPENROUTER_API_KEY unset -- so setting
+# NONE of these changes nothing about today's behavior.
+ORCHESTRATOR_API_KEY = os.environ.get("MESSA_ORCHESTRATOR_API_KEY") or OPENROUTER_API_KEY
+DEEPSEARCH_API_KEY = os.environ.get("MESSA_DEEPSEARCH_API_KEY") or OPENROUTER_API_KEY
+SUBAGENT_API_KEY = os.environ.get("MESSA_SUBAGENT_API_KEY") or OPENROUTER_API_KEY
+
+# Fine-grained escape hatch on top of the three-tier split above: pull ANY
+# individual subagent onto its own key (e.g. once you have a 4th or 5th key
+# and want email_agent split off from the shared "everything else" group
+# too), with no code change. Format: "agent_name=key,agent_name=key" --
+# comma-separated pairs, agent name exactly matching its subagent "name"
+# field (e.g. "deepsearch", "email_agent", "executive_assistant"). An
+# unrecognized agent name here is simply never looked up (see
+# api_key_for_agent below) -- harmless, not an error, so a typo doesn't
+# break startup.
+def _parse_agent_key_overrides(raw: str) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair or "=" not in pair:
+            continue
+        name, _, key = pair.partition("=")
+        name, key = name.strip(), key.strip()
+        if name and key:
+            overrides[name] = key
+    return overrides
+
+
+AGENT_API_KEY_OVERRIDES: dict[str, str] = _parse_agent_key_overrides(
+    os.environ.get("MESSA_AGENT_API_KEY_OVERRIDES", "")
+)
+
+
+def api_key_for_agent(agent_name: str) -> str:
+    """Resolves which OpenRouter key a given SUBAGENT (not the orchestrator
+    -- that's always ORCHESTRATOR_API_KEY, resolved directly where the
+    orchestrator model is built) should use, in priority order:
+    1. AGENT_API_KEY_OVERRIDES[agent_name], if that specific agent was
+       pulled out onto its own key.
+    2. DEEPSEARCH_API_KEY, if this is deepsearch specifically.
+    3. SUBAGENT_API_KEY, the shared default for every other subagent.
+    All three ultimately fall back to OPENROUTER_API_KEY if nothing at all
+    is configured -- see each var's own definition above."""
+    if agent_name in AGENT_API_KEY_OVERRIDES:
+        return AGENT_API_KEY_OVERRIDES[agent_name]
+    if agent_name == "deepsearch":
+        return DEEPSEARCH_API_KEY
+    return SUBAGENT_API_KEY
+
 # Backward-compatible alias: kept in case anything (or you) still refers to
 # "the main model" -- always Messa's own orchestrator model.
 MAIN_MODEL_NAME = ORCHESTRATOR_MODEL_NAME
@@ -474,6 +545,58 @@ PARALLEL_API_KEY = os.environ.get("MESSA_PARALLEL_API_KEY") or None
 # well under DEEPSEARCH's own tiers so a slow/unresponsive MCP endpoint
 # fails fast and visibly instead of quietly stalling Messa's reply.
 PARALLEL_MCP_TIMEOUT_SECONDS = float(os.environ.get("MESSA_PARALLEL_MCP_TIMEOUT_SECONDS", "15"))
+
+# ---- Memory (messa/memory.py, migrations/027_memory.sql) -- Mem0 on top of
+# Postgres/pgvector for a two-tier memory: a cheap always-on profile digest
+# (users.memory_profile, read every turn through the app's normal asyncpg
+# pool, no Mem0 involved) plus a larger day-by-day episodic archive Mem0
+# itself stores, searched only on demand via the recall_past_conversation
+# tool and written only by the once-a-day batch job -- never on the live
+# per-message hot path. See README's "Memory" section for the full design
+# and why.
+#
+# MESSA_MEM0_DIRECT_DATABASE_URL is deliberately a SEPARATE var from
+# DATABASE_URL above, and it MUST be Neon's DIRECT/unpooled connection
+# string, not the pooled one DATABASE_URL already uses. Why: the RLS
+# backstop below depends on a Postgres session variable (app.current_
+# user_id) set once per connection staying in effect for every query that
+# follows on that SAME physical connection -- true for a real direct
+# connection, NOT guaranteed under PgBouncer's transaction-pooling mode
+# (confirmed against Neon's own pooling behavior, and it's exactly why
+# DATABASE_URL already needs asyncpg's statement_cache_size=0 workaround
+# just above -- same underlying pooling mode). Left unset, the whole memory
+# feature no-ops cleanly (messa/memory.py returns a plain "memory isn't set
+# up yet" result instead of ever crashing a turn) -- nothing else in this
+# app requires it.
+MESSA_MEM0_DIRECT_DATABASE_URL = (
+    os.environ.get("MESSA_MEM0_DIRECT_DATABASE_URL", "").replace("postgresql+asyncpg://", "postgresql://") or None
+)
+MEM0_ENABLED = MESSA_MEM0_DIRECT_DATABASE_URL is not None
+# Table name -- matches migrations/027_memory.sql's mem0_memories table
+# exactly (Mem0's own auto-create default is just "mem0"; this project
+# pre-creates the table itself under this name so the RLS policy in that
+# migration is reviewable up front rather than bolted on after Mem0
+# auto-creates its own table on first use).
+MEM0_COLLECTION_NAME = os.environ.get("MESSA_MEM0_COLLECTION_NAME", "mem0_memories")
+# The dedicated per-call connection pool messa/memory.py opens is always
+# min=1/max=1 (one physical connection, one user, closed right after) --
+# see messa/memory.py's own docstring for why that's the whole point, not
+# a limitation to raise.
+MEM0_EMBEDDING_DIMS = int(os.environ.get("MESSA_MEM0_EMBEDDING_DIMS", "1536"))
+# Which embedder Mem0 uses. "openrouter" (default) reuses OPENROUTER_API_KEY
+# with zero new dependency -- unverified live as of this writing (see
+# README). "fastembed" is the local/CPU-only fallback (no torch) if that
+# doesn't pan out on the real deployment; switching requires also updating
+# MESSA_MEM0_EMBEDDING_DIMS to match that model's real output size.
+MEM0_EMBEDDER_PROVIDER = os.environ.get("MESSA_MEM0_EMBEDDER_PROVIDER", "openrouter")
+# How often server.py's _production_memory_batch_loop checks whether
+# today's batch has run yet. Coarse on purpose (default hourly, not the
+# tight ~10-20s cadence of the other production pollers -- see
+# background.POLL_INTERVAL_SECONDS) -- db.claim_daily_memory_batch_run's
+# ON CONFLICT DO NOTHING is what actually enforces "once a day", this
+# interval just controls how promptly a missed/restarted day gets picked
+# back up.
+MEMORY_BATCH_POLL_INTERVAL_SECONDS = float(os.environ.get("MESSA_MEMORY_BATCH_POLL_INTERVAL_SECONDS", "3600"))
 
 # ---- Live view sharing (Phase 3) ----
 # Base URL for the public /live/<token> page (see server.py + db.py's
@@ -1011,6 +1134,15 @@ class UserContext:
     # through every hook point. Never surfaced on the pricing page or in
     # plans.py; set with a manual `UPDATE users SET is_admin = true`.
     is_admin: bool = False
+    # From users.memory_profile (migrations/027_memory.sql) -- the cheap,
+    # always-on profile digest, read once per turn via db.get_memory_profile
+    # exactly like the fields above, NOT a live Mem0 call (see
+    # config.MEM0_ENABLED/messa/memory.py for the actual memory backend --
+    # this field is just the last digest that backend already wrote).
+    # None for a brand-new user or before their first daily batch run --
+    # _build_system_prompt omits it entirely in that case, same "absent
+    # field, not a placeholder" pattern as city/email above.
+    memory_profile: str | None = None
 
     @property
     def onboarding_complete(self) -> bool:

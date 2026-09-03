@@ -55,7 +55,7 @@ from typing import Any
 from deepagents import GeneralPurposeSubagentProfile, HarnessProfile, create_deep_agent, register_harness_profile
 from langchain_core.tools import BaseTool, tool
 
-from .. import config, console, db, timeutil
+from .. import config, console, db, memory, timeutil
 from ..approval import ApprovalGate, CLIApprovalGate
 from ..channels import sendblue
 from ..channels.sendblue import SendblueError
@@ -328,11 +328,38 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
             return f"Couldn't send that over text: {e}"
         return f"Sent {resolved.name} to {user.phone_number} as a text attachment."
 
+    @tool
+    async def recall_past_conversation(query: str) -> str:
+        """Search what you and this user have talked about on OTHER days --
+        NOT the current conversation (you already have that in context) and
+        NOT the 'Known about this user' profile digest above (that's
+        already given to you every turn, for free). Use this ONLY when the
+        user references something from more than a few days back that you
+        don't already have -- e.g. "what was that restaurant I mentioned
+        last month", "did I ever tell you my sister's birthday". Don't call
+        this reflexively on every message; it's a real lookup, not a cheap
+        one, so use it like the other backup-tier tools (web_search,
+        parallel_web_search): only when you actually need it.
+
+        This is separate from the profile digest by design -- see README's
+        "Memory" section: the digest is small, always-on, and free every
+        turn; this is the larger day-by-day archive, searched only on
+        demand so it never bloats your system prompt."""
+        result = await memory.search_memory(user, query)
+        if isinstance(result, dict) and result.get("error"):
+            return f"Couldn't search memory: {result['error']}"
+        results = (result or {}).get("results") or []
+        if not results:
+            return "Nothing found in past conversations matching that."
+        lines = [r.get("memory", "") for r in results if r.get("memory")]
+        return "From past conversations:\n" + "\n".join(f"- {line}" for line in lines)
+
     raw_tools: list[BaseTool] = [
         confirm_pending_action, reject_pending_action, list_pending_actions,
         track_project, list_active_projects, save_profile_info,
         set_app_preference, list_my_connected_apps,
         list_deepsearch_sessions, find_contact, send_pdf_over_text,
+        recall_past_conversation,
         *build_web_search_tools(),
     ]
     return trace_all(raw_tools, ORCHESTRATOR_LABEL)
@@ -470,6 +497,15 @@ def _build_system_prompt(
     )
     if user.messa_email:
         known.append(f"their own Messa email address is {user.messa_email}")
+    if user.memory_profile:
+        # The cheap, always-on profile digest (users.memory_profile,
+        # migrations/027_memory.sql) -- a plain column read, NOT a live
+        # Mem0 call (see messa/memory.py's module docstring for the full
+        # two-tier design and why this never touches Mem0 on this hot
+        # path). Absent entirely for a brand-new user or before their
+        # first daily batch run, same "omit rather than placeholder"
+        # pattern as every other optional field here.
+        known.append(f"what you've learned about them over time: {user.memory_profile}")
     for category in ("email", "calendar", "tasks"):
         # 'email' has a free, always-already-loaded fallback
         # (UserContext.default_email_provider, populated once per turn by
@@ -623,19 +659,24 @@ def _build_system_prompt(
         "  - wikipedia_lookup first for anything that's likely to have its own Wikipedia "
         "article (a person, place, company, historical event, concept) -- faster and more "
         "reliable than web_search for that shape of question.\n"
-        "  - web_search (DuckDuckGo) and parallel_web_search (Parallel) are your primary search "
-        "providers for web queries -- use either or both to find facts, news, or candidate links.\n"
+        "  - web_search for a plain factual lookup; parallel_web_search is a second, independent "
+        "search provider -- try it if web_search comes back empty/errors, or for a second "
+        "opinion, not as your default first choice.\n"
         "  - fetch_page_text for a page you already have a link to; it does no JS at all.\n"
-        "  - parallel_web_fetch (Parallel) as your primary JS-rendered and PDF reader if a page "
-        "needs JavaScript or fetch_page_text was empty. Fall back to fetch_rendered_page_text "
-        "(Jina) if parallel_web_fetch errors or fails. Neither costs any Browserbase session time.\n"
+        "  - fetch_rendered_page_text on the SAME url next if fetch_page_text came back empty, "
+        "tiny, or loading-shell-only -- most modern ticket/booking sites need real JS rendering "
+        "to show their actual content. parallel_web_fetch is a second, independent provider for "
+        "this exact same job -- try it if fetch_rendered_page_text also fails. Neither costs any "
+        "Browserbase session time (both run on a separate reader service), just slightly more "
+        "latency than a plain fetch -- still a second or few, not remotely close to what a real "
+        "browser session takes.\n"
         "  - Only once ALL of the above genuinely can't answer it (or the task needs actual "
         "interaction: a flow, a form, a login, a cart, clicking 'buy') should you delegate to "
         "deepsearch. For a task that mixes both -- comparing a few options and then acting on "
-        "one of them -- do the comparing with parallel_web_fetch (falling back to "
-        "fetch_rendered_page_text) across every candidate first, THEN delegate to deepsearch with "
-        "a description that already says exactly which page/option to act on, so it doesn't "
-        "spend paid session time re-discovering what you already found.\n\n"
+        "one of them -- do the comparing with fetch_rendered_page_text/parallel_web_fetch across "
+        "every candidate first, THEN delegate to deepsearch with a description that already says "
+        "exactly which page/option to act on, so it doesn't spend paid session time "
+        "re-discovering what you already found.\n\n"
         "Other apps and platforms (Reddit, Todoist, Slack, Notion, GitHub, Google Calendar, "
         "and everything else outside your other subagents -- never email, that always goes "
         "to email_agent/personal_inbox_agent): delegate to integrations_agent FIRST, before "
@@ -738,26 +779,55 @@ async def build_orchestrator(
     subagent_model: Any = None,
 ) -> Any:
     """`model` is Messa's own orchestrator model (config.ORCHESTRATOR_MODEL_NAME
-    by default); `subagent_model` is what every subagent below uses instead
-    (config.SUBAGENT_MODEL_NAME by default) -- see config.py's comment for why
-    these are deliberately two different models now rather than one shared
-    instance. Both params exist mainly so tests can inject fakes for either
-    or both independently; real callers (cli.py, server.py) just omit them
-    and get the configured defaults."""
+    by default, config.ORCHESTRATOR_API_KEY); `subagent_model`, when
+    explicitly passed, is what EVERY subagent below uses instead (kept for
+    tests that want to inject one fake model everywhere) -- real callers
+    (cli.py, server.py) always omit it, in which case each subagent gets
+    its OWN model instance instead, same config.SUBAGENT_MODEL_NAME but
+    bound to whichever OpenRouter key config.api_key_for_agent resolves
+    for that specific subagent's name (see _subagent_model_for below and
+    config.py's "Per-agent OpenRouter API keys" section for the full
+    three-tier-plus-overrides design -- this is what lets Messa's own
+    reply, deepsearch, and the rest of the subagents run on separate keys
+    so a busy one's rate/concurrency ceiling never queues up another)."""
     approval_gate = approval_gate or CLIApprovalGate()
     # effective_context_tokens: see config.py's big comment above
     # SUBAGENT_EFFECTIVE_CONTEXT_TOKENS/ORCHESTRATOR_EFFECTIVE_CONTEXT_TOKENS
     # -- without this, every agent's auto-compaction silently falls back to
     # deepagents' generic 170k-token trigger, since our OpenRouter model
     # strings don't match anything in LangChain's model-profile lookup.
+    #
+    # api_key=config.ORCHESTRATOR_API_KEY: Messa's own dedicated key (see
+    # config.py's "Per-agent OpenRouter API keys" section) -- separate from
+    # every subagent below by default, so a rate/concurrency ceiling on a
+    # busy subagent's key can never queue up Messa's own reply to the user.
     model = model or config.build_model(
         config.ORCHESTRATOR_MODEL_NAME,
         effective_context_tokens=config.ORCHESTRATOR_EFFECTIVE_CONTEXT_TOKENS,
+        api_key=config.ORCHESTRATOR_API_KEY,
     )
-    subagent_model = subagent_model or config.build_model(
-        config.SUBAGENT_MODEL_NAME,
-        effective_context_tokens=config.SUBAGENT_EFFECTIVE_CONTEXT_TOKENS,
-    )
+
+    def _subagent_model_for(agent_name: str) -> Any:
+        """Builds a per-agent model bound to config.api_key_for_agent's
+        resolution for that specific agent name -- deepsearch, or the
+        shared "everything else" key, or an individual override, per
+        config.py's own docstring. `subagent_model` (this function's own
+        closed-over param), when explicitly passed in by a caller (real
+        callers never do; tests inject a fake here to cover every subagent
+        with one object), takes priority over all of that -- same
+        backward-compatible escape hatch this param already was before
+        per-agent keys existed. Building N small ChatOpenAI clients here
+        instead of reusing one shared instance is cheap: construction does
+        no network call (confirmed by deepsearch_tools.py's own
+        _pick_subagent_model, which already relies on exactly that fact for
+        its per-call key rotation)."""
+        if subagent_model is not None:
+            return subagent_model
+        return config.build_model(
+            config.SUBAGENT_MODEL_NAME,
+            effective_context_tokens=config.SUBAGENT_EFFECTIVE_CONTEXT_TOKENS,
+            api_key=config.api_key_for_agent(agent_name),
+        )
     # A cheap LOCAL DB read (not a Composio API call -- see
     # db.get_active_connected_toolkits' own docstring for why that
     # distinction matters here specifically: this runs on every turn).
@@ -787,9 +857,9 @@ async def build_orchestrator(
             app_preferences[_category] = "messa"
 
     subagents = [
-        build_deepsearch_subagent(user, subagent_model, approval_gate),
-        build_executive_subagent(user, subagent_model),
-        build_email_subagent(user, subagent_model, approval_gate),
+        build_deepsearch_subagent(user, _subagent_model_for("deepsearch"), approval_gate),
+        build_executive_subagent(user, _subagent_model_for("executive_assistant")),
+        build_email_subagent(user, _subagent_model_for("email_agent"), approval_gate),
         {
             "name": "personal_inbox_agent",
             "description": (
@@ -799,14 +869,14 @@ async def build_orchestrator(
             ),
             "system_prompt": build_personal_inbox_system_prompt(user),
             "tools": build_personal_inbox_tools(user, approval_gate),
-            "model": subagent_model,
+            "model": _subagent_model_for("personal_inbox_agent"),
         },
         {
             "name": "document_agent",
             "description": "Generates polished PDF documents from structured content on request.",
             "system_prompt": DOCUMENT_SYSTEM_PROMPT,
             "tools": build_document_tools(),
-            "model": subagent_model,
+            "model": _subagent_model_for("document_agent"),
         },
         {
             "name": "routines_agent",
@@ -820,14 +890,14 @@ async def build_orchestrator(
             ),
             "system_prompt": ROUTINES_SYSTEM_PROMPT,
             "tools": build_routines_tools(user),
-            "model": subagent_model,
+            "model": _subagent_model_for("routines_agent"),
         },
         {
             "name": "integrations_agent",
             "description": _integrations_agent_description(connected_slugs, app_preferences.get("email", "messa")),
             "system_prompt": build_integration_system_prompt(user),
             "tools": build_integration_tools(user, approval_gate),
-            "model": subagent_model,
+            "model": _subagent_model_for("integrations_agent"),
         },
     ]
 
@@ -846,7 +916,7 @@ async def build_orchestrator(
             ),
             "system_prompt": ADMIN_SYSTEM_PROMPT,
             "tools": build_admin_tools(user),
-            "model": subagent_model,
+            "model": _subagent_model_for("admin_agent"),
         })
 
     agent = create_deep_agent(
