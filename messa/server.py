@@ -33,7 +33,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -51,7 +51,7 @@ from .channels.sendblue import SendblueError
 from .landing_page import render_landing_page
 from .live_view_page import render_live_view_page
 from .tools import email_tools, integration_tools
-from .tools.routines_tools import compute_next_run
+from .tools.routines_tools import ONE_SHOT_SENTINEL, compute_next_run
 
 app = FastAPI(title="Messa Sendblue webhook")
 
@@ -1078,44 +1078,309 @@ async def _production_reminder_loop() -> None:
         await asyncio.sleep(background.POLL_INTERVAL_SECONDS)
 
 
+def _job_meta(job: dict[str, Any]) -> dict[str, Any]:
+    """Same TEXT-JSON unpack as db._load_meta, duplicated here (not
+    imported) since it's a one-line, side-effect-free read and importing a
+    private db helper across module boundaries isn't worth it for this."""
+    raw = job.get("meta")
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+        return parsed if isinstance(parsed, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _digest_due(pending_count: int, local_now: datetime) -> bool:
+    """Extracted for testability: is it time to flush a user's digest
+    queue? Either the local-morning-hour window, or the backstop count,
+    whichever comes first (see _production_digest_loop's own docstring)."""
+    if pending_count >= config.ROUTINE_DIGEST_BACKSTOP_COUNT:
+        return True
+    return local_now.hour == config.ROUTINE_DIGEST_HOUR_LOCAL and local_now.minute < 5
+
+
+def _deadline_pace_minutes(remaining: timedelta) -> int:
+    """Sub-feature #2 (deadline-aware escalation): how long until the NEXT
+    check-in, given how much time is left before the deadline -- a light
+    nudge far out, more frequent as it actually nears, rather than one flat
+    reminder that's either too early to matter or too late to help."""
+    hours_left = remaining.total_seconds() / 3600
+    if hours_left <= 2:
+        return 30
+    if hours_left <= 24:
+        return 180
+    if hours_left <= 72:
+        return 720
+    return 1440
+
+
+async def _fire_notify_routine(job: dict[str, Any], meta: dict[str, Any]) -> None:
+    """'notify' mode: a plain reminder -- the USER does the thing, Messa's
+    only job is saying so at the right time. Deliberately NO agent/LLM call
+    on this path at all: a direct, deterministic Sendblue send, so a plain
+    reminder can never turn into Messa "helpfully" going and doing the task
+    herself. Handles sub-features #2 (deadline pacing), #3 (digest
+    batching), and #9 (escalation on non-response) -- all optional shape on
+    top of the same one primitive."""
+    phone = job["phone_number"]
+    user_id = job["user_id"]
+    is_one_shot = job["cron_expression"] == ONE_SHOT_SENTINEL
+    now = datetime.now(timezone.utc)
+
+    escalating = bool(meta.get("escalate_on_no_response"))
+    escalation_count = int(meta.get("escalation_count", 0))
+    last_notified = _parse_iso(meta.get("last_notified_at"))
+    if escalating and last_notified is not None and await db.has_user_replied_since(user_id, last_notified):
+        # The user engaged since the last check-in -- treat this follow-up
+        # chain as answered and stop pinging, rather than judge here
+        # whether the reply actually addressed it (that's Messa's own next
+        # live turn's job, not this poller's).
+        await db.set_cron_job_status(user_id, job["id"], "cancelled", {"ended_reason": "user_responded"})
+        return
+
+    text = meta.get("reminder_message") or f"Reminder: {job['prompt_or_task']}"
+    deadline = _parse_iso(meta.get("deadline_at"))
+    deadline_passed = deadline is not None and now >= deadline
+    if escalating and escalation_count > 0:
+        text = f"Following up again -- {text}"
+    final_notice = escalating and (escalation_count + 1) >= config.ROUTINE_ESCALATION_MAX_COUNT
+    if final_notice:
+        text += " (last check-in from me on this.)"
+    elif deadline_passed:
+        text += " (this was due already -- let me know if you still want a check-in.)"
+
+    if meta.get("digest"):
+        await db.enqueue_digest_item(user_id, job["id"], text)
+    else:
+        try:
+            await sendblue.send_message(phone, text)
+        except SendblueError as e:
+            console.system(f"[routine notify delivery failed] job=#{job['id']}: {e}")
+            return  # leave status/next_run_at untouched -- retried next poll, same as reminders
+
+    meta_patch = {"last_notified_at": now.isoformat(), "last_run_status": "ok"}
+
+    if is_one_shot and not escalating and not deadline:
+        # The plain "remind me at 4pm" case -- fires once, done.
+        await db.set_cron_job_status(user_id, job["id"], "cancelled",
+                                      {**meta_patch, "ended_reason": "completed_one_shot"})
+        return
+
+    if escalating:
+        if final_notice or deadline_passed:
+            await db.set_cron_job_status(
+                user_id, job["id"], "cancelled",
+                {**meta_patch, "ended_reason": "gave_up_no_response" if final_notice else "deadline_passed",
+                 "escalation_count": escalation_count + 1},
+            )
+            return
+        interval = max(
+            config.ROUTINE_ESCALATION_MIN_MINUTES,
+            int(config.ROUTINE_ESCALATION_BASE_MINUTES * (config.ROUTINE_ESCALATION_SHRINK_FACTOR ** (escalation_count + 1))),
+        )
+        meta_patch["escalation_count"] = escalation_count + 1
+        await db.reschedule_cron_job(job["id"], now + timedelta(minutes=interval), meta_patch)
+        return
+
+    if deadline:
+        if deadline_passed:
+            await db.set_cron_job_status(user_id, job["id"], "cancelled",
+                                          {**meta_patch, "ended_reason": "deadline_passed"})
+            return
+        interval = _deadline_pace_minutes(deadline - now)
+        await db.reschedule_cron_job(job["id"], now + timedelta(minutes=interval), meta_patch)
+        return
+
+    # Ordinary recurring notify job (no deadline/escalation) -- normal cadence.
+    next_run = compute_next_run(job["cron_expression"], job["user_timezone"])
+    await db.reschedule_cron_job(job["id"], next_run, meta_patch)
+
+
+async def _fire_autonomous_routine(job: dict[str, Any], meta: dict[str, Any]) -> None:
+    """'autonomous' mode: MESSA does the thing herself, using her full
+    toolset -- the real counterpart to background.py's CLI-only cron
+    preview (which only ever printed "would run now"). Re-invokes Messa for
+    real with the job's saved prompt_or_task (wrapped with enough context
+    that she knows this is an automated firing and how to call
+    finish_routine on herself -- see the wrapped_task string below), using
+    the same load_user_context/build_orchestrator/run_message path a live
+    inbound text would use.
+
+    Handles: expire_at (a self-checking watcher gives up after this long
+    with no resolution, sub-feature/gap "self-stopping retry loops"),
+    auto-retry with backoff on a failed run up to a bounded attempt count
+    (#5), digest batching of the result (#3), and honors a self-cancel via
+    finish_routine having already run mid-turn (checked by re-reading the
+    job's own status after the run, before deciding whether to
+    reschedule)."""
+    phone = job["phone_number"]
+    user_id = job["user_id"]
+    is_one_shot = job["cron_expression"] == ONE_SHOT_SENTINEL
+    now = datetime.now(timezone.utc)
+
+    expire_at = _parse_iso(meta.get("expire_at"))
+    if expire_at is not None and now >= expire_at:
+        try:
+            await sendblue.send_message(
+                phone,
+                f"I gave up checking on this after a while with no resolution: "
+                f"\"{job['prompt_or_task']}\". Let me know if you'd like me to try again.",
+            )
+        except SendblueError as e:
+            console.system(f"[routine expire notify failed] job=#{job['id']}: {e}")
+        await db.set_cron_job_status(user_id, job["id"], "cancelled", {"ended_reason": "expired"})
+        return
+
+    attempt_count = int(meta.get("attempt_count", 0))
+    digest_mode = bool(meta.get("digest"))
+    wrapped_task = (
+        f"(Automated check-in for routine #{job['id']} -- this is not a live message from the "
+        f"user right now, they won't see this line. Your saved task: {job['prompt_or_task']}\n"
+        f"If this is now fully resolved and no more automatic checks are needed, delegate to "
+        f"routines_agent and call finish_routine with cron_id={job['id']} and a short outcome "
+        f"summary so it stops running. Otherwise just do what the task needs -- this will check "
+        f"again automatically on its own schedule.)"
+    )
+
+    captured: list[str] = []
+
+    async def _capture_or_send(text: str, _phone: str = phone) -> None:
+        captured.append(text)
+        if not digest_mode:
+            await sendblue.send_message(_phone, text)
+
+    run_failed = False
+    try:
+        user = await cli.load_user_context(phone, channel="sms")
+        agent = await build_orchestrator(user, _approval_gate())
+        await cli.run_message(user, agent, wrapped_task, send=_capture_or_send)
+    except Exception as e:  # noqa: BLE001
+        run_failed = True
+        console.system(f"[autonomous routine run failed] job=#{job['id']}: {e}")
+
+    if digest_mode and captured:
+        await db.enqueue_digest_item(user_id, job["id"], "\n".join(captured))
+
+    # The run itself may have already self-finished the job (finish_routine)
+    # or a paused/cancelled it mid-run -- re-check before deciding anything else.
+    current_rows = await db.list_cron_jobs(user_id)
+    current = next((r for r in current_rows if r["id"] == job["id"]), None)
+    if current is None or current["status"] != "active":
+        return
+
+    if run_failed:
+        attempt_count += 1
+        if attempt_count >= config.ROUTINE_MAX_RETRY_ATTEMPTS:
+            try:
+                await sendblue.send_message(
+                    phone,
+                    f"I ran into trouble a few times trying to do this and I'm stopping for now: "
+                    f"\"{job['prompt_or_task']}\". Let me know if you'd like me to try again.",
+                )
+            except SendblueError as e:
+                console.system(f"[routine max-attempts notify failed] job=#{job['id']}: {e}")
+            await db.set_cron_job_status(
+                user_id, job["id"], "cancelled",
+                {"ended_reason": "max_attempts", "attempt_count": attempt_count, "last_run_status": "failed"},
+            )
+            return
+        next_run = now + timedelta(minutes=config.ROUTINE_RETRY_BACKOFF_MINUTES)
+        await db.reschedule_cron_job(
+            job["id"], next_run, {"attempt_count": attempt_count, "last_run_status": "retrying"}
+        )
+        return
+
+    if is_one_shot:
+        await db.set_cron_job_status(
+            user_id, job["id"], "cancelled",
+            {"ended_reason": "completed_one_shot", "attempt_count": 0, "last_run_status": "ok"},
+        )
+        return
+    next_run = compute_next_run(job["cron_expression"], job["user_timezone"])
+    await db.reschedule_cron_job(job["id"], next_run, {"attempt_count": 0, "last_run_status": "ok"})
+
+
 async def _production_cron_loop() -> None:
-    """The real counterpart to background.py's CLI-only cron preview (which
-    only ever printed "would run now"). This re-invokes Messa for real with
-    the job's saved prompt_or_task, using the same load_user_context/
-    build_orchestrator/run_message path a live inbound text would use, and
-    delivers whatever Messa produces via Sendblue -- so a recurring
-    automation (a weekly check-in, anything else a user asked Messa to set
-    up via routines_agent) actually happens instead of only ever being
-    provably schedulable.
+    """The real counterpart to background.py's CLI-only cron preview. Every
+    due routine branches on its own execution_mode ('notify' -- a plain,
+    no-agent-call reminder; 'autonomous' -- a full re-invoked Messa turn) --
+    see _fire_notify_routine/_fire_autonomous_routine above for what each
+    actually does, including one-shot vs recurring, deadlines, digests,
+    retries, and escalation. A pre-migration-024 row (no execution_mode
+    column at all) reads back as 'autonomous' by default, i.e. exactly
+    today's existing behavior, unchanged.
 
     exclude_kinds=BRIEFING_KINDS: the two system-provisioned morning/
     evening briefings (config.DEFAULT_BRIEFINGS) no longer come through
     here at all -- see briefings.py's module docstring for why (template-
     rendered, no model call, fanned out in parallel by the separate
     _production_briefing_loop below instead of one-at-a-time in this
-    for-loop). Everything else -- any automation a user actually asked
-    Messa to create -- is genuinely arbitrary, model-authored text with no
-    fixed shape, so it keeps going through a real LLM turn here,
-    unchanged."""
+    for-loop)."""
     while True:
         try:
             due = await db.get_due_cron_jobs_for_delivery(exclude_kinds=BRIEFING_KINDS)
             for job in due:
-                phone = job["phone_number"]
+                meta = _job_meta(job)
+                mode = job.get("execution_mode") or "autonomous"
                 try:
-                    user = await cli.load_user_context(phone, channel="sms")
-                    agent = await build_orchestrator(user, _approval_gate())
-
-                    async def _cron_send(text: str, _phone: str = phone) -> None:
-                        await sendblue.send_message(_phone, text)
-
-                    await cli.run_message(user, agent, job["prompt_or_task"], send=_cron_send)
+                    if mode == "notify":
+                        await _fire_notify_routine(job, meta)
+                    else:
+                        await _fire_autonomous_routine(job, meta)
                 except Exception as e:  # noqa: BLE001
                     console.system(f"[cron delivery failed] job=#{job['id']}: {e}")
-                next_run = compute_next_run(job["cron_expression"], job["user_timezone"])
-                await db.reschedule_cron_job(job["id"], next_run)
         except Exception as e:  # noqa: BLE001
             console.system(f"[cron poller error] {e}")
+        await asyncio.sleep(background.POLL_INTERVAL_SECONDS)
+
+
+async def _production_digest_loop() -> None:
+    """Sub-feature #3 ("while you were away" digest): flushes each user's
+    queued digest_queue items (written by a routine tagged meta.digest=true
+    -- see _fire_notify_routine/_fire_autonomous_routine above) into ONE
+    message instead of one text per resolved item. Fires either at the
+    user's own local morning hour (config.ROUTINE_DIGEST_HOUR_LOCAL, a
+    5-minute window checked each poll -- safe to re-check repeatedly since
+    a successful flush empties the queue, so there's nothing left to
+    re-flush for the rest of that window) or once
+    config.ROUTINE_DIGEST_BACKSTOP_COUNT items have piled up, whichever
+    comes first, so a user with a lot of background activity isn't left
+    waiting a full day for the first result."""
+    while True:
+        try:
+            pending = await db.get_users_with_pending_digest_items()
+            for row in pending:
+                tz_name = row.get("timezone") or config.DEFAULT_TIMEZONE
+                try:
+                    local_now = datetime.now(ZoneInfo(tz_name))
+                except Exception:
+                    local_now = datetime.now(timezone.utc)
+                if not _digest_due(row["pending_count"], local_now):
+                    continue
+                items = await db.get_pending_digest_items(row["user_id"])
+                if not items:
+                    continue
+                lines = [it["message_text"] for it in items]
+                intro = "While you were away:" if len(lines) > 1 else "While you were away --"
+                text = intro + "\n\n" + "\n\n".join(lines)
+                try:
+                    await sendblue.send_message(row["phone_number"], text)
+                    await db.clear_digest_items_for_user(row["user_id"])
+                except SendblueError as e:
+                    console.system(f"[digest delivery failed] user=#{row['user_id']}: {e}")
+        except Exception as e:  # noqa: BLE001
+            console.system(f"[digest poller error] {e}")
         await asyncio.sleep(background.POLL_INTERVAL_SECONDS)
 
 
@@ -1369,12 +1634,13 @@ async def _startup() -> None:
         asyncio.create_task(_production_reminder_loop()),
         asyncio.create_task(_production_cron_loop()),
         asyncio.create_task(_production_briefing_loop()),
+        asyncio.create_task(_production_digest_loop()),
         asyncio.create_task(_production_deepsearch_pause_loop()),
         asyncio.create_task(_production_email_connection_poll_loop()),
         asyncio.create_task(_production_app_connection_poll_loop()),
     ]
     console.system(
-        "Started production reminder/cron/briefing/deepsearch-pause/email-connection/"
+        "Started production reminder/cron/briefing/digest/deepsearch-pause/email-connection/"
         "app-connection delivery pollers."
     )
 

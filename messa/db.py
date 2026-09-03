@@ -931,6 +931,24 @@ async def delete_person(user_id: int, name: str) -> dict[str, Any]:
 # Cron jobs (create is gated via pending_actions; pause/cancel are direct)
 # ---------------------------------------------------------------------------
 
+def _load_meta(row: dict[str, Any]) -> dict[str, Any]:
+    """Every cron_jobs row's `meta` column (migrations/024_task_routines.sql)
+    is JSON-serialized TEXT, same convention as pending_actions.payload --
+    this is the one place that unpacks it back to a dict. Pre-migration-024
+    (no `meta` column at all) or a row somehow stored with an empty/invalid
+    value both come back as {} rather than raising -- a routine with no
+    extra behavior configured is supposed to look exactly like a routine
+    that predates this feature entirely."""
+    raw = row.get("meta")
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+
 async def list_cron_jobs(user_id: int) -> list[dict[str, Any]]:
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -1044,37 +1062,202 @@ async def get_due_briefing_jobs_for_delivery(now: datetime | None = None) -> lis
         return _rows(rows)
 
 
-async def reschedule_cron_job(cron_id: int, next_run_at: datetime) -> None:
+async def reschedule_cron_job(
+    cron_id: int, next_run_at: datetime, meta_patch: dict[str, Any] | None = None,
+) -> None:
+    """Sets the next fire time (used both for a normal recurring reschedule
+    and for sub-feature #7 -- a user's plain-language "ask me again in an
+    hour" reply resolving to reschedule_routine). `meta_patch`, when given,
+    is merged into the existing `meta` (not replaced) in the SAME statement
+    -- e.g. bumping last_notified_at/escalation_count together with the new
+    next_run_at, so a caller never has to make two round trips or risk a
+    torn read between them. No-ops the merge (silently ignores meta_patch)
+    pre-migration-024, same "degrade the optional part" pattern as the rest
+    of this module."""
     pool = await get_pool()
     async with pool.acquire() as conn:
+        has_meta = bool(meta_patch) and await _has_column(conn, "cron_jobs", "meta")
+        if has_meta:
+            row = await conn.fetchrow(
+                "SELECT meta FROM cron_jobs WHERE id = $1", cron_id
+            )
+            current = _load_meta(dict(row)) if row else {}
+            current.update(meta_patch)
+            await conn.execute(
+                "UPDATE cron_jobs SET last_run_at = NOW(), next_run_at = $2, meta = $3 WHERE id = $1",
+                cron_id, next_run_at, json.dumps(current, default=_json_default),
+            )
+        else:
+            await conn.execute(
+                "UPDATE cron_jobs SET last_run_at = NOW(), next_run_at = $2 WHERE id = $1",
+                cron_id, next_run_at,
+            )
+
+
+async def update_cron_job_meta(cron_id: int, patch: dict[str, Any]) -> None:
+    """Merges `patch` into a cron_jobs row's existing meta without touching
+    schedule/status -- used for bookkeeping-only updates (recording a failed
+    attempt's count, an outcome summary) where reschedule_cron_job's
+    combined write doesn't apply. No-op pre-migration-024."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_column(conn, "cron_jobs", "meta"):
+            return
+        row = await conn.fetchrow("SELECT meta FROM cron_jobs WHERE id = $1", cron_id)
+        if row is None:
+            return
+        current = _load_meta(dict(row))
+        current.update(patch)
         await conn.execute(
-            "UPDATE cron_jobs SET last_run_at = NOW(), next_run_at = $2 WHERE id = $1",
-            cron_id, next_run_at,
+            "UPDATE cron_jobs SET meta = $2 WHERE id = $1",
+            cron_id, json.dumps(current, default=_json_default),
         )
 
 
-async def set_cron_job_status(user_id: int, cron_id: int, status: str) -> dict[str, Any]:
+async def set_cron_job_status(
+    user_id: int, cron_id: int, status: str, meta_patch: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """`meta_patch` (optional): merged into `meta` in the same statement --
+    used when a status change also needs to record WHY (e.g. finish_routine
+    setting status='cancelled' alongside meta.ended_reason='completed_by_agent'
+    and meta.outcome, or the cron loop retiring an expired/exhausted
+    autonomous job with meta.ended_reason='expired'/'max_attempts')."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "UPDATE cron_jobs SET status = $3 WHERE id = $1 AND user_id = $2 RETURNING *",
-            cron_id, user_id, status,
-        )
+        if meta_patch and await _has_column(conn, "cron_jobs", "meta"):
+            existing = await conn.fetchrow(
+                "SELECT meta FROM cron_jobs WHERE id = $1 AND user_id = $2", cron_id, user_id
+            )
+            if existing is None:
+                return {}
+            current = _load_meta(dict(existing))
+            current.update(meta_patch)
+            row = await conn.fetchrow(
+                "UPDATE cron_jobs SET status = $3, meta = $4 WHERE id = $1 AND user_id = $2 RETURNING *",
+                cron_id, user_id, status, json.dumps(current, default=_json_default),
+            )
+        else:
+            row = await conn.fetchrow(
+                "UPDATE cron_jobs SET status = $3 WHERE id = $1 AND user_id = $2 RETURNING *",
+                cron_id, user_id, status,
+            )
         return dict(row) if row else {}
 
 
+async def has_user_replied_since(user_id: int, since: datetime) -> bool:
+    """Sub-feature #9 (polite escalation on non-response): has the user sent
+    ANY inbound message since `since`? Used right before a follow-up/notify
+    fire to decide whether to escalate (shorten pacing, more direct wording)
+    or hold steady -- a real reply of any kind resets escalation regardless
+    of what it said, since judging whether it actually addressed the
+    follow-up is exactly the kind of open-ended judgment call that belongs
+    to Messa's own next live turn, not this poller."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT 1 FROM message_history
+            WHERE user_id = $1 AND role = 'user' AND timestamp > $2
+            LIMIT 1
+            """,
+            user_id, since,
+        )
+        return row is not None
+
+
+# ---------------------------------------------------------------------------
+# Digest queue (sub-feature #3, migrations/024_task_routines.sql) -- an
+# autonomous or notify routine tagged meta.digest=true writes its result
+# here instead of texting immediately; server.py's _production_digest_loop
+# decides WHEN to flush a user's queue (their local morning hour, or a
+# backstop count) and calls the read/clear functions below to do it. This
+# module deliberately does no timing/scheduling judgment itself -- same
+# "db.py doesn't know about agents or business timing" boundary as the rest
+# of the file.
+# ---------------------------------------------------------------------------
+
+async def enqueue_digest_item(user_id: int, cron_job_id: int | None, message_text: str) -> None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO digest_queue (user_id, cron_job_id, message_text) VALUES ($1, $2, $3)",
+            user_id, cron_job_id, message_text,
+        )
+
+
+async def get_users_with_pending_digest_items() -> list[dict[str, Any]]:
+    """One row per user with at least one queued item: phone_number/timezone
+    (for the flush decision and the send itself), pending_count, and the
+    oldest item's created_at -- so a caller can decide per-user whether it's
+    that user's local flush hour yet or enough has piled up to flush early,
+    without a second query per user."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT u.id AS user_id, u.phone_number, u.timezone,
+                   COUNT(dq.id) AS pending_count, MIN(dq.created_at) AS oldest_item_at
+            FROM digest_queue dq JOIN users u ON u.id = dq.user_id
+            GROUP BY u.id, u.phone_number, u.timezone
+            """
+        )
+        return _rows(rows)
+
+
+async def get_pending_digest_items(user_id: int) -> list[dict[str, Any]]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT * FROM digest_queue WHERE user_id = $1 ORDER BY created_at", user_id
+        )
+        return _rows(rows)
+
+
+async def clear_digest_items_for_user(user_id: int) -> None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM digest_queue WHERE user_id = $1", user_id)
+
+
 async def _insert_cron_job(conn: asyncpg.Connection, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
-    # payload["next_run_at"] is already a tz-aware datetime by the time it
-    # gets here (tools/routines_tools.py computes it via compute_next_run,
-    # which is timezone-aware end to end) -- no string parsing needed.
-    row = await conn.fetchrow(
-        """
-        INSERT INTO cron_jobs (user_id, prompt_or_task, cron_expression, user_timezone, next_run_at, status)
-        VALUES ($1, $2, $3, $4, $5, 'active'::cron_job_status) RETURNING *
-        """,
-        user_id, payload["prompt_or_task"], payload["cron_expression"],
-        payload.get("user_timezone", config.DEFAULT_TIMEZONE), payload["next_run_at"],
-    )
+    """Applier for the 'create_routine' gated action (routines_tools.py's
+    propose_create_routine) -- confirm_pending_action hands this a payload
+    that's been through one full json.dumps/json.loads round trip (see
+    that function's own comment on `payload` columns being TEXT, not
+    JSONB), so `next_run_at` arrives as an ISO-8601-ish STRING here, not a
+    real datetime object, exactly like every other gated action's payload
+    in this file (see _insert_calendar_event's use of _parse_dt just above)
+    -- despite what an earlier version of this function's docstring
+    (incorrectly) claimed. Run through _parse_dt like everything else that
+    touches a timestamptz column, or asyncpg raises a DataError.
+
+    execution_mode/meta are written only if migration 024 has run
+    (_has_column-guarded) -- pre-migration, this behaves exactly as it did
+    before this feature existed: a plain recurring job, no meta."""
+    user_tz = payload.get("user_timezone", config.DEFAULT_TIMEZONE)
+    next_run_at = _parse_dt(payload["next_run_at"], user_tz)
+    has_mode = await _has_column(conn, "cron_jobs", "execution_mode")
+    has_meta = await _has_column(conn, "cron_jobs", "meta")
+    if has_mode and has_meta:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO cron_jobs
+                (user_id, prompt_or_task, cron_expression, user_timezone, next_run_at,
+                 status, execution_mode, meta)
+            VALUES ($1, $2, $3, $4, $5, 'active'::cron_job_status, $6, $7) RETURNING *
+            """,
+            user_id, payload["prompt_or_task"], payload["cron_expression"], user_tz, next_run_at,
+            payload.get("execution_mode", "autonomous"),
+            json.dumps(payload.get("meta") or {}, default=_json_default),
+        )
+    else:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO cron_jobs (user_id, prompt_or_task, cron_expression, user_timezone, next_run_at, status)
+            VALUES ($1, $2, $3, $4, $5, 'active'::cron_job_status) RETURNING *
+            """,
+            user_id, payload["prompt_or_task"], payload["cron_expression"], user_tz, next_run_at,
+        )
     return dict(row)
 
 
@@ -1092,7 +1275,7 @@ async def _retire_legacy_briefing_if_any(conn: asyncpg.Connection, user_id: int,
     config.LEGACY_BRIEFING_MATCH_KEYWORDS' own comment for the "replace
     entirely" decision this implements. `kind IS NULL` scopes this to jobs
     that predate the `kind` column entirely (an ordinary user-created job
-    via propose_create_recurring_cron); a job this function itself tagged
+    via propose_create_routine); a job this function itself tagged
     on an earlier call is never a candidate for re-matching here. Matches
     on exactly ONE candidate only -- zero or multiple candidates means
     "don't touch anything," since guessing wrong here means cancelling a
@@ -1128,7 +1311,7 @@ async def ensure_default_briefings(user_row: dict[str, Any]) -> None:
     without re-creating a briefing the user deliberately cancelled or
     paused -- existence of a row with this kind, regardless of its current
     status, is what's checked. This is also why it writes directly rather
-    than going through propose_action/create_recurring_cron's confirmation
+    than going through propose_action/create_routine's confirmation
     gate: that gate exists for a MODEL deciding to create new standing
     automation on its own initiative, not for a default the product itself
     turns on for everyone, the same reasoning get_or_create_live_share_token
@@ -1198,7 +1381,7 @@ _APPLIERS = {
     "create_calendar_event": _insert_calendar_event,
     "update_calendar_event": _update_calendar_event,
     "delete_calendar_event": _delete_calendar_event,
-    "create_recurring_cron": _insert_cron_job,
+    "create_routine": _insert_cron_job,
 }
 
 GATED_ACTION_TYPES = set(_APPLIERS)

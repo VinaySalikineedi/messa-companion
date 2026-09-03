@@ -525,8 +525,10 @@ def _build_system_prompt(
         "connected calendar), email_agent (the user's own Gmail), "
         "personal_inbox_agent (the user's own Messa-owned email address -- a different "
         "inbox from their Gmail), document_agent (generates PDFs), routines_agent "
-        "(recurring automations), integrations_agent (any other app -- Reddit, Todoist, "
-        "Slack, Notion, GitHub, Google Calendar, and 1,400+ more).\n\n"
+        "(recurring or one-time task routines -- both plain reminders where the USER does "
+        "something, and background tasks where YOU do something yourself and report back, "
+        "e.g. watchers, deadline-aware follow-ups), integrations_agent (any other app -- "
+        "Reddit, Todoist, Slack, Notion, GitHub, Google Calendar, and 1,400+ more).\n\n"
         "Email routing -- there are two separate inboxes, and you decide which one handles "
         "each request: personal_inbox_agent (their own address on your domain) and email_agent "
         "(their connected Gmail, once set up). For a GENERIC request that doesn't name an inbox "
@@ -775,8 +777,12 @@ async def build_orchestrator(
         {
             "name": "routines_agent",
             "description": (
-                "Sets up, lists, pauses, resumes, and cancels recurring automations "
-                "(cron-scheduled reminders/tasks). Use for anything recurring/scheduled."
+                "Sets up, lists, pauses, resumes, cancels, and reschedules task routines -- "
+                "both recurring and one-time, both plain reminders (the user does something) "
+                "and autonomous background tasks (you do something yourself later and report "
+                "back, e.g. watchers, deadline-aware follow-ups, digests). Use for anything "
+                "recurring/scheduled, or anything you're telling the user you'll check on or "
+                "follow up about later."
             ),
             "system_prompt": ROUTINES_SYSTEM_PROMPT,
             "tools": build_routines_tools(user),

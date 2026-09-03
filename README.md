@@ -5705,3 +5705,183 @@ conversationally rather than verbatim (same standing caveat as every
 other prompt/tool-error-text change in this project), and the
 `EMAIL_SEND_ACTION_SLUGS` allowlist's exact slug strings are a best-effort
 starting set, not confirmed against a live Composio catalog.
+
+## Task routines: "remind the user" vs "Messa does it herself," one-shot scheduling, watchers, deadlines, digests, retries, escalation
+
+routines_agent used to do exactly one thing: recurring cron jobs that
+re-invoke Messa's full agent turn on schedule. That's genuinely two
+different behaviors wearing one costume -- "remind me to check Gmail"
+(the user does it) and "check my Gmail and summarize it" (Messa does it)
+can be phrased almost identically, but need opposite handling: the first
+should be a cheap, guaranteed-exact text with no model involved; the
+second needs Messa's full toolset re-run on schedule. There was also no
+way to schedule something once ("check back in a few hours"), no way for
+a background watcher to decide for itself that it's done, and no bound on
+how long an autonomous check-in loop could keep running.
+
+migration `024_task_routines.sql` adds two columns to the existing
+`cron_jobs` table -- `execution_mode` (`'notify'` or `'autonomous'`,
+default `'autonomous'` so every pre-existing row keeps behaving exactly as
+it already did) and `meta` (TEXT/JSON, same convention as
+`pending_actions.payload` -- deliberately not JSONB, see migration 004's
+own reasoning for keeping one convention) -- plus a new `digest_queue`
+table. One-shot scheduling needed no schema change at all: `next_run_at`
+already means "when to fire next" for both cases, so a one-shot job just
+stores the sentinel `'once'` in `cron_expression` (never fed to
+`croniter`) and gets marked terminal after firing instead of rescheduled.
+
+- **The mode split, and why it's not just a label.** `_production_cron_loop`
+  (`server.py`) now branches per job: `notify` jobs never touch the LLM at
+  all -- a direct, deterministic Sendblue send (`_fire_notify_routine`), so
+  a plain reminder can never turn into Messa deciding to "helpfully" do the
+  task herself. `autonomous` jobs (`_fire_autonomous_routine`) re-invoke the
+  full orchestrator exactly like today, wrapped with enough context that
+  Messa knows this is an automated firing and its own routine id (so she
+  can call `finish_routine` on herself mid-run). Picking the mode is
+  `routines_agent`'s job at creation time (`propose_create_routine`'s own
+  docstring spells out the heuristic: whose words describe doing the
+  thing), and the proposal text echoed back for confirmation says which
+  one was picked in plain language, so a wrong read gets caught before
+  it's confirmed rather than silently locked in.
+- **One-shot scheduling.** `propose_create_routine(execution_mode,
+  cron_expression=None, run_once_in_minutes=None, ...)` takes exactly one
+  of the two schedule params. A one-shot `notify` with nothing else set
+  fires once and retires itself (`status='cancelled'`,
+  `meta.ended_reason='completed_one_shot'`) -- the "call me back in a few
+  hours" case that had no home before this.
+- **Self-stopping watchers.** A new `finish_routine(cron_id,
+  outcome_summary)` tool, callable by Messa from *inside* an autonomous
+  routine's own firing, marks the job terminal right then -- the ticket
+  watcher that finds what it was looking for stops itself instead of
+  continuing to check forever. `_fire_autonomous_routine` re-reads the
+  job's own status after the run completes, before deciding whether to
+  reschedule, so a self-finish mid-turn is honored rather than clobbered.
+- **A real cost/time bound on autonomous loops.** Every `autonomous`
+  routine gets an `expire_at` (default `MESSA_ROUTINE_DEFAULT_EXPIRE_HOURS`,
+  48h; hard-capped at `MESSA_ROUTINE_MAX_EXPIRE_HOURS`, 7 days) unless the
+  model explicitly passes `expire_in_hours=0` -- a documented, deliberate
+  opt-out for something genuinely meant to run indefinitely (a daily "check
+  my Gmail every weekday morning," which is recurring+autonomous but not a
+  bounded watcher). Reaching `expire_at` sends one "I gave up" text and
+  retires the job, without ever re-invoking the agent for that check.
+- **Auto-retry on failure (bounded).** An autonomous run that raises
+  reschedules itself after `MESSA_ROUTINE_RETRY_BACKOFF_MINUTES` (default
+  30) instead of reporting failure once and going quiet, up to
+  `MESSA_ROUTINE_MAX_RETRY_ATTEMPTS` (default 5) attempts, after which it
+  sends one "I'm stopping for now" text and retires. `meta.attempt_count`
+  resets to 0 on any successful run.
+- **Deadline-aware pacing.** `deadline_in_minutes` on either mode stores
+  `meta.deadline_at`; a `notify` routine tied to one paces its own
+  check-ins via `_deadline_pace_minutes` (a light nudge days out, more
+  frequent as it actually nears -- 30min inside 2h, 3h inside a day, 12h
+  inside 3 days, daily further out) instead of firing on a single flat
+  schedule, and sends one final "this was due already" notice instead of
+  silently going quiet once the deadline passes unresolved.
+- **"While you were away" digest.** `digest=True` on either mode makes a
+  routine's result land in the new `digest_queue` table
+  (`db.enqueue_digest_item`) instead of a text the instant it resolves. A
+  new `_production_digest_loop` flushes each user's queue into ONE message
+  either at their own local `MESSA_ROUTINE_DIGEST_HOUR_LOCAL` (default
+  8am, a 5-minute poll window -- safe to re-check every cycle since a
+  successful flush empties the queue) or once
+  `MESSA_ROUTINE_DIGEST_BACKSTOP_COUNT` (default 3) items pile up,
+  whichever comes first, so someone with a lot of background activity
+  isn't left waiting a full day for the first result.
+- **Polite escalation on non-response.** `escalate_on_no_response=True` on
+  a one-shot `notify` routine (the "did you call them?" follow-up case)
+  checks `db.has_user_replied_since` the last check-in before firing
+  again: a real reply of any kind (judging whether it actually *addressed*
+  the follow-up is left to Messa's own next live turn, not this poller)
+  cancels the chain quietly (`ended_reason='user_responded'`); no reply
+  shrinks the wait before the next check-in
+  (`MESSA_ROUTINE_ESCALATION_BASE_MINUTES` x
+  `MESSA_ROUTINE_ESCALATION_SHRINK_FACTOR` per unanswered attempt, floored
+  at `MESSA_ROUTINE_ESCALATION_MIN_MINUTES`) and prefixes the text
+  ("Following up again -- "), bounded by
+  `MESSA_ROUTINE_ESCALATION_MAX_COUNT` (default 3) after which it sends
+  one last "last check-in from me on this" message and gives up, rather
+  than pinging at any pace forever.
+- **Conditional plans need no special modeling at all.** "If it drops
+  under $50 buy it, otherwise tell me Friday" is just `autonomous` mode
+  with that sentence as `prompt_or_task` -- Messa reads and acts on the
+  full instruction fresh, with her real judgment and toolset, every time
+  the routine fires. No condition/branch columns, no separate engine.
+- **Natural-language reschedule.** New `reschedule_routine(cron_id,
+  delay_minutes)` tool -- when a user replies to a check-in with "not yet,
+  ask me again in an hour," `routines_agent` looks the job up (via the
+  enhanced `list_cron_jobs`, which now also surfaces mode/deadline/
+  digest/retry/ended-reason state for sub-feature visibility) and pushes
+  its `next_run_at` out, no separate confirmation needed (matching
+  pause/resume/cancel, not the create-a-new-routine gate).
+- **A real, pre-existing bug fixed along the way.** The old
+  `_insert_cron_job`'s docstring claimed `next_run_at` arrived "already a
+  tz-aware datetime" -- it doesn't: `pending_actions.payload` round-trips
+  through `json.dumps`/`json.loads` like every other gated action's
+  payload in `db.py` (see `_insert_calendar_event`'s use of `_parse_dt`
+  right above it in the same file), so confirming a routine's creation
+  would have handed asyncpg a raw ISO string for a `timestamptz` column
+  and raised a `DataError`. Fixed by routing it through `_parse_dt` like
+  everything else that touches a timestamptz column -- caught while
+  rewriting this function for `execution_mode`/`meta`, not otherwise in
+  scope, but a real bug worth fixing in place rather than leaving.
+- The `create_recurring_cron` gated-action-type string is renamed to
+  `create_routine` (it now creates both recurring and one-shot routines) --
+  `action_type` is free-text (migration made it `VARCHAR(100)` a while
+  back), not an ENUM, so this needed no migration, and `pending_actions`
+  rows expire in 30 minutes regardless, so there's no real in-flight
+  backward-compatibility concern from the rename.
+
+### Verification
+
+New `/tmp/test_task_routines.py`: the `_parse_dt` bug fix (a payload with
+`next_run_at` as a plain ISO string, exactly what a real confirm does,
+inserts without raising, and comes back tz-aware), the pre-migration-024
+fallback (`_has_column` false still inserts successfully, defaults read
+back as `'autonomous'`), `meta` merge semantics across
+`reschedule_cron_job`/`update_cron_job_meta`/`set_cron_job_status` (a
+patch adds/overwrites keys without clobbering others already present),
+`has_user_replied_since`'s cutoff boundary, the digest-queue read/write/
+clear functions, `propose_create_routine`'s full validation surface (bad
+mode, both/neither schedule given, bad cron expression, negative
+minutes), its payload shape (one-shot sentinel, `expire_in_hours=0`
+opt-out honored, a huge requested value capped at the platform max,
+deadline/escalate/digest flags landing in `meta` correctly),
+`finish_routine`/`reschedule_routine`/`cancel_cron_job` acting on real
+rows, the pure helpers (`_deadline_pace_minutes`'s staircase, `_job_meta`
+on missing/malformed JSON, `_parse_iso`, `_digest_due`'s two conditions),
+and -- the largest section -- `_fire_notify_routine`/
+`_fire_autonomous_routine` end to end against a fake Postgres pool plus
+faked `cli.load_user_context`/`build_orchestrator`/`cli.run_message`/
+`sendblue.send_message`: plain one-shot/recurring notify, the full
+escalation chain (first fire unprefixed, second fire "Following up
+again," eventual give-up), a mid-chain user reply cancelling quietly, a
+Sendblue failure leaving the job untouched for the next poll to retry,
+autonomous success on both one-shot and recurring, retry-then-give-up on
+repeated failure with the correct backoff interval, an already-expired
+job giving up WITHOUT ever re-invoking the agent, a self-finish mid-run
+(via `finish_routine`) being honored rather than double-handled, and
+digest routing capturing text into the queue instead of sending directly
+for both modes. Also fixed the one real regression this introduced: `/tmp/
+test_approval_gating_scope.py` hardcoded the old `create_recurring_cron`
+string in its expected `GATED_ACTION_TYPES` set -- updated to
+`create_routine`, the intentional rename above. Re-ran the full existing
+suite afterward; every other failure is the same pre-existing,
+unrelated-to-this-change set documented in the usage-limits entry just
+above (browser/CDP-dependent suites, `test_dashboard_route.py`,
+`test_active_tab_live_view.py` referencing a function that no longer
+exists, `test_onboarding_and_deepsearch_msg.py`'s missing
+`OPENROUTER_API_KEY`, and a standalone `test_toolnode_concurrency.py` that
+doesn't import this project's code at all).
+
+Not verified: no real Postgres/production environment was available in
+this sandbox to confirm migration `024_task_routines.sql` applies cleanly
+against a live Neon database with existing rows, or that a real deployed
+`_production_cron_loop`/`_production_digest_loop` actually stays alive and
+polling over a long period the way this sandbox can't exercise. Also not
+verified: no live LLM was available to confirm Messa actually picks the
+right `execution_mode` from ambiguous natural language in practice (the
+heuristic lives in `propose_create_routine`'s docstring and
+`ROUTINES_SYSTEM_PROMPT`, same standing caveat as every other prompt-only
+behavior change in this project), or that a real autonomous run reliably
+calls `finish_routine` on itself when it should rather than continuing to
+fire on its normal schedule after the task is actually already done.

@@ -815,7 +815,7 @@ DEFAULT_BRIEFINGS: dict[str, dict[str, str]] = {
 
 # For existing users who already had a simple, hand-set-up morning/evening
 # briefing BEFORE this feature existed (a plain user-created cron job, via
-# propose_create_recurring_cron -- `kind` is NULL on those rows, since
+# propose_create_routine -- `kind` is NULL on those rows, since
 # tagging didn't exist yet). Per an explicit "replace entirely" product
 # decision: rather than leave that old job running alongside a brand new
 # tagged one (a real user would get double-texted every morning),
@@ -846,6 +846,44 @@ WEATHER_TEMPERATURE_UNIT = os.environ.get("MESSA_WEATHER_TEMPERATURE_UNIT", "fah
 # single fetch (today for the morning briefing, tomorrow for the evening
 # briefing's "quick look at tomorrow").
 WEATHER_FORECAST_DAYS = int(os.environ.get("MESSA_WEATHER_FORECAST_DAYS", "2"))
+
+# ---- Task routines (migrations/024_task_routines.sql) ----
+# Bounds for the "Messa does it herself" (execution_mode='autonomous') side
+# of routines_agent -- kept as env-editable knobs (same HFS-editable-config
+# convention as the usage-limits plans in messa/plans.py) rather than
+# hardcoded, since these are exactly the kind of number you'd want to tune
+# without a code change: how long a background watcher is allowed to keep
+# retrying before it gives up and tells the user, how many failed attempts
+# it gets, how quickly it backs off, and how insistent it's allowed to get
+# when the user isn't responding to something time-sensitive.
+#
+# Every one of these is a DEFAULT applied when a routine doesn't specify its
+# own value (propose_create_routine lets the model set a tighter or looser
+# bound per-routine) -- never a hard ceiling the model can't ask to extend,
+# except ROUTINE_MAX_EXPIRE_HOURS, which IS a hard ceiling: no autonomous
+# routine, however it's configured, can run longer than that without either
+# finishing itself or getting rescheduled by the user, so a background loop
+# can never become an unbounded, silently-running cost sink.
+ROUTINE_DEFAULT_EXPIRE_HOURS = float(os.environ.get("MESSA_ROUTINE_DEFAULT_EXPIRE_HOURS", "48"))
+ROUTINE_MAX_EXPIRE_HOURS = float(os.environ.get("MESSA_ROUTINE_MAX_EXPIRE_HOURS", "168"))  # 7 days
+ROUTINE_MAX_RETRY_ATTEMPTS = int(os.environ.get("MESSA_ROUTINE_MAX_RETRY_ATTEMPTS", "5"))
+ROUTINE_RETRY_BACKOFF_MINUTES = int(os.environ.get("MESSA_ROUTINE_RETRY_BACKOFF_MINUTES", "30"))
+# "While you were away" digest (#3): local hour a user's queued digest
+# items get flushed into one message, plus a backstop count so someone with
+# a lot of background activity isn't left waiting a full day for the first
+# result.
+ROUTINE_DIGEST_HOUR_LOCAL = int(os.environ.get("MESSA_ROUTINE_DIGEST_HOUR_LOCAL", "8"))
+ROUTINE_DIGEST_BACKSTOP_COUNT = int(os.environ.get("MESSA_ROUTINE_DIGEST_BACKSTOP_COUNT", "3"))
+# Polite escalation on non-response (#9): bounded so it can never become
+# spam -- each unanswered check-in shrinks the wait before the next one
+# (BASE_MINUTES * SHRINK_FACTOR^attempts, floored at MIN_MINUTES), and once
+# ROUTINE_ESCALATION_MAX_COUNT unanswered check-ins have gone out, the
+# routine sends one last message saying so and stops on its own rather than
+# continuing to ping at any pace, however gentle, forever.
+ROUTINE_ESCALATION_MAX_COUNT = int(os.environ.get("MESSA_ROUTINE_ESCALATION_MAX_COUNT", "3"))
+ROUTINE_ESCALATION_BASE_MINUTES = int(os.environ.get("MESSA_ROUTINE_ESCALATION_BASE_MINUTES", "60"))
+ROUTINE_ESCALATION_SHRINK_FACTOR = float(os.environ.get("MESSA_ROUTINE_ESCALATION_SHRINK_FACTOR", "0.5"))
+ROUTINE_ESCALATION_MIN_MINUTES = int(os.environ.get("MESSA_ROUTINE_ESCALATION_MIN_MINUTES", "15"))
 
 
 @dataclass
