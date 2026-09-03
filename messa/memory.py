@@ -152,9 +152,26 @@ def _configure_connection(conn, user_id: int) -> None:
     checkout/checkin). autocommit=True so the SET below takes effect
     immediately and stays in effect for the life of this connection
     without needing an explicit commit that could otherwise interact
-    oddly with Mem0's own per-operation transactions."""
+    oddly with Mem0's own per-operation transactions.
+
+    BUG FIXED HERE (caught in production, see error.txt): `SET` is DDL-like
+    and does NOT accept a bind parameter -- `conn.execute("SET x = %s",
+    (val,))` raises `psycopg.errors.SyntaxError: syntax error at or near
+    "$1"` every time, which psycopg_pool swallows into a silent
+    "pool initialization incomplete after 15 sec" from the CALLER's side
+    (the real error only shows up in the pool's own background log line,
+    "error connecting in 'pool-N': ..."). scripts/verify_memory_rls.py hit
+    and fixed this exact issue while being built, with a comment explaining
+    why -- that fix was never backported here, which is how it shipped.
+    Not fixed by parameterizing differently: the value has to be a literal
+    in the SQL text. Made safe by validating it's actually an int FIRST
+    (raises before ever touching SQL-string construction if it isn't) --
+    user_id here always originates from a real users.id column value, never
+    raw external/user-typed input, but this makes that a hard guarantee
+    rather than trusting the `int` type hint alone."""
     conn.autocommit = True
-    conn.execute("SET app.current_user_id = %s", (str(user_id),))
+    safe_user_id = int(user_id)
+    conn.execute(f"SET app.current_user_id = '{safe_user_id}'")
 
 
 def _run_scoped_sync(user_id: int, fn: Callable[[Any], Any]) -> Any:
