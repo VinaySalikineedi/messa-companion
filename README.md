@@ -5885,3 +5885,144 @@ heuristic lives in `propose_create_routine`'s docstring and
 behavior change in this project), or that a real autonomous run reliably
 calls `finish_routine` on itself when it should rather than continuing to
 fire on its normal schedule after the task is actually already done.
+
+## New-user signup cap + waitlist, and an admin-only broadcast (preview -> approval -> execute)
+
+Two independent additions, both designed to be completely non-destructive by
+default -- with zero configuration, every existing user and every existing
+behavior is untouched.
+
+### New-user cap + waitlist (`messa/waitlist.py`, `migrations/025_new_user_cap_waitlist.sql`)
+
+The ask: a way to throttle how many *brand-new* people can sign up from the
+moment the cap is turned on, without touching anyone who already texted
+Messa before that moment -- so a sudden spike in downloads can't overwhelm
+the app, and existing users never notice anything changed.
+
+- **One env var**: `MESSA_NEW_USER_CAP` (0 = unlimited, the default -- set
+  it in your `.env` locally or as an HF Space variable/secret in
+  production). At 0, `waitlist.check_new_user_admission` short-circuits on
+  a single `if` before ever touching the database, so the feature is
+  literally inert until you set a real number.
+- **"Existing users" needed a precise definition with no manual step.** The
+  natural boundary is "whoever already has a `users` row the moment the cap
+  is turned on," but that moment isn't known in advance. Solved with a
+  lazily-captured baseline: the first time the cap actually needs to check
+  a brand-new number, it reads `MAX(users.id)` once and stores it in a new
+  generic `app_settings` key/value table (`INSERT ... ON CONFLICT DO
+  NOTHING`, race-safe against concurrent inbound texts), then reuses that
+  same stored value forever after. "New user" becomes `COUNT(users WHERE id
+  > baseline)`. No second variable to compute or set by hand, and no
+  migration needed to backfill anything for current users.
+- **Waitlist is its own table**, not a flag on `users` -- someone who's
+  waitlisted was never let onboard in the first place, so there's no
+  half-created user row to clean up later. `waitlist.check_new_user_admission`
+  runs as the very first thing in `server.py`'s `_process_inbound` (before
+  `cli.load_user_context`/`db.get_or_create_user`, the actual onboarding
+  point), and if the number is new, over the cap, and not specially
+  admitted, the whole rest of that turn is skipped -- no agent runs, no
+  user row is created, just a direct text back.
+- **Messaging**: the first time someone hits the cap, they get a full
+  explanation and a note that they're on the waitlist. Every text after
+  that from the same still-waitlisted number gets a short "you're still on
+  the waitlist" instead of the long message again or total silence --
+  avoids both a confusing black hole and repeat spam.
+- **Admin escape hatch**: `admit_from_waitlist(phone_number)` (an admin-only
+  chat tool, see below) lets one specific person in past a full cap without
+  raising the cap for anyone else -- useful for letting in a friend or a
+  VIP without opening the floodgates. Raising the cap itself is still only
+  ever done via the env var, on purpose -- not something either an admin or
+  Messa herself can do from chat.
+
+### Admin broadcast (`messa/tools/admin_tools.py`, `migrations/026_admin_broadcast.sql`)
+
+The ask: an admin can tell Messa to broadcast a message, and it goes out to
+every user in the database, gated by a real preview-then-approval step so
+nothing sends on a misheard or misread instruction.
+
+- **Reuses the existing confirmation gate**, not a new one. Calendar events
+  and routines already go through `propose_action` -> a `pending_actions`
+  row -> the user explicitly saying yes -> `confirm_pending_action`, which
+  only then runs the real applier. `broadcast_message` was added as a third
+  entry in `GATED_ACTION_TYPES`/`_APPLIERS` alongside those, so broadcasting
+  gets the exact same "nothing happens until you explicitly confirm the
+  exact text" guarantee for free, instead of a bespoke second mechanism.
+  `db.py`'s comment on `GATED_ACTION_TYPES` now explains broadcast as a
+  second, deliberate exception to "only scheduling needs confirmation."
+- **Admin-only, at the tool-routing level, not just a runtime check.** A new
+  `admin_agent` subagent (`messa/tools/admin_tools.py`) is only ever
+  appended to the orchestrator's subagent list when `user.is_admin` is
+  true -- a non-admin user has no tool that can reach any of this, and the
+  top-level system prompt never even mentions the subagent exists for them.
+  Two independent layers (no tool path, and no prompt mention) rather than
+  a single point that could be bypassed. `is_admin` itself isn't new -- it's
+  the existing manual-only DB flag from migration 023 (`UPDATE users SET
+  is_admin = true`), reused as-is, never surfaced anywhere a regular user
+  could see or set it themselves.
+- **Delivery is asynchronous**, not inline in the confirming chat turn.
+  Confirming only stages a `broadcasts` row (`status='pending'`); a new
+  background loop (`_production_broadcast_loop` in `server.py`, following
+  the same poll-loop pattern as the cron/digest/briefing loops already in
+  this file) picks it up, atomically claims it (`status: pending ->
+  sending`, so a second loop tick or a restart mid-send can never double-fire
+  it), and fans the send out to every user with a bounded
+  `asyncio.Semaphore` (`MESSA_BROADCAST_MAX_CONCURRENT_SENDS`, default 20 --
+  same pattern as deepsearch's existing `DEEPSEARCH_MAX_SUBAGENTS` bounded
+  pool) so a large user base can't hammer Sendblue's API all at once.
+  Whether it finishes clean or some sends fail, the admin who requested it
+  gets a completion text with the final sent/failed counts -- it never just
+  goes quiet.
+- **Only "all existing users" for now**, exactly as asked -- `list_broadcasts`
+  and the `broadcasts` table are shaped so that region/plan/active-only
+  targeting can be added later as an additional filter on the recipient
+  query, without changing the gate, the loop, or the table shape.
+- **Admin chat tools** (`messa/tools/admin_tools.py`): `propose_broadcast_message`
+  (stages it, reports the exact text and recipient count back for
+  confirmation), `list_broadcasts` (status of recent broadcasts),
+  `get_new_user_cap_status` and `list_waitlist` (read-only checks on the
+  cap feature above), and `admit_from_waitlist`.
+
+### Verification
+
+New `/tmp/test_new_user_cap_and_broadcast.py` against the same fake-Postgres-
+pool harness used throughout this project: the cap off (0) short-circuits
+with no DB call at all; an existing user is always let through regardless of
+the count; the baseline is captured exactly once, lazily, on the first
+genuinely-new number (and NOT on a check that short-circuits on an existing
+user); counting correctly excludes everyone at/under the baseline; a number
+under the cap is let through and counted; a number at/over the cap is
+waitlisted with the full message on the first hit and the short "still
+waiting" message on repeat hits; an explicitly admitted waitlisted number is
+let through regardless of the current count. For broadcast:
+`propose_broadcast_message` stages a real gated `pending_actions` row
+without sending anything; confirming it runs `_run_one_broadcast`, which
+sends to every user, marks the row completed with correct sent/failed
+counts, and separately notifies the requesting admin with a completion
+text (verified as two distinct groups of sent messages, not conflated); a
+send failure for one recipient doesn't stop the others or crash the loop.
+Also updated `/tmp/test_approval_gating_scope.py`'s hardcoded
+`GATED_ACTION_TYPES` expected set to include `broadcast_message`, the same
+kind of fix already needed once before for the `create_routine` rename.
+Re-ran the full existing suite afterward (`~/tmp/test_*.py`, excluding the
+browser/CDP-dependent set); the only failures are the same pre-existing,
+unrelated ones already documented in the task-routines entry above
+(`test_mcp_concurrency.py`/`test_register_only.py` failing to spawn a
+Playwright MCP subprocess in this sandbox, `test_onboarding_and_deepsearch_msg.py`'s
+missing `OPENROUTER_API_KEY`, `test_toolnode_concurrency.py` not importing
+this project's code at all, and `test_snapshot_size_nudge.py`'s own
+assertions all pass -- it only fails during unrelated asyncio-loop
+teardown after the test itself is done) -- none of them reference or
+exercise anything this change touches.
+
+Not verified: no real Postgres/production environment was available in this
+sandbox to confirm migrations `025_new_user_cap_waitlist.sql` and
+`026_admin_broadcast.sql` apply cleanly against a live Neon database with
+existing rows, or that `_production_broadcast_loop` stays alive and polling
+correctly over a long real deployment the way this sandbox can't exercise.
+Also not verified: no live LLM was available to confirm Messa reliably
+relays the exact broadcast text back for confirmation rather than
+paraphrasing it (the instruction lives in `propose_broadcast_message`'s
+docstring and `ADMIN_SYSTEM_PROMPT`, same standing prompt-only caveat as
+every other behavior change in this project), or real-world Sendblue
+throughput/rate-limit behavior at `MESSA_BROADCAST_MAX_CONCURRENT_SENDS=20`
+against a genuinely large user base.

@@ -59,6 +59,7 @@ from .. import config, console, db, timeutil
 from ..approval import ApprovalGate, CLIApprovalGate
 from ..channels import sendblue
 from ..channels.sendblue import SendblueError
+from ..tools.admin_tools import ADMIN_SYSTEM_PROMPT, build_admin_tools
 from ..tools.deepsearch_tools import build_deepsearch_subagent
 from ..tools.common import trace_all
 from ..tools.document_tools import DOCUMENT_SYSTEM_PROMPT, build_document_tools
@@ -508,6 +509,17 @@ def _build_system_prompt(
             "the way a person texting would. Keep it as short as the answer allows.\n\n"
         )
 
+    # Only ever non-empty for an admin account (user.is_admin) -- a regular
+    # user's system prompt never even mentions admin_agent exists, matching
+    # how it's also simply absent from their subagents list below (see
+    # build_orchestrator). Two independent layers, neither relying on the
+    # other: even if this string were somehow left in by mistake, a
+    # non-admin's orchestrator still has no admin_agent to delegate to.
+    admin_agent_mention = (
+        ", admin_agent (admin-only: broadcast a message to all users, manage the "
+        "new-user waitlist)"
+    ) if user.is_admin else ""
+
     live_view_str = ""
     if user.live_view_share_url:
         live_view_str = (
@@ -528,7 +540,8 @@ def _build_system_prompt(
         "(recurring or one-time task routines -- both plain reminders where the USER does "
         "something, and background tasks where YOU do something yourself and report back, "
         "e.g. watchers, deadline-aware follow-ups), integrations_agent (any other app -- "
-        "Reddit, Todoist, Slack, Notion, GitHub, Google Calendar, and 1,400+ more).\n\n"
+        f"Reddit, Todoist, Slack, Notion, GitHub, Google Calendar, and 1,400+ more)"
+        f"{admin_agent_mention}.\n\n"
         "Email routing -- there are two separate inboxes, and you decide which one handles "
         "each request: personal_inbox_agent (their own address on your domain) and email_agent "
         "(their connected Gmail, once set up). For a GENERIC request that doesn't name an inbox "
@@ -796,6 +809,24 @@ async def build_orchestrator(
             "model": subagent_model,
         },
     ]
+
+    # Admin-only, and only ever added here -- a non-admin's subagents list
+    # simply never contains this entry, so there's no tool/delegation path
+    # to it at all (not just a runtime check inside it). Same quiet,
+    # unadvertised user.is_admin flag usage.py already gates the metering
+    # bypass on.
+    if user.is_admin:
+        subagents.append({
+            "name": "admin_agent",
+            "description": (
+                "Admin-only: broadcast a message to every user (preview -> approval -> "
+                "execute), and manage the new-user waitlist/signup cap. Only reachable "
+                "for admin accounts."
+            ),
+            "system_prompt": ADMIN_SYSTEM_PROMPT,
+            "tools": build_admin_tools(user),
+            "model": subagent_model,
+        })
 
     agent = create_deep_agent(
         model=model,

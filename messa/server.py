@@ -43,7 +43,7 @@ import httpx
 from fastapi import BackgroundTasks, FastAPI, Header, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
-from . import background, briefings, cli, config, console, db, live_activity, pdf_reader
+from . import background, briefings, cli, config, console, db, live_activity, pdf_reader, waitlist
 from .agents.registry import build_orchestrator
 from .approval import AutoApproveGate, DenyApprovalGate
 from .channels import browserbase, sendblue
@@ -834,6 +834,20 @@ def _sms_send_factory(from_number: str):
 
 
 async def _process_inbound(from_number: str, content: str, channel: str, media_url: str | None = None) -> None:
+    # New-user cap gate (messa/waitlist.py) -- checked before ANY other work
+    # on a message that might be from a brand-new phone number, so a
+    # waitlisted text costs no PDF download, no typing indicator, no agent
+    # turn. A no-op (one int comparison) unless MESSA_NEW_USER_CAP is set;
+    # an already-existing user always passes through untouched.
+    admission = await waitlist.check_new_user_admission(from_number)
+    if not admission.allowed:
+        if admission.reply_text:
+            try:
+                await sendblue.send_message(from_number, admission.reply_text)
+            except SendblueError as e:
+                console.system(f"[waitlist notify failed] {from_number}: {e}")
+        return
+
     effective_content = content
     if media_url:
         pdf_note = await _maybe_read_inbound_pdf(media_url)
@@ -1430,6 +1444,71 @@ async def _production_briefing_loop() -> None:
         await asyncio.sleep(background.POLL_INTERVAL_SECONDS)
 
 
+async def _run_one_broadcast(b: dict[str, Any]) -> None:
+    """Fans one already-claimed broadcast out to every current user,
+    bounded to config.BROADCAST_MAX_CONCURRENT_SENDS concurrent Sendblue
+    sends at once (same asyncio.Semaphore shape as deepsearch's own
+    sub-worker pool -- see config.DEEPSEARCH_MAX_SUBAGENTS) so a large user
+    base doesn't fire thousands of simultaneous HTTP requests at Sendblue's
+    API. The recipient list is read fresh here, not at proposal time, so a
+    broadcast confirmed a while ago still reaches anyone who signed up in
+    between. Always finishes by marking the row 'completed' with real
+    counts and texting the admin who sent it a one-line summary, even if
+    every single send failed -- a broadcast should never just vanish
+    without the admin finding out what happened."""
+    numbers = await db.get_all_user_phone_numbers()
+    total = len(numbers)
+    sem = asyncio.Semaphore(config.BROADCAST_MAX_CONCURRENT_SENDS)
+    counts = {"sent": 0, "failed": 0}
+    lock = asyncio.Lock()
+
+    async def _send_one(number: str) -> None:
+        async with sem:
+            try:
+                await sendblue.send_message(number, b["message_text"])
+                key = "sent"
+            except SendblueError as e:
+                console.system(f"[broadcast send failed] broadcast=#{b['id']} to={number}: {e}")
+                key = "failed"
+        async with lock:
+            counts[key] += 1
+
+    await asyncio.gather(*(_send_one(n) for n in numbers), return_exceptions=True)
+    await db.complete_broadcast(b["id"], total, counts["sent"], counts["failed"])
+
+    try:
+        admin = await db.get_user_by_id(b["created_by"])
+        if admin:
+            summary = f"Broadcast #{b['id']} complete: sent to {counts['sent']}/{total} user(s)."
+            if counts["failed"]:
+                summary += f" {counts['failed']} failed to deliver."
+            await sendblue.send_message(admin["phone_number"], summary)
+    except Exception as e:  # noqa: BLE001 - the broadcast itself already succeeded/completed either way
+        console.system(f"[broadcast completion notify failed] broadcast=#{b['id']}: {e}")
+
+
+async def _production_broadcast_loop() -> None:
+    """Real delivery for admin_tools.py's propose_broadcast_message, once
+    confirmed (db._insert_broadcast just stages a 'pending' row -- this is
+    what actually sends it). Each due broadcast is claimed atomically
+    (db.claim_broadcast, pending -> sending) before being handed to
+    _run_one_broadcast, so two overlapping poll cycles can never double-send
+    the same broadcast. Runs on the same poll cadence as every other
+    production loop in this file."""
+    while True:
+        try:
+            pending = await db.get_pending_broadcasts()
+            for b in pending:
+                if await db.claim_broadcast(b["id"]):
+                    try:
+                        await _run_one_broadcast(b)
+                    except Exception as e:  # noqa: BLE001
+                        console.system(f"[broadcast delivery failed] broadcast=#{b['id']}: {e}")
+        except Exception as e:  # noqa: BLE001
+            console.system(f"[broadcast poller error] {e}")
+        await asyncio.sleep(background.POLL_INTERVAL_SECONDS)
+
+
 async def _production_deepsearch_pause_loop() -> None:
     """Notifies you when deepsearch is waiting on a login/CAPTCHA/2FA page
     (see tools/deepsearch_tools.py's request_human_help and db.py's
@@ -1635,13 +1714,14 @@ async def _startup() -> None:
         asyncio.create_task(_production_cron_loop()),
         asyncio.create_task(_production_briefing_loop()),
         asyncio.create_task(_production_digest_loop()),
+        asyncio.create_task(_production_broadcast_loop()),
         asyncio.create_task(_production_deepsearch_pause_loop()),
         asyncio.create_task(_production_email_connection_poll_loop()),
         asyncio.create_task(_production_app_connection_poll_loop()),
     ]
     console.system(
-        "Started production reminder/cron/briefing/digest/deepsearch-pause/email-connection/"
-        "app-connection delivery pollers."
+        "Started production reminder/cron/briefing/digest/broadcast/deepsearch-pause/"
+        "email-connection/app-connection delivery pollers."
     )
 
 

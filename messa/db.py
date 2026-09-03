@@ -163,6 +163,141 @@ async def get_user_by_id(user_id: int) -> dict[str, Any] | None:
         return dict(row) if row else None
 
 
+async def get_user_by_phone(phone_number: str) -> dict[str, Any] | None:
+    """Read-only lookup by phone number -- unlike get_or_create_user, NEVER
+    creates a row. This is exactly the distinction messa/waitlist.py's gate
+    needs: "does this inbound text belong to someone who already exists"
+    without the side effect of creating them as a side effect of checking."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM users WHERE phone_number = $1", phone_number)
+        return dict(row) if row else None
+
+
+async def count_all_users() -> int:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval("SELECT COUNT(*) FROM users")
+
+
+async def get_all_user_phone_numbers() -> list[str]:
+    """Every user's phone number -- the recipient list for a broadcast (all
+    users, unfiltered, per the current product scope; a future round can
+    narrow this by region/plan/active-only without changing the broadcast
+    engine itself)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT phone_number FROM users")
+        return [r["phone_number"] for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# New-user cap + waitlist (migrations/025_new_user_cap_waitlist.sql,
+# messa/waitlist.py, messa/tools/admin_tools.py). Every function here is a
+# no-op-safe plain data operation -- the actual "should this person be let
+# in right now" decision lives in messa/waitlist.py, not here, same
+# db.py-stays-thin boundary as everywhere else in this file.
+# ---------------------------------------------------------------------------
+
+async def get_new_user_baseline_id() -> int:
+    """Auto-captured exactly once: the highest users.id that already existed
+    the moment the new-user cap first got checked for real (i.e. the first
+    time MESSA_NEW_USER_CAP was set above 0 and someone new texted in) --
+    stored in app_settings so it survives restarts and is shared across
+    however many server instances are running. Every user with an id at or
+    below this baseline is permanently grandfathered in, regardless of the
+    cap; "new user" only ever means someone who signed up after this point.
+
+    Race-safe: ON CONFLICT DO NOTHING means two concurrent first-callers
+    can't produce two different baselines -- both re-read after their own
+    insert attempt and return whichever value actually won."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM app_settings WHERE key = 'new_user_baseline_id'")
+        if row:
+            return int(row["value"])
+        current_max = await conn.fetchval("SELECT COALESCE(MAX(id), 0) FROM users")
+        await conn.execute(
+            """
+            INSERT INTO app_settings (key, value) VALUES ('new_user_baseline_id', $1)
+            ON CONFLICT (key) DO NOTHING
+            """,
+            str(current_max),
+        )
+        row2 = await conn.fetchrow("SELECT value FROM app_settings WHERE key = 'new_user_baseline_id'")
+        return int(row2["value"]) if row2 else current_max
+
+
+async def count_new_users_since_baseline() -> int:
+    baseline = await get_new_user_baseline_id()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetchval("SELECT COUNT(*) FROM users WHERE id > $1", baseline)
+
+
+async def get_new_user_cap_summary() -> dict[str, int]:
+    """Admin-facing snapshot (admin_tools.py's get_new_user_cap_status):
+    cap=0 means the cap isn't enabled, in which case `count` is reported as
+    0 rather than actually queried -- there's no baseline to have been
+    captured yet if the cap has never been checked for real."""
+    cap = config.NEW_USER_CAP
+    count = await count_new_users_since_baseline() if cap > 0 else 0
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        waitlist_count = await conn.fetchval("SELECT COUNT(*) FROM waitlist WHERE admitted_at IS NULL")
+    return {"cap": cap, "count": count, "waitlist_count": waitlist_count or 0}
+
+
+async def get_waitlist_entry(phone_number: str) -> dict[str, Any] | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM waitlist WHERE phone_number = $1", phone_number)
+        return dict(row) if row else None
+
+
+async def add_to_waitlist(phone_number: str) -> dict[str, Any]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            INSERT INTO waitlist (phone_number) VALUES ($1)
+            ON CONFLICT (phone_number) DO NOTHING RETURNING *
+            """,
+            phone_number,
+        )
+        if row:
+            return dict(row)
+        existing = await conn.fetchrow("SELECT * FROM waitlist WHERE phone_number = $1", phone_number)
+        return dict(existing) if existing else {}
+
+
+async def mark_waitlist_notified(phone_number: str) -> None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE waitlist SET notified_at = NOW() WHERE phone_number = $1", phone_number)
+
+
+async def admit_from_waitlist(phone_number: str) -> dict[str, Any] | None:
+    """Sets admitted_at -- doesn't create their users row itself (that still
+    only happens through the normal get_or_create_user path), just tells
+    messa/waitlist.py's gate to let their NEXT inbound text all the way
+    through instead of re-waitlisting them, even if the cap is still full."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "UPDATE waitlist SET admitted_at = NOW() WHERE phone_number = $1 RETURNING *",
+            phone_number,
+        )
+        return dict(row) if row else None
+
+
+async def list_waitlist() -> list[dict[str, Any]]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM waitlist ORDER BY requested_at")
+        return _rows(rows)
+
+
 async def update_user_timezone(
     user_id: int,
     timezone_name: str,
@@ -1365,16 +1500,77 @@ async def ensure_default_briefings(user_row: dict[str, Any]) -> None:
                 )
 
 
+async def _insert_broadcast(conn: asyncpg.Connection, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    """Applier for the 'broadcast_message' gated action (admin_tools.py's
+    propose_broadcast_message) -- only ever stages a `broadcasts` row with
+    status='pending'. The actual fan-out send happens asynchronously in
+    server.py's _production_broadcast_loop, not here: sending to a whole
+    user base can take a while and shouldn't block the admin's confirming
+    chat turn (see that loop's own docstring)."""
+    row = await conn.fetchrow(
+        "INSERT INTO broadcasts (created_by, message_text, status) VALUES ($1, $2, 'pending') RETURNING *",
+        user_id, payload["message_text"],
+    )
+    return dict(row)
+
+
+async def get_pending_broadcasts() -> list[dict[str, Any]]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM broadcasts WHERE status = 'pending' ORDER BY created_at")
+        return _rows(rows)
+
+
+async def claim_broadcast(broadcast_id: int) -> bool:
+    """Atomic claim (status='pending' -> 'sending' in one statement) so two
+    overlapping poll cycles -- or, later, two server instances -- can never
+    both fan out the same broadcast twice."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "UPDATE broadcasts SET status = 'sending' WHERE id = $1 AND status = 'pending' RETURNING id",
+            broadcast_id,
+        )
+        return row is not None
+
+
+async def complete_broadcast(broadcast_id: int, total: int, sent: int, failed: int) -> None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE broadcasts SET status = 'completed', total_recipients = $2,
+                sent_count = $3, failed_count = $4, completed_at = NOW()
+            WHERE id = $1
+            """,
+            broadcast_id, total, sent, failed,
+        )
+
+
+async def list_broadcasts(limit: int = 10) -> list[dict[str, Any]]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM broadcasts ORDER BY created_at DESC LIMIT $1", limit)
+        return _rows(rows)
+
+
 # ---------------------------------------------------------------------------
 # Pending actions -- the confirm-before-write gate.
 #
-# Per explicit product decision, only SCHEDULING requires confirmation now:
-# create/update/delete calendar event, and creating a new recurring
-# automation (routines_agent's cron jobs -- also a scheduling action).
-# Tasks, reminders, notes, and contacts all write directly (see their
-# sections above) since they're low-stakes and trivially reversible with a
-# follow-up message -- an earlier version of this gate also covered those,
-# which added confirmation friction the product decision explicitly removed.
+# Per explicit product decision, only SCHEDULING requires confirmation:
+# create/update/delete calendar event, and creating a new recurring/one-time
+# automation (routines_agent's routines -- also a scheduling action). Tasks,
+# reminders, notes, and contacts all write directly (see their sections
+# above) since they're low-stakes and trivially reversible with a follow-up
+# message -- an earlier version of this gate also covered those, which
+# added confirmation friction the product decision explicitly removed.
+#
+# One deliberate second category joined it later: broadcast_message. It's
+# not scheduling, but it's the same shape of risk that motivated the
+# original rule in the first place (something that, once it fires, reaches
+# a lot of people at once and can't be walked back) -- admin_tools.py's own
+# "preview -> approval -> execute" requirement is exactly this gate, reused
+# rather than building a second confirm mechanism.
 # ---------------------------------------------------------------------------
 
 _APPLIERS = {
@@ -1382,6 +1578,7 @@ _APPLIERS = {
     "update_calendar_event": _update_calendar_event,
     "delete_calendar_event": _delete_calendar_event,
     "create_routine": _insert_cron_job,
+    "broadcast_message": _insert_broadcast,
 }
 
 GATED_ACTION_TYPES = set(_APPLIERS)

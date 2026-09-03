@@ -885,6 +885,25 @@ ROUTINE_ESCALATION_BASE_MINUTES = int(os.environ.get("MESSA_ROUTINE_ESCALATION_B
 ROUTINE_ESCALATION_SHRINK_FACTOR = float(os.environ.get("MESSA_ROUTINE_ESCALATION_SHRINK_FACTOR", "0.5"))
 ROUTINE_ESCALATION_MIN_MINUTES = int(os.environ.get("MESSA_ROUTINE_ESCALATION_MIN_MINUTES", "15"))
 
+# ---- New-user cap + waitlist (migrations/025_new_user_cap_waitlist.sql,
+# messa/waitlist.py) ----
+# How many NEW users (signed up after this cap was first turned on -- see
+# db.get_new_user_baseline_id for how "new" is defined, auto-captured so
+# existing users are never retroactively counted) are allowed in before
+# server.py's _process_inbound starts waitlisting instead of onboarding.
+# 0 (the default) means unlimited -- completely unset, this changes nothing
+# about the existing app; only set this to actually turn the cap on.
+NEW_USER_CAP = int(os.environ.get("MESSA_NEW_USER_CAP", "0"))
+
+# ---- Admin broadcast (migrations/026_admin_broadcast.sql,
+# messa/tools/admin_tools.py) ----
+# Caps how many Sendblue sends a single broadcast fires at once (an
+# asyncio.Semaphore in server.py's _run_one_broadcast) -- same reasoning as
+# DEEPSEARCH_MAX_SUBAGENTS' own semaphore: broadcasting to a large user base
+# shouldn't fire thousands of concurrent HTTP requests at Sendblue's API at
+# once.
+BROADCAST_MAX_CONCURRENT_SENDS = int(os.environ.get("MESSA_BROADCAST_MAX_CONCURRENT_SENDS", "20"))
+
 
 @dataclass
 class UserContext:
