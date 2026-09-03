@@ -6026,3 +6026,208 @@ docstring and `ADMIN_SYSTEM_PROMPT`, same standing prompt-only caveat as
 every other behavior change in this project), or real-world Sendblue
 throughput/rate-limit behavior at `MESSA_BROADCAST_MAX_CONCURRENT_SENDS=20`
 against a genuinely large user base.
+
+## Deepsearch cost tiering: a keyless Jina Reader tier + Wikipedia lookup, so most browsing never opens a paid Browserbase session
+
+Your question was specific: Browserbase bills by TIME a browsing session is
+held open, not by how much you actually did with it, and today EVERY
+deepsearch delegation opens one immediately (`BrowserToolProvider.__aenter__`
+creates the Browserbase session and spawns `@playwright/mcp` unconditionally,
+the moment a delegation starts) -- even for a task that turns out to be pure
+reading, like checking whether a movie's tickets have gone on sale yet. This
+adds a real middle tier between "plain HTTP fetch" and "a real browser
+session," and wires the routing so both Messa and deepsearch itself default
+to the free tier whenever it can actually answer the question.
+
+### The three tiers
+
+1. **`fetch_page_text`** (already existed) -- a plain HTTP GET, no
+   JavaScript at all. Fastest, free, but blind to any JS-rendered content --
+   most modern ticket/booking sites (Fandango, AMC, Ticketmaster) come back
+   as an empty loading shell.
+2. **`fetch_rendered_page_text`** (new, `messa/tools/jina_reader.py`) -- the
+   URL is rendered through Jina AI's free Reader API (`r.jina.ai`): a real
+   headless browser runs on THEIR infrastructure, not ours, and hands back
+   clean text. From our side this is still just one HTTP call -- no session
+   to open or close, no Browserbase involved, so it costs literally nothing
+   against your Browserbase bill. Slightly slower than tier 1 (real
+   rendering takes a few seconds) but still read-only and still free.
+3. **A real deepsearch delegation** -- the only tier that can actually
+   click, type, log in, submit a form, or add something to a cart. The only
+   one billed by Browserbase session time.
+
+**Started on the keyless tier, per your answer.** `config.JINA_API_KEY`
+defaults to unset -- Jina's own published free rate limit (20 requests/
+minute) applies with zero signup, zero secret to add. `MESSA_JINA_API_KEY`
+is there in `.env.example` for later, but nothing else changes if/when you
+add one; it just raises the rate ceiling.
+
+**Wikipedia lookup** (`wikipedia_lookup`, also new): a fourth, even cheaper
+tool for anything likely to have its own Wikipedia article -- a person,
+place, company, historical event, or concept. It hits Wikipedia's own free,
+keyless REST API (`/api/rest_v1/page/summary/{title}`) directly, falling
+back to MediaWiki's `opensearch` endpoint (same free service) to resolve a
+loose query like "einstein" to the real article title "Albert Einstein"
+when the exact-title lookup 404s. Explicitly flags a disambiguation page
+(Wikipedia's own `type` field) instead of returning a thin, unhelpful
+summary for one. Deliberately scoped OUT of anything time-sensitive --
+its own docstring tells Messa not to use it for today's score, this week's
+news, or live prices, since an encyclopedia article isn't the right source
+for those regardless of how fast it answers.
+
+### Where each tool is wired in, and why both places matter
+
+`fetch_rendered_page_text` and `wikipedia_lookup` are added to
+`web_search_tools.py`'s existing toolset -- available directly on Messa's
+OWN toolset (`agents/registry.py`), the same toolset an autonomous routine
+firing reuses in full (`server.py`'s `_fire_autonomous_routine` calls
+`build_orchestrator`, the exact same orchestrator a live text uses). This
+is the single biggest lever for your ticket-watcher example: a routine that
+re-checks a page every 15-30 minutes now has a real option to do that check
+without ever delegating to deepsearch at all -- no Browserbase session
+opens for it, full stop.
+
+`fetch_rendered_page_text` is ALSO added directly onto deepsearch's own
+toolset (`BrowserToolProvider.__aenter__`, given to both the top-level
+provider and every `delegate_website_task` sub-worker) -- for the
+"combined" case you asked about, where a task genuinely needs both reading
+and acting (e.g. "check these 3 sites and buy from whichever is cheapest").
+The Browserbase session for that task still has to open (something on it
+needs to be clicked), but once it's open, deepsearch can compare all the
+candidate pages via `fetch_rendered_page_text` -- costing zero EXTRA
+session time per comparison, since it's a separate HTTP call, not a
+Playwright round trip -- and spend its actual `browser_navigate`/session
+time only on the one site it ends up acting on.
+
+### The orchestration/routing changes
+
+Both `deepsearch_tools.py`'s system prompts (`DEEPSEARCH_SYSTEM_PROMPT` for
+the top-level agent, `_SUBAGENT_SYSTEM_PROMPT` for a `delegate_website_task`
+sub-worker) and `agents/registry.py`'s top-level "Speed matters" paragraph
+(renamed "Speed AND cost matter") were rewritten with explicit,
+money-specific language -- not just "this is faster," but "this session is
+billed by TIME HELD OPEN regardless of what you actually do with it," and a
+concrete instruction for the combined case: compare every candidate with
+the free tool FIRST, decide which one wins, THEN delegate/navigate for the
+one that actually needs it, never navigating to a page purely to compare it
+against others when a free read would tell you the same thing. This applies
+explicitly during an autonomous routine's own firing too, called out
+directly in the prompt, since that's exactly the "check on this
+periodically" shape your ticket-watcher example is.
+
+### What this deliberately does NOT change yet, and why
+
+`BrowserToolProvider.__aenter__` still opens the Browserbase session
+EAGERLY the instant a deepsearch delegation starts, even if the model ends
+up never using the browser at all during that delegation. Making this
+fully lazy (only open the session on the FIRST actual `browser_*` tool
+call) is a real, valuable next step, but a much bigger and riskier change
+than this round: `@playwright/mcp`'s own tool schemas are currently only
+knowable by querying the LIVE MCP server after a Browserbase session is
+already connected (`load_mcp_tools` in `__aenter__`), so true laziness
+means either caching those schemas up front (they're effectively fixed --
+feasible, but not yet built) or wrapping every browser tool in a proxy that
+creates the session on first real use -- and a lot of carefully-tuned,
+already-tested session-lifecycle logic (the live-view URL, the cursor
+overlay injection, human-help polling, multi-tab sub-worker claiming) is
+built assuming the session exists from the start of `__aenter__`. Given
+this round's constraint (not destructive to the existing app), that's a
+separate, focused piece of work I'd want to scope on its own rather than
+bolt on here.
+
+In practice, this round's change already closes most of the real gap for
+your use case: since Messa now has a genuine option to answer a read-only
+check WITHOUT delegating to deepsearch at all, the routines that matter
+most for spend (periodic "has this changed yet" watchers) should mostly
+stop opening Browserbase sessions in the first place -- the eager-session
+cost only still applies to tasks that genuinely do need the real browser at
+some point, where it was always going to be billed regardless.
+
+### Other free tools/MCPs considered
+
+Beyond Jina Reader and Wikipedia, I looked specifically for other free
+APIs or MCP servers that would meaningfully speed up or cheapen deepsearch.
+Being honest about what that search actually turned up: most current "best
+free MCP server" roundups skew toward developer-tooling use cases
+(library documentation lookups, GitHub, code search) that don't fit a
+consumer texting assistant, and the genuinely relevant options
+(DuckDuckGo, Firecrawl) were either already integrated (`web_search`
+already uses DuckDuckGo via the `ddgs` package) or already covered by the
+recommendation above (Firecrawl's structured-extraction angle is a real,
+separate idea -- see the prior conversation's writeup -- but wasn't asked
+for as a keyless option this round, and Jina's plain-text tier already
+covers the "read a JS-rendered page" gap it would have filled). Open-Meteo
+(weather + geocoding, `messa/weather.py`/`timeutil.py`) was already the
+established free/keyless provider for that domain before this round. The
+real remaining lever specific to a handful of frequently-hit sites (a
+ticket vendor's own public JSON endpoint behind the page, for instance)
+is genuinely site-specific reverse-engineering work, not a general tool --
+worth doing later for a small number of sites you check often, but out of
+scope for a general-purpose change.
+
+### Verification
+
+New `/tmp/test_jina_wikipedia_cost_tiering.py`: `jina_reader.fetch_rendered_page_text`'s
+request shape (the target URL appended raw after the base, confirmed
+against Jina's long-stable documented contract -- see that module's own
+"not live-verified" note below), the keyless-by-default behavior (no
+`Authorization` header sent with `JINA_API_KEY` unset), the opt-in key
+behavior once one IS configured, and its 429/5xx/network-exception failure
+paths (all degrade to a clear `ERROR` message, never a raised exception).
+`web_search_tools.py`'s `fetch_rendered_page_text` tool proven to be a thin
+passthrough to that same shared implementation, not a second, driftable
+copy. `_format_wikipedia_summary`'s pure formatting logic (normal
+summary, the disambiguation case, a missing extract, truncation) against
+fixed inputs. `wikipedia_lookup` end to end with `httpx` faked: a direct
+title hit (exactly one HTTP call, no wasted fallback), the 404-then-
+opensearch-fallback path (confirmed as exactly 3 calls: summary, opensearch,
+summary again with the resolved title), a genuinely no-match query, and a
+network failure -- all degrading gracefully. String-presence checks
+(same style as `/tmp/test_routing_boundaries.py`) confirming the new tools
+and the explicit "billed by time held open" cost language actually landed
+in `registry._build_system_prompt`'s real output and in both of
+`deepsearch_tools.py`'s system prompts. A source-level check that
+`fetch_rendered_page_text` is registered inside `BrowserToolProvider.__aenter__`
+unconditionally (both the top-level provider and every sub-worker), ahead
+of `delegate_website_task`'s own owning-provider-only gated registration --
+not a live session (a real Browserbase account + MCP subprocess is needed
+for that, out of scope for this sandbox, same as this project's other
+browser/CDP-dependent tests). Also fixed a real, expected regression:
+`/tmp/test_presearch_guidance.py` had a hardcoded token-budget ceiling on
+`DEEPSEARCH_SYSTEM_PROMPT` (950 tokens) sized for one earlier, smaller
+addition -- raised to 1250 with a comment explaining why, the same kind of
+deliberate-cost acknowledgment as every other prompt-budget test in this
+suite, not a silently loosened check. Re-ran the full existing suite
+afterward; the only failures are the same pre-existing, unrelated set
+already documented in earlier entries above (browser/CDP-dependent suites,
+`test_onboarding_and_deepsearch_msg.py`'s missing `OPENROUTER_API_KEY`,
+`test_toolnode_concurrency.py` not importing this project's code at all,
+`test_mcp_concurrency.py`/`test_register_only.py` failing to spawn a
+Playwright MCP subprocess in this sandbox, `test_snapshot_size_nudge.py`'s
+own assertions all passing but failing only during unrelated asyncio-loop
+teardown).
+
+Not verified: this sandbox's own outbound network is allowlisted to a
+fixed set of domains (package registries, the Anthropic API) -- confirmed
+directly (a raw `curl` to `en.wikipedia.org` from this sandbox gets a 403
+from the sandbox's own proxy before ever reaching the real internet, the
+exact same restriction already documented for `web_search_tools.py`'s
+DuckDuckGo calls). So neither Jina's real API nor Wikipedia's real API was
+actually called end to end from here -- the request shapes match their
+long-stable, publicly documented contracts, and the failure-path handling
+was verified against realistic faked responses (429, 4xx, malformed/empty
+body), but a real deployed run against Jina's live free tier and
+Wikipedia's live API is the first genuine confirmation that the request
+shape is exactly right and that Jina's real free-tier rate limit behaves
+as documented. Also not verified: no live LLM was available to confirm
+Messa/deepsearch actually follow the new routing guidance correctly in
+practice (same standing caveat as every other prompt-only behavior change
+in this project) -- what's verified is that the right tools exist, are
+wired into the right toolsets, and the right guidance text is generated for
+the model to act on, not that a real model reliably chooses the cheap tier
+over deepsearch on a real ambiguous request. And, as covered above, true
+lazy Browserbase session creation (only opening the session on first real
+browser use, not eagerly on delegation start) was deliberately NOT built
+this round -- it remains the main further lever if you want the
+"combined" case to also avoid opening a session at all for delegations that
+turn out not to need the real browser after all.

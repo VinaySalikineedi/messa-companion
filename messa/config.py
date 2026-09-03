@@ -433,6 +433,27 @@ BROWSERBASE_SESSION_TIMEOUT_SECONDS = int(
     os.environ.get("MESSA_BROWSERBASE_SESSION_TIMEOUT_SECONDS", "1800")
 )
 
+# ---- Jina Reader (tools/jina_reader.py) -- a JS-capable page read that
+# costs no Browserbase session time, sitting between a plain HTTP fetch
+# (web_search_tools.fetch_page_text, no JS at all) and a real deepsearch
+# delegation (the only tier that can actually click/type/log in, billed by
+# Browserbase session TIME). See jina_reader.py's own docstring for the full
+# three-tier design and README's "Deepsearch cost tiering" section for why.
+#
+# Keyless by default -- Jina's own published free tier is 20 requests/minute
+# with no key at all, which is exactly why this starts here rather than
+# requiring a signup before it does anything. JINA_API_KEY stays unset
+# (None) until you add one; nothing else needs to change to start using a
+# key later; see README for how a key raises the rate limit once real usage
+# outgrows the free tier.
+JINA_API_KEY = os.environ.get("MESSA_JINA_API_KEY") or None
+JINA_READER_BASE_URL = os.environ.get("MESSA_JINA_READER_BASE_URL", "https://r.jina.ai").rstrip("/")
+# JS rendering genuinely takes longer than a plain HTTP GET (fetch_page_text's
+# own FETCH_TIMEOUT_SECONDS is 10s) -- sized to give a real JS-heavy page
+# room to finish rendering server-side on Jina's infrastructure without
+# waiting so long it stops being the "fast" tier in practice.
+JINA_READER_TIMEOUT_SECONDS = float(os.environ.get("MESSA_JINA_READER_TIMEOUT_SECONDS", "20"))
+
 # ---- Live view sharing (Phase 3) ----
 # Base URL for the public /live/<token> page (see server.py + db.py's
 # live_share_token functions). Defaults to the now-permanent custom domain

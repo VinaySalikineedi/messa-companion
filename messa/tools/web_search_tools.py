@@ -10,27 +10,46 @@ a single useful thing happens: opening a Browserbase session, launching
 the whole Playwright tool schema in context -- see deepsearch_tools.py's
 BrowserToolProvider. For a pure "look this up" request, all of that is
 pure overhead with zero benefit; a plain HTTP search + a plain HTTP page
-fetch answers the same question in a fraction of the time and tokens.
+fetch answers the same question in a fraction of the time and tokens --
+and, unlike deepsearch, Browserbase never bills a cent for any of it, since
+no Browserbase session is ever involved.
 
-`web_search` (DuckDuckGo, via the `ddgs` package -- no API key, actively
-maintained) and `fetch_page_text` (a direct HTTP GET + HTML-to-text) are
-exposed directly on Messa's own toolset (see agents/registry.py), not
-nested inside deepsearch -- the routing decision ("does this need a real
-browser or not") has to happen BEFORE a browser session ever opens, or the
-whole point is lost. Messa's system prompt tells her to prefer these for a
-plain factual lookup and reserve deepsearch for anything that actually
-requires clicking through a site, logging in, or filling out a form.
+Three tools, three tiers of the same "don't open a browser you don't need"
+idea, all exposed directly on Messa's own toolset (see agents/registry.py),
+not nested inside deepsearch -- the routing decision ("does this need a
+real browser or not") has to happen BEFORE a browser session ever opens, or
+the whole point is lost:
 
-Both tools fail closed and cheap: a network error or empty result returns
-a short message suggesting deepsearch as a fallback, rather than raising
-and losing the turn -- a plain HTTP fetch has no way to run the JS some
-pages need to render their content at all, and that's a real, expected
-limitation, not a bug.
+  - `web_search` (DuckDuckGo, via the `ddgs` package -- no API key) for a
+    quick factual lookup when you don't have a URL yet.
+  - `wikipedia_lookup` (Wikipedia's own REST API -- no key) for anything
+    that's likely to have its own encyclopedia article -- faster and more
+    reliable than a generic search for that specific shape of question.
+  - `fetch_page_text` (plain HTTP GET, no JS) for reading a page you
+    already have a link to.
+  - `fetch_rendered_page_text` (tools/jina_reader.py -- JS rendered on
+    Jina's own infrastructure, still no browser session of ours) for a
+    page `fetch_page_text` came back empty on, e.g. a modern JS-heavy
+    ticket/booking site.
+
+Messa's system prompt tells her to prefer this whole tier for a plain
+factual lookup or a read-only check (including inside an autonomous
+routine's periodic firing -- see server.py's `_fire_autonomous_routine`,
+which reuses this same toolset), and reserve deepsearch for anything that
+actually requires clicking through a site, logging in, or filling out a
+form -- the one tier genuinely billed by Browserbase session time.
+
+Every tool here fails closed and cheap: a network error or empty result
+returns a short message suggesting the next tier up (fetch_rendered_page_text,
+then deepsearch) as a fallback, rather than raising and losing the turn --
+a plain HTTP fetch has no way to run the JS some pages need to render their
+content at all, and that's a real, expected limitation, not a bug.
 """
 from __future__ import annotations
 
 import asyncio
 from typing import Any, Optional
+from urllib.parse import quote
 
 import httpx
 from bs4 import BeautifulSoup
@@ -47,12 +66,16 @@ except ImportError:
 from langchain_core.tools import BaseTool, tool
 
 from .common import trace_all
+from .jina_reader import fetch_rendered_page_text as _fetch_rendered_page_text
 
 LABEL = "web_search"
 
 DEFAULT_MAX_FETCH_CHARS = 6000
 FETCH_TIMEOUT_SECONDS = 10.0
 _USER_AGENT = "Mozilla/5.0 (compatible; MessaBot/1.0; +https://textmessa.com)"
+
+WIKIPEDIA_API_BASE = "https://en.wikipedia.org"
+WIKIPEDIA_TIMEOUT_SECONDS = 10.0
 
 
 def _format_results(results: list[dict[str, Any]]) -> str:
@@ -87,6 +110,48 @@ def extract_readable_text(html: str, max_chars: int = DEFAULT_MAX_FETCH_CHARS) -
     return text
 
 
+def _format_wikipedia_summary(data: dict[str, Any], max_chars: int = DEFAULT_MAX_FETCH_CHARS) -> str:
+    """Pure formatting for a Wikipedia REST API page-summary response --
+    split out so it's unit-testable without a network call, same pattern as
+    _format_results/extract_readable_text above. Handles the disambiguation
+    case explicitly (Wikipedia's own `type` field) rather than returning a
+    thin, unhelpful summary for a page that doesn't actually answer
+    anything on its own."""
+    title = (data.get("title") or "").strip()
+    extract = (data.get("extract") or "").strip()
+    url = ((data.get("content_urls") or {}).get("desktop") or {}).get("page", "")
+    if data.get("type") == "disambiguation":
+        return (
+            f"\"{title}\" is a disambiguation page on Wikipedia -- it doesn't point to one "
+            f"specific article. {extract or 'Multiple different things share this name.'} Ask "
+            f"the user which one they mean, or try wikipedia_lookup again with a more specific "
+            f"title.\n{url}"
+        ).strip()
+    if not extract:
+        return "(Wikipedia article found, but it has no summary text.)"
+    if len(extract) > max_chars:
+        extract = extract[:max_chars] + " ... (truncated)"
+    return f"{title}: {extract}\n{url}".strip()
+
+
+async def _wikipedia_resolve_title(client: httpx.AsyncClient, query: str) -> str | None:
+    """Wikipedia's summary endpoint only matches an exact (or lightly
+    redirect-normalized) title -- 'einstein' won't find 'Albert Einstein'.
+    Falls back to the MediaWiki opensearch API (same free, keyless
+    Wikimedia service, a fuzzy title search) to resolve a loose query to
+    its real article title, returning the top match's title or None if
+    opensearch itself found nothing."""
+    resp = await client.get(
+        f"{WIKIPEDIA_API_BASE}/w/api.php",
+        params={"action": "opensearch", "format": "json", "limit": 1, "search": query},
+        headers={"User-Agent": _USER_AGENT},
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    titles = data[1] if isinstance(data, list) and len(data) > 1 else []
+    return titles[0] if titles else None
+
+
 def build_web_search_tools() -> list[BaseTool]:
     @tool
     async def web_search(query: str, max_results: int = 5) -> str:
@@ -113,22 +178,76 @@ def build_web_search_tools() -> list[BaseTool]:
 
     @tool
     async def fetch_page_text(url: str, max_chars: int = DEFAULT_MAX_FETCH_CHARS) -> str:
-        """Fetch a URL and return its readable text content -- fast, for reading
-        an article or page you already have a link to (e.g. from web_search's
-        results). This does NOT run JavaScript and can't click/scroll/log in --
-        it just reads whatever HTML the server returns. If the page needs JS to
-        render its actual content, is behind a login, or you need to interact
-        with it, use deepsearch instead."""
+        """Fetch a URL and return its readable text content -- fast, free, and
+        costs no Browserbase session time, for reading an article or page you
+        already have a link to (e.g. from web_search's results). This does NOT
+        run JavaScript and can't click/scroll/log in -- it just reads whatever
+        HTML the server returns as-is. If the returned text looks empty, tiny,
+        or like a bare loading shell, the page is probably JS-rendered --
+        try fetch_rendered_page_text on the SAME url next, which runs the page's
+        JS server-side (still no browser session of ours) before falling back
+        to deepsearch. Go straight to deepsearch instead of either fetch tool
+        only when the task needs real interaction: a login, a form, a cart,
+        clicking through a flow -- not just reading a page's current content."""
         try:
             async with httpx.AsyncClient(timeout=FETCH_TIMEOUT_SECONDS, follow_redirects=True) as client:
                 resp = await client.get(url, headers={"User-Agent": _USER_AGENT})
             resp.raise_for_status()
         except Exception as e:  # noqa: BLE001
             return (
-                f"ERROR fetching {url}: {e}. If this page needs a real browser (JS-rendered "
-                "content, a login wall, etc), delegate to deepsearch instead."
+                f"ERROR fetching {url}: {e}. Try fetch_rendered_page_text on the same url next "
+                "(handles JS-rendered pages); delegate to deepsearch only if this needs real "
+                "interaction (a login wall, a form, clicking through a flow)."
             )
         return extract_readable_text(resp.text, max_chars)
 
-    raw_tools: list[BaseTool] = [web_search, fetch_page_text]
+    @tool
+    async def fetch_rendered_page_text(url: str, max_chars: int = DEFAULT_MAX_FETCH_CHARS) -> str:
+        """Fetch a URL's content AFTER letting its JavaScript run, and return
+        readable text -- for a page fetch_page_text came back empty, tiny, or
+        loading-shell-only on (most modern ticket/booking/listing sites need
+        this: Fandango, AMC, Ticketmaster, and similar). The JS is rendered on
+        a remote reader service, not in a browser of ours, so this still costs
+        NO Browserbase session time and no session to open or close -- just one
+        HTTP call, same as fetch_page_text, just slightly slower (real page
+        rendering takes a few seconds). Still read-only: it can't click, type,
+        scroll, or log in. If this ALSO comes back empty/unhelpful, or the task
+        genuinely needs to interact with the page (buy, submit, log in),
+        delegate to deepsearch instead -- that's the only tier that can."""
+        return await _fetch_rendered_page_text(url, max_chars=max_chars)
+
+    @tool
+    async def wikipedia_lookup(topic: str) -> str:
+        """Free, instant lookup of a Wikipedia article's summary -- for a
+        person, place, thing, event, or concept likely to have its own
+        Wikipedia page (a public figure, a company, a historical event, a
+        scientific concept, a country/city). Faster and more reliable than
+        web_search for this specific shape of question, since it goes
+        straight to the actual article instead of guessing from search
+        snippets -- try this FIRST for anything encyclopedia-shaped. NOT for
+        anything current/time-sensitive (today's score, this week's news,
+        live prices, today's showtimes) -- Wikipedia articles lag real-time
+        events; use web_search for those instead. If the topic name is
+        ambiguous (matches more than one thing), says so instead of
+        guessing -- ask the user which one they meant."""
+        try:
+            async with httpx.AsyncClient(timeout=WIKIPEDIA_TIMEOUT_SECONDS, follow_redirects=True) as client:
+                resp = await client.get(
+                    f"{WIKIPEDIA_API_BASE}/api/rest_v1/page/summary/{quote(topic)}",
+                    headers={"User-Agent": _USER_AGENT},
+                )
+                if resp.status_code == 404:
+                    resolved = await _wikipedia_resolve_title(client, topic)
+                    if not resolved:
+                        return f"No Wikipedia article found for \"{topic}\". Try web_search instead."
+                    resp = await client.get(
+                        f"{WIKIPEDIA_API_BASE}/api/rest_v1/page/summary/{quote(resolved)}",
+                        headers={"User-Agent": _USER_AGENT},
+                    )
+                resp.raise_for_status()
+        except Exception as e:  # noqa: BLE001
+            return f"ERROR looking up \"{topic}\" on Wikipedia: {e}. Try web_search instead."
+        return _format_wikipedia_summary(resp.json())
+
+    raw_tools: list[BaseTool] = [web_search, fetch_page_text, fetch_rendered_page_text, wikipedia_lookup]
     return trace_all(raw_tools, LABEL)
