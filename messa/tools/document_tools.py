@@ -582,6 +582,290 @@ def _build_generic_pdf(title: str, sections: list[dict[str, Any]], out_path: Pat
     doc.build(story, canvasmaker=canvas_cls)
 
 
+def _analyze_contract_text(contract_text: str, user_role: str = "service_provider") -> dict[str, Any]:
+    """Perform deterministic risk analysis on contract text across the core legal risk pillars."""
+    text_lower = contract_text.lower()
+
+    # Extract detected title
+    first_lines = [
+        line.strip()
+        for line in contract_text.split("\n")
+        if line.strip() and not line.strip().lower().startswith("[attachment:")
+    ][:5]
+    detected_title = "Agreement"
+    for line in first_lines:
+        clean = line.strip("#-* \t\r")
+        if any(w in clean.lower() for w in ["agreement", "contract", "nda", "terms", "sow", "order", "statement of work"]):
+            detected_title = clean
+            break
+    if detected_title == "Agreement" and first_lines:
+        detected_title = first_lines[0].strip("#-* \t\r")
+
+    risk_score = 0
+    findings: list[dict[str, Any]] = []
+    missing_clauses: list[str] = []
+    redlines: list[dict[str, str]] = []
+
+    # --- PILLAR 1: Limitation of Liability ---
+    has_liability_cap = any(
+        phrase in text_lower
+        for phrase in [
+            "limitation of liability",
+            "aggregate liability",
+            "shall not exceed",
+            "liability is limited to",
+            "in no event shall either party be liable for",
+            "consequential damages",
+            "indirect, incidental",
+        ]
+    )
+    if not has_liability_cap:
+        risk_score += 35
+        findings.append({
+            "pillar": "Limitation of Liability",
+            "severity": "CRITICAL",
+            "issue": "Missing Limitation of Liability Clause",
+            "explanation": (
+                "The agreement contains no cap on liability and no waiver of indirect/consequential damages. "
+                "Under general contract law, this exposes you to unlimited financial and indirect liability in any dispute."
+            ),
+        })
+        missing_clauses.append("Limitation of Liability (Mutual Fee Cap & Consequential Damages Waiver)")
+        redlines.append({
+            "section": "Limitation of Liability",
+            "proposed_clause": (
+                "Limitation of Liability. EXCEPT FOR GROSS NEGLIGENCE OR WILLFUL MISCONDUCT, NEITHER PARTY SHALL "
+                "BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, PUNITIVE, OR CONSEQUENTIAL DAMAGES ARISING OUT OF "
+                "OR RELATED TO THIS AGREEMENT. EACH PARTY'S TOTAL AGGREGATE LIABILITY UNDER THIS AGREEMENT SHALL BE "
+                "STRICTLY LIMITED TO THE TOTAL AMOUNTS PAID OR PAYABLE UNDER THIS AGREEMENT IN THE TWELVE (12) MONTHS "
+                "PRECEDING THE CLAIM."
+            ),
+        })
+    else:
+        is_onesided = (
+            ("client's liability" in text_lower and "provider's liability" not in text_lower and "contractor's liability" not in text_lower)
+            or ("service provider's liability shall not exceed" in text_lower and "client's liability" not in text_lower)
+        )
+        if is_onesided:
+            risk_score += 25
+            findings.append({
+                "pillar": "Limitation of Liability",
+                "severity": "HIGH",
+                "issue": "One-Sided / Asymmetrical Liability Cap",
+                "explanation": "The liability cap protects the counterparty while leaving your own liability uncapped.",
+            })
+            redlines.append({
+                "section": "Limitation of Liability",
+                "proposed_clause": "Amend the limitation of liability to be expressly mutual so both parties receive identical protection.",
+            })
+
+    # --- PILLAR 2: Indemnification ---
+    has_indemnity = any(phrase in text_lower for phrase in ["indemnif", "hold harmless", "defend and hold"])
+    if has_indemnity:
+        provider_indemnifies = bool(
+            re.search(r"\b(contractor|provider|consultant)\b\s+(?:agrees\s+to\s+|shall\s+)?(?:defend[,\s]+)?indemnif", text_lower)
+        ) or any(p in text_lower for p in ["contractor agrees to indemnify", "provider agrees to indemnify", "consultant shall indemnify"])
+        client_indemnifies = bool(
+            re.search(r"\bclient\b\s+(?:agrees\s+to\s+|shall\s+)?(?:defend[,\s]+)?indemnif", text_lower)
+        ) or any(p in text_lower for p in ["client agrees to indemnify", "mutually indemnify", "each party shall indemnify", "each party agrees to indemnify"])
+        if provider_indemnifies and not client_indemnifies:
+            risk_score += 25
+            findings.append({
+                "pillar": "Indemnification",
+                "severity": "HIGH",
+                "issue": "One-Sided Indemnification Exposure",
+                "explanation": "You are required to defend and indemnify the counterparty without reciprocal indemnification protection.",
+            })
+            redlines.append({
+                "section": "Indemnification",
+                "proposed_clause": (
+                    "Indemnification. Each party agrees to defend, indemnify, and hold harmless the other party from "
+                    "and against third-party claims arising solely out of the indemnifying party's gross negligence, "
+                    "willful misconduct, or infringement of third-party intellectual property rights, conditioned upon "
+                    "prompt written notice of any claim."
+                ),
+            })
+
+    # --- PILLAR 3: Intellectual Property & Work for Hire ---
+    has_ip = any(phrase in text_lower for phrase in ["intellectual property", "work made for hire", "work for hire", "ownership of deliverables", "assigns all right"])
+    if has_ip:
+        conditioned_on_payment = bool(
+            re.search(r"upon\s+(?:[a-zA-Z'\s]{1,25}\s+)?receipt\s+of\s+(?:full|payment)", text_lower)
+        ) or any(
+            phrase in text_lower
+            for phrase in [
+                "upon receipt of full",
+                "upon full payment",
+                "subject to full payment",
+                "conditioned upon payment",
+                "contingent upon receipt",
+                "receipt of full and final payment",
+            ]
+        )
+        if not conditioned_on_payment and user_role in ["service_provider", "contractor", "consultant"]:
+            risk_score += 20
+            findings.append({
+                "pillar": "Intellectual Property",
+                "severity": "HIGH",
+                "issue": "Premature IP Assignment Before Payment",
+                "explanation": (
+                    "Deliverables transfer ownership immediately upon creation. If the client refuses or delays "
+                    "payment, they will already legally own your work product."
+                ),
+            })
+            redlines.append({
+                "section": "Ownership of Deliverables",
+                "proposed_clause": (
+                    "Ownership of Deliverables. Conditioned expressly upon Provider's receipt of full and final "
+                    "payment for the applicable services, Provider hereby assigns to Client all right, title, and "
+                    "interest in and to the custom deliverables created specifically for Client. Provider retains "
+                    "ownership of all pre-existing tools, templates, and background technology."
+                ),
+            })
+    elif user_role in ["service_provider", "contractor", "consultant"]:
+        risk_score += 15
+        missing_clauses.append("Intellectual Property & Deliverables Ownership (with Background IP Reservation)")
+        findings.append({
+            "pillar": "Intellectual Property",
+            "severity": "MODERATE",
+            "issue": "Missing IP Ownership & Background IP Reservation",
+            "explanation": "No clause establishes who owns deliverables or reserves your pre-existing tools and methodologies.",
+        })
+
+    # --- PILLAR 4: Payment Terms & Invoicing ---
+    has_payment = any(phrase in text_lower for phrase in ["fee", "fees", "compensation", "payment", "invoice"])
+    if has_payment:
+        if "net 60" in text_lower or "net 90" in text_lower:
+            risk_score += 15
+            findings.append({
+                "pillar": "Payment Terms",
+                "severity": "MODERATE",
+                "issue": "Extended Payment Terms (Net 60/90)",
+                "explanation": "Payment window is excessively delayed, creating working capital friction.",
+            })
+            redlines.append({
+                "section": "Payment Terms",
+                "proposed_clause": "Invoices shall be due and payable within thirty (30) days of receipt (Net 30).",
+            })
+        has_late_fees = any(phrase in text_lower for phrase in ["late fee", "late charge", "interest of", "1.5%", "per month", "overdue"])
+        if not has_late_fees and user_role in ["service_provider", "contractor", "consultant"]:
+            risk_score += 10
+            missing_clauses.append("Late Payment Interest & Costs of Collection")
+            redlines.append({
+                "section": "Late Payments",
+                "proposed_clause": (
+                    "Late Invoices. Past-due balances shall accrue interest at 1.5% per month (or the maximum permitted "
+                    "by law), plus reasonable costs of collection."
+                ),
+            })
+    else:
+        risk_score += 20
+        missing_clauses.append("Payment Terms, Invoicing Cadence, and Due Dates")
+
+    # --- PILLAR 5: Termination & Payment on Cancellation ---
+    has_term = any(phrase in text_lower for phrase in ["cancellation", "terminate", "termination"])
+    if has_term:
+        if any(p in text_lower for p in ["terminate for convenience", "cancel this agreement", "either party may cancel", "terminate at any time"]):
+            has_payment_on_term = bool(
+                re.search(r"\bpay(?:s|ment|ed)?\b.*?\bservices\b", text_lower)
+            ) or any(
+                p in text_lower
+                for p in [
+                    "paid for services", "payment for work completed", "reimbursed for",
+                    "services performed up to", "promptly pay", "pays for all services",
+                    "pay for all services",
+                ]
+            )
+            if not has_payment_on_term and user_role in ["service_provider", "contractor", "consultant"]:
+                risk_score += 20
+                findings.append({
+                    "pillar": "Termination",
+                    "severity": "HIGH",
+                    "issue": "Termination for Convenience Without Payment Guarantee",
+                    "explanation": (
+                        "The contract allows termination or cancellation without guaranteeing prompt payment for work "
+                        "performed and commitments incurred up to the cancellation date."
+                    ),
+                })
+                redlines.append({
+                    "section": "Payment Upon Termination",
+                    "proposed_clause": (
+                        "Payment Upon Termination. Upon any early termination or cancellation, Client shall promptly pay "
+                        "Provider for all services rendered, deliverables completed, and approved expenses incurred "
+                        "through the effective date of termination."
+                    ),
+                })
+    else:
+        risk_score += 15
+        missing_clauses.append("Term and Termination Notice Clause")
+
+    # --- PILLAR 6: Restrictive Covenants / Non-Compete ---
+    if any(p in text_lower for p in ["non-compete", "covenant not to compete", "shall not engage in any business"]):
+        risk_score += 25
+        findings.append({
+            "pillar": "Restrictive Covenants",
+            "severity": "HIGH",
+            "issue": "Overly Restrictive Non-Compete Clause",
+            "explanation": "Restricts your right to practice your profession or take on other industry clients.",
+        })
+        redlines.append({
+            "section": "Non-Compete",
+            "proposed_clause": "Strike the non-compete clause in its entirety.",
+        })
+
+    # --- PILLAR 7: Governing Law & Jurisdiction ---
+    has_law = any(p in text_lower for p in ["governing law", "governed by", "laws of the state of", "jurisdiction", "venue"])
+    if not has_law:
+        risk_score += 15
+        missing_clauses.append("Governing Law, Jurisdiction, and Dispute Venue")
+        redlines.append({
+            "section": "Governing Law",
+            "proposed_clause": (
+                "Governing Law and Jurisdiction. This Agreement shall be governed by and construed in accordance with "
+                "the laws of the State of Delaware (or Provider's home jurisdiction), without regard to conflicts of law. "
+                "The parties submit to the exclusive jurisdiction of the courts located therein."
+            ),
+        })
+
+    # --- PILLAR 8: Integration & Entire Agreement ---
+    has_integration = any(p in text_lower for p in ["entire agreement", "integration", "supersedes all prior"])
+    if not has_integration:
+        missing_clauses.append("Entire Agreement / Integration Clause")
+
+    # Risk Rating
+    if risk_score >= 50:
+        overall_rating = "CRITICAL RISK"
+        summary_verdict = (
+            "DO NOT SIGN IN PRESENT FORM. The contract contains critical structural vulnerabilities, "
+            "including missing liability protections and potential financial exposure. Mandatory redlines required."
+        )
+    elif risk_score >= 30:
+        overall_rating = "HIGH RISK"
+        summary_verdict = (
+            "SUBSTANTIAL RISK DETECTED. The contract lacks essential defensive clauses or contains one-sided terms. "
+            "Negotiate recommended redlines before signing."
+        )
+    elif risk_score >= 15:
+        overall_rating = "MODERATE RISK"
+        summary_verdict = (
+            "MODERATE COMMERCIAL FRICTION. The agreement is workable but has minor gaps (e.g. payment timing, late fees, "
+            "or missing boilerplate) that should be clarified."
+        )
+    else:
+        overall_rating = "LOW RISK"
+        summary_verdict = "WELL-BALANCED AGREEMENT. The terms appear balanced and customary for commercial transactions."
+
+    return {
+        "title": detected_title,
+        "overall_rating": overall_rating,
+        "risk_score": risk_score,
+        "summary_verdict": summary_verdict,
+        "findings": findings,
+        "missing_clauses": missing_clauses,
+        "redlines": redlines,
+    }
+
+
 def build_document_tools(user: config.UserContext | None = None) -> list[BaseTool]:
     out_dir = Path(config.OUTPUTS_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -705,7 +989,100 @@ def build_document_tools(user: config.UserContext | None = None) -> list[BaseToo
             return f"Error generating PDF: {e}"
         return f"Generated PDF at {out_path.resolve()}"
 
-    raw_tools: list[BaseTool] = [generate_contract_pdf, generate_report_pdf, generate_pdf]
+    @tool
+    async def audit_contract(
+        contract_text: str,
+        user_role: str = "service_provider",
+        generate_audit_report_pdf: bool = False,
+        report_filename: Optional[str] = None,
+    ) -> str:
+        """Analyze a legal contract, agreement, or SOW to identify high-risk clauses,
+        one-sided liabilities, missing protections, and generate actionable redlines.
+
+        contract_text: The full text of the agreement (extracted from PDF or email).
+        user_role: The user's role in the contract ('service_provider', 'client', 'contractor', 'consultant').
+        generate_audit_report_pdf: If True, also compiles a formal executive PDF risk audit report in /outputs/.
+        report_filename: Optional filename for the generated audit report PDF.
+        """
+        analysis = _analyze_contract_text(contract_text, user_role)
+        lines = [
+            f"# Legal Risk Audit: {analysis['title']}",
+            f"**Overall Risk Rating**: {analysis['overall_rating']} (Risk Score: {analysis['risk_score']}/100)",
+            f"**Executive Verdict**: {analysis['summary_verdict']}\n",
+        ]
+
+        if analysis["findings"]:
+            lines.append("### Key Red Flags & Exposure Points:")
+            for idx, f in enumerate(analysis["findings"], 1):
+                lines.append(f"{idx}. **{f['issue']}** [{f['severity']}] ({f['pillar']})")
+                lines.append(f"   - **Risk**: {f['explanation']}")
+            lines.append("")
+
+        if analysis["missing_clauses"]:
+            lines.append("### Missing Critical Protections:")
+            for mc in analysis["missing_clauses"]:
+                lines.append(f"- {mc}")
+            lines.append("")
+
+        if analysis["redlines"]:
+            lines.append("### Recommended Redlines & Counter-Proposals:")
+            for r in analysis["redlines"]:
+                lines.append(f"**Section: {r['section']}**")
+                lines.append(f"> \"{r['proposed_clause']}\"\n")
+
+        if generate_audit_report_pdf:
+            doc_title = f"Legal Risk Audit: {analysis['title']}"
+            sections = []
+
+            if analysis["findings"]:
+                findings_table = [["Issue", "Severity", "Risk Pillar", "Analysis"]]
+                for f in analysis["findings"]:
+                    findings_table.append([f["issue"], f["severity"], f["pillar"], f["explanation"]])
+                sections.append({
+                    "heading": "1. Key Red Flags & Identified Vulnerabilities",
+                    "table": findings_table,
+                })
+
+            if analysis["missing_clauses"]:
+                sections.append({
+                    "heading": "2. Missing Standard Boilerplate Protections",
+                    "bullets": analysis["missing_clauses"],
+                })
+
+            if analysis["redlines"]:
+                redline_bullets = [
+                    f"<b>{r['section']}</b>: \"{r['proposed_clause']}\""
+                    for r in analysis["redlines"]
+                ]
+                sections.append({
+                    "heading": "3. Actionable Redline Amendments",
+                    "bullets": redline_bullets,
+                })
+
+            slug = _slugify(report_filename or f"audit-{analysis['title']}")
+            pdf_path = out_dir / f"{slug}.pdf"
+            try:
+                _build_report_pdf(
+                    title=doc_title,
+                    subtitle="Comprehensive Contract Risk Assessment & Redline Counter-Offer",
+                    executive_summary=f"Risk Rating: {analysis['overall_rating']}. {analysis['summary_verdict']}",
+                    key_findings=[f"{f['issue']} ({f['severity']})" for f in analysis["findings"][:4]],
+                    sections=sections,
+                    metadata={"Assessed Role": user_role.replace("_", " ").title(), "Document": analysis["title"]},
+                    out_path=pdf_path,
+                )
+                lines.append(f"Generated Report PDF at {pdf_path.resolve()}")
+            except Exception as e:
+                lines.append(f"(Note: Failed to compile audit PDF report: {e})")
+
+        return "\n".join(lines)
+
+    raw_tools: list[BaseTool] = [
+        generate_contract_pdf,
+        generate_report_pdf,
+        generate_pdf,
+        audit_contract,
+    ]
     return trace_all(raw_tools, LABEL)
 
 
@@ -723,15 +1100,30 @@ def build_document_system_prompt(user: config.UserContext | None = None) -> str:
 
     return (
         "You are the document specialist: you turn requests into professional, ready-to-use "
-        "contracts, executive reports, and PDFs, delegated to you by Messa.\n\n"
+        "contracts, executive reports, legal audits, and PDFs, delegated to you by Messa.\n\n"
         f"{user_identity}"
         "TOOL SELECTION:\n"
-        "- generate_contract_pdf: For legal agreements, NDAs, independent contractor agreements, "
+        "- generate_contract_pdf: For drafting binding legal agreements, NDAs, independent contractor agreements, "
         "consulting agreements, MSAs, SOWs, bills of sale, and offer letters.\n"
         "- generate_report_pdf: For market research, intelligence digests, executive briefings, "
         "financial summaries, and competitive audits.\n"
         "- generate_pdf: For general multi-section documents that do not require legal hierarchy "
-        "or executive callouts.\n\n"
+        "or executive callouts.\n"
+        "- audit_contract: For analyzing existing contracts or agreements (sent by counterparties via email "
+        "or text) to identify one-sided liabilities, uncapped risks, missing protections, and formulate "
+        "concrete redline counter-proposals.\n\n"
+        "CLARIFICATION PROTOCOL (Ask Once With Smart Defaults, Don't Spam):\n"
+        "When the user asks you to draft a contract or report and certain commercial terms are missing:\n"
+        "1. NEVER stall drafting with endless questions or multiple text messages.\n"
+        "2. Formulate ONE concise reply proposing standard commercial defaults:\n"
+        "   - Payment: Net 30, invoice upon monthly completion or milestone deliverables.\n"
+        "   - Term & Termination: 30 days mutual written notice; immediate for uncured breach.\n"
+        "   - Limitation of Liability: Mutual cap equal to fees paid in prior 12 months, waiver of consequential damages.\n"
+        "   - Governing Law: User's home state or Delaware.\n"
+        "   - Confidentiality: Mutual 2-year non-disclosure obligation.\n"
+        "3. Ask ONLY for the truly variable deal points (e.g. Counterparty legal name and agreed price/rate) "
+        "in a single message, explicitly stating that standard protective defaults will be used for all other terms "
+        "unless they specify otherwise.\n\n"
         "LEGAL CONTRACT DRAFTING STANDARDS (Zero-Mistake Contract Engine):\n"
         "1. Complete & Actionable: Contracts must be ready to sign immediately. NEVER leave placeholders "
         "such as [Insert Date], [Client Name], <TBD>, or [State]. The Zero-Bracket validator will reject them.\n"
@@ -746,6 +1138,12 @@ def build_document_system_prompt(user: config.UserContext | None = None) -> str:
         "3. Structured Clauses: Group clauses logically into numbered sections (1.1, 1.2, 2.1).\n"
         "4. Signature Blocks: Always supply execution details for both parties so formal signature lines "
         "are generated at the bottom.\n\n"
+        "CONTRACT RISK AUDITING STANDARDS:\n"
+        "- When auditing a contract with audit_contract, scrutinize all 8 risk pillars: Liability Cap, "
+        "Indemnification, IP Assignment, Payment Terms, Termination Rights, Restrictive Covenants, "
+        "Governing Law, and Entire Agreement.\n"
+        "- Deliver clear, actionable redline amendments that the user can immediately paste into an email "
+        "or counter-offer back to the other party.\n\n"
         "EXECUTIVE REPORT STANDARDS:\n"
         "- Provide a concise 2-3 sentence executive_summary for the styled callout box.\n"
         "- Provide 3-5 key_findings as bullet takeaways.\n"
@@ -759,3 +1157,4 @@ def build_document_system_prompt(user: config.UserContext | None = None) -> str:
 
 # Backward-compatible static prompt string
 DOCUMENT_SYSTEM_PROMPT = build_document_system_prompt(None)
+
