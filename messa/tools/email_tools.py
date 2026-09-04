@@ -156,7 +156,7 @@ def _get_or_create_gmail_auth_config_id(client) -> str:
             "name": _GMAIL_AUTH_CONFIG_NAME,
             "tool_access_config": {
                 "tools_for_connected_account_creation": [
-                    _SLUG_LIST, _SLUG_SEND, _SLUG_REPLY, _SLUG_GET_ATTACHMENT,
+                    _SLUG_LIST, _SLUG_SEND, _SLUG_REPLY, _SLUG_GET_ATTACHMENT, _SLUG_GET_MESSAGE,
                 ],
             },
         },
@@ -327,8 +327,12 @@ def build_email_tools(user: config.UserContext, approval_gate: ApprovalGate | No
                     if a.get("attachmentId") == resolved_att_id:
                         target_att = a
                         break
-                if not target_att and att_list:
-                    target_att = att_list[0]
+                if not target_att:
+                    available = ", ".join(a.get("attachmentId") or "unknown" for a in att_list)
+                    return (
+                        f"Attachment ID {resolved_att_id!r} was not found in email {message_id!r}. "
+                        f"Available attachment IDs: {available}"
+                    )
             else:
                 # Neither provided: if only 1 attachment, pick it
                 if len(att_list) == 1:

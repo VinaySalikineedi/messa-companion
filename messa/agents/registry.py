@@ -63,7 +63,7 @@ from ..channels.sendblue import SendblueError
 from ..tools.admin_tools import ADMIN_SYSTEM_PROMPT, build_admin_tools
 from ..tools.deepsearch_tools import build_deepsearch_subagent, count_warm_sessions_for_user, purge_warm_sessions_for_user
 from ..tools.common import trace_all
-from ..tools.document_tools import DOCUMENT_SYSTEM_PROMPT, build_document_system_prompt, build_document_tools
+from ..tools.document_tools import build_document_system_prompt, build_document_tools
 from ..tools.email_tools import build_email_subagent
 from ..tools.executive_tools import _format_contact_line, build_executive_subagent
 from ..tools.integration_tools import app_category_for_toolkit, build_integration_system_prompt, build_integration_tools

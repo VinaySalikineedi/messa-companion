@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config
+from .phone import format_phone_display
 
 _TEMPLATE_PATH = Path(__file__).parent / "assets" / "landing" / "index.html"
 
@@ -39,39 +40,28 @@ def _load_template() -> str:
     return _cached_template
 
 
-def _format_phone(raw: str | None) -> tuple[str, str]:
-    """(display, sms_href) for whatever's in config.SENDBLUE_NUMBER.
-
-    Sendblue numbers are provisioned as E.164 (e.g. "+15551234567") --
-    formatted here as "+1 (555) 123 4567" for a 10 or 11-digit US/Canada
-    number (a space, not a hyphen, separates the last block -- the landing
-    page's copy avoids dashes entirely, by request), since that's
-    overwhelmingly what this'll be given Sendblue's
-    own coverage. Anything that doesn't match that shape (a different
-    country code, or just a format we didn't anticipate) falls back to
-    displaying the configured value exactly as-is rather than mangling it
-    into something wrong -- same "don't guess, degrade honestly" instinct
-    as the rest of this codebase (see e.g. weather.py's drop-if-unreliable
-    contract). The sms: href always uses the raw digits/plus-sign form
-    Sendblue gave us, regardless of how it's displayed, since that's what
-    actually has to work when a phone dials it.
-
-    Returns ("", "sms:") if SENDBLUE_NUMBER isn't configured at all (e.g.
-    a fresh checkout of this repo, or a preview build without production
-    secrets) -- the page still renders, just without a working number to
-    show, since a customer-facing page erroring out entirely over one
-    missing env var is a worse failure than an honestly-blank number."""
+def _sms_href(raw: str | None) -> str:
+    """sms: link target for whatever's in config.SENDBLUE_NUMBER -- always
+    uses the raw digits/plus-sign form Sendblue gave us, regardless of how
+    it's displayed (see phone.format_phone_display), since that's what
+    actually has to work when a phone dials it. "sms:" (no number) if
+    unconfigured -- the page still renders, just without a working number
+    to show (see render_landing_page's own fallback for the display half)."""
     if not raw or not raw.strip():
-        return "", "sms:"
+        return "sms:"
     raw = raw.strip()
     digits = re.sub(r"\D", "", raw)
-    ten = digits[1:] if len(digits) == 11 and digits.startswith("1") else digits
-    if len(ten) == 10:
-        display = f"+1 ({ten[0:3]}) {ten[3:6]} {ten[6:]}"
-    else:
-        display = raw
     sms_target = raw if raw.startswith("+") else (f"+{digits}" if digits else raw)
-    return display, f"sms:{sms_target}"
+    return f"sms:{sms_target}"
+
+
+def _format_phone(raw: str | None) -> tuple[str, str]:
+    """(display, sms_href) for whatever's in config.SENDBLUE_NUMBER.
+    Thin compatibility wrapper -- the actual display formatting now lives
+    in messa/phone.py's format_phone_display (shared with the Messa-email
+    signature in channels/resend.py), this just pairs it back up with the
+    sms: href this page still needs."""
+    return format_phone_display(raw), _sms_href(raw)
 
 
 def render_landing_page() -> str:

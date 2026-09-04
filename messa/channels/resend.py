@@ -53,6 +53,7 @@ from typing import Any
 import httpx
 
 from .. import config, db
+from ..phone import format_phone_display
 
 BASE_URL = "https://api.resend.com"
 
@@ -60,6 +61,27 @@ BASE_URL = "https://api.resend.com"
 class ResendError(RuntimeError):
     """Raised on a non-2xx response from Resend's API, or when Resend isn't
     configured at all."""
+
+
+def _signature_block() -> str:
+    """Appended to every Messa-owned-mailbox send/reply (see send_email
+    below) so the email reads like it's genuinely from Messa, not just a
+    bare address with a display-name header -- the user's own explicit
+    ask. Deliberately NOT applied to tools/email_tools.py's Gmail sends
+    (those go through Composio, never through this module at all, so
+    there's no shared code path to gate here). Phone number is pulled
+    from config.SENDBLUE_NUMBER via phone.format_phone_display, never
+    hardcoded -- the "at {phone}" clause is dropped entirely (rather than
+    shown blank/broken) if that env var isn't configured, same
+    don't-guess-degrade-honestly instinct as landing_page.py's own use of
+    this same helper."""
+    phone_display = format_phone_display(config.SENDBLUE_NUMBER)
+    tagline = (
+        f"Text Messa to be your own assistant -- managing your emails, tasks, and more -- "
+        f"at {phone_display}." if phone_display
+        else "Text Messa to be your own assistant -- managing your emails, tasks, and more."
+    )
+    return f"\n\n--\nMessa\n{tagline}"
 
 
 def _validate_attachment_path(attachment_path: str) -> Path:
@@ -113,12 +135,19 @@ async def send_email(
     from tools/document_tools.py's generate_pdf) to attach -- validated by
     _validate_attachment_path above before anything is read or sent. None
     (the default) sends a plain email with no attachment, unchanged from
-    before this parameter existed."""
+    before this parameter existed.
+
+    Every send/reply through this function gets Messa's own signature +
+    tagline appended to `text` (see _signature_block above) -- Messa
+    herself doesn't need to sign her own emails, this always happens
+    here, once, regardless of caller."""
     if not config.RESEND_API_KEY:
         raise ResendError(
             "Resend isn't configured -- add RESEND_API_KEY to .env to enable Messa's own "
             "email address."
         )
+
+    text = f"{text}{_signature_block()}"
 
     message_id = f"<{uuid.uuid4()}@{config.TEXTMESSA_EMAIL_DOMAIN}>"
     from_address = f"{from_local_part}@{config.TEXTMESSA_EMAIL_DOMAIN}"
@@ -129,6 +158,14 @@ async def send_email(
         headers["In-Reply-To"] = in_reply_to
     if references:
         headers["References"] = references
+    if sent_autonomously:
+        # RFC 3834 -- tells any compliant mail system (including another
+        # user's own Messa mailbox) that this was an automated reply, so
+        # it knows not to auto-reply back. Combined with the consecutive-
+        # autonomous-reply cap in tools/personal_inbox_tools.py's
+        # reply_to_email, this is the loop-safety backstop for two
+        # auto-replying systems bouncing messages at each other forever.
+        headers["Auto-Submitted"] = "auto-replied"
 
     payload: dict[str, Any] = {
         "from": from_field,

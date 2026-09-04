@@ -1,0 +1,31 @@
+-- Additive migration for Messa-owned-mailbox loop safety.
+--
+-- messa_email_messages.auto_submitted -- true when an INBOUND message
+-- arrived carrying an RFC 3834 "Auto-Submitted" header with an auto-*
+-- value (auto-replied, auto-generated, auto-notified), meaning it was
+-- itself sent by some other automated system, not typed by a human. The
+-- worker (cloudflare/personal-email-worker/worker.js) forwards this header
+-- via PostalMime's already-parsed header list; server.py's inbound webhook
+-- computes the boolean and passes it to db.log_inbound_personal_email.
+--
+-- Why this exists: tools/personal_inbox_tools.py's reply_to_email has a
+-- "risk-based autonomy" carve-out letting Messa reply on her own judgment
+-- for something clearly low-stakes. Without a hard backstop, two
+-- auto-replying mailboxes (most concerning: two different users' own
+-- Messa mailboxes) could bounce an autonomous "thank you" back and forth
+-- forever. This column is one half of that backstop: reply_to_email
+-- refuses autonomous=True for a message flagged auto_submitted, on top of
+-- (not instead of) the separate consecutive-autonomous-reply cap that
+-- covers the general case even when this header isn't present. See
+-- channels/resend.py's own outbound Auto-Submitted header (set whenever
+-- Messa sends autonomously) -- the two halves are reciprocal: every
+-- compliant mail system, including another Messa mailbox, both emits and
+-- honors this same signal.
+--
+-- NOT NULL DEFAULT false -- every pre-existing row (all genuinely
+-- human-sent, or simply unclassified before this shipped) is correctly
+-- treated as "not known to be automated," which is the safe default: it
+-- just means the OTHER backstop (the consecutive-reply cap) is what
+-- protects those older threads, not this column.
+
+ALTER TABLE messa_email_messages ADD COLUMN IF NOT EXISTS auto_submitted BOOLEAN NOT NULL DEFAULT false;

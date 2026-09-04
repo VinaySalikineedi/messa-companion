@@ -112,6 +112,15 @@ export default {
       ? parsed.references.join(" ")
       : parsed.references || null;
 
+    // RFC 3834 loop safety (messa/db.py's messa_email_messages.auto_submitted,
+    // migrations/030_email_loop_safety.sql): PostalMime already parses every
+    // header into this array (keys lowercased) -- forward the raw value, if
+    // present, so the backend can tell an auto-generated message (an "out of
+    // office" bot, or another user's own Messa mailbox auto-replying) from a
+    // real human, and refuse to auto-reply back to it.
+    const autoSubmittedHeader =
+      (parsed.headers || []).find((h) => h.key === "auto-submitted")?.value || null;
+
     // Forward only PDF-shaped attachments (by mimeType or filename
     // extension) and only ones under the size ceiling above -- messa/
     // server.py's personal_email_inbound_webhook (see messa/pdf_reader.py)
@@ -157,6 +166,7 @@ export default {
       message_id: parsed.messageId || null,
       in_reply_to: parsed.inReplyTo || null,
       references,
+      auto_submitted_header: autoSubmittedHeader,
       pdf_attachments: pdfAttachments,
     };
 

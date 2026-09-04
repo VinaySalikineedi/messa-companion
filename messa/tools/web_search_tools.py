@@ -14,34 +14,19 @@ fetch answers the same question in a fraction of the time and tokens --
 and, unlike deepsearch, Browserbase never bills a cent for any of it, since
 no Browserbase session is ever involved.
 
-Six tools, all at the same "don't open a browser you don't need" tier, all
+Two tools, both at the same "don't open a browser you don't need" tier, both
 exposed directly on Messa's own toolset (see agents/registry.py), not
 nested inside deepsearch -- the routing decision ("does this need a real
 browser or not") has to happen BEFORE a browser session ever opens, or the
-whole point is lost. Two independent PROVIDERS sit behind the search/fetch
-job on purpose (not redundancy for its own sake) -- see tools/parallel_search.py's
-own docstring for why a single free provider having a bad day shouldn't be
-the thing that pushes a read-only question into a billed deepsearch
-delegation:
+whole point is lost. Each is itself backed by a multi-provider waterfall
+(see search_engine.py) so a single free provider having a bad day doesn't
+push a read-only question into a billed deepsearch delegation:
 
-  - `web_search` (DuckDuckGo, via the `ddgs` package -- no API key) for a
-    quick factual lookup when you don't have a URL yet.
-  - `parallel_web_search` (Parallel Search MCP -- free, no API key) -- a
-    second, independent search provider, purpose-built for AI agents. Try
-    this if web_search comes back empty/errors, or as a second opinion.
-  - `wikipedia_lookup` (Wikipedia's own REST API -- no key) for anything
-    that's likely to have its own encyclopedia article -- faster and more
-    reliable than a generic search for that specific shape of question.
-  - `fetch_page_text` (plain HTTP GET, no JS) for reading a page you
-    already have a link to.
-  - `fetch_rendered_page_text` (tools/jina_reader.py -- JS rendered on
-    Jina's own infrastructure, still no browser session of ours) for a
-    page `fetch_page_text` came back empty on, e.g. a modern JS-heavy
-    ticket/booking site.
-  - `parallel_web_fetch` (Parallel Search MCP again -- free, no API key) --
-    a second, independent provider for the SAME job as fetch_rendered_page_text
-    (JS-rendered reads, plus PDFs). Try this if fetch_rendered_page_text
-    comes back empty/errors on a page you genuinely need to read.
+  - `search_web` (Tavily -> Brave -> Serper -> Parallel -> DuckDuckGo) for
+    a quick factual lookup when you don't have a URL yet.
+  - `read_webpage` (Jina Reader -> Firecrawl Cloud -> Parallel Fetch ->
+    plain HTTP) for reading a page's rendered text content, JS included,
+    without opening a browser session.
 
 Messa's system prompt tells her to prefer this whole tier for a plain
 factual lookup or a read-only check (including inside an autonomous
@@ -78,9 +63,6 @@ except ImportError:
 from langchain_core.tools import BaseTool, tool
 
 from .common import trace_all
-from .jina_reader import fetch_rendered_page_text as _fetch_rendered_page_text
-from .parallel_search import parallel_web_fetch as _parallel_web_fetch
-from .parallel_search import parallel_web_search as _parallel_web_search
 from .search_engine import unified_web_read as _unified_web_read
 from .search_engine import unified_web_search as _unified_web_search
 
@@ -184,10 +166,6 @@ def build_web_search_tools() -> list[BaseTool]:
         that executes JavaScript server-side. Costs ZERO browser session time. Use this to read
         articles, compare options, or inspect content on candidate URLs."""
         return await _unified_web_read(url, max_chars=max_chars)
-
-    # Legacy aliases for backward compatibility if called directly
-    web_search = search_web
-    fetch_rendered_page_text = read_webpage
 
     raw_tools: list[BaseTool] = [search_web, read_webpage]
     return trace_all(raw_tools, LABEL)

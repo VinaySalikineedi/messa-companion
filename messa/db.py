@@ -3150,6 +3150,7 @@ async def log_inbound_personal_email(
     references: str | None = None,
     raw_json: str | None = None,
     attachment_filename: str | None = None,
+    auto_submitted: bool = False,
 ) -> dict[str, Any] | None:
     """Durable write + dedup in one step: ON CONFLICT (message_id) DO
     NOTHING means a redelivered webhook (see migrations/014's docstring)
@@ -3171,6 +3172,15 @@ async def log_inbound_personal_email(
     mail too, not just outbound. None (unchanged default) for a plain
     email with nothing attached.
 
+    `auto_submitted` (migrations/030_email_loop_safety.sql): True when the
+    worker forwarded an RFC 3834 "Auto-Submitted" header on this inbound
+    message (an auto-*-value, not a real human hitting send) -- see
+    server.py's webhook route for where this is computed. tools/
+    personal_inbox_tools.py's reply_to_email refuses an autonomous=True
+    reply to a message flagged this way, part of this project's loop-
+    safety backstop against two auto-replying mailboxes bouncing forever.
+    False (unchanged default) for an ordinary human-sent email.
+
     Returns the inserted row (including its computed thread_id) for a
     genuinely new message; None for a duplicate, or if migration 014 hasn't
     been applied yet."""
@@ -3185,7 +3195,26 @@ async def log_inbound_personal_email(
             conn, user_id, real_message_id, in_reply_to, references, subject, from_address
         )
         has_attachment_col = await _has_column(conn, "messa_email_messages", "attachment_filename")
-        if has_attachment_col:
+        has_auto_submitted_col = await _has_column(conn, "messa_email_messages", "auto_submitted")
+        if has_attachment_col and has_auto_submitted_col:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO messa_email_messages
+                    (user_id, direction, thread_id, message_id, in_reply_to, references_header,
+                     from_address, to_address, subject, body_text, raw_json, attachment_filename,
+                     auto_submitted)
+                VALUES ($1, 'inbound', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                ON CONFLICT (message_id) DO NOTHING
+                RETURNING *
+                """,
+                user_id, thread_id, real_message_id, in_reply_to, references,
+                from_address, to_address, subject, body_text, raw_json, attachment_filename,
+                auto_submitted,
+            )
+        elif has_attachment_col:
+            # migration 030 not applied yet -- degrade gracefully rather
+            # than erroring: the email itself is still worth logging even
+            # if we can't note whether it was auto-submitted.
             row = await conn.fetchrow(
                 """
                 INSERT INTO messa_email_messages
@@ -3201,7 +3230,9 @@ async def log_inbound_personal_email(
         else:
             # migration 016 not applied yet -- degrade gracefully rather
             # than erroring: the email itself is still worth logging even
-            # if we can't note that it had an attachment.
+            # if we can't note that it had an attachment (or, in turn,
+            # whether it was auto-submitted -- that column check is moot
+            # if we're already this far back).
             row = await conn.fetchrow(
                 """
                 INSERT INTO messa_email_messages
@@ -3348,6 +3379,33 @@ async def get_latest_inbound_message_in_thread(user_id: int, thread_id: str) -> 
             user_id, thread_id,
         )
         return dict(row) if row else None
+
+
+async def get_recent_outbound_messages_in_thread(
+    user_id: int, thread_id: str, limit: int = 2
+) -> list[dict[str, Any]]:
+    """The most recent `limit` OUTBOUND rows in this thread, newest first --
+    backs tools/personal_inbox_tools.py's reply_to_email consecutive-
+    autonomous-reply cap (loop-safety backstop against two auto-replying
+    mailboxes -- most concerning, two different users' own Messa mailboxes
+    -- bouncing an autonomous reply back and forth forever): if the last
+    `limit` outbound sends in a thread were ALL sent_autonomously, a
+    further autonomous send is refused until a non-autonomous (user-
+    directed) reply resets the count. Empty list if this thread has no
+    outbound messages yet, or migration 014 hasn't been applied."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "messa_email_messages"):
+            return []
+        rows = await conn.fetch(
+            """
+            SELECT * FROM messa_email_messages
+            WHERE user_id = $1 AND thread_id = $2 AND direction = 'outbound'
+            ORDER BY created_at DESC LIMIT $3
+            """,
+            user_id, thread_id, limit,
+        )
+        return [dict(r) for r in rows]
 
 
 async def search_personal_emails(

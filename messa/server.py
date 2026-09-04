@@ -999,6 +999,19 @@ async def personal_email_inbound_webhook(
         from .tools.web_search_tools import extract_readable_text
         body_text = extract_readable_text(payload["html"]).strip()
 
+    # RFC 3834 loop safety (migrations/030_email_loop_safety.sql): the
+    # worker (cloudflare/personal-email-worker/worker.js) forwards the raw
+    # "Auto-Submitted" header's value, if present, via PostalMime's own
+    # parsed header list -- any auto-* value (auto-replied, auto-generated,
+    # auto-notified) means this message was itself sent by some other
+    # automated system, not typed by a human. tools/personal_inbox_tools.py's
+    # reply_to_email refuses an autonomous=True reply to a message flagged
+    # this way, part of the backstop against two auto-replying mailboxes
+    # (most concerning: two different users' own Messa mailboxes) bouncing
+    # a reply back and forth forever.
+    auto_submitted_header = (payload.get("auto_submitted_header") or "").strip().lower()
+    is_auto_submitted = auto_submitted_header.startswith("auto-")
+
     # Durable write + dedup in one step (migrations/014_messa_email_messages.sql):
     # a redelivered webhook for the same message_id comes back None here
     # instead of creating a second row or re-triggering a turn. This also
@@ -1015,6 +1028,7 @@ async def personal_email_inbound_webhook(
         references=payload.get("references"),
         raw_json=json.dumps(sanitized_payload),
         attachment_filename=attachment_filename,
+        auto_submitted=is_auto_submitted,
     )
     if logged is None:
         return JSONResponse({"status": "ignored (duplicate delivery)"})
@@ -1104,11 +1118,18 @@ async def _process_inbound_personal_email(
     subject = logged.get("subject") or ""
     body_excerpt = (logged.get("body_text") or "")[: config.INBOUND_EMAIL_BODY_MAX_CHARS]
     pdf_section = f"\n{pdf_note}\n" if pdf_note else ""
+    auto_submitted_note = (
+        "\nNote: this message arrived already marked as automated/machine-generated "
+        "(Auto-Submitted header) -- it isn't a human on the other end. reply_to_email will "
+        "refuse an autonomous reply to it either way, but don't even try; just relay it to me.\n"
+        if logged.get("auto_submitted") else ""
+    )
     prompt = (
         f"An email just arrived at your Messa address ({user.messa_email or 'not yet set up'}):\n"
         f"From: {from_address}\n"
         f"Subject: {subject or '(no subject)'}\n"
-        f"Thread ID: {logged['thread_id']}\n\n"
+        f"Thread ID: {logged['thread_id']}\n"
+        f"{auto_submitted_note}\n"
         f"{body_excerpt}\n"
         f"{pdf_section}\n"
         "---\n"

@@ -1009,6 +1009,9 @@ def build_document_tools(user: config.UserContext | None = None) -> list[BaseToo
             f"# Legal Risk Audit: {analysis['title']}",
             f"**Overall Risk Rating**: {analysis['overall_rating']} (Risk Score: {analysis['risk_score']}/100)",
             f"**Executive Verdict**: {analysis['summary_verdict']}\n",
+            "_This is an automated review for informational purposes only, not legal advice. "
+            "For anything above low risk, or before signing, have a licensed attorney review "
+            "the actual agreement._\n",
         ]
 
         if analysis["findings"]:
@@ -1058,6 +1061,17 @@ def build_document_tools(user: config.UserContext | None = None) -> list[BaseToo
                     "heading": "3. Actionable Redline Amendments",
                     "bullets": redline_bullets,
                 })
+
+            sections.append({
+                "heading": "Disclaimer",
+                "bullets": [
+                    "This report is an automated review generated for informational purposes only "
+                    "and does not constitute legal advice. It is not a substitute for review by a "
+                    "licensed attorney, and no attorney-client relationship is formed by its use. "
+                    "Have a qualified attorney review this agreement before signing, especially for "
+                    "any risk rating above Low."
+                ],
+            })
 
             slug = _slugify(report_filename or f"audit-{analysis['title']}")
             pdf_path = out_dir / f"{slug}.pdf"
