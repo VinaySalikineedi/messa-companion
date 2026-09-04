@@ -178,6 +178,31 @@ class _TooManyConsecutiveToolErrors(RuntimeError):
     failure already was, just capped now instead of open-ended."""
 
 
+# In-memory registry of live BrowserToolProvider instances kept warm across
+# resumed turns / steps. When a task pauses (due to step budget or human-in-the-loop wait),
+# keeping the provider alive in memory preserves the remote Browserbase session, the
+# @playwright/mcp Node process, open modals, and form inputs -- eliminating the latency
+# and state loss of reconnecting to about:blank on resume.
+_WARM_SESSION_PROVIDERS: dict[int, Any] = {}
+_WARM_SESSION_EXPIRY: dict[int, float] = {}
+WARM_SESSION_TTL_SECONDS = 600.0  # 10 minutes session warmth TTL
+
+
+async def _cleanup_expired_warm_sessions() -> None:
+    now = time.monotonic()
+    expired = [sid for sid, exp in _WARM_SESSION_EXPIRY.items() if now > exp]
+    for sid in expired:
+        _WARM_SESSION_EXPIRY.pop(sid, None)
+        prov = _WARM_SESSION_PROVIDERS.pop(sid, None)
+        if prov is not None:
+            console.system(f"Deepsearch: warm session #{sid} expired from memory cache -- closing.")
+            try:
+                prov._is_warm = False
+                await prov.close()
+            except Exception as e:  # noqa: BLE001
+                console.system(f"Deepsearch: error closing expired warm session #{sid}: {e}")
+
+
 _DEAD_SESSION_ERROR_MARKERS = ("410", "session not running")
 
 
@@ -353,6 +378,130 @@ def _parse_evaluate_text(raw: Any) -> str | None:
     return val
 
 
+def _extract_eval_result_json(raw: Any) -> Any:
+    text = str(raw)
+    m = _EVALUATE_RESULT_RE.search(text)
+    if m:
+        val = m.group(1).strip()
+    else:
+        m2 = re.search(r"### Result\s*\n(.*?)\n### Ran", text, re.DOTALL)
+        if m2:
+            val = m2.group(1).strip()
+        else:
+            val = text
+    if val.startswith('"') and val.endswith('"'):
+        try:
+            val = json.loads(val)
+        except Exception:  # noqa: BLE001
+            pass
+    if isinstance(val, str):
+        try:
+            return json.loads(val)
+        except Exception:  # noqa: BLE001
+            pass
+    return val
+
+
+# Set-of-Marks JS snippet: scans visible interactive elements, computes stable selectors,
+# and renders high-visibility numbered badges [1], [2], [3] directly on the live DOM.
+_SET_OF_MARKS_FN = (
+    "() => {"
+    "  try {"
+    "    document.querySelectorAll('.messa-som-badge').forEach(b => b.remove());"
+    "    const selectors = ["
+    "      'button', 'input:not([type=\"hidden\"])', 'select', 'textarea', 'a[href]',"
+    "      '[role=\"button\"]', '[role=\"checkbox\"]', '[role=\"tab\"]', '[role=\"menuitem\"]',"
+    "      '[role=\"link\"]', '[role=\"switch\"]', '[role=\"radio\"]', '[tabindex]:not([tabindex=\"-1\"])'"
+    "    ];"
+    "    const allElements = Array.from(document.querySelectorAll(selectors.join(',')));"
+    "    const marks = [];"
+    "    let markId = 1;"
+    "    const isVisible = (el) => {"
+    "      if (!el) return false;"
+    "      const style = window.getComputedStyle(el);"
+    "      if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;"
+    "      const rect = el.getBoundingClientRect();"
+    "      if (rect.width <= 3 || rect.height <= 3) return false;"
+    "      return rect.bottom >= 0 && rect.top <= (window.innerHeight || 800) &&"
+    "             rect.right >= 0 && rect.left <= (window.innerWidth || 1280);"
+    "    };"
+    "    const getStableSelector = (el, tag, role, text, name, type) => {"
+    "      if (el.id && !el.id.match(/^[0-9]/) && !el.id.includes(':') && document.querySelectorAll('#' + CSS.escape(el.id)).length === 1) {"
+    "        return '#' + CSS.escape(el.id);"
+    "      }"
+    "      if (role && name) {"
+    "        return 'role=' + role + '[name=\"' + name.replace(/\"/g, '\\\\\"') + '\"]';"
+    "      }"
+    "      const attrName = el.getAttribute('name');"
+    "      if (attrName) {"
+    "        return tag + '[name=\"' + attrName.replace(/\"/g, '\\\\\"') + '\"]';"
+    "      }"
+    "      const testId = el.getAttribute('data-testid') || el.getAttribute('data-test');"
+    "      if (testId) {"
+    "        return '[data-testid=\"' + testId + '\"]';"
+    "      }"
+    "      const placeholder = el.getAttribute('placeholder');"
+    "      if (placeholder) {"
+    "        return tag + '[placeholder=\"' + placeholder.replace(/\"/g, '\\\\\"') + '\"]';"
+    "      }"
+    "      const ariaLabel = el.getAttribute('aria-label');"
+    "      if (ariaLabel) {"
+    "        return '[aria-label=\"' + ariaLabel.replace(/\"/g, '\\\\\"') + '\"]';"
+    "      }"
+    "      if ((tag === 'button' || role === 'button' || tag === 'a') && text && text.length > 0 && text.length <= 40) {"
+    "        return 'text=\"' + text.replace(/\"/g, '\\\\\"') + '\"';"
+    "      }"
+    "      if (tag === 'input' && type) {"
+    "        return 'input[type=\"' + type + '\"]';"
+    "      }"
+    "      return tag;"
+    "    };"
+    "    for (const el of allElements) {"
+    "      if (marks.length >= 60) break;"
+    "      if (!isVisible(el)) continue;"
+    "      const rect = el.getBoundingClientRect();"
+    "      const tag = el.tagName.toLowerCase();"
+    "      const role = el.getAttribute('role') || (tag === 'button' ? 'button' : (tag === 'a' ? 'link' : (tag === 'input' ? (['checkbox', 'radio'].includes(el.type) ? el.type : 'textbox') : '')));"
+    "      const type = el.getAttribute('type') || '';"
+    "      let label = '';"
+    "      if (el.labels && el.labels.length > 0) label = el.labels[0].innerText.trim();"
+    "      const text = (el.innerText || el.textContent || el.value || el.placeholder || el.getAttribute('aria-label') || label || '').trim().replace(/\\s+/g, ' ').slice(0, 50);"
+    "      const accessibleName = el.getAttribute('aria-label') || label || text || el.placeholder || '';"
+    "      const selector = getStableSelector(el, tag, role, text, accessibleName, type);"
+    "      const badge = document.createElement('div');"
+    "      badge.className = 'messa-som-badge';"
+    "      badge.textContent = markId;"
+    "      badge.style.position = 'fixed';"
+    "      badge.style.left = Math.max(0, rect.left) + 'px';"
+    "      badge.style.top = Math.max(0, rect.top) + 'px';"
+    "      badge.style.background = '#ff0055';"
+    "      badge.style.color = '#ffffff';"
+    "      badge.style.fontSize = '11px';"
+    "      badge.style.fontWeight = 'bold';"
+    "      badge.style.fontFamily = 'monospace, sans-serif';"
+    "      badge.style.padding = '1px 5px';"
+    "      badge.style.borderRadius = '3px';"
+    "      badge.style.zIndex = '2147483640';"
+    "      badge.style.pointerEvents = 'none';"
+    "      badge.style.boxShadow = '0 2px 5px rgba(0,0,0,0.5)';"
+    "      badge.style.border = '1px solid #ffffff';"
+    "      (document.body || document.documentElement).appendChild(badge);"
+    "      marks.push({ id: markId, tag: tag, role: role || tag, type: type, text: text, selector: selector });"
+    "      markId++;"
+    "    }"
+    "    setTimeout(() => {"
+    "      document.querySelectorAll('.messa-som-badge').forEach(b => {"
+    "        b.style.transition = 'opacity 500ms';"
+    "        b.style.opacity = '0';"
+    "        setTimeout(() => b.remove(), 500);"
+    "      });"
+    "    }, 15000);"
+    "    return JSON.stringify(marks);"
+    "  } catch(e) { return JSON.stringify([{error: e.toString()}]); }"
+    "}"
+)
+
+
 # Deterministic backstop for human-help detection (per your answer: model-
 # driven first, this is only the safety net). Deliberately a short, generic
 # list -- this only needs to catch the OBVIOUS cases; anything subtler is
@@ -500,6 +649,8 @@ def _describe_action(name: str, args: dict[str, Any]) -> str:
     if name == "browser_action_chain":
         acts = kwargs.get("actions") or []
         return f"Executing {len(acts)} action sequence" if acts else "Executing action sequence"
+    if name == "browser_get_interactive_elements":
+        return "Scanning interactive page elements"
     if "scroll" in name:
         return "Scrolling the page"
     return name.replace("browser_", "").replace("_", " ").strip().capitalize() or "Working on it"
@@ -838,6 +989,10 @@ class BrowserToolProvider:
         # of leaving a "Task was destroyed but it is pending" warning behind
         # on shutdown.
         self._cursor_move_task: asyncio.Task | None = None
+        # Interactive Set-of-Marks mapping: marker number string ("1", "2") -> stable selector string
+        self._interactive_markers: dict[str, str] = {}
+        # Warm session flag: True when this provider is preserved in-memory across resumed turns
+        self._is_warm = False
         # Shared mutable state referenced by the closures below.
         # last_snapshot_text: the most recent successful browser_snapshot's
         # result, truncated -- read by the deterministic human-help backstop
@@ -945,6 +1100,12 @@ class BrowserToolProvider:
         )
 
     async def __aenter__(self) -> "BrowserToolProvider":
+        if self._live_session_ready:
+            # Warm session reuse: server, MCP client, and Browserbase session are already running
+            self._is_warm = False
+            console.system(f"Deepsearch: entered existing warm session (tab {self._tab_id}).")
+            return self
+
         if self._owns_server:
             self._session_open_lock = asyncio.Lock()
             global _CACHED_TOOL_SPECS
@@ -1070,6 +1231,18 @@ class BrowserToolProvider:
                 "interactive browser automation. Does NOT consume browser time."
             ),
         ))
+        # Set-of-Marks visual index tool: returns numbered markers [1], [2], [3] for interactive elements
+        self.tools.append(StructuredTool.from_function(
+            coroutine=self._browser_get_interactive_elements,
+            name="browser_get_interactive_elements",
+            description=(
+                "Scan visible interactive elements on the page (buttons, inputs, links, checkboxes) "
+                "and display numbered markers [1], [2], [3] directly on-screen in the live view. "
+                "Returns a concise list of elements and their stable selectors. You can target elements "
+                "directly by their marker numbers (e.g. target='[1]' or target='1') in browser_click, "
+                "browser_fill_form, browser_type, or browser_action_chain without taking a full page snapshot."
+            ),
+        ))
         # Compound multi-action tool: executes a fast sequence of browser actions in ONE turn
         # (e.g. accepting terms, clicking continue, and filling form fields) without separate LLM round-trips.
         self.tools.append(StructuredTool.from_function(
@@ -1081,7 +1254,11 @@ class BrowserToolProvider:
                 "and filling email/password fields) quickly like a human user without wasting round-trip turns. "
                 "Accepts an array of action dicts: [{'action': 'click', 'target': 'role=checkbox', 'element': 'Terms'}, "
                 "{'action': 'click', 'target': 'text=\"Continue with your Email\"'}, "
-                "{'action': 'fill', 'target': 'role=textbox[name=\"Email\"]', 'value': 'user@example.com'}]. "
+                "{'action': 'fill', 'target': 'role=textbox[name=\"Email\"]', 'value': 'user@example.com'}, "
+                "{'action': 'select', 'target': 'role=combobox', 'values': ['Option']}, "
+                "{'action': 'hover', 'target': 'role=menuitem'}, "
+                "{'action': 'scroll', 'direction': 'down'}]. "
+                "Supports target='[1]' marker numbers from browser_get_interactive_elements. "
                 "Executes sequentially and returns the final page snapshot."
             ),
         ))
@@ -1327,31 +1504,20 @@ class BrowserToolProvider:
 
             self._live_session_ready = True
 
-    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        # Belt-and-suspenders: guarded() already stops any in-flight reading
-        # animation before every real action, so normally nothing is left
-        # running by the time a task finishes. But if the run ended via an
-        # exception/step-limit right after a browser_snapshot (before any
-        # further guarded() call could fire the stop signal), a background
-        # task could still be sitting there awaiting a browser_evaluate call
-        # into a session we're about to tear down -- cancel it here so that
-        # never turns into an "Attempted write to closed pipe"-style warning
-        # on shutdown.
+    async def close(self) -> None:
+        """Definitively closes the MCP subprocess, client session, and releases the Browserbase session."""
         if self._reading_task is not None and not self._reading_task.done():
             self._reading_task.cancel()
         if self._cursor_move_task is not None and not self._cursor_move_task.done():
             self._cursor_move_task.cancel()
         if self._session_cm is not None:
             try:
-                await self._session_cm.__aexit__(exc_type, exc, tb)
+                await self._session_cm.__aexit__(None, None, None)
             except Exception as e:
                 console.system(f"Deepsearch: suppressed session teardown error ({type(e).__name__}): {e}")
+            self._session_cm = None
+            self._session = None
         if not self._owns_server:
-            # A sub-worker only closes its OWN client connection -- the
-            # shared server process and the Browserbase session both belong
-            # to the top-level provider, which tears those down (below)
-            # once the whole deepsearch run ends, not when one delegated
-            # sub-worker's single-site task finishes.
             console.system(f"Deepsearch: sub-worker tab {self._tab_id} closed.")
             return
         if self._mcp_proc is not None and self._mcp_proc.returncode is None:
@@ -1363,23 +1529,26 @@ class BrowserToolProvider:
                     self._mcp_proc.kill()
                 except Exception:  # noqa: BLE001
                     pass
+            self._mcp_proc = None
         if self._bb_session_id is not None:
             try:
                 await browserbase.release_session(self._bb_session_id)
             except BrowserbaseError as e:
-                # Best-effort: the session will idle out on its own either way.
                 console.tool_error(LABEL, "browserbase_release", str(e))
             console.system("Deepsearch: browser closed.")
+            self._bb_session_id = None
         else:
-            # The lazy-open path's success case: this run never made a
-            # single real browser tool call (e.g. it answered from
-            # fetch_rendered_page_text/parallel_web_fetch alone, or the
-            # model never got that far before finishing/erroring/being
-            # cancelled) -- so _ensure_live_session never ran and no
-            # Browserbase session was ever opened or billed. Worth its own
-            # distinct log line rather than a possibly-misleading "browser
-            # closed" for a browser that never existed.
             console.system("Deepsearch: run finished without ever opening a browser session.")
+        self._live_session_ready = False
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self._is_warm:
+            console.system(
+                f"Deepsearch: keeping browser session #{self._deepsearch_session_id} WARM in memory "
+                "(skipping browser shutdown so subsequent turns or continuations retain tab state)."
+            )
+            return
+        await self.close()
 
     def _fire_cursor_move(self, name: str, element: str | None, target: str | None) -> None:
         """Fire-and-forget entry point for the cosmetic cursor arrow (+
@@ -1594,6 +1763,82 @@ class BrowserToolProvider:
         except Exception:  # noqa: BLE001
             return None
 
+    def _resolve_target(self, target: Any) -> Any:
+        """Resolves Set-of-Marks markers (e.g. '[1]', '1', '#1', 'marker 1') to stable Playwright selectors."""
+        if not target or not isinstance(target, str):
+            return target
+        t = target.strip()
+        m = re.match(r"^\[?#?(?:mark(?:er)?[:\s]*)?(\d+)\]?$", t, re.IGNORECASE)
+        if m:
+            num = m.group(1)
+            if hasattr(self, "_interactive_markers") and num in self._interactive_markers:
+                resolved = self._interactive_markers[num]
+                console.system(f"Deepsearch: resolved marker [{num}] to selector '{resolved}'")
+                return resolved
+        return target
+
+    async def _browser_get_interactive_elements(self, focus_area: str | None = None) -> str:
+        """Model-facing tool: Scan visible interactive elements on the page and display
+        numbered badges [1], [2], [3] directly on-screen in the live view.
+
+        Returns an indexed list of interactive elements (buttons, inputs, links, checkboxes)
+        with their stable selectors and markers. You can use these markers directly as targets
+        (e.g. target="[1]" or target="1") in browser_click, browser_fill_form, browser_type,
+        or browser_action_chain.
+        """
+        await self._ensure_live_session()
+        await self._stop_reading_animation()
+
+        evaluate_tool = self._raw_tools_by_name.get("browser_evaluate")
+        if not evaluate_tool:
+            return "ERROR: browser_evaluate tool is unavailable."
+
+        self._live_set_description("Scanning interactive elements")
+        self._live_mark_active()
+
+        try:
+            raw = await evaluate_tool.coroutine(
+                element="interactive elements",
+                function=_SET_OF_MARKS_FN,
+            )
+            parsed = _extract_eval_result_json(raw)
+            if isinstance(parsed, str):
+                try:
+                    parsed = json.loads(parsed)
+                except Exception:
+                    pass
+
+            if not isinstance(parsed, list) or not parsed:
+                return "No visible interactive elements detected on the current page. Try taking a browser_snapshot."
+
+            self._interactive_markers = {}
+            lines = [f"Found {len(parsed)} visible interactive elements on the page (marked on-screen [1] to [{len(parsed)}]):"]
+            for item in parsed:
+                if not isinstance(item, dict):
+                    continue
+                if "error" in item:
+                    return f"ERROR scanning elements: {item['error']}"
+                mid = str(item.get("id"))
+                selector = item.get("selector", "")
+                self._interactive_markers[mid] = selector
+
+                tag = item.get("tag", "element")
+                role = item.get("role", "")
+                typ = item.get("type", "")
+                text = item.get("text", "").strip()
+                desc_parts = [role or tag]
+                if typ:
+                    desc_parts.append(f"type={typ}")
+                if text:
+                    desc_parts.append(f'"{text}"')
+
+                lines.append(f"[{mid}] {' '.join(desc_parts)} -> selector: {selector}")
+
+            lines.append("\nTip: Target elements directly by marker number (e.g. target=\"[1]\" or target=\"1\") in browser_click, browser_type, browser_fill_form, or browser_action_chain!")
+            return "\n".join(lines)
+        except Exception as e:
+            return f"ERROR scanning interactive elements: {e}"
+
     async def _browser_action_chain(self, actions: list[dict[str, Any]]) -> str:
         """Model-facing tool: execute a rapid compound chain of browser actions sequentially
         in ONE turn. Use this to handle multi-step interactions (e.g. accepting terms, clicking
@@ -1607,6 +1852,9 @@ class BrowserToolProvider:
               - {"action": "type", "target": "role=textbox[name='Password']", "text": "secret"}
               - {"action": "press", "key": "Enter"}
               - {"action": "wait", "time": 1.5}
+              - {"action": "select", "target": "role=combobox", "values": ["US"]}
+              - {"action": "hover", "target": "role=menuitem"}
+              - {"action": "scroll", "direction": "down"}
               - {"action": "navigate", "url": "https://..."}
 
         Returns:
@@ -1629,71 +1877,129 @@ class BrowserToolProvider:
                 if not isinstance(act, dict):
                     continue
                 act_type = str(act.get("action") or "").strip().lower()
-                target = act.get("target")
+                raw_target = act.get("target")
+                target = self._resolve_target(raw_target) if raw_target else None
                 element = act.get("element") or act.get("name") or "element"
                 desc = f"{act_type}({element or target or ''})"
 
                 try:
-                    if act_type == "click":
-                        if not target:
-                            return f"ERROR: 'target' is required for click action at step {idx+1}."
-                        if config.DEEPSEARCH_CURSOR_OVERLAY and target:
-                            self._fire_cursor_move("browser_click", element, target)
-                        tool = self._raw_tools_by_name.get("browser_click")
-                        if not tool:
-                            return "ERROR: browser_click tool is unavailable."
-                        res = await tool.coroutine(target=target, element=element)
+                    for attempt in range(2):
+                        if act_type == "click":
+                            if not target:
+                                return f"ERROR: 'target' is required for click action at step {idx+1}."
+                            if config.DEEPSEARCH_CURSOR_OVERLAY and target:
+                                self._fire_cursor_move("browser_click", element, target)
+                                await asyncio.sleep(0.18)
+                            tool = self._raw_tools_by_name.get("browser_click")
+                            if not tool:
+                                return "ERROR: browser_click tool is unavailable."
+                            res = await tool.coroutine(target=target, element=element)
 
-                    elif act_type == "fill":
-                        tool = self._raw_tools_by_name.get("browser_fill_form")
-                        if not tool:
-                            return "ERROR: browser_fill_form tool is unavailable."
-                        if "fields" in act and isinstance(act["fields"], list):
-                            res = await tool.coroutine(fields=act["fields"])
-                        elif target:
-                            val = str(act.get("value") or act.get("text") or "")
-                            res = await tool.coroutine(fields=[{"target": target, "value": val, "name": element, "type": "textbox"}])
+                        elif act_type == "fill":
+                            tool = self._raw_tools_by_name.get("browser_fill_form")
+                            if not tool:
+                                return "ERROR: browser_fill_form tool is unavailable."
+                            if "fields" in act and isinstance(act["fields"], list):
+                                for f in act["fields"]:
+                                    if isinstance(f, dict) and "target" in f:
+                                        f["target"] = self._resolve_target(f["target"])
+                                if config.DEEPSEARCH_CURSOR_OVERLAY and act["fields"]:
+                                    first_target = act["fields"][0].get("target")
+                                    if first_target:
+                                        self._fire_cursor_move("browser_type", act["fields"][0].get("name"), first_target)
+                                        await asyncio.sleep(0.15)
+                                res = await tool.coroutine(fields=act["fields"])
+                            elif target:
+                                if config.DEEPSEARCH_CURSOR_OVERLAY and target:
+                                    self._fire_cursor_move("browser_type", element, target)
+                                    await asyncio.sleep(0.15)
+                                val = str(act.get("value") or act.get("text") or "")
+                                res = await tool.coroutine(fields=[{"target": target, "value": val, "name": element, "type": "textbox"}])
+                            else:
+                                return f"ERROR: 'target' or 'fields' is required for fill action at step {idx+1}."
+
+                        elif act_type == "type":
+                            if not target:
+                                return f"ERROR: 'target' is required for type action at step {idx+1}."
+                            if config.DEEPSEARCH_CURSOR_OVERLAY and target:
+                                self._fire_cursor_move("browser_type", element, target)
+                                await asyncio.sleep(0.15)
+                            tool = self._raw_tools_by_name.get("browser_type")
+                            if not tool:
+                                return "ERROR: browser_type tool is unavailable."
+                            text = str(act.get("text") or act.get("value") or "")
+                            res = await tool.coroutine(target=target, text=text, element=element)
+
+                        elif act_type in ("select", "select_option"):
+                            if not target:
+                                return f"ERROR: 'target' is required for select action at step {idx+1}."
+                            if config.DEEPSEARCH_CURSOR_OVERLAY and target:
+                                self._fire_cursor_move("browser_select_option", element, target)
+                                await asyncio.sleep(0.15)
+                            tool = self._raw_tools_by_name.get("browser_select_option")
+                            if not tool:
+                                return "ERROR: browser_select_option tool is unavailable."
+                            vals = act.get("values") or [act.get("value")]
+                            res = await tool.coroutine(target=target, values=vals, element=element)
+
+                        elif act_type == "hover":
+                            if not target:
+                                return f"ERROR: 'target' is required for hover action at step {idx+1}."
+                            if config.DEEPSEARCH_CURSOR_OVERLAY and target:
+                                self._fire_cursor_move("browser_hover", element, target)
+                                await asyncio.sleep(0.15)
+                            tool = self._raw_tools_by_name.get("browser_hover")
+                            if not tool:
+                                return "ERROR: browser_hover tool is unavailable."
+                            res = await tool.coroutine(target=target, element=element)
+
+                        elif act_type == "scroll":
+                            tool = self._raw_tools_by_name.get("browser_scroll")
+                            if not tool:
+                                return "ERROR: browser_scroll tool is unavailable."
+                            direction = str(act.get("direction") or "down").lower()
+                            res = await tool.coroutine(direction=direction)
+
+                        elif act_type == "press":
+                            tool = self._raw_tools_by_name.get("browser_press_key")
+                            if not tool:
+                                return "ERROR: browser_press_key tool is unavailable."
+                            key = act.get("key") or "Enter"
+                            res = await tool.coroutine(key=key)
+
+                        elif act_type == "wait":
+                            tool = self._raw_tools_by_name.get("browser_wait_for")
+                            if not tool:
+                                return "ERROR: browser_wait_for tool is unavailable."
+                            t = float(act.get("time") or 1.0)
+                            res = await tool.coroutine(time=t)
+
+                        elif act_type == "navigate":
+                            url = act.get("url")
+                            if not url:
+                                return f"ERROR: 'url' is required for navigate action at step {idx+1}."
+                            if not _domain_allowed(url):
+                                return f"BLOCKED: '{url}' is not in the allowed domain list."
+                            tool = self._raw_tools_by_name.get("browser_navigate")
+                            if not tool:
+                                return "ERROR: browser_navigate tool is unavailable."
+                            res = await tool.coroutine(url=url)
+
                         else:
-                            return f"ERROR: 'target' or 'fields' is required for fill action at step {idx+1}."
+                            return f"ERROR: Unsupported action '{act_type}' at step {idx+1}. Supported: click, fill, type, select, hover, scroll, press, wait, navigate."
 
-                    elif act_type == "type":
-                        if not target:
-                            return f"ERROR: 'target' is required for type action at step {idx+1}."
-                        tool = self._raw_tools_by_name.get("browser_type")
-                        if not tool:
-                            return "ERROR: browser_type tool is unavailable."
-                        text = str(act.get("text") or act.get("value") or "")
-                        res = await tool.coroutine(target=target, text=text, element=element)
+                        res_str = str(res)
+                        # Transient delay check: if target was not found or timed out, retry once after a short settle
+                        is_transient = (
+                            ("TimeoutError" in res_str or "does not match any elements" in res_str or "Ref not found" in res_str)
+                            and act_type in ("click", "fill", "type", "select", "select_option", "hover")
+                        )
+                        if is_transient and attempt == 0:
+                            console.system(f"Deepsearch: action '{desc}' transiently failed ({res_str[:80]}), retrying once after 0.4s...")
+                            await asyncio.sleep(0.4)
+                            continue
+                        break
 
-                    elif act_type == "press":
-                        tool = self._raw_tools_by_name.get("browser_press_key")
-                        if not tool:
-                            return "ERROR: browser_press_key tool is unavailable."
-                        key = act.get("key") or "Enter"
-                        res = await tool.coroutine(key=key)
-
-                    elif act_type == "wait":
-                        tool = self._raw_tools_by_name.get("browser_wait_for")
-                        if not tool:
-                            return "ERROR: browser_wait_for tool is unavailable."
-                        t = float(act.get("time") or 1.0)
-                        res = await tool.coroutine(time=t)
-
-                    elif act_type == "navigate":
-                        url = act.get("url")
-                        if not url:
-                            return f"ERROR: 'url' is required for navigate action at step {idx+1}."
-                        if not _domain_allowed(url):
-                            return f"BLOCKED: '{url}' is not in the allowed domain list."
-                        tool = self._raw_tools_by_name.get("browser_navigate")
-                        if not tool:
-                            return "ERROR: browser_navigate tool is unavailable."
-                        res = await tool.coroutine(url=url)
-
-                    else:
-                        return f"ERROR: Unsupported action '{act_type}' at step {idx+1}. Supported: click, fill, type, press, wait, navigate."
-
-                    res_str = str(res)
                     if (
                         res_str.startswith("ERROR:")
                         or "### Error" in res_str
@@ -1711,7 +2017,7 @@ class BrowserToolProvider:
 
                     executed.append(desc)
                     self._live_add_step(desc)
-                    await asyncio.sleep(0.3)
+                    await asyncio.sleep(0.25)
 
                 except Exception as e:
                     snap_tool = self._raw_tools_by_name.get("browser_snapshot")
@@ -2117,6 +2423,14 @@ class BrowserToolProvider:
             await self._ensure_live_session()
             original = self._raw_tools_by_name[name]
 
+            # Auto-resolve Set-of-Marks markers (e.g. target="[1]" or target="1") to stable selectors
+            if "target" in kwargs and isinstance(kwargs["target"], str):
+                kwargs["target"] = self._resolve_target(kwargs["target"])
+            if name == "browser_fill_form" and "fields" in kwargs and isinstance(kwargs["fields"], list):
+                for f in kwargs["fields"]:
+                    if isinstance(f, dict) and "target" in f and isinstance(f["target"], str):
+                        f["target"] = self._resolve_target(f["target"])
+
             # A real action is about to happen -- if the "reading" scroll
             # animation is still playing from the previous browser_snapshot,
             # tell it to wind down now, before this call's own action, so
@@ -2370,6 +2684,9 @@ DEEPSEARCH_SYSTEM_PROMPT = (
     "- Base every factual claim strictly on text that literally appears in snapshots.\n"
     "- ACT AS A HUMAN USER: You navigate pages visually with snapshots, mouse clicks, and typing. "
     "Never attempt to inspect script tags, webpack bundles, or reverse-engineer backend APIs.\n"
+    "- FAST INTERACTION WITH SET-OF-MARKS: Call `browser_get_interactive_elements` to instantly see numbered markers [1], [2], [3] "
+    "for all visible buttons, links, and form inputs without wading through a massive page snapshot. You can use these marker numbers "
+    "directly as targets (e.g. target='[1]' or target='1') in `browser_click`, `browser_fill_form`, or `browser_action_chain`!\n"
     "- COMPOUND ACTIONS FOR HUMAN SPEED: When interacting with forms, dialogs, or multiple connected steps "
     "(e.g. accepting terms, clicking continue, and filling fields), use `browser_action_chain` to execute the whole sequence "
     "in ONE turn. This runs smoothly and quickly like a human user instead of taking 10 separate round-trips.\n"
@@ -2561,12 +2878,39 @@ def build_deepsearch_subagent(
             # opens (possibly well after this point now that opening is
             # lazy -- see that method's own docstring), instead of this
             # function doing it eagerly right after __aenter__ like before.
-            provider = BrowserToolProvider(
-                approval_gate, user_id=user.user_id, deepsearch_session_id=session_id, model=model,
-                messa_email=user.messa_email, task_title=task_title,
-                phone_number=user.phone_number, live_view_share_url=user.live_view_share_url,
-                initial_resume_url=initial_resume_url,
-            )
+            # Warm session management: reap expired cached sessions first
+            await _cleanup_expired_warm_sessions()
+
+            # Check if this session already has an active warm browser provider
+            provider = None
+            if session_id and session_id in _WARM_SESSION_PROVIDERS:
+                candidate = _WARM_SESSION_PROVIDERS.get(session_id)
+                if (
+                    candidate is not None
+                    and candidate._mcp_proc is not None
+                    and candidate._mcp_proc.returncode is None
+                ):
+                    console.system(
+                        f"Deepsearch: REUSING active warm browser session #{session_id} "
+                        f"(preserving live tab, modal state, and form inputs!)."
+                    )
+                    provider = candidate
+                    provider._approval_gate = approval_gate
+                    provider._is_warm = False
+                    _WARM_SESSION_PROVIDERS.pop(session_id, None)
+                    _WARM_SESSION_EXPIRY.pop(session_id, None)
+                else:
+                    _WARM_SESSION_PROVIDERS.pop(session_id, None)
+                    _WARM_SESSION_EXPIRY.pop(session_id, None)
+
+            if provider is None:
+                provider = BrowserToolProvider(
+                    approval_gate, user_id=user.user_id, deepsearch_session_id=session_id, model=model,
+                    messa_email=user.messa_email, task_title=task_title,
+                    phone_number=user.phone_number, live_view_share_url=user.live_view_share_url,
+                    initial_resume_url=initial_resume_url,
+                )
+
             try:
                 async with provider:
                     try:
@@ -2583,6 +2927,13 @@ def build_deepsearch_subagent(
                                 timeout=config.DEEPSEARCH_MAX_SESSION_SECONDS,
                             )
                             final_messages = result["messages"]
+                            # Finished successfully -- release warm session if previously cached
+                            if session_id and session_id in _WARM_SESSION_PROVIDERS:
+                                old = _WARM_SESSION_PROVIDERS.pop(session_id, None)
+                                _WARM_SESSION_EXPIRY.pop(session_id, None)
+                                if old is not None:
+                                    old._is_warm = False
+                                    await old.close()
                         except GraphRecursionError:
                             status = "active"
                             state_snapshot = await inner_agent.aget_state(run_config)
@@ -2591,16 +2942,20 @@ def build_deepsearch_subagent(
                                 f"Deepsearch: hit its {config.DEEPSEARCH_MAX_STEPS}-step limit -- "
                                 f"saving progress to session #{session_id} for later."
                             )
+                            # Keep provider warm in memory so continuing retains form inputs and modal state
+                            if (
+                                session_id
+                                and provider._live_session_ready
+                                and provider._mcp_proc is not None
+                                and provider._mcp_proc.returncode is None
+                            ):
+                                provider._is_warm = True
+                                _WARM_SESSION_PROVIDERS[session_id] = provider
+                                _WARM_SESSION_EXPIRY[session_id] = time.monotonic() + WARM_SESSION_TTL_SECONDS
+                                console.system(
+                                    f"Deepsearch: kept browser session #{session_id} WARM in memory (TTL={int(WARM_SESSION_TTL_SECONDS)}s)."
+                                )
                         except asyncio.TimeoutError:
-                            # Belt-and-suspenders session cap (config.DEEPSEARCH_MAX_SESSION_SECONDS)
-                            # -- independent of DEEPSEARCH_MAX_STEPS (a step COUNT,
-                            # not a time bound) and independent of
-                            # request_human_help's own bounded wait, this is what
-                            # actually guarantees a Browserbase session can't stay
-                            # open indefinitely even if something upstream of here
-                            # hangs. `async with` below still runs its normal
-                            # teardown on the way out of this except block, same as
-                            # any other exception.
                             status = "active"
                             try:
                                 state_snapshot = await inner_agent.aget_state(run_config)
@@ -2612,30 +2967,23 @@ def build_deepsearch_subagent(
                                 f"session time limit -- closing the browser and saving progress to "
                                 f"session #{session_id} for later."
                             )
+                            if session_id in _WARM_SESSION_PROVIDERS:
+                                old = _WARM_SESSION_PROVIDERS.pop(session_id, None)
+                                _WARM_SESSION_EXPIRY.pop(session_id, None)
+                                if old is not None:
+                                    old._is_warm = False
+                                    await old.close()
                         except asyncio.CancelledError:
-                            # cancel_active_search (registry.py) cancelled
-                            # deepsearch_control's handle on this task --
-                            # the user asked to stop, or clearly implied
-                            # switching to something else, in a NEW message
-                            # that ran concurrently with this one (see
-                            # deepsearch_control's own module docstring for
-                            # why that's possible at all). Best-effort save
-                            # of whatever progress exists, exactly like the
-                            # timeout/step-limit cases above, but this must
-                            # re-raise at the end -- swallowing a
-                            # CancelledError would leave this task's own
-                            # cancellation silently incomplete, which is an
-                            # asyncio correctness bug, not just a style
-                            # preference. Everything after this whole
-                            # try/except (the status={status} log line, the
-                            # final db.update_deepsearch_session, the
-                            # return) is deliberately never reached on this
-                            # path -- the save below is a complete
-                            # substitute for it, not a partial one.
                             status = "abandoned"
                             console.system(
                                 f"Deepsearch: session #{session_id} cancelled by the user."
                             )
+                            if session_id in _WARM_SESSION_PROVIDERS:
+                                old = _WARM_SESSION_PROVIDERS.pop(session_id, None)
+                                _WARM_SESSION_EXPIRY.pop(session_id, None)
+                                if old is not None:
+                                    old._is_warm = False
+                                    await old.close()
                             try:
                                 state_snapshot = await inner_agent.aget_state(run_config)
                                 final_messages = state_snapshot.values.get("messages", messages)
@@ -2664,39 +3012,13 @@ def build_deepsearch_subagent(
                                 final_messages = messages
                             final_messages = [*final_messages, AIMessage(content=f"(run errored: {e})")]
                     finally:
-                        # Signal "closing" *before* this `async with` block ends --
-                        # the browser is still open and the DB still says a session
-                        # is live (we haven't cleared it yet), but the live-view
-                        # page's next poll can now proactively swap to a "Compiling
-                        # your results..." screen instead of riding out whatever
-                        # Browserbase's own embedded debug page renders the instant
-                        # its CDP connection is torn down (a raw "Debugging
-                        # connection was closed" banner) -- which happens moments
-                        # from now, when `provider.__aexit__` below actually
-                        # releases the Browserbase session.
-                        if provider.live_view_url:
+                        if provider.live_view_url and not getattr(provider, "_is_warm", False):
                             live_activity.set_closing(user.user_id)
             finally:
-                # provider.live_view_url reflects reality now whether or not
-                # the browser ever actually opened (see
-                # BrowserToolProvider._ensure_live_session -- it's only ever
-                # set once a REAL session opens) -- unlike before this fix,
-                # when the browser opened unconditionally and eagerly, a
-                # run can now legitimately finish having never opened one at
-                # all (it answered entirely from fetch_rendered_page_text/
-                # parallel_web_fetch, or errored/got cancelled before its
-                # first real tool call). db.clear_live_browser_active stays
-                # conditional (nothing to clear if nothing was ever set
-                # live), but live_activity.clear() now runs UNCONDITIONALLY
-                # -- live_activity.start() above always creates an entry
-                # regardless of whether the browser ever opens, and it must
-                # always be cleared on the way out or it leaks forever
-                # (previously masked by the browser opening unconditionally
-                # too, so this pairing was never actually exercised as
-                # unconditional-start/conditional-clear before).
-                if provider.live_view_url:
+                if provider.live_view_url and not getattr(provider, "_is_warm", False):
                     await db.clear_live_browser_active(user.user_id)
-                live_activity.clear(user.user_id)
+                if not getattr(provider, "_is_warm", False):
+                    live_activity.clear(user.user_id)
 
             console.system(f"Deepsearch: whole run took {time.monotonic() - run_start:.2f}s (status={status}).")
             summary = _last_ai_text(final_messages)
@@ -2712,7 +3034,7 @@ def build_deepsearch_subagent(
                 )
                 if status == "active":
                     header = (
-                        f"[deepsearch session #{session_id} -- not finished, hit its step limit. "
+                        f"[deepsearch session #{session_id} -- paused at step limit, browser kept warm. "
                         f"Say \"continue session #{session_id}\" to keep going.]\n"
                     )
                 else:
