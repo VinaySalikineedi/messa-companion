@@ -1,0 +1,9 @@
+{
+  "name": "textmessa-landing-proxy",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker proxying textmessa.com to Messa backend on Hugging Face",
+  "main": "worker.js",
+  "scripts": {
+    "deploy": "wrangler deploy"
+  }
+}

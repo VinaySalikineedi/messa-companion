@@ -1,0 +1,9 @@
+name = "textmessa-landing-proxy"
+main = "worker.js"
+compatibility_date = "2026-08-01"
+workers_dev = false
+
+routes = [
+  { pattern = "textmessa.com/*", zone_name = "textmessa.com" },
+  { pattern = "www.textmessa.com/*", zone_name = "textmessa.com" }
+]
