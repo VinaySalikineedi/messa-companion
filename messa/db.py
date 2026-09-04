@@ -624,6 +624,15 @@ async def save_profile_field(user_id: int, field: str, value: str) -> dict[str, 
             await conn.execute("UPDATE users SET onboarding_step = $2 WHERE id = $1", user_id, next_step)
             row = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
 
+    if field == "name" and value and value.strip().lower() != "skip":
+        # User just gave their name! Provision their <username>@textmessa.com address immediately.
+        await get_or_create_messa_email_local_part(user_id, value.strip())
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            fresh_row = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
+            if fresh_row:
+                row = fresh_row
+
     if field == "city" and value and value.strip().lower() != "skip":
         resolution = await timeutil.resolve_timezone(value.strip())
         if resolution is not None:
@@ -2921,53 +2930,83 @@ async def set_memory_profile(user_id: int, profile_text: str) -> dict[str, Any] 
 # been applied.
 # ---------------------------------------------------------------------------
 
-def _slugify_local_part(name: str | None, user_id: int) -> str:
-    """Best-effort local-part from a display name ("Jane Doe" -> "janedoe"),
-    falling back to "user<id>" for a still-nameless brand-new user (email
-    provisioning runs on every context load, including before onboarding
-    asks for a name -- see cli.load_user_context) or a name that's nothing
-    but punctuation/emoji once stripped. Deliberately plain
-    alphanumeric-only: an RFC 5322 local-part technically allows a lot more,
-    but plenty of real mail providers choke on anything fancier, and this is
-    meant to be easy to read aloud/type into a form, not maximally
-    expressive."""
-    base = re.sub(r"[^a-z0-9]+", "", (name or "").lower())[:24]
-    return base if base else f"user{user_id}"
+def _slugify_local_part(name: str | None, user_id: int) -> str | None:
+    """Best-effort local-part from a display name ("Jane Doe" -> "janedoe").
+    Returns None if no name is available yet, or if the name contains no
+    alphanumeric characters once stripped. We wait until we have the user's
+    name before assigning a Messa email address (<username>@textmessa.com).
+    Deliberately plain alphanumeric-only: an RFC 5322 local-part technically
+    allows a lot more, but plenty of real mail providers choke on anything
+    fancier, and this is meant to be easy to read aloud/type into a form,
+    not maximally expressive."""
+    if not name:
+        return None
+    base = re.sub(r"[^a-z0-9]+", "", name.lower())[:24]
+    return base if base else None
 
 
 async def get_or_create_messa_email_local_part(user_id: int, name: str | None) -> str | None:
     """Idempotent: returns the existing local part if this user already has
-    one, otherwise claims one now and persists it. Called on every
-    cli.load_user_context (same "cheap after the first time" shape as
-    get_or_create_live_share_token), so a user's address is ready before
-    they ever ask for it.
+    one, otherwise claims one and persists it once the user's name is known.
+    Called on every cli.load_user_context (same "cheap after the first time"
+    shape as get_or_create_live_share_token), but waits until the user has
+    provided their name before provisioning an address (<username>@textmessa.com).
 
-    Collision handling: tries the clean slug first (e.g. "janedoe"), and
-    only falls back to a decorated one ("janedoe482", using this user's own
-    id) on an actual collision -- rather than pre-emptively checking and
-    then racing another concurrent signup for the same name, the fallback
-    itself (base + a unique user_id) can never collide, so one retry always
-    succeeds without a loop."""
+    Collision handling: tries the clean slug first (e.g. "vinay"), and
+    falls back to a decorated one ("vinay10", using this user's own id)
+    on an actual collision with an existing user.
+
+    Legacy upgrade: if a user previously received a placeholder like 'user10'
+    before their name was collected, providing their name upgrades their address
+    to <username>@textmessa.com."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         if not await _has_column(conn, "users", "messa_email_local_part"):
             return None
-        row = await conn.fetchrow("SELECT messa_email_local_part FROM users WHERE id = $1", user_id)
+        row = await conn.fetchrow("SELECT messa_email_local_part, name FROM users WHERE id = $1", user_id)
         if row is None:
             return None  # unknown user id -- nothing to provision
-        if row["messa_email_local_part"]:
-            return row["messa_email_local_part"]
 
-        base = _slugify_local_part(name, user_id)
-        for candidate in (base, f"{base}{user_id}"):
+        current_part = row["messa_email_local_part"]
+        is_placeholder = bool(current_part and re.match(r"^user\d+$", current_part))
+
+        # If user already has a personalized local-part (not a legacy placeholder), keep it
+        if current_part and not is_placeholder:
+            return current_part
+
+        # Check effective name from argument or DB row
+        effective_name = (name or row.get("name") or "").strip()
+        base = _slugify_local_part(effective_name, user_id)
+        if not base:
+            # We don't have the user's name yet -- wait until we get it.
+            # Do NOT create or assign a placeholder 'user<id>'.
+            return current_part if not is_placeholder else None
+
+        # Clean slug first, then slug + user_id on collision
+        candidates = [base, f"{base}{user_id}"]
+        for candidate in candidates:
             try:
                 await conn.execute(
                     "UPDATE users SET messa_email_local_part = $2 WHERE id = $1", user_id, candidate,
                 )
                 return candidate
             except asyncpg.UniqueViolationError:
-                continue  # the clean slug was taken -- try the decorated fallback
-        return None  # unreachable in practice: base+user_id is always unique
+                continue
+
+        # In the exceedingly rare case both base and base+user_id collide
+        counter = 1
+        while counter < 100:
+            candidate = f"{base}{user_id}{counter}"[:64]
+            try:
+                await conn.execute(
+                    "UPDATE users SET messa_email_local_part = $2 WHERE id = $1", user_id, candidate,
+                )
+                return candidate
+            except asyncpg.UniqueViolationError:
+                counter += 1
+                continue
+
+        return None
 
 
 async def get_user_by_messa_email_local_part(local_part: str) -> dict[str, Any] | None:

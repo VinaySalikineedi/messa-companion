@@ -106,6 +106,12 @@ def build_personal_inbox_tools(
         email is, or when you need it to give out on their behalf."""
         local_part = await _local_part(user)
         if not local_part:
+            if not user.name:
+                return (
+                    "The user hasn't told you their name yet -- you need their name first "
+                    "to set up their personalized Messa email address (<name>@textmessa.com). "
+                    "Ask them what their name is."
+                )
             return (
                 "Messa's own email addresses aren't set up on this deployment yet "
                 "(run migrations/013_personal_email.sql)."

@@ -315,9 +315,13 @@ async def _onboarding_complete_messages(user: config.UserContext) -> list[str]:
     ]
 
     reveal_parts = []
-    if user.messa_email:
+    local_part = fresh.get("messa_email_local_part")
+    if not local_part and name:
+        local_part = await db.get_or_create_messa_email_local_part(user.user_id, name)
+    messa_email = f"{local_part}@{config.TEXTMESSA_EMAIL_DOMAIN}" if local_part else user.messa_email
+    if messa_email:
         reveal_parts.append(
-            f"Here's my own email: {user.messa_email} -- it's mine to manage, so feel "
+            f"Here's my own email: {messa_email} -- it's mine to manage, so feel "
             "free to hand it out anywhere (signups, forms, whatever) and I'll take care "
             "of what lands there, looping you in before anything that needs your OK. I "
             "can manage your personal inbox too, just say the word."

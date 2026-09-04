@@ -147,6 +147,8 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
         directly; don't call this tool for that."""
         row = await db.save_profile_field(uid, field, value)
         msg = f"Saved {field}. Onboarding is now at: {row['onboarding_step']}."
+        if field == "name" and row.get("messa_email_local_part"):
+            msg += f" Assigned Messa email: {row['messa_email_local_part']}@{config.TEXTMESSA_EMAIL_DOMAIN}."
         if field == "city" and value and value.strip().lower() != "skip":
             if row.get("timezone_confirmed"):
                 msg += f" Resolved timezone: {row['timezone']}."
@@ -563,7 +565,8 @@ _ONBOARDING_PROMPTS = {
     "awaiting_name": (
         "This is a brand-new user and you don't know their name yet. Before diving into "
         "their first request (or right after helping with it if they jumped straight to a "
-        "task), casually ask what you should call them, then call save_profile_info('name', ...)."
+        "task), naturally ask \"What's your name?\" in a friendly, conversational way, "
+        "then call save_profile_info('name', ...)."
     ),
     "awaiting_location": (
         "You know the user's name but not their location. Ask for their city AND "
