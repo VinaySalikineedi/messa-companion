@@ -1125,7 +1125,7 @@ DEFAULT_BRIEFINGS: dict[str, dict[str, str]] = {
         "prompt_or_task": (
             "Give me my morning briefing as a short text. Check today's calendar events "
             "and any tasks due today or overdue, and list them briefly. Include a short, "
-            "one-line weather summary for today for my location (use web_search for "
+            "one-line weather summary for today for my location (use search_web for "
             "current weather -- don't guess). If I have nothing scheduled and no tasks "
             "due, don't just say so -- remind me you're happy to help set something up, "
             "or take care of anything on my mind, including things that need actually "

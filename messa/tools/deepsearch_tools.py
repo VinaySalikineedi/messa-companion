@@ -128,8 +128,6 @@ from ..channels import browserbase, sendblue
 from ..channels.browserbase import BrowserbaseError
 from ..channels.sendblue import SendblueError
 from ..config import UserContext
-from .jina_reader import fetch_rendered_page_text as _jina_fetch_rendered_page_text
-from .parallel_search import parallel_web_fetch as _parallel_web_fetch
 from .search_engine import unified_web_read as _unified_web_read
 from .search_engine import unified_web_search as _unified_web_search
 
@@ -1337,51 +1335,6 @@ class BrowserToolProvider:
                 "{'action': 'scroll', 'direction': 'down'}]. "
                 "Supports target='[1]' marker numbers from browser_get_interactive_elements. "
                 "Executes sequentially and returns the final page snapshot."
-            ),
-        ))
-        # Given to BOTH the top-level provider and every sub-worker, same
-        # reasoning as request_human_help just above -- any tab can want a
-        # cheap read of some OTHER page before deciding whether it's worth
-        # a real browser_navigate. This is a pure function (see
-        # jina_reader.py) with no instance state of its own, so it's wired
-        # in directly rather than as a bound method like the others above.
-        # Deliberately does NOT trigger a lazy open -- its whole point is
-        # comparing candidates BEFORE spending any real browser/session time.
-        self.tools.append(StructuredTool.from_function(
-            coroutine=_jina_fetch_rendered_page_text,
-            name="fetch_rendered_page_text",
-            description=(
-                "Read a URL's rendered text WITHOUT using this browser session -- it runs "
-                "on a remote reader service, not this Browserbase session, so it costs NO "
-                "session time and doesn't touch this tab at all. Use it for reconnaissance "
-                "or comparison: checking what a candidate page currently says, or comparing "
-                "several candidate pages/sites, BEFORE deciding which one (if any) actually "
-                "needs browser_navigate and real interaction -- this is how a task that "
-                "combines reading and acting (e.g. 'find the cheapest of these and buy it') "
-                "should be done: compare with this tool first across every candidate, THEN "
-                "spend real browser/session time only on the one you're actually acting on. "
-                "Still read-only -- it can't click, type, scroll, or log in. If it comes "
-                "back empty or unhelpful for a page you genuinely need to read, fall back "
-                "to browser_navigate + browser_snapshot on it instead."
-            ),
-        ))
-        # A second, independent provider for the exact same job as
-        # fetch_rendered_page_text just above (Parallel Search MCP instead
-        # of Jina Reader) -- same reasoning as request_human_help for being
-        # given to both top-level and sub-workers: if Jina is ever down or
-        # rate-limited, this is a real fallback that's still free/no-session,
-        # not an automatic escalation straight to spending more of this
-        # session's own browser time. Also doesn't trigger a lazy open.
-        self.tools.append(StructuredTool.from_function(
-            coroutine=_parallel_web_fetch,
-            name="parallel_web_fetch",
-            description=(
-                "A second, independent provider for the SAME job as fetch_rendered_page_text "
-                "(a JS-rendered page read costing NO Browserbase session time) -- try this if "
-                "fetch_rendered_page_text comes back empty or errors out on a page you "
-                "genuinely need to read for comparison/reconnaissance. Also handles PDFs. "
-                "Still read-only. If this ALSO fails, fall back to browser_navigate + "
-                "browser_snapshot instead."
             ),
         ))
         # delegate_website_task is deliberately owning-provider-only --
@@ -2904,10 +2857,9 @@ _SUBAGENT_SYSTEM_PROMPT = (
     "- Do exactly what the instructions ask, nothing more -- no exploring beyond this one goal, "
     "no extra things to report. A short, focused session is what's wanted here.\n"
     "- This tab's session time is genuinely billed -- before navigating anywhere, ask whether "
-    "fetch_rendered_page_text (or parallel_web_fetch if that fails) could answer it instead "
-    "(comparing this site against others, confirming a fact, checking current content). Both "
-    "cost no session time at all. Only use browser_navigate once you know THIS is the page you "
-    "actually need to interact with.\n"
+    "read_webpage (or search_web) could answer it instead (comparing this site against others, "
+    "confirming a fact, checking current content). Both cost no session time at all. Only use "
+    "browser_navigate once you know THIS is the page you actually need to interact with.\n"
     "- After navigating, always call browser_snapshot to read actual page content. Prefer "
     "browser_find or browser_snapshot's `depth` argument over a full snapshot when you just "
     "need to confirm something worked.\n"
@@ -2946,8 +2898,8 @@ DEEPSEARCH_SYSTEM_PROMPT = (
     "actual page content.\n"
     "- Money matters, not just speed: this whole session is billed by TIME held open, "
     "regardless of how much or little you actually do with it. Use the fast HTTP tools FIRST: "
-    "search_web for searching and finding URLs, and read_webpage (or fetch_rendered_page_text) "
-    "for reading page content. Both cost ZERO browser/session time and answer in <1-2 seconds. "
+    "search_web for searching and finding URLs, and read_webpage for reading page content. "
+    "Both cost ZERO browser/session time and answer in <1-2 seconds. "
     "For a task that combines reading/comparing with acting (e.g. 'check these 3 sites and buy from "
     "whichever is cheapest'), the right shape is: search and read every candidate FIRST with "
     "search_web and read_webpage, decide which one wins, THEN spend real browser_navigate/session "

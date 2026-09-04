@@ -63,7 +63,7 @@ from ..channels.sendblue import SendblueError
 from ..tools.admin_tools import ADMIN_SYSTEM_PROMPT, build_admin_tools
 from ..tools.deepsearch_tools import build_deepsearch_subagent, count_warm_sessions_for_user, purge_warm_sessions_for_user
 from ..tools.common import trace_all
-from ..tools.document_tools import DOCUMENT_SYSTEM_PROMPT, build_document_tools
+from ..tools.document_tools import DOCUMENT_SYSTEM_PROMPT, build_document_system_prompt, build_document_tools
 from ..tools.email_tools import build_email_subagent
 from ..tools.executive_tools import _format_contact_line, build_executive_subagent
 from ..tools.integration_tools import app_category_for_toolkit, build_integration_system_prompt, build_integration_tools
@@ -725,7 +725,7 @@ def _build_system_prompt(
         "browsing (checking a live price, filling out a form on a website, signing up for "
         "something, buying/ordering online, etc.), don't delegate to deepsearch or claim you're "
         "checking -- tell them plainly that live browsing isn't turned on for their account yet, "
-        "and offer to help another way if one exists (e.g. web_search for general info that "
+        "and offer to help another way if one exists (e.g. search_web for general info that "
         "doesn't need a live page)."
     )
 
@@ -775,7 +775,7 @@ def _build_system_prompt(
         "reminders, notes, contacts, and Messa's own INTERNAL calendar -- not a real "
         "connected calendar), email_agent (the user's own Gmail), "
         "personal_inbox_agent (the user's own Messa-owned email address -- a different "
-        "inbox from their Gmail), document_agent (generates PDFs), routines_agent "
+        "inbox from their Gmail), document_agent (contracts, executive reports, and PDFs), routines_agent "
         "(recurring or one-time task routines -- both plain reminders where the USER does "
         "something, and background tasks where YOU do something yourself and report back, "
         "e.g. watchers, deadline-aware follow-ups), integrations_agent (any other app -- "
@@ -831,7 +831,11 @@ def _build_system_prompt(
         "(Messa's own email) -- email_agent (Gmail) doesn't support attachments in this build, "
         "so if the user's default/named inbox is Gmail and they want a document emailed with an "
         "attachment, tell them plainly that attachments only work from their Messa address "
-        "right now (or offer to text it instead) rather than sending it without the file.\n\n"
+        "right now (or offer to text it instead) rather than sending it without the file. "
+        "For legal agreements (NDAs, consulting contracts, MSAs, SOWs) or executive reports, "
+        "delegate to document_agent with all known details. If critical terms like payment rate "
+        "or counterparty name are missing, ask the user once in a single concise message with "
+        "sensible defaults rather than multiple follow-up texts.\n\n"
         "Reading PDFs the user sends YOU: if the user texts you a PDF, or a PDF arrives "
         "attached to an email in your own inbox, its extracted text is already included right "
         f"in the message that told you about it (capped at {config.MAX_PDF_READ_PAGES} pages "
@@ -875,7 +879,7 @@ def _build_system_prompt(
         "Other apps and platforms (Reddit, Todoist, Slack, Notion, GitHub, Google Calendar, "
         "and everything else outside your other subagents -- never email, that always goes "
         "to email_agent/personal_inbox_agent): delegate to integrations_agent FIRST, before "
-        "considering deepsearch or web_search, for anything that names or clearly implies one "
+        "considering deepsearch or search_web, for anything that names or clearly implies one "
         "of these -- 'check Reddit', 'post to Slack', 'add a Todoist task'. Composio has "
         "authenticated API access to these, which is faster and more reliable than browsing "
         "the site by hand. If it reports the app isn't supported at all (nothing Composio "
@@ -1070,9 +1074,12 @@ async def build_orchestrator(
         },
         {
             "name": "document_agent",
-            "description": "Generates polished PDF documents from structured content on request.",
-            "system_prompt": DOCUMENT_SYSTEM_PROMPT,
-            "tools": build_document_tools(),
+            "description": (
+                "Generates legally structured contracts (NDAs, consulting agreements, MSAs, SOWs, "
+                "offers) and polished executive reports/briefings as PDFs from structured content."
+            ),
+            "system_prompt": build_document_system_prompt(user),
+            "tools": build_document_tools(user),
             "model": _subagent_model_for("document_agent"),
         },
         {
