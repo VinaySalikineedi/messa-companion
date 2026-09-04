@@ -203,6 +203,26 @@ async def _cleanup_expired_warm_sessions() -> None:
                 console.system(f"Deepsearch: error closing expired warm session #{sid}: {e}")
 
 
+async def purge_warm_sessions_for_user(user_id: int) -> list[int]:
+    """Forcefully closes and evicts all warm browser sessions belonging to this user.
+    Used by the kill switch to immediately terminate Browserbase billing and MCP
+    processes when the user asks to stop or cancel."""
+    purged: list[int] = []
+    for sid, prov in list(_WARM_SESSION_PROVIDERS.items()):
+        if getattr(prov, "_user_id", None) == user_id:
+            _WARM_SESSION_PROVIDERS.pop(sid, None)
+            _WARM_SESSION_EXPIRY.pop(sid, None)
+            if prov is not None:
+                console.system(f"Deepsearch: purging warm browser session #{sid} for user #{user_id}.")
+                try:
+                    prov._is_warm = False
+                    await prov.close()
+                    purged.append(sid)
+                except Exception as e:  # noqa: BLE001
+                    console.system(f"Deepsearch: error closing purged session #{sid}: {e}")
+    return purged
+
+
 _DEAD_SESSION_ERROR_MARKERS = ("410", "session not running")
 
 
@@ -897,6 +917,7 @@ class BrowserToolProvider:
         server_url: str | None = None,
         model: BaseChatModel | None = None,
         messa_email: str | None = None,
+        user_email: str | None = None,
         task_title: str | None = None,
         phone_number: str | None = None,
         live_view_share_url: str | None = None,
@@ -905,6 +926,8 @@ class BrowserToolProvider:
         self._approval_gate = approval_gate
         self._user_id = user_id
         self._initial_resume_url = initial_resume_url
+        self._current_url: str = initial_resume_url or ""
+        self._user_email = user_email
         # Owning-provider-only, for the "browser is actually live now" SMS
         # fired from inside _ensure_live_session -- see that method's own
         # comment for why the link moved here instead of going out with the
@@ -1754,6 +1777,7 @@ class BrowserToolProvider:
         matched later against Browserbase's own pages[] (by url) to resolve
         this specific tab's live-view debug link. See
         channels/browserbase.get_session_pages and server.py's status route."""
+        self._current_url = url
         if self._user_id is None:
             return
         if self._owns_server:
@@ -1808,6 +1832,50 @@ class BrowserToolProvider:
             return int(text) if text is not None else None
         except Exception:  # noqa: BLE001
             return None
+
+    def _sanitize_typed_text(self, text: str, element_desc: str | None, current_url: str | None = None) -> str:
+        """Inspects text being typed into the browser. If the agent attempts to type an
+        unauthorized or hallucinated email address into an account/signup/login field or auth page,
+        automatically substitutes the user's authoritative Messa email address."""
+        if not text or not self._messa_email or "@" not in text:
+            return text
+
+        email_pattern = r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"
+        matches = re.findall(email_pattern, text)
+        if not matches:
+            return text
+
+        elem_str = (element_desc or "").lower()
+        url_str = (current_url or self._current_url or "").lower()
+
+        # Check if the field or context is an account/email/login/signup field
+        is_auth_field = any(kw in elem_str for kw in (
+            "email", "phone number or email", "username", "login", "sign in", "signin",
+            "sign up", "signup", "register", "auth", "account", "user", "e-mail"
+        ))
+        is_auth_page = any(kw in url_str for kw in (
+            "auth", "login", "signin", "sign-in", "signup", "sign-up", "register", "account"
+        ))
+
+        # Do not intercept if explicitly a generic content search box unless on an auth page
+        if any(kw in elem_str for kw in ("search", "find restaurants", "search box")) and not is_auth_page:
+            return text
+
+        sanitized = text
+        for email in matches:
+            email_lower = email.lower()
+            allowed = {self._messa_email.lower()}
+            if self._user_email:
+                allowed.add(self._user_email.lower())
+
+            if email_lower not in allowed:
+                console.system(
+                    f"Deepsearch Guardrail: intercepted hallucinated email '{email}', "
+                    f"substituting authorized Messa email '{self._messa_email}'"
+                )
+                sanitized = sanitized.replace(email, self._messa_email)
+
+        return sanitized
 
     def _resolve_target(self, target: Any) -> Any:
         """Resolves Set-of-Marks markers (e.g. '[1]', '1', '#1', 'marker 1') to stable Playwright selectors."""
@@ -1947,8 +2015,11 @@ class BrowserToolProvider:
                                 return "ERROR: browser_fill_form tool is unavailable."
                             if "fields" in act and isinstance(act["fields"], list):
                                 for f in act["fields"]:
-                                    if isinstance(f, dict) and "target" in f:
-                                        f["target"] = self._resolve_target(f["target"])
+                                    if isinstance(f, dict):
+                                        if "target" in f:
+                                            f["target"] = self._resolve_target(f["target"])
+                                        if "value" in f:
+                                            f["value"] = self._sanitize_typed_text(str(f["value"]), f.get("name"), self._current_url)
                                 if config.DEEPSEARCH_CURSOR_OVERLAY and act["fields"]:
                                     first_target = act["fields"][0].get("target")
                                     if first_target:
@@ -1960,6 +2031,7 @@ class BrowserToolProvider:
                                     self._fire_cursor_move("browser_type", element, target)
                                     await asyncio.sleep(0.15)
                                 val = str(act.get("value") or act.get("text") or "")
+                                val = self._sanitize_typed_text(val, element, self._current_url)
                                 res = await tool.coroutine(fields=[{"target": target, "value": val, "name": element, "type": "textbox"}])
                             else:
                                 return f"ERROR: 'target' or 'fields' is required for fill action at step {idx+1}."
@@ -1974,6 +2046,7 @@ class BrowserToolProvider:
                             if not tool:
                                 return "ERROR: browser_type tool is unavailable."
                             text = str(act.get("text") or act.get("value") or "")
+                            text = self._sanitize_typed_text(text, element, self._current_url)
                             res = await tool.coroutine(target=target, text=text, element=element)
 
                         elif act_type in ("select", "select_option"):
@@ -2136,6 +2209,18 @@ class BrowserToolProvider:
             f"Deepsearch: awaiting email verification code on tab {self._tab_id} "
             f"(sender_keyword={sender_keyword!r}, up to {wait_seconds}s)."
         )
+
+        # 1. Immediate lookback: check if a matching email arrived in the last 3 minutes
+        # (catches the common race where the site emailed the code in 1-2s upon clicking
+        # submit, while the LLM spent 10-20s generating the next tool call).
+        recent = await db.find_recent_otp_in_inbox(self._user_id, sender_keyword, max_age_seconds=180)
+        if recent and recent.get("code"):
+            console.system(
+                f"Deepsearch: found recent verification code {recent['code']} already in inbox on tab {self._tab_id}."
+            )
+            self._live_add_step("Received verification code")
+            return f"RESOLVED: Received verification code {recent['code']}. Enter it now."
+
         request_row = await db.create_otp_expectation(
             self._user_id, self._deepsearch_session_id, self._tab_id, sender_keyword,
         )
@@ -2159,6 +2244,17 @@ class BrowserToolProvider:
                     )
                     self._live_add_step("Received verification code")
                     return f"RESOLVED: Received verification code {row['code']}. Enter it now."
+
+                # Backstop check: directly query inbox during wait loop in case webhook didn't resolve expectation
+                inbox_check = await db.find_recent_otp_in_inbox(self._user_id, sender_keyword, max_age_seconds=120)
+                if inbox_check and inbox_check.get("code"):
+                    console.system(
+                        f"Deepsearch: picked up verification code {inbox_check['code']} directly from inbox on tab {self._tab_id} after {elapsed}s."
+                    )
+                    await db.expire_otp_expectation(expectation_id)
+                    self._live_add_step("Received verification code")
+                    return f"RESOLVED: Received verification code {inbox_check['code']}. Enter it now."
+
                 if row and row.get("status") == "expired":
                     # Extremely unlikely (nothing else expires this row while
                     # we're the one still polling it) but handled for
@@ -2638,6 +2734,21 @@ class BrowserToolProvider:
                     return msg
                 state["snapshot_fresh"] = False
 
+            if name == "browser_type":
+                text_val = str(kwargs.get("text", "") or (args[0] if args else ""))
+                clean_text = self._sanitize_typed_text(text_val, kwargs.get("element"), self._current_url)
+                if clean_text != text_val:
+                    kwargs["text"] = clean_text
+                    if args:
+                        args = (clean_text, *args[1:])
+
+            if name == "browser_fill_form":
+                fields = kwargs.get("fields")
+                if isinstance(fields, list):
+                    for f in fields:
+                        if isinstance(f, dict) and "value" in f:
+                            f["value"] = self._sanitize_typed_text(str(f["value"]), f.get("name"), self._current_url)
+
             if name in CURSOR_ANIMATED_TOOLS:
                 self._fire_cursor_move(name, kwargs.get("element"), kwargs.get("target"))
 
@@ -2647,6 +2758,10 @@ class BrowserToolProvider:
                 console.tool_result(LABEL, name, result)
                 self._live_add_step(action_desc)
                 if name == "browser_snapshot":
+                    if isinstance(result, str):
+                        url_m = re.search(r"Page URL:\s*([^\s\n]+)", result)
+                        if url_m:
+                            self._current_url = url_m.group(1).strip()
                     # Kept for the deterministic human-help backstop below
                     # (_looks_like_auth_wall) -- truncated so a very large
                     # page snapshot doesn't bloat this in-memory state.
@@ -2903,6 +3018,29 @@ def build_deepsearch_subagent(
     the open/close-per-task and session-resumption design."""
 
     async def _run(state: dict[str, Any]) -> dict[str, Any]:
+        # v1 launch gate: live web browsing/deepsearch is OFF for the
+        # general public, open only to admins and hand-picked beta accounts
+        # -- see config.UserContext.has_deepsearch_access's own docstring
+        # for the full "why" and for exactly how this flips to public later
+        # (one env var, nothing here changes). Checked FIRST, before even
+        # the usage-limit check right below -- an ungated user's request
+        # doesn't touch the usage counter, doesn't open a Browserbase
+        # session, doesn't spawn the MCP subprocess, doesn't run an LLM
+        # turn. Plain, calm decline (not an "ERROR:"-prefixed string) since
+        # this is an expected, everyday outcome for most users right now,
+        # not a failure -- registry.py's system prompt already primes
+        # Messa on how to phrase this to someone who asks.
+        if not user.has_deepsearch_access:
+            console.system(
+                f"Deepsearch: declined for user #{user.user_id} -- browsing/deepsearch isn't "
+                "enabled on this account yet (beta-gated for v1)."
+            )
+            return {"messages": [AIMessage(content=(
+                "Live web browsing/research isn't available on your account yet -- it's in a "
+                "limited beta right now while we get it fully ready for everyone. I can still "
+                "help with everything else!"
+            ))]}
+
         # One usage-limits unit per top-level browsing session opened here
         # (session resumption included -- BrowserToolProvider's own
         # "open/close-per-task" design means even a continuation opens a
@@ -3073,7 +3211,7 @@ def build_deepsearch_subagent(
             if provider is None:
                 provider = BrowserToolProvider(
                     approval_gate, user_id=user.user_id, deepsearch_session_id=session_id, model=model,
-                    messa_email=user.messa_email, task_title=task_title,
+                    messa_email=user.messa_email, user_email=user.email, task_title=task_title,
                     phone_number=user.phone_number, live_view_share_url=user.live_view_share_url,
                     initial_resume_url=initial_resume_url,
                 )
@@ -3082,8 +3220,19 @@ def build_deepsearch_subagent(
                 async with provider:
                     try:
                         _summarization = _deepsearch_summarization_middleware(model)
+                        user_identity_prompt = (
+                            f"\n\nUSER IDENTITY & AUTHORIZED SIGNUP CREDENTIALS:\n"
+                            f"- Target User Name: {user.name or 'User'}\n"
+                            f"- User Messa Email: {user.messa_email or 'None provisioned'}\n"
+                            f"- User Personal Email: {user.email or 'None'}\n"
+                            f"STRICT SIGNUP RULE: When creating an account, signing up, or registering on ANY website or service, "
+                            f"you MUST use the user's authorized Messa email address ({user.messa_email}). "
+                            f"NEVER invent, guess, or type fictional/dummy email addresses (such as dummy @gmail.com or @space addresses). "
+                            f"Any signup with a made-up address will fail verification."
+                        )
                         inner_agent = create_agent(
-                            model=model, tools=provider.tools, system_prompt=DEEPSEARCH_SYSTEM_PROMPT,
+                            model=model, tools=provider.tools,
+                            system_prompt=DEEPSEARCH_SYSTEM_PROMPT + user_identity_prompt,
                             checkpointer=checkpointer,
                             middleware=[_summarization] if _summarization is not None else [],
                         )

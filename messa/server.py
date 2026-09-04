@@ -1037,6 +1037,22 @@ async def personal_email_inbound_webhook(
         )
         return JSONResponse({"status": "accepted (resolved otp expectation)"})
 
+    # If an OTP code arrived while deepsearch is currently in flight for this user,
+    # suppress the ordinary unsolicited SMS notification -- deepsearch's
+    # await_email_verification_code is either running or about to run, and will
+    # consume this code directly from messa_email_messages via find_recent_otp_in_inbox.
+    otp_code = db._extract_otp_code(payload.get("subject") or "", body_text)
+    if otp_code:
+        from . import deepsearch_control
+        active_search = deepsearch_control.describe(user["id"])
+        if active_search:
+            console.system(
+                f"Personal-email: email contains OTP code {otp_code} while deepsearch is actively running "
+                f"('{active_search}') for user #{user['id']} -- suppressing normal notification turn "
+                "so deepsearch can consume it from the inbox."
+            )
+            return JSONResponse({"status": "accepted (otp reserved for active deepsearch)"})
+
     background_tasks.add_task(_process_inbound_personal_email, user["id"], logged, pdf_note)
     return JSONResponse({"status": "accepted"})
 

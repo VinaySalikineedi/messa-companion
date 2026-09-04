@@ -83,6 +83,7 @@ async def _context_from_row(user_row: dict, channel: str) -> config.UserContext:
         default_email_provider=user_row.get("default_email_provider") or "messa",
         plan_id=user_row.get("plan_id") or config.plans.DEFAULT_PLAN_ID,
         is_admin=bool(user_row.get("is_admin", False)),
+        deepsearch_beta_access=bool(user_row.get("deepsearch_beta_access", False)),
         memory_profile=user_row.get("memory_profile"),
     )
 

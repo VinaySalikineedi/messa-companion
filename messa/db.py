@@ -1881,6 +1881,31 @@ async def list_deepsearch_sessions(user_id: int, status: str | None = None) -> l
         return _rows(rows)
 
 
+async def cancel_all_active_deepsearch_sessions(user_id: int) -> int:
+    """Marks all 'active' deepsearch sessions for this user as 'abandoned'
+    (the enum value representing cancelled/halted sessions) and clears any
+    pending OTP expectations for this user. Returns the count of cancelled sessions."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        count = 0
+        if await _has_table(conn, "deepsearch_sessions"):
+            res = await conn.execute(
+                "UPDATE deepsearch_sessions SET status = 'abandoned'::deepsearch_status, "
+                "summary = '(cancelled by user)' WHERE user_id = $1 AND status = 'active'::deepsearch_status",
+                user_id,
+            )
+            try:
+                count = int(res.split(" ")[-1])
+            except Exception:
+                count = 0
+        if await _has_table(conn, "deepsearch_otp_expectations"):
+            await conn.execute(
+                "DELETE FROM deepsearch_otp_expectations WHERE user_id = $1",
+                user_id,
+            )
+        return count
+
+
 # ---------------------------------------------------------------------------
 # Human-in-the-loop pause (deepsearch hit a login wall/CAPTCHA/2FA and is
 # waiting on you) -- see migrations/008_deepsearch_human_help.sql and
@@ -2111,6 +2136,60 @@ async def resolve_otp_expectation_from_email(
             chosen["id"], code,
         )
         return dict(updated) if updated else None
+
+
+async def find_recent_otp_in_inbox(
+    user_id: int, sender_filter: str | None = None, max_age_seconds: int = 180,
+) -> dict[str, Any] | None:
+    """Checks messa_email_messages for any inbound email that arrived within the
+    last max_age_seconds, optionally matching sender_filter in from_address/subject,
+    and containing an extractable OTP code. Used to catch the race where a website
+    emailed the code immediately before deepsearch called await_email_verification_code.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "messa_email_messages"):
+            return None
+        rows = await conn.fetch(
+            """
+            SELECT from_address, subject, body_text, created_at
+            FROM messa_email_messages
+            WHERE user_id = $1
+              AND direction = 'inbound'
+              AND created_at >= NOW() - ($2 || ' seconds')::interval
+            ORDER BY created_at DESC
+            LIMIT 10
+            """,
+            user_id, str(int(max_age_seconds)),
+        )
+        if not rows:
+            return None
+
+        sf = (sender_filter or "").strip().lower()
+        for r in rows:
+            haystack = f"{r['from_address'] or ''}\n{r['subject'] or ''}".lower()
+            if sf and sf not in haystack:
+                continue
+            code = _extract_otp_code(r["subject"], r["body_text"])
+            if code:
+                return {
+                    "code": code,
+                    "from_address": r["from_address"],
+                    "subject": r["subject"],
+                    "created_at": r["created_at"],
+                }
+
+        if not sf:
+            for r in rows:
+                code = _extract_otp_code(r["subject"], r["body_text"])
+                if code:
+                    return {
+                        "code": code,
+                        "from_address": r["from_address"],
+                        "subject": r["subject"],
+                        "created_at": r["created_at"],
+                    }
+        return None
 
 
 # ---------------------------------------------------------------------------

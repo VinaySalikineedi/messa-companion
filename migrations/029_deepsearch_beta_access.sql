@@ -1,0 +1,26 @@
+-- Additive migration for the v1 launch's deepsearch access gate.
+--
+-- users.deepsearch_beta_access -- a quiet, manually-flipped bypass exactly
+-- like users.is_admin (migrations/023_usage_limits.sql): a plain boolean,
+-- nothing discoverable, nothing on a pricing page, granted per account with
+-- a manual
+--     UPDATE users SET deepsearch_beta_access = true WHERE phone_number = '+1...';
+--
+-- Why this exists: at v1 launch, live web browsing/deepsearch is turned OFF
+-- for the general public -- every Browserbase session is real, metered
+-- money, and the feature needs more real-world runway before it's
+-- public-ready -- and turned on only for a handful of hand-picked
+-- beta/investor accounts. See messa/config.py's DEEPSEARCH_PUBLIC_ACCESS
+-- and UserContext.has_deepsearch_access for the actual combined gate every
+-- call site reads (tools/deepsearch_tools.py's build_deepsearch_subagent
+-- checks it first thing in _run, before even the usage-limit check, so a
+-- gated user's request never opens a Browserbase session or spends
+-- anything at all).
+--
+-- Going public later needs NONE of this touched again: it's a single
+-- config flip (MESSA_DEEPSEARCH_PUBLIC_ACCESS=true), not a fresh migration
+-- or a per-user backfill. This column stays around afterward too --
+-- harmless once the public switch is on, and useful again if access ever
+-- needs to be narrowed back down.
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS deepsearch_beta_access BOOLEAN NOT NULL DEFAULT false;

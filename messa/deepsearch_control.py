@@ -37,13 +37,17 @@ nothing else) -- exactly "stop the search," not a partial/unsafe cancel."""
 from __future__ import annotations
 
 import asyncio
+import time
 
-_active_tasks: dict[int, asyncio.Task] = {}
+_active_tasks: dict[int, set[asyncio.Task]] = {}
 # Human-readable "what is it doing" text, kept alongside the task handle so
 # registry.py's system-prompt hint can tell the model what would be
 # cancelled without importing live_activity itself (avoids a needless
 # cross-module coupling for what's a one-line hint).
 _active_titles: dict[int, str] = {}
+# Tracks when a user explicitly issued a cancellation, so subsequent automated
+# wakeups (e.g. late-arriving OTP email webhooks) know the task was halted.
+_user_cancelled_at: dict[int, float] = {}
 
 
 def register(user_id: int, title: str | None = None) -> None:
@@ -53,21 +57,33 @@ def register(user_id: int, title: str | None = None) -> None:
     and cancel this task."""
     task = asyncio.current_task()
     if task is not None:
-        _active_tasks[user_id] = task
+        _active_tasks.setdefault(user_id, set()).add(task)
         _active_titles[user_id] = title or "a search"
 
 
-def unregister(user_id: int) -> None:
+def unregister(user_id: int, task: asyncio.Task | None = None) -> None:
     """Called in _run's outermost `finally`, so this is cleared on every
     exit path -- clean finish, step-limit cutoff, timeout, error, or a
     cancellation triggered by cancel() itself."""
-    _active_tasks.pop(user_id, None)
-    _active_titles.pop(user_id, None)
+    target = task or asyncio.current_task()
+    tasks = _active_tasks.get(user_id)
+    if tasks is not None:
+        if target is not None:
+            tasks.discard(target)
+        # Prune any already-completed tasks from the set
+        active = {t for t in tasks if not t.done()}
+        if active:
+            _active_tasks[user_id] = active
+        else:
+            _active_tasks.pop(user_id, None)
+            _active_titles.pop(user_id, None)
 
 
 def is_active(user_id: int) -> bool:
-    task = _active_tasks.get(user_id)
-    return task is not None and not task.done()
+    tasks = _active_tasks.get(user_id)
+    if not tasks:
+        return False
+    return any(not t.done() for t in tasks)
 
 
 def describe(user_id: int) -> str | None:
@@ -77,17 +93,24 @@ def describe(user_id: int) -> str | None:
 
 
 def cancel(user_id: int) -> bool:
-    """Cancels the in-flight deepsearch task for this user, if any. Returns
-    True if there was something to cancel, False if nothing was running
-    (already finished, or never started) -- both are normal, expected
-    outcomes, never an error. The actual cleanup (releasing the Browserbase
-    session, clearing live_activity/db state) happens via the existing
-    try/finally chain in tools/deepsearch_tools.py's _run and
-    BrowserToolProvider.__aexit__, triggered naturally by the
-    asyncio.CancelledError this raises inside that task -- nothing here
-    touches the browser or the DB directly."""
-    task = _active_tasks.get(user_id)
-    if task is not None and not task.done():
-        task.cancel()
-        return True
-    return False
+    """Cancels all in-flight deepsearch tasks for this user, if any. Returns
+    True if there was at least one active task cancelled, False if nothing was
+    running."""
+    _user_cancelled_at[user_id] = time.monotonic()
+    tasks = _active_tasks.pop(user_id, set())
+    _active_titles.pop(user_id, None)
+    cancelled_any = False
+    for t in tasks:
+        if not t.done():
+            t.cancel()
+            cancelled_any = True
+    return cancelled_any
+
+
+def is_cancelled_recently(user_id: int, within_seconds: float = 300.0) -> bool:
+    """Returns True if the user issued a stop/cancel within the last `within_seconds`."""
+    ts = _user_cancelled_at.get(user_id)
+    if ts is None:
+        return False
+    return (time.monotonic() - ts) <= within_seconds
+

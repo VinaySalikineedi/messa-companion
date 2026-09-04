@@ -55,12 +55,12 @@ from typing import Any
 from deepagents import GeneralPurposeSubagentProfile, HarnessProfile, create_deep_agent, register_harness_profile
 from langchain_core.tools import BaseTool, tool
 
-from .. import config, console, db, deepsearch_control, memory, timeutil
+from .. import config, console, db, deepsearch_control, live_activity, memory, timeutil
 from ..approval import ApprovalGate, CLIApprovalGate
 from ..channels import sendblue
 from ..channels.sendblue import SendblueError
 from ..tools.admin_tools import ADMIN_SYSTEM_PROMPT, build_admin_tools
-from ..tools.deepsearch_tools import build_deepsearch_subagent
+from ..tools.deepsearch_tools import build_deepsearch_subagent, purge_warm_sessions_for_user
 from ..tools.common import trace_all
 from ..tools.document_tools import DOCUMENT_SYSTEM_PROMPT, build_document_tools
 from ..tools.email_tools import build_email_subagent
@@ -357,9 +357,9 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
     @tool
     async def cancel_active_search(reason: str | None = None) -> str:
         """Stop a deepsearch (browsing/research) task that's currently
-        running in the background for this user RIGHT NOW -- ends it
-        immediately and releases its browser session, instead of it
-        continuing to run.
+        running in the background or warm for this user RIGHT NOW -- ends it
+        immediately, closes and releases its browser session, and cancels
+        any active browsing sessions in the database so it will not resume.
 
         Call this ONLY when the user's message is a clear, explicit signal
         to stop or abandon what's currently running -- either directly
@@ -375,10 +375,23 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
 
         A no-op (not an error) if nothing is currently running -- safe to
         call even if you're not fully sure a search is still active."""
-        cancelled = deepsearch_control.cancel(uid)
-        if not cancelled:
-            return "Nothing was currently running to cancel."
-        return "Cancelled the search that was running -- its browser session is being released now."
+        tasks_cancelled = deepsearch_control.cancel(uid)
+        warm_sessions_purged = await purge_warm_sessions_for_user(uid)
+        db_cancelled_count = await db.cancel_all_active_deepsearch_sessions(uid)
+        live_activity.clear(uid)
+
+        if not tasks_cancelled and not warm_sessions_purged and db_cancelled_count == 0:
+            return "Nothing was currently running or active to cancel."
+
+        details = []
+        if tasks_cancelled:
+            details.append("stopped in-flight search task")
+        if warm_sessions_purged:
+            details.append(f"closed {len(warm_sessions_purged)} warm browser session(s)")
+        if db_cancelled_count:
+            details.append(f"cancelled {db_cancelled_count} active database session(s)")
+
+        return f"Cancelled all browsing activity ({', '.join(details)}). The browser is fully closed and no further actions will run."
 
     raw_tools: list[BaseTool] = [
         confirm_pending_action, reject_pending_action, list_pending_actions,
@@ -582,6 +595,26 @@ def _build_system_prompt(
         "new-user waitlist)"
     ) if user.is_admin else ""
 
+    # Only ever non-empty for a user WITHOUT deepsearch access (the common
+    # case at v1 launch -- see UserContext.has_deepsearch_access's own
+    # docstring). Told up front, before the delegation-routing paragraphs
+    # below even mention deepsearch, specifically so Messa never opens with
+    # "sending this to deepsearch now" / "checking on that" and THEN has to
+    # backpedal once the tool call comes back declined -- it can just
+    # explain plainly in one go instead. The task tool itself would also
+    # decline gracefully even without this (build_deepsearch_subagent's own
+    # _run checks the same flag first thing), so this is purely about
+    # smoother phrasing, not a second enforcement layer.
+    deepsearch_access_str = "" if user.has_deepsearch_access else (
+        "\n\nLive web browsing/research (deepsearch) is NOT available on this account yet -- "
+        "it's in a limited beta right now. If the user asks for anything that would need real "
+        "browsing (checking a live price, filling out a form on a website, signing up for "
+        "something, buying/ordering online, etc.), don't delegate to deepsearch or claim you're "
+        "checking -- tell them plainly that live browsing isn't turned on for their account yet, "
+        "and offer to help another way if one exists (e.g. web_search for general info that "
+        "doesn't need a live page)."
+    )
+
     live_view_str = ""
     if user.live_view_share_url:
         live_view_str = (
@@ -767,6 +800,7 @@ def _build_system_prompt(
         f"{time_str}"
         f"{onboarding_str}"
         f"{channel_str}"
+        f"{deepsearch_access_str}"
         "Responsiveness: delegating to a subagent can take a little while. Before calling "
         "the task tool, send one short line acknowledging what you're about to do (e.g. "
         "\"Checking flights now...\") so the user isn't staring at silence -- don't just go "

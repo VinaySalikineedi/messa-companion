@@ -969,6 +969,20 @@ DEEPSEARCH_OTP_WAIT_POLL_INTERVAL_SECONDS = int(
 # genuine multi-step research work around it.
 DEEPSEARCH_MAX_SESSION_SECONDS = int(os.environ.get("MESSA_DEEPSEARCH_MAX_SESSION_SECONDS", "1200"))
 
+# v1 launch switch: live web browsing/deepsearch is OFF for the general
+# public at launch (every Browserbase session is real, metered money, and
+# the feature needs more real-world runway before it's public-ready) --
+# open only to hand-picked beta/investor accounts, via
+# UserContext.deepsearch_beta_access (migrations/029_deepsearch_beta_
+# access.sql, granted with a manual `UPDATE users SET
+# deepsearch_beta_access = true WHERE phone_number = ...`, same convention
+# as users.is_admin). THIS is the one flag to flip for public release:
+# set MESSA_DEEPSEARCH_PUBLIC_ACCESS=true and every user gets access
+# immediately -- no code change, no migration, no per-user column to
+# populate. See UserContext.has_deepsearch_access for the actual
+# combined check every call site uses.
+DEEPSEARCH_PUBLIC_ACCESS = os.environ.get("MESSA_DEEPSEARCH_PUBLIC_ACCESS", "false").strip().lower() in ("1", "true", "yes")
+
 # Scalability fix (pre-1000-user launch): a hard, process-wide cap on how
 # many TOP-LEVEL deepsearch sessions can be running at once, across every
 # user sharing this one container. Before this, there was no such
@@ -1306,6 +1320,18 @@ class UserContext:
     # through every hook point. Never surfaced on the pricing page or in
     # plans.py; set with a manual `UPDATE users SET is_admin = true`.
     is_admin: bool = False
+    # From users.deepsearch_beta_access (migrations/029_deepsearch_beta_
+    # access.sql) -- same quiet, manually-flipped-by-SQL shape as is_admin
+    # just above, deliberately kept as its own separate column rather than
+    # folded into is_admin or plan_id: v1 launches with live web
+    # browsing/deepsearch turned OFF for the public (Browserbase sessions
+    # cost real money per-session and the whole feature needs more runway
+    # before it's public-ready), open only to a handful of hand-picked
+    # beta/investor accounts. See DEEPSEARCH_PUBLIC_ACCESS below and
+    # has_deepsearch_access's own docstring for the actual gate this
+    # column feeds -- going public later never touches this column at all,
+    # it's a single config flip.
+    deepsearch_beta_access: bool = False
     # From users.memory_profile (migrations/027_memory.sql) -- the cheap,
     # always-on profile digest, read once per turn via db.get_memory_profile
     # exactly like the fields above, NOT a live Mem0 call (see
@@ -1319,6 +1345,25 @@ class UserContext:
     @property
     def onboarding_complete(self) -> bool:
         return self.onboarding_step == "complete"
+
+    @property
+    def has_deepsearch_access(self) -> bool:
+        """The single gate tools/deepsearch_tools.py's build_deepsearch_
+        subagent._run checks, first thing, before even the usage-limit
+        check -- an ungated user's request never touches the DB usage
+        counter, never opens a Browserbase session, never spends a cent.
+        True for: DEEPSEARCH_PUBLIC_ACCESS (the v1 -> public-release
+        switch -- flip this one env var and every user everywhere gets
+        access immediately, no code change, no migration, no per-user
+        flag to set), or an admin account (is_admin), or a hand-picked
+        beta account (deepsearch_beta_access, granted with a manual
+        `UPDATE users SET deepsearch_beta_access = true WHERE phone_number
+        = ...`, same convention as is_admin). Deliberately a property here
+        (not a bare module-level check in deepsearch_tools.py) so every
+        caller -- the subagent gate, the "deepsearch isn't available yet"
+        prompt hint in _build_system_prompt -- reads the exact same
+        decision, and there's only one place this logic could ever drift."""
+        return DEEPSEARCH_PUBLIC_ACCESS or self.is_admin or self.deepsearch_beta_access
 
     @property
     def messa_email(self) -> str | None:
