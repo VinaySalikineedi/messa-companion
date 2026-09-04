@@ -1349,20 +1349,35 @@ async def _production_cron_loop() -> None:
     here at all -- see briefings.py's module docstring for why (template-
     rendered, no model call, fanned out in parallel by the separate
     _production_briefing_loop below instead of one-at-a-time in this
-    for-loop)."""
+    for-loop).
+
+    Bounded concurrency (config.CRON_MAX_CONCURRENT_JOBS, same asyncio.
+    Semaphore + asyncio.gather shape as _run_one_broadcast) instead of the
+    old one-job-at-a-time for-loop: an 'autonomous' job is a full re-invoked
+    Messa LLM turn, so at launch-scale traffic one slow model call or one
+    stuck user's job no longer holds up every other due reminder behind it
+    in the same poll tick. return_exceptions=True so one job's own
+    exception -- already caught and logged per-job below -- can never
+    cancel the rest of the batch."""
+    sem = asyncio.Semaphore(config.CRON_MAX_CONCURRENT_JOBS)
+
+    async def _run_one(job: dict[str, Any]) -> None:
+        async with sem:
+            meta = _job_meta(job)
+            mode = job.get("execution_mode") or "autonomous"
+            try:
+                if mode == "notify":
+                    await _fire_notify_routine(job, meta)
+                else:
+                    await _fire_autonomous_routine(job, meta)
+            except Exception as e:  # noqa: BLE001
+                console.system(f"[cron delivery failed] job=#{job['id']}: {e}")
+
     while True:
         try:
             due = await db.get_due_cron_jobs_for_delivery(exclude_kinds=BRIEFING_KINDS)
-            for job in due:
-                meta = _job_meta(job)
-                mode = job.get("execution_mode") or "autonomous"
-                try:
-                    if mode == "notify":
-                        await _fire_notify_routine(job, meta)
-                    else:
-                        await _fire_autonomous_routine(job, meta)
-                except Exception as e:  # noqa: BLE001
-                    console.system(f"[cron delivery failed] job=#{job['id']}: {e}")
+            if due:
+                await asyncio.gather(*(_run_one(job) for job in due), return_exceptions=True)
         except Exception as e:  # noqa: BLE001
             console.system(f"[cron poller error] {e}")
         await asyncio.sleep(background.POLL_INTERVAL_SECONDS)
@@ -1379,29 +1394,42 @@ async def _production_digest_loop() -> None:
     re-flush for the rest of that window) or once
     config.ROUTINE_DIGEST_BACKSTOP_COUNT items have piled up, whichever
     comes first, so a user with a lot of background activity isn't left
-    waiting a full day for the first result."""
+    waiting a full day for the first result.
+
+    Bounded concurrency (config.DIGEST_MAX_CONCURRENT_SENDS, same shape as
+    _run_one_broadcast/_production_cron_loop above) instead of the old
+    one-user-at-a-time for-loop -- at launch-scale traffic, everyone whose
+    digest window/backstop count trips at once (e.g. a shared local morning
+    hour) is a real batch, and one slow/failed Sendblue send should never
+    delay another user's digest behind it."""
+    sem = asyncio.Semaphore(config.DIGEST_MAX_CONCURRENT_SENDS)
+
+    async def _flush_one(row: dict[str, Any]) -> None:
+        tz_name = row.get("timezone") or config.DEFAULT_TIMEZONE
+        try:
+            local_now = datetime.now(ZoneInfo(tz_name))
+        except Exception:
+            local_now = datetime.now(timezone.utc)
+        if not _digest_due(row["pending_count"], local_now):
+            return
+        items = await db.get_pending_digest_items(row["user_id"])
+        if not items:
+            return
+        lines = [it["message_text"] for it in items]
+        intro = "While you were away:" if len(lines) > 1 else "While you were away --"
+        text = intro + "\n\n" + "\n\n".join(lines)
+        async with sem:
+            try:
+                await sendblue.send_message(row["phone_number"], text)
+                await db.clear_digest_items_for_user(row["user_id"])
+            except SendblueError as e:
+                console.system(f"[digest delivery failed] user=#{row['user_id']}: {e}")
+
     while True:
         try:
             pending = await db.get_users_with_pending_digest_items()
-            for row in pending:
-                tz_name = row.get("timezone") or config.DEFAULT_TIMEZONE
-                try:
-                    local_now = datetime.now(ZoneInfo(tz_name))
-                except Exception:
-                    local_now = datetime.now(timezone.utc)
-                if not _digest_due(row["pending_count"], local_now):
-                    continue
-                items = await db.get_pending_digest_items(row["user_id"])
-                if not items:
-                    continue
-                lines = [it["message_text"] for it in items]
-                intro = "While you were away:" if len(lines) > 1 else "While you were away --"
-                text = intro + "\n\n" + "\n\n".join(lines)
-                try:
-                    await sendblue.send_message(row["phone_number"], text)
-                    await db.clear_digest_items_for_user(row["user_id"])
-                except SendblueError as e:
-                    console.system(f"[digest delivery failed] user=#{row['user_id']}: {e}")
+            if pending:
+                await asyncio.gather(*(_flush_one(row) for row in pending), return_exceptions=True)
         except Exception as e:  # noqa: BLE001
             console.system(f"[digest poller error] {e}")
         await asyncio.sleep(background.POLL_INTERVAL_SECONDS)

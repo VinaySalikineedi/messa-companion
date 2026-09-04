@@ -213,6 +213,31 @@ _CACHED_TOOL_SPECS: list[tuple[str, str, Any]] | None = None
 
 _SESSION_REF_RE = re.compile(r"session\s*#?\s*(\d+)", re.IGNORECASE)
 
+# Process-wide cap on TOP-LEVEL deepsearch sessions (distinct from
+# BrowserToolProvider._subagent_semaphore above, which bounds sub-worker
+# tabs WITHIN one already-running session). Each top-level session spawns
+# its own @playwright/mcp Node subprocess and holds one Browserbase
+# session for the run's whole duration -- both real, per-session costs
+# that don't shrink just because the box is under load. Without a cap, a
+# burst of simultaneous "deepsearch" delegations (easy at launch-scale
+# traffic) can spawn unbounded Node subprocesses on the one box this app
+# runs on (see config.py's DEEPSEARCH_MAX_CONCURRENT_SESSIONS comment for
+# the full reasoning) and/or exceed the real Browserbase plan's concurrent-
+# session limit, which fails BOTH the request that pushed it over AND
+# whichever other concurrent session Browserbase decides to reject.
+# Created lazily (not at import time) so it's always built against
+# whatever config.DEEPSEARCH_MAX_CONCURRENT_SESSIONS is at first use --
+# matters for tests, which patch config before the module's own import-time
+# state would otherwise have frozen it in.
+_session_semaphore: asyncio.Semaphore | None = None
+
+
+def _get_session_semaphore() -> asyncio.Semaphore:
+    global _session_semaphore
+    if _session_semaphore is None:
+        _session_semaphore = asyncio.Semaphore(config.DEEPSEARCH_MAX_CONCURRENT_SESSIONS)
+    return _session_semaphore
+
 # @playwright/mcp's own snapshot refs (from browser_snapshot's output, e.g.
 # "[ref=e12]") are always exactly this "e<number>" shape -- verified
 # empirically against the real, currently-pinned package version (see
@@ -2155,6 +2180,38 @@ def build_deepsearch_subagent(
         if not limit_result.allowed:
             return {"messages": [AIMessage(content=limit_result.upgrade_message)]}
 
+        # Global concurrent-session cap (config.DEEPSEARCH_MAX_CONCURRENT_SESSIONS
+        # -- see _get_session_semaphore's own comment for why this exists at
+        # all). A BOUNDED wait, not an unbounded queue: at launch-scale
+        # traffic, a request that sits behind an indefinite backlog is worse
+        # for someone texting than a prompt "try again shortly" reply, and an
+        # unbounded queue of waiting coroutines is itself a resource leak
+        # under sustained overload. Acquired here, before the session
+        # lookup/creation below and before deepsearch_control.register --
+        # a request that can't get a slot never touches the DB for a new
+        # session row and never shows up as an "active search" the model or
+        # cancel_active_search would need to know about. Released in the
+        # `finally` alongside deepsearch_control.unregister() further down,
+        # once this run (successful, errored, timed out, or cancelled) is
+        # actually done with its Browserbase session and MCP subprocess.
+        semaphore = _get_session_semaphore()
+        try:
+            await asyncio.wait_for(
+                semaphore.acquire(), timeout=config.DEEPSEARCH_SESSION_QUEUE_WAIT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            console.system(
+                f"Deepsearch: at capacity ({config.DEEPSEARCH_MAX_CONCURRENT_SESSIONS} concurrent "
+                f"sessions) -- user #{user.user_id}'s request timed out waiting "
+                f"{config.DEEPSEARCH_SESSION_QUEUE_WAIT_SECONDS}s for a free slot."
+            )
+            return {
+                "messages": [AIMessage(content=(
+                    "Deepsearch is at capacity right now -- a lot of browsing sessions are "
+                    "running at once. Please try again in a minute or two."
+                ))]
+            }
+
         incoming = state["messages"]
         last_text = _message_text(incoming[-1]) if incoming else ""
         match = _SESSION_REF_RE.search(last_text)
@@ -2406,6 +2463,7 @@ def build_deepsearch_subagent(
             return {"messages": [AIMessage(content=header + summary)]}
         finally:
             deepsearch_control.unregister(user.user_id)
+            semaphore.release()
 
     return {
         "name": "deepsearch",

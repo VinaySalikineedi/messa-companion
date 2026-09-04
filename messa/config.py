@@ -262,17 +262,62 @@ def build_model(
         model=model_name,
         base_url="https://openrouter.ai/api/v1",
         api_key=api_key or OPENROUTER_API_KEY,
+        # Scalability fix (pre-1000-user launch): unset before this, so a
+        # hung/slow OpenRouter response could stall a user's whole turn
+        # (and the asyncio task handling their webhook) for however long
+        # the underlying httpx client's own default takes to give up --
+        # effectively unbounded from this app's point of view. This is a
+        # safety-net ceiling, not a normal-path limit: a real call
+        # finishes in single-digit seconds per the timing logs threaded
+        # through this project's own console.system lines, so timing out
+        # at LLM_REQUEST_TIMEOUT_SECONDS only ever fires on a genuinely
+        # stuck request, and just turns that into a normal caught
+        # exception (server.py's existing "something went wrong, mind
+        # trying again" fallback) instead of an indefinitely hung task
+        # quietly eating a slot every user is sharing.
+        timeout=LLM_REQUEST_TIMEOUT_SECONDS,
     )
     if effective_context_tokens is not None:
         model.profile = {"max_input_tokens": effective_context_tokens}
     return model
 
 
+# How long a single OpenRouter call is allowed to hang before this app gives
+# up on it -- see build_model's own comment for the full "why". 120s is
+# generous relative to real observed call latency (single-digit seconds
+# typically, low double digits for a heavily-loaded deepsearch planning
+# call) so this should never fire on a healthy request, only a genuinely
+# stuck one.
+LLM_REQUEST_TIMEOUT_SECONDS = int(os.environ.get("MESSA_LLM_REQUEST_TIMEOUT_SECONDS", "120"))
+
 # ---- Database ----
 # SQLAlchemy-style DSN in .env (postgresql+asyncpg://...). asyncpg wants a
 # plain postgresql:// DSN, so we strip the driver qualifier here.
 _RAW_DATABASE_URL = _require("DATABASE_URL")
 DATABASE_URL = _RAW_DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://")
+
+# Scalability fix (pre-1000-user launch): the pool used to be hardcoded at
+# min_size=1, max_size=5 in db.py -- fine for a handful of test users, a
+# real bottleneck once you have N concurrent webhook turns PLUS ~9 always-
+# on background poller loops all sharing the same 5 connections. Both ends
+# are env-configurable now (db.py's get_pool reads these) so this can be
+# tuned per deploy without a code change. 20 is a reasonable default for a
+# single-container launch -- this is still going through Neon's PgBouncer
+# pooled endpoint (see db.py's own statement_cache_size=0 comment for why
+# that matters), which multiplexes many more client-side connections than
+# this onto a much smaller number of real Postgres backend connections, so
+# raising this number is safe regardless of your actual Neon plan tier.
+DB_POOL_MIN_SIZE = int(os.environ.get("MESSA_DB_POOL_MIN_SIZE", "2"))
+DB_POOL_MAX_SIZE = int(os.environ.get("MESSA_DB_POOL_MAX_SIZE", "20"))
+# Per-query ceiling (asyncpg's own `command_timeout`, applied to every
+# query on every connection in the pool automatically -- no per-call-site
+# changes needed). Same "safety net, not a normal-path limit" reasoning as
+# LLM_REQUEST_TIMEOUT_SECONDS above: a healthy query returns in
+# milliseconds, so this only ever fires on something genuinely stuck
+# (Neon blip, a lock some other transaction is holding), turning an
+# indefinite hang into a normal caught exception instead of a connection
+# (and whoever's waiting on it) stuck forever.
+DB_COMMAND_TIMEOUT_SECONDS = int(os.environ.get("MESSA_DB_COMMAND_TIMEOUT_SECONDS", "30"))
 
 # ---- Composio (email agent) ----
 COMPOSIO_API_KEY = os.environ.get("COMPOSIO_API_KEY")  # optional until Phase 2 wiring
@@ -881,6 +926,47 @@ DEEPSEARCH_HUMAN_HELP_POLL_INTERVAL_SECONDS = int(
 # genuine multi-step research work around it.
 DEEPSEARCH_MAX_SESSION_SECONDS = int(os.environ.get("MESSA_DEEPSEARCH_MAX_SESSION_SECONDS", "1200"))
 
+# Scalability fix (pre-1000-user launch): a hard, process-wide cap on how
+# many TOP-LEVEL deepsearch sessions can be running at once, across every
+# user sharing this one container. Before this, there was no such
+# ceiling -- DEEPSEARCH_MAX_SUBAGENTS just below only bounds sub-worker
+# tabs WITHIN one already-running session. Each top-level session spawns a
+# real `npx @playwright/mcp` Node child process plus a Browserbase
+# session, so with no cap, a burst of concurrent deepsearch requests
+# (plausible the moment you have hundreds of real users) could spawn one
+# Node process per request, exhausting the container's CPU/RAM/file
+# descriptors, or blow past whatever your Browserbase plan's own
+# concurrent-session limit is (session creation would just start failing
+# from there). Enforced by a single process-wide asyncio.Semaphore in
+# tools/deepsearch_tools.py, acquired before anything expensive happens
+# (before the Browserbase session, before the Node subprocess) and
+# released once the run fully ends. Default of 20 leaves headroom under
+# the real, confirmed ceiling for your current Browserbase plan (Developer,
+# $20/mo: 25 concurrent browsers -- this must never be set >= that number,
+# or session creation starts failing instead of queueing cleanly once
+# you're actually at capacity). Raise this to ~80-90 if/when you upgrade to
+# the Startup plan ($99/mo, 100 concurrent browsers) -- see README's
+# "Scaling" section. Note this isn't the only Browserbase ceiling that
+# matters at launch: the Developer plan also only includes 100 browser-
+# HOURS/month ($0.12/hr overage beyond that) -- at DEEPSEARCH_MAX_SESSION_
+# SECONDS's own 20-minute cap per session, that's roughly 300 sessions/
+# month total across every user before overage kicks in, which a 100-user
+# launch can plausibly reach well before hitting the concurrency cap.
+# Watch Browserbase's own usage dashboard for browser-hours, not just
+# concurrent-session count.
+DEEPSEARCH_MAX_CONCURRENT_SESSIONS = int(
+    os.environ.get("MESSA_DEEPSEARCH_MAX_CONCURRENT_SESSIONS", "20")
+)
+# How long a request waits for a free slot (queued behind the cap above)
+# before giving up and telling the user we're at capacity, rather than
+# leaving them (and their asyncio task) hanging indefinitely behind a long
+# queue. Deliberately short relative to how long a user will patiently
+# wait for a text back -- past this, "try again in a bit" is a better
+# experience than silence.
+DEEPSEARCH_SESSION_QUEUE_WAIT_SECONDS = int(
+    os.environ.get("MESSA_DEEPSEARCH_SESSION_QUEUE_WAIT_SECONDS", "45")
+)
+
 # Multi-site delegation (delegate_website_task, tools/deepsearch_tools.py):
 # how many sub-worker tabs can be running concurrently at once, across
 # however many delegate_website_task calls the model makes in one turn.
@@ -1094,6 +1180,23 @@ NEW_USER_CAP = int(os.environ.get("MESSA_NEW_USER_CAP", "0"))
 # shouldn't fire thousands of concurrent HTTP requests at Sendblue's API at
 # once.
 BROADCAST_MAX_CONCURRENT_SENDS = int(os.environ.get("MESSA_BROADCAST_MAX_CONCURRENT_SENDS", "20"))
+
+# ---- Production poll loop concurrency (server.py) ----
+# _production_cron_loop and _production_digest_loop used to process their
+# whole due batch one job/user at a time in a plain `for` loop -- fine at a
+# handful of users, but at launch-scale traffic (1000+ users, a shared
+# 5-minute-ish poll cadence) a batch can contain many due jobs at once, and
+# an "autonomous" cron job is a FULL re-invoked Messa LLM turn -- one slow
+# model call or one user's stuck job would otherwise hold up everyone else's
+# reminder behind it in the same poll tick. Bounded concurrency here mirrors
+# _run_one_broadcast's existing asyncio.Semaphore + asyncio.gather shape
+# (BROADCAST_MAX_CONCURRENT_SENDS above) rather than introducing a new
+# pattern. Kept well below DEEPSEARCH_MAX_CONCURRENT_SESSIONS's concern
+# (these are LLM calls, not new Browserbase sessions/Node subprocesses) but
+# still bounded, since unbounded fan-out of LLM turns is its own way to
+# saturate the box (CPU, memory, and OpenRouter rate limits all at once).
+CRON_MAX_CONCURRENT_JOBS = int(os.environ.get("MESSA_CRON_MAX_CONCURRENT_JOBS", "10"))
+DIGEST_MAX_CONCURRENT_SENDS = int(os.environ.get("MESSA_DIGEST_MAX_CONCURRENT_SENDS", "20"))
 
 
 @dataclass

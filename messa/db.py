@@ -45,8 +45,22 @@ async def get_pool() -> asyncpg.Pool:
         # again, which matters a lot here since this project's whole
         # migration philosophy is additive ALTER TABLEs run against the
         # live database while the app keeps running.
+        # Pool size and command_timeout are configurable (MESSA_DB_POOL_MIN_SIZE
+        # / MESSA_DB_POOL_MAX_SIZE / MESSA_DB_COMMAND_TIMEOUT_SECONDS, see
+        # config.py) rather than hardcoded -- launch-scale traffic needs more
+        # headroom than the original min=1/max=5 gave us, and PgBouncer's
+        # transaction pooling in front of this (see the statement_cache_size
+        # comment above) means a bigger asyncpg-side pool multiplexes safely
+        # onto Neon's actual backend connections instead of each of these 20
+        # holding open its own dedicated Postgres backend. command_timeout
+        # guards against a single slow/stuck query holding a pool connection
+        # (and therefore a request) open indefinitely under load.
         _pool = await asyncpg.create_pool(
-            config.DATABASE_URL, min_size=1, max_size=5, statement_cache_size=0,
+            config.DATABASE_URL,
+            min_size=config.DB_POOL_MIN_SIZE,
+            max_size=config.DB_POOL_MAX_SIZE,
+            statement_cache_size=0,
+            command_timeout=config.DB_COMMAND_TIMEOUT_SECONDS,
         )
         async with _pool.acquire() as conn:
             try:
