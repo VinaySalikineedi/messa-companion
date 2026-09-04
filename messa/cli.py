@@ -36,7 +36,7 @@ _STALL_PATTERN = re.compile(
 )
 
 
-async def _context_from_row(user_row: dict, channel: str) -> config.UserContext:
+async def _context_from_row(user_row: dict, channel: str, message_handle: str | None = None) -> config.UserContext:
     """Shared tail end of both load_user_context (below) and
     load_user_context_by_id: everything from here on only needs the user's
     row, not how it was looked up (phone number vs a bare id) -- see each
@@ -85,11 +85,15 @@ async def _context_from_row(user_row: dict, channel: str) -> config.UserContext:
         is_admin=bool(user_row.get("is_admin", False)),
         deepsearch_beta_access=bool(user_row.get("deepsearch_beta_access", False)),
         memory_profile=user_row.get("memory_profile"),
+        message_handle=message_handle,
     )
 
 
 async def load_user_context(
-    phone_number: str, name: str | None = None, channel: str = "cli"
+    phone_number: str,
+    name: str | None = None,
+    channel: str = "cli",
+    message_handle: str | None = None,
 ) -> config.UserContext:
     """(Re)reads the user row from the DB. Called at startup and again before
     every turn, so onboarding fields saved mid-conversation (see
@@ -102,7 +106,7 @@ async def load_user_context(
     server (real inbound phone_number, one per sender) -- see run_message
     below for the rest of what the server reuses from here."""
     user_row = await db.get_or_create_user(phone_number, name, config.DEFAULT_TIMEZONE)
-    return await _context_from_row(user_row, channel)
+    return await _context_from_row(user_row, channel, message_handle=message_handle)
 
 
 async def load_user_context_by_id(user_id: int, channel: str = "sms") -> config.UserContext | None:

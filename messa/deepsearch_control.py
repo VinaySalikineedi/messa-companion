@@ -86,6 +86,14 @@ def is_active(user_id: int) -> bool:
     return any(not t.done() for t in tasks)
 
 
+def active_count(user_id: int) -> int:
+    """Returns the number of in-flight active asyncio tasks for this user."""
+    tasks = _active_tasks.get(user_id)
+    if not tasks:
+        return 0
+    return sum(1 for t in tasks if not t.done())
+
+
 def describe(user_id: int) -> str | None:
     """The title/description to show the model for its "should I cancel
     this" judgment call, or None if nothing is running."""

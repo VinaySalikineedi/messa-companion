@@ -50,6 +50,7 @@ below strips them once, globally, for every agent built on our model.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from deepagents import GeneralPurposeSubagentProfile, HarnessProfile, create_deep_agent, register_harness_profile
@@ -60,7 +61,7 @@ from ..approval import ApprovalGate, CLIApprovalGate
 from ..channels import sendblue
 from ..channels.sendblue import SendblueError
 from ..tools.admin_tools import ADMIN_SYSTEM_PROMPT, build_admin_tools
-from ..tools.deepsearch_tools import build_deepsearch_subagent, purge_warm_sessions_for_user
+from ..tools.deepsearch_tools import build_deepsearch_subagent, count_warm_sessions_for_user, purge_warm_sessions_for_user
 from ..tools.common import trace_all
 from ..tools.document_tools import DOCUMENT_SYSTEM_PROMPT, build_document_tools
 from ..tools.email_tools import build_email_subagent
@@ -338,8 +339,8 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
         don't already have -- e.g. "what was that restaurant I mentioned
         last month", "did I ever tell you my sister's birthday". Don't call
         this reflexively on every message; it's a real lookup, not a cheap
-        one, so use it like the other backup-tier tools (web_search,
-        parallel_web_search): only when you actually need it.
+        one, so use it like the other lookup tools (search_web): only when you
+        actually need it.
 
         This is separate from the profile digest by design -- see README's
         "Memory" section: the digest is small, always-on, and free every
@@ -385,18 +386,131 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
 
         details = []
         if tasks_cancelled:
-            details.append("stopped in-flight search task")
+            details.append("stopped in-flight active background task")
         if warm_sessions_purged:
             details.append(f"closed {len(warm_sessions_purged)} warm browser session(s)")
         if db_cancelled_count:
-            details.append(f"cancelled {db_cancelled_count} active database session(s)")
+            details.append(f"marked {db_cancelled_count} inactive historical session record(s) as closed in database")
 
-        return f"Cancelled all browsing activity ({', '.join(details)}). The browser is fully closed and no further actions will run."
+        summary = "Stopped active task." if (tasks_cancelled or warm_sessions_purged) else "No tasks were running in memory."
+        return f"{summary} ({', '.join(details)}). The browser is fully closed and no background actions are running."
+
+    @tool
+    async def get_system_status() -> str:
+        """Get authoritative, real-time ground truth on the system state for this user:
+        how many background tasks are running in memory, how many warm browser sessions
+        exist, what the last browsing session was and when it ended, and any pending OTPs.
+        CALL THIS FIRST whenever the user asks 'is something running', 'who is doing this',
+        'why am I getting codes', or tells you to 'stop'.
+        CRITICAL: If active background tasks is 0, NEVER claim, speculate, or apologize
+        that a task is running or looping. State the ground truth clearly."""
+        in_flight = deepsearch_control.active_count(uid)
+        warm_count = count_warm_sessions_for_user(uid)
+        last_session = await db.get_latest_deepsearch_session(uid)
+        pending_otps = await db.list_active_otp_expectations(uid)
+
+        lines = [
+            f"Active background tasks in memory: {in_flight}",
+            f"Warm browser sessions in memory: {warm_count}",
+        ]
+        if last_session:
+            updated_str = str(last_session.get("updated_at") or "")[:19]
+            lines.append(
+                f"Most recent browsing session: #{last_session['id']} "
+                f"[status: {last_session['status']}, steps: {last_session['steps_used']}, last updated: {updated_str} UTC]"
+            )
+            if last_session.get("summary"):
+                lines.append(f"  Summary: {last_session['summary'][:160]}")
+        else:
+            lines.append("Most recent browsing session: None")
+
+        if pending_otps:
+            otp_descs = [f"#{o['id']} (filter: {o.get('sender_filter') or 'any'})" for o in pending_otps]
+            lines.append(f"Pending verification code expectations: {', '.join(otp_descs)}")
+        else:
+            lines.append("Pending verification code expectations: None")
+
+        state = "ACTIVE (tasks currently running)" if (in_flight or warm_count) else "IDLE (zero tasks running, browser closed)"
+        lines.append(f"Authoritative State: {state}")
+        return "\n".join(lines)
+
+    @tool
+    async def get_session_details(session_id: int) -> str:
+        """Inspect the detailed history of a specific past browsing session by its ID #.
+        Returns the session's title, final status, total steps used, creation and update
+        timestamps, live view URL, and final outcome summary so you can explain what
+        actually happened without guessing or hallucinating."""
+        row = await db.get_deepsearch_session(uid, session_id)
+        if not row:
+            return f"No browsing session #{session_id} found for this user."
+        created_str = str(row.get("created_at") or "")[:19]
+        updated_str = str(row.get("updated_at") or "")[:19]
+        return (
+            f"Browsing Session #{row['id']} Details:\n"
+            f"- Status: {row['status']}\n"
+            f"- Title: {row['title']}\n"
+            f"- Steps executed: {row['steps_used']}\n"
+            f"- Created: {created_str} UTC\n"
+            f"- Last Updated: {updated_str} UTC\n"
+            f"- Live View: {row.get('live_view_url') or 'None'}\n"
+            f"- Outcome Summary: {row.get('summary') or 'None'}"
+        )
+
+    @tool
+    async def get_recent_message_activity() -> str:
+        """Check when you (Messa) last sent an outgoing text to this user and what you said.
+        Use this before sending autonomous or scheduled routine remarks, or secondary alerts,
+        to ensure you are not spamming or repeating messages sent just moments ago."""
+        msgs = await db.get_recent_assistant_messages(uid, limit=3)
+        if not msgs:
+            return "No recent outgoing assistant messages found."
+        now = datetime.now(timezone.utc)
+        lines = ["Recent outgoing messages to user:"]
+        for i, m in enumerate(msgs):
+            ts = m["timestamp"]
+            diff_sec = int((now - ts).total_seconds()) if ts else 0
+            time_desc = f"{diff_sec}s ago" if diff_sec < 120 else f"{diff_sec // 60}m ago"
+            channel = m.get("channel") or "sms"
+            preview = (m.get("content") or "").replace("\n", " ")[:100]
+            lines.append(f"  {i+1}. [{time_desc} via {channel}]: \"{preview}...\"")
+        last_diff = int((now - msgs[0]["timestamp"]).total_seconds()) if msgs[0]["timestamp"] else 999
+        if last_diff < 120:
+            lines.append(f"NOTICE: You sent a message {last_diff} seconds ago. If this current turn is a background check or non-urgent routine update, do NOT send another message unless the user explicitly asked for one.")
+        return "\n".join(lines)
+
+    @tool
+    async def react_to_message(reaction: str) -> str:
+        """Send an Apple iMessage tapback reaction to the user's latest incoming text.
+        `reaction` can be: 'like' (thumbs up), 'love' (heart), 'dislike' (thumbs down),
+        'laugh' (ha ha), 'emphasize' (!!), 'question' (?), or a single emoji like '👍' or '❤️'.
+        Use this for quick, natural acknowledgments ('thumbs up') instead of sending a full text bubble."""
+        if not user.message_handle:
+            return "Tapback reactions are only supported on incoming iMessage threads, not SMS or CLI."
+        try:
+            await sendblue.send_reaction(user.phone_number, user.message_handle, reaction)
+            return f"Reacted with '{reaction}' to user's message."
+        except SendblueError as e:
+            return f"Could not send reaction: {e}"
+
+    @tool
+    async def send_styled_message(content: str, effect: str) -> str:
+        """Send a message to the user with an Apple iMessage visual effect.
+        `effect` can be: 'confetti', 'celebration', 'fireworks', 'shooting_star',
+        'lasers', 'love', 'balloons', 'spotlight', 'echo', 'gentle', 'loud', 'slam'.
+        Use 'confetti' or 'celebration' when completing a big goal or congratulating the user,
+        or 'gentle' for quiet late-evening check-ins."""
+        try:
+            await sendblue.send_message(user.phone_number, content, send_style=effect)
+            return f"Delivered message with Apple effect '{effect}'."
+        except SendblueError as e:
+            return f"Could not deliver styled message: {e}"
 
     raw_tools: list[BaseTool] = [
         confirm_pending_action, reject_pending_action, list_pending_actions,
         track_project, list_active_projects, save_profile_info,
         set_app_preference, list_my_connected_apps,
+        get_system_status, get_session_details, get_recent_message_activity,
+        react_to_message, send_styled_message,
         list_deepsearch_sessions, find_contact, send_pdf_over_text,
         recall_past_conversation, cancel_active_search,
         *build_web_search_tools(),
@@ -645,6 +759,14 @@ def _build_system_prompt(
             "just a progress check, or genuinely unrelated (could just as well run after this "
             "one finishes), leave it running -- don't cancel on a guess."
         )
+    else:
+        active_search_str = (
+            "\n\nSystem Ground Truth: There is NO background task currently running for this user right now. "
+            "If the user asks 'is something running', 'why did you do X', 'why am I getting codes', or says 'stop', "
+            "call get_system_status or get_session_details to inspect the real facts. "
+            "NEVER claim, hallucinate, or apologize that a task is currently running, looping, or resending codes when none is active. "
+            "If cancel_active_search was called and closed historical sessions, tell the user that no task was actively running and the browser is closed."
+        )
 
     return (
         "You are Messa, a personal assistant reachable by text, email, and (soon) WhatsApp. "
@@ -724,40 +846,32 @@ def _build_system_prompt(
         "one match, ask which one before sending anything; if it finds none (or finds the "
         "contact but not the info you actually need), ask the user directly rather than "
         "guessing or inventing an address/number.\n\n"
-        "Speed AND cost matter: you have web_search, parallel_web_search, wikipedia_lookup, "
-        "fetch_page_text, fetch_rendered_page_text, and parallel_web_fetch as your OWN direct "
-        "tools (no delegation, no browser session, answers in a second or a few) -- use them for "
-        "a plain factual lookup (a fact, news, a definition, 'who is X', an encyclopedia-shaped "
-        "question) OR a read-only check (\"does this page say X yet\", \"has this gone on sale\", "
-        "\"what does this listing show right now\") instead of delegating to deepsearch. This "
-        "matters for real money, not just speed: deepsearch opens an actual Browserbase browser "
-        "session that's billed by TIME HELD OPEN, regardless of how simple the underlying "
-        "question was -- never delegate to it for something these six tools can answer. This "
-        "applies just as much when you're running because an autonomous routine just fired (a "
-        "recurring 'check on X' watcher) as it does in a live conversation -- a routine that "
-        "re-checks a page every few minutes should almost never open a fresh browser session to "
-        "do it.\n"
-        "  - wikipedia_lookup first for anything that's likely to have its own Wikipedia "
-        "article (a person, place, company, historical event, concept) -- faster and more "
-        "reliable than web_search for that shape of question.\n"
-        "  - web_search for a plain factual lookup; parallel_web_search is a second, independent "
-        "search provider -- try it if web_search comes back empty/errors, or for a second "
-        "opinion, not as your default first choice.\n"
-        "  - fetch_page_text for a page you already have a link to; it does no JS at all.\n"
-        "  - fetch_rendered_page_text on the SAME url next if fetch_page_text came back empty, "
-        "tiny, or loading-shell-only -- most modern ticket/booking sites need real JS rendering "
-        "to show their actual content. parallel_web_fetch is a second, independent provider for "
-        "this exact same job -- try it if fetch_rendered_page_text also fails. Neither costs any "
-        "Browserbase session time (both run on a separate reader service), just slightly more "
-        "latency than a plain fetch -- still a second or few, not remotely close to what a real "
-        "browser session takes.\n"
-        "  - Only once ALL of the above genuinely can't answer it (or the task needs actual "
-        "interaction: a flow, a form, a login, a cart, clicking 'buy') should you delegate to "
-        "deepsearch. For a task that mixes both -- comparing a few options and then acting on "
-        "one of them -- do the comparing with fetch_rendered_page_text/parallel_web_fetch across "
-        "every candidate first, THEN delegate to deepsearch with a description that already says "
-        "exactly which page/option to act on, so it doesn't spend paid session time "
-        "re-discovering what you already found.\n\n"
+        "Speed AND cost matter: you have search_web and read_webpage as your OWN direct "
+        "tools (no delegation, no browser session, answers in under a second) -- use them for "
+        "a plain factual lookup (a fact, news, a definition, 'who is X', web query) OR a read-only check "
+        "(\"does this page say X yet\", \"has this gone on sale\", \"what does this listing show right now\") "
+        "instead of delegating to deepsearch. This matters for real money, not just speed: deepsearch opens "
+        "an actual Browserbase browser session that's billed by TIME HELD OPEN, regardless of how simple the "
+        "underlying question was -- never delegate to it for something search_web or read_webpage can answer. "
+        "Both search_web and read_webpage use fast multi-provider waterfalls (Tavily, Brave, Jina Reader, "
+        "Firecrawl Cloud, Parallel Search, DuckDuckGo) that execute server-side and cost ZERO browser session time.\n"
+        "  - search_web(query) for looking up facts, URLs, recent news, or general web answers.\n"
+        "  - read_webpage(url) for reading the rendered content of any specific page or link.\n"
+        "  - Only when a task needs ACTUAL browser interaction (a multi-step flow, filling a form, logging in, "
+        "adding to cart, or clicking buttons) should you delegate to deepsearch. For tasks that mix both, do the "
+        "research with search_web and read_webpage first, THEN delegate to deepsearch with the exact target page.\n\n"
+        "Apple iMessage features and reactions:\n"
+        "  - react_to_message(reaction): send a quick tapback reaction ('like' / 👍, 'love' / ❤️, 'laugh', etc.) "
+        "to acknowledge a message naturally without sending an unnecessary text bubble.\n"
+        "  - send_styled_message(content, effect): send an iMessage with full-screen Apple effects like 'confetti', "
+        "'celebration', 'fireworks', 'balloons', or bubble effects like 'gentle', 'loud', 'slam'. Use 'confetti' or "
+        "'celebration' for congratulating the user or completing a milestone, and 'gentle' for quiet late check-ins.\n\n"
+        "System state and anti-spam:\n"
+        "  - get_system_status(): returns authoritative real-time counts of active tasks, warm browser sessions, "
+        "the latest browsing session, and pending OTPs. Always trust this over memory or assumptions.\n"
+        "  - get_session_details(session_id): look up the exact status and outcome of any browsing session.\n"
+        "  - get_recent_message_activity(): checks when you last texted the user. If running in an autonomous routine "
+        "or secondary check and a message was sent under 2 minutes ago, refrain from sending duplicate/spam texts.\n\n"
         "Other apps and platforms (Reddit, Todoist, Slack, Notion, GitHub, Google Calendar, "
         "and everything else outside your other subagents -- never email, that always goes "
         "to email_agent/personal_inbox_agent): delegate to integrations_agent FIRST, before "

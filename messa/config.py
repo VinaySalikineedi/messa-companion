@@ -1341,6 +1341,9 @@ class UserContext:
     # _build_system_prompt omits it entirely in that case, same "absent
     # field, not a placeholder" pattern as city/email above.
     memory_profile: str | None = None
+    # For inbound iMessage turns via Sendblue, the handle of the incoming message bubble.
+    # Allows Messa to send tapback reactions directly to this message.
+    message_handle: str | None = None
 
     @property
     def onboarding_complete(self) -> bool:

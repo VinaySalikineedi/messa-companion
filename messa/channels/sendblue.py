@@ -58,8 +58,17 @@ async def _post(endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
         return {}
 
 
-async def send_message(number: str, content: str, *, media_url: str | None = None) -> dict[str, Any]:
-    """Send a reply. `number` is the recipient in E.164 format."""
+async def send_message(
+    number: str,
+    content: str,
+    *,
+    media_url: str | None = None,
+    send_style: str | None = None,
+) -> dict[str, Any]:
+    """Send a reply. `number` is the recipient in E.164 format.
+    `send_style` applies an Apple iMessage effect (e.g. 'confetti', 'celebration',
+    'fireworks', 'lasers', 'love', 'balloons', 'spotlight', 'echo', 'invisible',
+    'gentle', 'loud', 'slam'). Best-effort -- Sendblue falls back gracefully on SMS."""
     payload: dict[str, Any] = {
         "number": number,
         "from_number": config.SENDBLUE_NUMBER,
@@ -67,7 +76,28 @@ async def send_message(number: str, content: str, *, media_url: str | None = Non
     }
     if media_url:
         payload["media_url"] = media_url
+    if send_style:
+        payload["send_style"] = send_style.strip().lower()
     return await _post("send-message", payload)
+
+
+async def send_reaction(
+    number: str,
+    message_handle: str,
+    reaction: str,
+) -> dict[str, Any]:
+    """Send a tapback reaction to an incoming message (iMessage only).
+    `reaction` can be: 'love', 'like', 'dislike', 'laugh', 'emphasize', 'question',
+    or a single emoji (e.g. '👍', '❤️', '🔥')."""
+    return await _post(
+        "send-reaction",
+        {
+            "from_number": config.SENDBLUE_NUMBER,
+            "number": number,
+            "message_handle": message_handle,
+            "reaction": reaction.strip(),
+        },
+    )
 
 
 async def send_typing_indicator(number: str) -> dict[str, Any]:
@@ -80,3 +110,4 @@ async def send_typing_indicator(number: str) -> dict[str, Any]:
 async def mark_read(number: str) -> dict[str, Any]:
     """Send a read receipt for the inbound message just processed."""
     return await _post("mark-read", {"number": number, "from_number": config.SENDBLUE_NUMBER})
+

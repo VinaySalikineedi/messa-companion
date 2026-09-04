@@ -1906,6 +1906,64 @@ async def cancel_all_active_deepsearch_sessions(user_id: int) -> int:
         return count
 
 
+async def get_latest_deepsearch_session(user_id: int) -> dict[str, Any] | None:
+    """Returns the most recent deepsearch session row for this user, or None."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "deepsearch_sessions"):
+            return None
+        row = await conn.fetchrow(
+            """
+            SELECT id, title, status, steps_used, created_at, updated_at, summary, live_view_url
+            FROM deepsearch_sessions
+            WHERE user_id = $1
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            user_id,
+        )
+        return dict(row) if row else None
+
+
+async def list_active_otp_expectations(user_id: int) -> list[dict[str, Any]]:
+    """Lists any OTP expectation rows actively pending for this user."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "deepsearch_otp_expectations"):
+            return []
+        rows = await conn.fetch(
+            """
+            SELECT id, sender_filter, created_at
+            FROM deepsearch_otp_expectations
+            WHERE user_id = $1 AND status = 'pending'
+            ORDER BY created_at DESC
+            """,
+            user_id,
+        )
+        return _rows(rows)
+
+
+async def get_recent_assistant_messages(user_id: int, limit: int = 3) -> list[dict[str, Any]]:
+    """Returns the user's most recent outgoing assistant messages with timestamps."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "message_history"):
+            return []
+        rows = await conn.fetch(
+            """
+            SELECT id, role, content, timestamp, channel
+            FROM message_history
+            WHERE user_id = $1 AND role = 'assistant'
+            ORDER BY timestamp DESC
+            LIMIT $2
+            """,
+            user_id,
+            limit,
+        )
+        return _rows(rows)
+
+
+
 # ---------------------------------------------------------------------------
 # Human-in-the-loop pause (deepsearch hit a login wall/CAPTCHA/2FA and is
 # waiting on you) -- see migrations/008_deepsearch_human_help.sql and

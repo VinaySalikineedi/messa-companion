@@ -762,8 +762,9 @@ async def sendblue_webhook(
 
     service = (payload.get("service") or "sms").strip().lower()
     channel = _CHANNEL_BY_SERVICE.get(service, "sms")
+    message_handle = (payload.get("message_handle") or payload.get("handle") or "").strip() or None
 
-    background_tasks.add_task(_process_inbound, from_number, content, channel, media_url)
+    background_tasks.add_task(_process_inbound, from_number, content, channel, media_url, message_handle)
     return JSONResponse({"status": "accepted"})
 
 
@@ -842,7 +843,13 @@ def _sms_send_factory(from_number: str):
     return _send
 
 
-async def _process_inbound(from_number: str, content: str, channel: str, media_url: str | None = None) -> None:
+async def _process_inbound(
+    from_number: str,
+    content: str,
+    channel: str,
+    media_url: str | None = None,
+    message_handle: str | None = None,
+) -> None:
     # New-user cap gate (messa/waitlist.py) -- checked before ANY other work
     # on a message that might be from a brand-new phone number, so a
     # waitlisted text costs no PDF download, no typing indicator, no agent
@@ -878,7 +885,7 @@ async def _process_inbound(from_number: str, content: str, channel: str, media_u
     _send = _sms_send_factory(from_number)
 
     try:
-        user = await cli.load_user_context(from_number, name=None, channel=channel)
+        user = await cli.load_user_context(from_number, name=None, channel=channel, message_handle=message_handle)
         agent = await build_orchestrator(user, _approval_gate())
         await cli.run_message(user, agent, effective_content, send=_send)
     except Exception as e:  # noqa: BLE001 - a webhook background task must never raise unseen

@@ -223,6 +223,14 @@ async def purge_warm_sessions_for_user(user_id: int) -> list[int]:
     return purged
 
 
+def count_warm_sessions_for_user(user_id: int) -> int:
+    """Returns the count of active warm, in-memory browser sessions held for this user."""
+    return sum(
+        1 for sid, prov in _WARM_SESSION_PROVIDERS.items()
+        if getattr(prov, "_user_id", None) == user_id
+    )
+
+
 _DEAD_SESSION_ERROR_MARKERS = ("410", "session not running")
 
 

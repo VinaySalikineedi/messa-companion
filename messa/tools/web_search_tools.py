@@ -170,115 +170,25 @@ async def _wikipedia_resolve_title(client: httpx.AsyncClient, query: str) -> str
 
 def build_web_search_tools() -> list[BaseTool]:
     @tool
-    async def web_search(query: str, max_results: int = 5) -> str:
-        """Quick, no-browser web search for a factual lookup -- a fact, current
-        news, a definition, a simple 'what is X' / 'who is X' / 'what's the
-        latest on X' question. Powered by a multi-provider waterfall (Tavily,
-        Brave, Serper, Parallel, DuckDuckGo) for high reliability and instant
-        answers. Returns short titles/snippets/URLs and direct answers --
-        follow up with fetch_page_text or fetch_rendered_page_text on a specific
-        URL from the results if you need more detail. NOT for anything that
-        requires clicking through a site, logging in, filling out a form, or
-        adding something to a cart -- delegate those to deepsearch instead."""
+    async def search_web(query: str, max_results: int = 5) -> str:
+        """Search the web instantly without opening a browser or using session time.
+        Powered by a fast multi-provider search engine (Tavily, Brave, Serper, Parallel, DuckDuckGo).
+        Use this for looking up facts, finding URLs, researching options, or getting background info.
+        Returns titles, URLs, snippets, and direct answers in <1 second."""
         return await _unified_web_search(query, max_results=max_results)
 
     @tool
-    async def parallel_web_search(objective: str, search_queries: Optional[list[str]] = None) -> str:
-        """A second, independent web search provider (Parallel Search MCP --
-        free, no API key), purpose-built for AI agents rather than a browser
-        UI. Try this if web_search comes back empty, errors out, or you just
-        want a second opinion on results -- it's not a replacement for
-        web_search, it's a backup at the same free/no-browser tier. `objective`
-        is a plain-English description of what you're trying to find out;
-        `search_queries` (optional) lets you pass one or more specific search
-        strings instead of leaving query formulation to Parallel. Like
-        web_search, this can't interact with a page at all -- only read
-        search results; delegate to deepsearch for anything needing a click,
-        login, form, or cart."""
-        return await _parallel_web_search(objective, search_queries)
-
-    @tool
-    async def fetch_page_text(url: str, max_chars: int = DEFAULT_MAX_FETCH_CHARS) -> str:
-        """Fetch a URL and return its readable text content -- fast, free, and
-        costs no Browserbase session time, for reading an article or page you
-        already have a link to (e.g. from web_search's results). This does NOT
-        run JavaScript and can't click/scroll/log in -- it just reads whatever
-        HTML the server returns as-is. If the returned text looks empty, tiny,
-        or like a bare loading shell, the page is probably JS-rendered --
-        try fetch_rendered_page_text on the SAME url next, which runs the page's
-        JS server-side (still no browser session of ours) before falling back
-        to deepsearch. Go straight to deepsearch instead of either fetch tool
-        only when the task needs real interaction: a login, a form, a cart,
-        clicking through a flow -- not just reading a page's current content."""
-        try:
-            async with httpx.AsyncClient(timeout=FETCH_TIMEOUT_SECONDS, follow_redirects=True) as client:
-                resp = await client.get(url, headers={"User-Agent": _USER_AGENT})
-            resp.raise_for_status()
-        except Exception as e:  # noqa: BLE001
-            return (
-                f"ERROR fetching {url}: {e}. Try fetch_rendered_page_text on the same url next "
-                "(handles JS-rendered pages); delegate to deepsearch only if this needs real "
-                "interaction (a login wall, a form, clicking through a flow)."
-            )
-        return extract_readable_text(resp.text, max_chars)
-
-    @tool
-    async def fetch_rendered_page_text(url: str, max_chars: int = DEFAULT_MAX_FETCH_CHARS) -> str:
-        """Fetch a URL's content AFTER letting its JavaScript run, and return
-        readable text -- powered by a multi-provider scrape waterfall (Jina Reader,
-        Firecrawl Cloud, Parallel Fetch) with zero Browserbase session overhead.
-        For pages that need JS to render (most modern sites). Still read-only:
-        it can't click, type, scroll, or log in. If this ALSO comes back
-        empty/unhelpful, or the task genuinely needs to interact with the page
-        (buy, submit, log in), delegate to deepsearch instead."""
+    async def read_webpage(url: str, max_chars: int = DEFAULT_MAX_FETCH_CHARS) -> str:
+        """Read a web page's rendered text content instantly WITHOUT opening a browser.
+        Powered by a remote reader waterfall (Jina Reader, Firecrawl Cloud, Parallel Fetch, HTTP)
+        that executes JavaScript server-side. Costs ZERO browser session time. Use this to read
+        articles, compare options, or inspect content on candidate URLs."""
         return await _unified_web_read(url, max_chars=max_chars)
 
-    @tool
-    async def parallel_web_fetch(url: str) -> str:
-        """A second, independent provider (Parallel Search MCP -- free, no
-        API key) for the SAME job as fetch_rendered_page_text: a JS-rendered
-        page read that costs no Browserbase session time. Try this if
-        fetch_rendered_page_text comes back empty or errors out on a page
-        you genuinely need to read -- also handles PDFs. Still read-only --
-        can't click, type, scroll, or log in. If this ALSO fails, or the
-        task needs real interaction, delegate to deepsearch."""
-        return await _parallel_web_fetch(url)
+    # Legacy aliases for backward compatibility if called directly
+    web_search = search_web
+    fetch_rendered_page_text = read_webpage
 
-    @tool
-    async def wikipedia_lookup(topic: str) -> str:
-        """Free, instant lookup of a Wikipedia article's summary -- for a
-        person, place, thing, event, or concept likely to have its own
-        Wikipedia page (a public figure, a company, a historical event, a
-        scientific concept, a country/city). Faster and more reliable than
-        web_search for this specific shape of question, since it goes
-        straight to the actual article instead of guessing from search
-        snippets -- try this FIRST for anything encyclopedia-shaped. NOT for
-        anything current/time-sensitive (today's score, this week's news,
-        live prices, today's showtimes) -- Wikipedia articles lag real-time
-        events; use web_search for those instead. If the topic name is
-        ambiguous (matches more than one thing), says so instead of
-        guessing -- ask the user which one they meant."""
-        try:
-            async with httpx.AsyncClient(timeout=WIKIPEDIA_TIMEOUT_SECONDS, follow_redirects=True) as client:
-                resp = await client.get(
-                    f"{WIKIPEDIA_API_BASE}/api/rest_v1/page/summary/{quote(topic)}",
-                    headers={"User-Agent": _USER_AGENT},
-                )
-                if resp.status_code == 404:
-                    resolved = await _wikipedia_resolve_title(client, topic)
-                    if not resolved:
-                        return f"No Wikipedia article found for \"{topic}\". Try web_search instead."
-                    resp = await client.get(
-                        f"{WIKIPEDIA_API_BASE}/api/rest_v1/page/summary/{quote(resolved)}",
-                        headers={"User-Agent": _USER_AGENT},
-                    )
-                resp.raise_for_status()
-        except Exception as e:  # noqa: BLE001
-            return f"ERROR looking up \"{topic}\" on Wikipedia: {e}. Try web_search instead."
-        return _format_wikipedia_summary(resp.json())
-
-    raw_tools: list[BaseTool] = [
-        web_search, parallel_web_search, fetch_page_text, fetch_rendered_page_text,
-        parallel_web_fetch, wikipedia_lookup,
-    ]
+    raw_tools: list[BaseTool] = [search_web, read_webpage]
     return trace_all(raw_tools, LABEL)
+
