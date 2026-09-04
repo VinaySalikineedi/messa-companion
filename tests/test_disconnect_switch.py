@@ -280,6 +280,9 @@ class FakeEmailConnectedAccounts:
     def delete(self, connected_account_id, revoke_on_delete=False):
         self.delete_calls.append((connected_account_id, revoke_on_delete))
 
+    def list(self, **_kw):
+        return []
+
 
 class FakeEmailAuthConfigs:
     def __init__(self):
@@ -482,6 +485,9 @@ class FakeIntegrationConnectedAccounts:
 
     def delete(self, connected_account_id, revoke_on_delete=False):
         self.delete_calls.append((connected_account_id, revoke_on_delete))
+
+    def list(self, **_kw):
+        return []
 
 
 class FakeIntegrationAuthConfigs:

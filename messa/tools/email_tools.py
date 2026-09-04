@@ -53,15 +53,18 @@ it in a bounded loop.
 from __future__ import annotations
 
 import asyncio
+import base64
+import pathlib
 from typing import Any, Optional
 
+import httpx
 from langchain.agents import create_agent
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import BaseTool, tool
 
-from .. import config, console, db, usage
+from .. import config, console, db, pdf_reader, usage
 from ..approval import ApprovalGate
 from ..channels.sendblue import SendblueError, send_message
 from .common import last_ai_text, trace_tool
@@ -73,6 +76,8 @@ LABEL = "email_agent"
 # _get_or_create_gmail_auth_config_id (below) an Outlook equivalent.
 _SLUG_LIST = "GMAIL_FETCH_EMAILS"
 _SLUG_GET = "GMAIL_FETCH_EMAILS"
+_SLUG_GET_MESSAGE = "GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID"
+_SLUG_GET_ATTACHMENT = "GMAIL_GET_ATTACHMENT"
 _SLUG_SEND = "GMAIL_SEND_EMAIL"
 _SLUG_REPLY = "GMAIL_REPLY_TO_THREAD"
 
@@ -150,7 +155,9 @@ def _get_or_create_gmail_auth_config_id(client) -> str:
             "type": "use_composio_managed_auth",
             "name": _GMAIL_AUTH_CONFIG_NAME,
             "tool_access_config": {
-                "tools_for_connected_account_creation": [_SLUG_LIST, _SLUG_SEND, _SLUG_REPLY],
+                "tools_for_connected_account_creation": [
+                    _SLUG_LIST, _SLUG_SEND, _SLUG_REPLY, _SLUG_GET_ATTACHMENT,
+                ],
             },
         },
     )
@@ -226,10 +233,213 @@ def build_email_tools(user: config.UserContext, approval_gate: ApprovalGate | No
         if not user.email_connected:
             return _not_connected_message()
         try:
-            result = await _execute(_SLUG_GET, query=f"id:{message_id}", max_results=1)
+            result = await _execute(_SLUG_GET_MESSAGE, message_id=message_id)
+            if not isinstance(result, dict) or not result.get("successful"):
+                result = await _execute(_SLUG_GET, query=f"id:{message_id}", max_results=1)
         except _NotConfigured as e:
             return str(e)
-        return str(result)
+        except Exception:
+            try:
+                result = await _execute(_SLUG_GET, query=f"id:{message_id}", max_results=1)
+            except Exception as e:
+                return str(e)
+
+        output = str(result)
+        # Format attachment information cleanly if present
+        data = result.get("data") if isinstance(result, dict) else None
+        if isinstance(data, dict):
+            att_list = data.get("attachmentList")
+            if att_list is None and "messages" in data and isinstance(data["messages"], list) and data["messages"]:
+                att_list = data["messages"][0].get("attachmentList")
+            if att_list and isinstance(att_list, list):
+                att_summaries = [
+                    f"- {a.get('filename', 'attachment')} (attachmentId: {a.get('attachmentId')}, type: {a.get('mimeType', 'unknown')})"
+                    for a in att_list
+                    if isinstance(a, dict)
+                ]
+                if att_summaries:
+                    output += (
+                        "\n\nAttachments detected in this email:\n"
+                        + "\n".join(att_summaries)
+                        + "\nCall read_email_attachment(message_id=..., attachment_id=..., filename=...) to extract and read any attachment's text."
+                    )
+        return output
+
+    @tool
+    async def read_email_attachment(
+        message_id: str,
+        attachment_id: Optional[str] = None,
+        filename: Optional[str] = None,
+    ) -> str:
+        """Read and extract text from an email attachment in Gmail (such as a PDF contract, report, or text document).
+
+        message_id: the ID of the email containing the attachment (from list_recent_emails or get_email).
+        attachment_id: optional specific attachment ID from the email's attachmentList. If omitted,
+                       it will be automatically discovered from the email's attachments.
+        filename: optional filename (e.g. 'contract.pdf') to match if the email has multiple attachments
+                  or if attachment_id is omitted.
+        """
+        if not user.email_connected:
+            return _not_connected_message()
+
+        resolved_att_id = attachment_id
+        resolved_filename = filename
+
+        # If attachment_id or filename is missing, inspect the message to resolve them
+        if not resolved_att_id or not resolved_filename:
+            try:
+                msg_res = await _execute(_SLUG_GET_MESSAGE, message_id=message_id)
+                if not isinstance(msg_res, dict) or not msg_res.get("successful"):
+                    msg_res = await _execute(_SLUG_GET, query=f"id:{message_id}", max_results=1)
+            except _NotConfigured as e:
+                return str(e)
+            except Exception as e:
+                return f"Could not fetch email details to find attachments: {e}"
+
+            msg_data = msg_res.get("data") if isinstance(msg_res, dict) else {}
+            att_list = []
+            if isinstance(msg_data, dict):
+                if "attachmentList" in msg_data and isinstance(msg_data["attachmentList"], list):
+                    att_list = msg_data["attachmentList"]
+                elif "messages" in msg_data and isinstance(msg_data["messages"], list) and msg_data["messages"]:
+                    att_list = msg_data["messages"][0].get("attachmentList") or []
+
+            if not att_list:
+                return f"No attachments found in email message {message_id!r}."
+
+            # If user provided a filename, try to find matching attachment
+            target_att = None
+            if resolved_filename:
+                target_lower = resolved_filename.lower()
+                for a in att_list:
+                    fname = (a.get("filename") or "").lower()
+                    if target_lower == fname or target_lower in fname or fname in target_lower:
+                        target_att = a
+                        break
+                if not target_att:
+                    available = ", ".join(a.get("filename") or "unknown" for a in att_list)
+                    return (
+                        f"Attachment {resolved_filename!r} was not found in email {message_id!r}. "
+                        f"Available attachments: {available}"
+                    )
+            elif resolved_att_id:
+                for a in att_list:
+                    if a.get("attachmentId") == resolved_att_id:
+                        target_att = a
+                        break
+                if not target_att and att_list:
+                    target_att = att_list[0]
+            else:
+                # Neither provided: if only 1 attachment, pick it
+                if len(att_list) == 1:
+                    target_att = att_list[0]
+                else:
+                    # If multiple, prefer a PDF
+                    pdf_candidates = [
+                        a for a in att_list if (a.get("filename") or "").lower().endswith(".pdf")
+                    ]
+                    if len(pdf_candidates) == 1:
+                        target_att = pdf_candidates[0]
+                    else:
+                        names = ", ".join(f"'{a.get('filename')}'" for a in att_list)
+                        return (
+                            f"Multiple attachments found in email {message_id!r}: {names}. "
+                            "Please specify the filename to read."
+                        )
+
+            if target_att:
+                resolved_att_id = target_att.get("attachmentId")
+                resolved_filename = target_att.get("filename") or resolved_filename
+
+        if not resolved_att_id:
+            return f"Could not determine attachment ID for email {message_id!r}."
+        if not resolved_filename:
+            resolved_filename = "attachment.pdf"
+
+        # Execute Composio GMAIL_GET_ATTACHMENT
+        try:
+            att_result = await _execute(
+                _SLUG_GET_ATTACHMENT,
+                message_id=message_id,
+                attachment_id=resolved_att_id,
+                file_name=resolved_filename,
+            )
+        except _NotConfigured as e:
+            return str(e)
+        except Exception as e:
+            return f"Failed to retrieve attachment from Gmail: {e}"
+
+        if not isinstance(att_result, dict) or not att_result.get("successful"):
+            err_msg = att_result.get("error") if isinstance(att_result, dict) else str(att_result)
+            return f"Gmail attachment retrieval was unsuccessful: {err_msg}"
+
+        data = att_result.get("data") or {}
+        file_info = data.get("file") if isinstance(data, dict) else {}
+        if not isinstance(file_info, dict):
+            file_info = {}
+
+        # Fetch bytes from s3url, content, or path
+        s3url = file_info.get("s3url") or (data.get("s3url") if isinstance(data, dict) else None)
+        raw_bytes: bytes = b""
+
+        if s3url:
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as http_client:
+                    resp = await http_client.get(s3url)
+                    resp.raise_for_status()
+                    raw_bytes = resp.content
+            except Exception as e:
+                return f"Downloaded attachment link expired or failed to fetch: {e}"
+        elif file_info.get("content"):
+            try:
+                raw_bytes = base64.b64decode(file_info["content"])
+            except Exception as e:
+                return f"Attachment content could not be base64-decoded: {e}"
+        elif file_info.get("path"):
+            try:
+                raw_bytes = pathlib.Path(file_info["path"]).read_bytes()
+            except Exception as e:
+                return f"Could not read local attachment file at {file_info['path']}: {e}"
+
+        if not raw_bytes:
+            return f"Attachment {resolved_filename!r} could not be downloaded (empty response)."
+
+        if len(raw_bytes) > config.MAX_PDF_READ_BYTES:
+            limit_mb = config.MAX_PDF_READ_BYTES / (1024 * 1024)
+            size_mb = len(raw_bytes) / (1024 * 1024)
+            return (
+                f"Attachment {resolved_filename!r} is too large to read "
+                f"({size_mb:.1f}MB, system limit is {limit_mb:.0f}MB)."
+            )
+
+        # Check if PDF or text
+        mimetype = str(file_info.get("mimetype") or "").lower()
+        is_pdf = (
+            resolved_filename.lower().endswith(".pdf")
+            or raw_bytes.startswith(b"%PDF-")
+            or "pdf" in mimetype
+        )
+
+        if is_pdf:
+            try:
+                text, pages_read, truncated = pdf_reader.extract_pdf_text(raw_bytes)
+            except pdf_reader.PdfReadFailure as e:
+                return f"Attachment {resolved_filename!r} arrived but couldn't be parsed as a PDF: {e}"
+
+            trunc_note = (
+                f" -- showing the first {pages_read} page(s), capped at {config.MAX_PDF_READ_PAGES}"
+                if truncated else f" ({pages_read} page(s))"
+            )
+            return f"[Attachment: {resolved_filename}{trunc_note}]\n\n{text}"
+        else:
+            try:
+                text = raw_bytes.decode("utf-8")
+                return f"[Attachment: {resolved_filename}]\n\n{text}"
+            except UnicodeDecodeError:
+                return (
+                    f"Attachment {resolved_filename!r} is a binary file ({len(raw_bytes)} bytes) "
+                    "that cannot be parsed as plain text."
+                )
 
     @tool
     async def send_email(to: str, subject: str, body: str) -> str:
@@ -448,7 +658,7 @@ def build_email_tools(user: config.UserContext, approval_gate: ApprovalGate | No
         return True
 
     raw_tools: list[BaseTool] = [
-        list_recent_emails, get_email, send_email, reply_to_email,
+        list_recent_emails, get_email, read_email_attachment, send_email, reply_to_email,
         request_email_connection, check_email_connection_status, disconnect_email,
     ]
 
@@ -507,6 +717,11 @@ def _build_system_prompt(user: config.UserContext) -> str:
         "list_recent_emails first to find the message you need -- each result carries the "
         "message's OWN id and the id of the thread it's part of; use those ids for get_email/"
         "reply_to_email rather than guessing one you weren't just given.\n"
+        "- Reading attachments: when an email contains attachments (indicated in get_email "
+        "or list_recent_emails), call read_email_attachment(message_id=..., filename=...) to "
+        "extract and read the text of the attachment (e.g. PDF contracts, documents, reports). "
+        "You can specify the filename or attachment_id; if there is only one attachment, passing "
+        "just the message_id is enough.\n"
         "- reply_to_email needs the THREAD id (not a single message's own id) -- Gmail threads "
         "the reply server-side once you pass the right one; if you only have a message id, use "
         "the thread id from that same result instead.\n"
@@ -572,10 +787,11 @@ def build_email_subagent(
     return {
         "name": "email_agent",
         "description": (
-            "Reads, searches, and sends the user's own Gmail (via Composio), and handles "
-            "connecting/reconnecting their account. Use for anything specifically about the "
-            "user's Gmail inbox, for 'connect my email/gmail' requests, and for a generic "
-            "'send/check my email' request when Gmail is currently the user's default inbox."
+            "Reads, searches, and sends the user's own Gmail (via Composio), reads email "
+            "attachments (contracts, PDFs, documents), and handles connecting/reconnecting "
+            "their account. Use for anything specifically about the user's Gmail inbox, "
+            "for reading Gmail attachments, for 'connect my email/gmail' requests, and for "
+            "a generic 'send/check my email' request when Gmail is currently the user's default inbox."
         ),
         "runnable": RunnableLambda(_run),
     }
