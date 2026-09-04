@@ -81,6 +81,8 @@ from .common import trace_all
 from .jina_reader import fetch_rendered_page_text as _fetch_rendered_page_text
 from .parallel_search import parallel_web_fetch as _parallel_web_fetch
 from .parallel_search import parallel_web_search as _parallel_web_search
+from .search_engine import unified_web_read as _unified_web_read
+from .search_engine import unified_web_search as _unified_web_search
 
 LABEL = "web_search"
 
@@ -171,24 +173,14 @@ def build_web_search_tools() -> list[BaseTool]:
     async def web_search(query: str, max_results: int = 5) -> str:
         """Quick, no-browser web search for a factual lookup -- a fact, current
         news, a definition, a simple 'what is X' / 'who is X' / 'what's the
-        latest on X' question. Returns short titles/snippets/URLs, not full
-        page content -- follow up with fetch_page_text on a specific URL from
-        the results if you need more detail. NOT for anything that requires
-        clicking through a site, logging in, filling out a form, or adding
-        something to a cart -- delegate those to deepsearch instead, since
-        this tool can't interact with a page at all, only read search results."""
-        try:
-            results = await asyncio.to_thread(
-                lambda: list(DDGS().text(query, max_results=max_results))
-            )
-        except DDGSException as e:
-            return (
-                f"ERROR: web search failed ({e}). If this needs an actual browser "
-                "(e.g. the search itself requires JS or login), delegate to deepsearch instead."
-            )
-        except Exception as e:  # noqa: BLE001 - a tool must never crash the agent loop
-            return f"ERROR: web search failed ({e})."
-        return _format_results(results)
+        latest on X' question. Powered by a multi-provider waterfall (Tavily,
+        Brave, Serper, Parallel, DuckDuckGo) for high reliability and instant
+        answers. Returns short titles/snippets/URLs and direct answers --
+        follow up with fetch_page_text or fetch_rendered_page_text on a specific
+        URL from the results if you need more detail. NOT for anything that
+        requires clicking through a site, logging in, filling out a form, or
+        adding something to a cart -- delegate those to deepsearch instead."""
+        return await _unified_web_search(query, max_results=max_results)
 
     @tool
     async def parallel_web_search(objective: str, search_queries: Optional[list[str]] = None) -> str:
@@ -233,17 +225,13 @@ def build_web_search_tools() -> list[BaseTool]:
     @tool
     async def fetch_rendered_page_text(url: str, max_chars: int = DEFAULT_MAX_FETCH_CHARS) -> str:
         """Fetch a URL's content AFTER letting its JavaScript run, and return
-        readable text -- for a page fetch_page_text came back empty, tiny, or
-        loading-shell-only on (most modern ticket/booking/listing sites need
-        this: Fandango, AMC, Ticketmaster, and similar). The JS is rendered on
-        a remote reader service, not in a browser of ours, so this still costs
-        NO Browserbase session time and no session to open or close -- just one
-        HTTP call, same as fetch_page_text, just slightly slower (real page
-        rendering takes a few seconds). Still read-only: it can't click, type,
-        scroll, or log in. If this ALSO comes back empty/unhelpful, or the task
-        genuinely needs to interact with the page (buy, submit, log in),
-        delegate to deepsearch instead -- that's the only tier that can."""
-        return await _fetch_rendered_page_text(url, max_chars=max_chars)
+        readable text -- powered by a multi-provider scrape waterfall (Jina Reader,
+        Firecrawl Cloud, Parallel Fetch) with zero Browserbase session overhead.
+        For pages that need JS to render (most modern sites). Still read-only:
+        it can't click, type, scroll, or log in. If this ALSO comes back
+        empty/unhelpful, or the task genuinely needs to interact with the page
+        (buy, submit, log in), delegate to deepsearch instead."""
+        return await _unified_web_read(url, max_chars=max_chars)
 
     @tool
     async def parallel_web_fetch(url: str) -> str:

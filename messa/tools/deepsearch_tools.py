@@ -130,6 +130,8 @@ from ..channels.sendblue import SendblueError
 from ..config import UserContext
 from .jina_reader import fetch_rendered_page_text as _jina_fetch_rendered_page_text
 from .parallel_search import parallel_web_fetch as _parallel_web_fetch
+from .search_engine import unified_web_read as _unified_web_read
+from .search_engine import unified_web_search as _unified_web_search
 
 LABEL = "deepsearch"
 
@@ -998,6 +1000,33 @@ class BrowserToolProvider:
             coroutine=self._get_account_credential,
             name="get_account_credential",
             description=(self._get_account_credential.__doc__ or "").strip(),
+        ))
+        # Multi-provider instant web search (Tavily -> Brave -> Serper -> Parallel -> DuckDuckGo).
+        # Completely independent of Browserbase -- answers search queries and finds candidate URLs
+        # in <1 second without opening a browser or consuming browser session minutes.
+        self.tools.append(StructuredTool.from_function(
+            coroutine=_unified_web_search,
+            name="search_web",
+            description=(
+                "Search the web instantly without opening a browser or using Browserbase session time. "
+                "Powered by a fast multi-provider search engine (Tavily, Brave, Serper, Parallel, DuckDuckGo). "
+                "Use this for looking up facts, finding URLs, researching options, or getting background info "
+                "BEFORE deciding whether you need to navigate to a page. Returns titles, URLs, snippets, "
+                "and direct answers in <1 second. Does NOT consume browser time."
+            ),
+        ))
+        # Multi-provider instant web page reader (Jina Reader -> Firecrawl Cloud -> Parallel Fetch -> HTTP).
+        # Renders JS server-side and costs ZERO browser session minutes.
+        self.tools.append(StructuredTool.from_function(
+            coroutine=_unified_web_read,
+            name="read_webpage",
+            description=(
+                "Read a web page's rendered text content instantly WITHOUT using this browser session or tab. "
+                "Powered by a remote reader waterfall (Jina Reader, Firecrawl Cloud, Parallel Fetch) that executes "
+                "JavaScript server-side, costing NO Browserbase session time. Use this to read articles, compare "
+                "options, or inspect content across several candidate URLs before deciding if you actually need "
+                "interactive browser automation. Does NOT consume browser time."
+            ),
         ))
         # Given to BOTH the top-level provider and every sub-worker, same
         # reasoning as request_human_help just above -- any tab can want a
@@ -2107,15 +2136,14 @@ DEEPSEARCH_SYSTEM_PROMPT = (
     "- Break the goal into steps. After navigating, always call browser_snapshot to read "
     "actual page content.\n"
     "- Money matters, not just speed: this whole session is billed by TIME held open, "
-    "regardless of how much or little you actually do with it. Before calling browser_navigate "
-    "on any candidate page you're not already sure you need to interact with, ask whether "
-    "fetch_rendered_page_text could answer it instead (parallel_web_fetch if that one fails) -- "
-    "both run on a separate reader service and cost NOTHING against this session. For a task "
-    "that combines reading/comparing with acting (e.g. 'check these 3 sites and buy from "
-    "whichever is cheapest'), the right shape is: read every candidate FIRST with one of those "
-    "tools, decide which one wins, THEN spend real browser_navigate/session time only on that "
-    "one -- never navigate to a page purely to compare it against others when a fast read would "
-    "tell you the same thing.\n"
+    "regardless of how much or little you actually do with it. Use the fast HTTP tools FIRST: "
+    "search_web for searching and finding URLs, and read_webpage (or fetch_rendered_page_text) "
+    "for reading page content. Both cost ZERO browser/session time and answer in <1-2 seconds. "
+    "For a task that combines reading/comparing with acting (e.g. 'check these 3 sites and buy from "
+    "whichever is cheapest'), the right shape is: search and read every candidate FIRST with "
+    "search_web and read_webpage, decide which one wins, THEN spend real browser_navigate/session "
+    "time only on that one -- never navigate to a page purely to compare it against others when a "
+    "fast read would tell you the same thing.\n"
     "- Speed matters too -- users notice how long this takes. Prefer the cheaper tool for what "
     "you actually need right now instead of defaulting to a full browser_snapshot every time:\n"
     "  - browser_find(text=... or regex=...) locates one specific element (and its ref) "
@@ -2148,12 +2176,11 @@ DEEPSEARCH_SYSTEM_PROMPT = (
     "independent, though: if one site's result determines the next step (e.g. which flight "
     "dates to search hotels for), handle those directly or one delegation at a time instead. "
     "See delegate_website_task's own description for the rest.\n"
-    "- Don't know the right URL yet (a specific results page, not just a homepage)? Do one "
-    "quick search yourself first (google.com or perplexity.ai, in your own tab) for a direct "
-    "deep-link or reference fact, THEN delegate with that as your starting point -- a real head "
-    "start, not a required step. Skip it once you already have a working URL, and never treat "
-    "a search result as today's live price/availability -- delegate_website_task is still the "
-    "source of truth for that.\n"
+    "- Don't know the right URL yet, or need factual background/links? Call search_web first -- "
+    "it returns instant results and direct answers in <1s and costs ZERO browser/session time. "
+    "NEVER navigate to google.com or any search engine in a browser tab; search_web answers it "
+    "without opening a browser. Only use browser_navigate and browser actions when you genuinely "
+    "need to interact: logging in, submitting forms, clicking buttons, or managing interactive flows.\n"
     "- When you're done, reply with a clear, complete, honest summary of what you found or did "
     "-- this goes straight back to the user.\n"
 )

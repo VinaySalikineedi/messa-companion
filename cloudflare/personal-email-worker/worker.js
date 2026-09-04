@@ -153,6 +153,7 @@ export default {
       from: message.from,
       subject: parsed.subject || "",
       text,
+      html: parsed.html || null,
       message_id: parsed.messageId || null,
       in_reply_to: parsed.inReplyTo || null,
       references,

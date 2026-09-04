@@ -987,6 +987,11 @@ async def personal_email_inbound_webhook(
             {"filename": a.get("filename")} for a in pdf_attachments
         ]
 
+    body_text = (payload.get("text") or "").strip()
+    if not body_text and payload.get("html"):
+        from .tools.web_search_tools import extract_readable_text
+        body_text = extract_readable_text(payload["html"]).strip()
+
     # Durable write + dedup in one step (migrations/014_messa_email_messages.sql):
     # a redelivered webhook for the same message_id comes back None here
     # instead of creating a second row or re-triggering a turn. This also
@@ -998,7 +1003,7 @@ async def personal_email_inbound_webhook(
         from_address,
         to_address,
         (payload.get("subject") or "").strip(),
-        (payload.get("text") or "").strip(),
+        body_text,
         in_reply_to=payload.get("in_reply_to"),
         references=payload.get("references"),
         raw_json=json.dumps(sanitized_payload),

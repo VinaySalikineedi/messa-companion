@@ -591,6 +591,22 @@ PARALLEL_API_KEY = os.environ.get("MESSA_PARALLEL_API_KEY") or None
 # fails fast and visibly instead of quietly stalling Messa's reply.
 PARALLEL_MCP_TIMEOUT_SECONDS = float(os.environ.get("MESSA_PARALLEL_MCP_TIMEOUT_SECONDS", "15"))
 
+# ---- Multi-Provider Web Search & Scraping Waterfall (tools/search_engine.py) ----
+# Resilient, fast HTTP search and extraction across legitimate free-tier providers
+# (Tavily, Brave Search, Serper/Google, Firecrawl Cloud, Jina Reader).
+# Eliminates Browserbase cloud browser overhead for read-only lookups and research.
+TAVILY_API_KEY = os.environ.get("MESSA_TAVILY_API_KEY") or os.environ.get("TAVILY_API_KEY") or None
+BRAVE_SEARCH_API_KEY = (
+    os.environ.get("MESSA_BRAVE_SEARCH_API_KEY") or os.environ.get("BRAVE_SEARCH_API_KEY") or None
+)
+SERPER_API_KEY = os.environ.get("MESSA_SERPER_API_KEY") or os.environ.get("SERPER_API_KEY") or None
+FIRECRAWL_API_KEY = (
+    os.environ.get("MESSA_FIRECRAWL_API_KEY") or os.environ.get("FIRECRAWL_API_KEY") or None
+)
+FIRECRAWL_BASE_URL = os.environ.get("MESSA_FIRECRAWL_BASE_URL", "https://api.firecrawl.dev").rstrip("/")
+SEARCH_HTTP_TIMEOUT_SECONDS = float(os.environ.get("MESSA_SEARCH_HTTP_TIMEOUT_SECONDS", "10.0"))
+
+
 # ---- Memory (messa/memory.py, migrations/027_memory.sql) -- Mem0 on top of
 # Postgres/pgvector for a two-tier memory: a cheap always-on profile digest
 # (users.memory_profile, read every turn through the app's normal asyncpg
