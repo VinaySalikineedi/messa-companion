@@ -761,8 +761,11 @@ DEEPSEARCH_ALLOWED_DOMAINS: list[str] = [
 # the orchestrator's own RECURSION_LIMIT -- deep research tasks legitimately
 # need many steps, and hitting this cap is expected/handled (the session is
 # saved and can be resumed) rather than an error condition.
-# 40 steps is optimal for fast, human-paced browsing without spinning indefinitely.
-DEEPSEARCH_MAX_STEPS = int(os.environ.get("MESSA_DEEPSEARCH_MAX_STEPS", "40"))
+# 80 steps gives ample headroom to navigate, handle modals, and submit forms without mid-task cutoff.
+DEEPSEARCH_MAX_STEPS = int(os.environ.get("MESSA_DEEPSEARCH_MAX_STEPS", "80"))
+
+# Automatically recover the last visited URL on resumed sessions if the new browser opens at about:blank
+DEEPSEARCH_AUTO_NAVIGATE_ON_RESUME = bool(os.environ.get("MESSA_DEEPSEARCH_AUTO_NAVIGATE_ON_RESUME", "1").lower() in ("1", "true", "yes"))
 
 # Deterministic backstop for snapshot-size discipline (the "reinforce/verify
 # the snapshot-size guidance" option flagged, unimplemented, in the speed

@@ -497,6 +497,9 @@ def _describe_action(name: str, args: dict[str, Any]) -> str:
         return "Running a script on the page"
     if name == "browser_handle_dialog":
         return "Responding to a dialog"
+    if name == "browser_action_chain":
+        acts = kwargs.get("actions") or []
+        return f"Executing {len(acts)} action sequence" if acts else "Executing action sequence"
     if "scroll" in name:
         return "Scrolling the page"
     return name.replace("browser_", "").replace("_", " ").strip().capitalize() or "Working on it"
@@ -529,6 +532,33 @@ def _last_ai_text(messages: list[Any]) -> str:
             if text:
                 return text
     return "(no summary produced)"
+
+
+def _extract_last_target_url(messages: list[Any]) -> str | None:
+    """Scan messages backwards to find the last visited HTTP/HTTPS URL that isn't about:blank."""
+    for m in reversed(messages):
+        tool_calls = getattr(m, "tool_calls", None) or []
+        for tc in tool_calls:
+            name = tc.get("name")
+            args = tc.get("args") or {}
+            if name in ("browser_navigate", "browser_navigate_back"):
+                url = args.get("url")
+                if url and isinstance(url, str) and url.startswith(("http://", "https://")) and not url.endswith("about:blank"):
+                    return url
+            if name == "browser_action_chain":
+                for act in args.get("actions") or []:
+                    if act.get("action") == "navigate":
+                        url = act.get("url")
+                        if url and isinstance(url, str) and url.startswith(("http://", "https://")) and not url.endswith("about:blank"):
+                            return url
+        content = getattr(m, "content", "")
+        if isinstance(content, str):
+            match = re.search(r"Page URL:\s*(https?://[^\s\n]+)", content)
+            if match:
+                found = match.group(1).strip()
+                if not found.endswith("about:blank"):
+                    return found
+    return None
 
 
 def _deepsearch_summarization_middleware(model: Any) -> SummarizationMiddleware | None:
@@ -681,9 +711,11 @@ class BrowserToolProvider:
         task_title: str | None = None,
         phone_number: str | None = None,
         live_view_share_url: str | None = None,
+        initial_resume_url: str | None = None,
     ):
         self._approval_gate = approval_gate
         self._user_id = user_id
+        self._initial_resume_url = initial_resume_url
         # Owning-provider-only, for the "browser is actually live now" SMS
         # fired from inside _ensure_live_session -- see that method's own
         # comment for why the link moved here instead of going out with the
@@ -1038,6 +1070,21 @@ class BrowserToolProvider:
                 "interactive browser automation. Does NOT consume browser time."
             ),
         ))
+        # Compound multi-action tool: executes a fast sequence of browser actions in ONE turn
+        # (e.g. accepting terms, clicking continue, and filling form fields) without separate LLM round-trips.
+        self.tools.append(StructuredTool.from_function(
+            coroutine=self._browser_action_chain,
+            name="browser_action_chain",
+            description=(
+                "Execute a rapid compound chain of browser actions sequentially in ONE turn. "
+                "Use this to perform multi-step flows (e.g. checking terms, clicking continue, "
+                "and filling email/password fields) quickly like a human user without wasting round-trip turns. "
+                "Accepts an array of action dicts: [{'action': 'click', 'target': 'role=checkbox', 'element': 'Terms'}, "
+                "{'action': 'click', 'target': 'text=\"Continue with your Email\"'}, "
+                "{'action': 'fill', 'target': 'role=textbox[name=\"Email\"]', 'value': 'user@example.com'}]. "
+                "Executes sequentially and returns the final page snapshot."
+            ),
+        ))
         # Given to BOTH the top-level provider and every sub-worker, same
         # reasoning as request_human_help just above -- any tab can want a
         # cheap read of some OTHER page before deciding whether it's worth
@@ -1242,6 +1289,20 @@ class BrowserToolProvider:
                 raw_tools = await self._connect_and_discover()
                 if _CACHED_TOOL_SPECS is None:
                     _CACHED_TOOL_SPECS = [(t.name, t.description, t.args_schema) for t in raw_tools]
+
+                # Automatic URL recovery on resumed sessions: if this session was continued from an earlier task
+                # and opens at about:blank, immediately navigate back to the last visited URL.
+                if self._initial_resume_url and config.DEEPSEARCH_AUTO_NAVIGATE_ON_RESUME:
+                    nav_tool = self._raw_tools_by_name.get("browser_navigate")
+                    if nav_tool is not None:
+                        try:
+                            console.system(
+                                f"Deepsearch: auto-navigating resumed session from about:blank back to {self._initial_resume_url}"
+                            )
+                            await nav_tool.coroutine(url=self._initial_resume_url)
+                            self._state["snapshot_fresh"] = False
+                        except Exception as nav_err:
+                            console.system(f"Deepsearch: auto-navigation to {self._initial_resume_url} failed: {nav_err}")
             except Exception as e:  # noqa: BLE001
                 console.tool_error(LABEL, "browserbase_cdp_connect", str(e))
                 # __aexit__ is never called for a failure here (this isn't
@@ -1532,6 +1593,142 @@ class BrowserToolProvider:
             return int(text) if text is not None else None
         except Exception:  # noqa: BLE001
             return None
+
+    async def _browser_action_chain(self, actions: list[dict[str, Any]]) -> str:
+        """Model-facing tool: execute a rapid compound chain of browser actions sequentially
+        in ONE turn. Use this to handle multi-step interactions (e.g. accepting terms, clicking
+        continue, filling out email & password, or submitting a form) without waiting for
+        separate LLM round-trips.
+
+        Args:
+            actions: An array of action dicts executed in order. Supported actions:
+              - {"action": "click", "target": "role=checkbox", "element": "Terms and conditions"}
+              - {"action": "fill", "target": "role=textbox[name='Email']", "value": "user@textmessa.com"}
+              - {"action": "type", "target": "role=textbox[name='Password']", "text": "secret"}
+              - {"action": "press", "key": "Enter"}
+              - {"action": "wait", "time": 1.5}
+              - {"action": "navigate", "url": "https://..."}
+
+        Returns:
+            A summary of executed steps and a fresh snapshot of the resulting page state.
+        """
+        if not actions or not isinstance(actions, list):
+            return "ERROR: 'actions' must be a non-empty list of action dicts."
+
+        await self._ensure_live_session()
+        await self._stop_reading_animation()
+
+        executed: list[str] = []
+        action_summary = f"Executing {len(actions)} actions in sequence"
+        console.tool_call(LABEL, "browser_action_chain", {"actions_count": len(actions)})
+        self._live_set_description(action_summary)
+        self._live_mark_active()
+
+        async with self._tool_call_lock:
+            for idx, act in enumerate(actions):
+                if not isinstance(act, dict):
+                    continue
+                act_type = str(act.get("action") or "").strip().lower()
+                target = act.get("target")
+                element = act.get("element") or act.get("name") or "element"
+                desc = f"{act_type}({element or target or ''})"
+
+                try:
+                    if act_type == "click":
+                        if not target:
+                            return f"ERROR: 'target' is required for click action at step {idx+1}."
+                        if config.DEEPSEARCH_CURSOR_OVERLAY and target:
+                            self._fire_cursor_move("browser_click", element, target)
+                        tool = self._raw_tools_by_name.get("browser_click")
+                        if not tool:
+                            return "ERROR: browser_click tool is unavailable."
+                        res = await tool.coroutine(target=target, element=element)
+
+                    elif act_type == "fill":
+                        tool = self._raw_tools_by_name.get("browser_fill_form")
+                        if not tool:
+                            return "ERROR: browser_fill_form tool is unavailable."
+                        if "fields" in act and isinstance(act["fields"], list):
+                            res = await tool.coroutine(fields=act["fields"])
+                        elif target:
+                            val = str(act.get("value") or act.get("text") or "")
+                            res = await tool.coroutine(fields=[{"target": target, "value": val, "name": element, "type": "textbox"}])
+                        else:
+                            return f"ERROR: 'target' or 'fields' is required for fill action at step {idx+1}."
+
+                    elif act_type == "type":
+                        if not target:
+                            return f"ERROR: 'target' is required for type action at step {idx+1}."
+                        tool = self._raw_tools_by_name.get("browser_type")
+                        if not tool:
+                            return "ERROR: browser_type tool is unavailable."
+                        text = str(act.get("text") or act.get("value") or "")
+                        res = await tool.coroutine(target=target, text=text, element=element)
+
+                    elif act_type == "press":
+                        tool = self._raw_tools_by_name.get("browser_press_key")
+                        if not tool:
+                            return "ERROR: browser_press_key tool is unavailable."
+                        key = act.get("key") or "Enter"
+                        res = await tool.coroutine(key=key)
+
+                    elif act_type == "wait":
+                        tool = self._raw_tools_by_name.get("browser_wait_for")
+                        if not tool:
+                            return "ERROR: browser_wait_for tool is unavailable."
+                        t = float(act.get("time") or 1.0)
+                        res = await tool.coroutine(time=t)
+
+                    elif act_type == "navigate":
+                        url = act.get("url")
+                        if not url:
+                            return f"ERROR: 'url' is required for navigate action at step {idx+1}."
+                        if not _domain_allowed(url):
+                            return f"BLOCKED: '{url}' is not in the allowed domain list."
+                        tool = self._raw_tools_by_name.get("browser_navigate")
+                        if not tool:
+                            return "ERROR: browser_navigate tool is unavailable."
+                        res = await tool.coroutine(url=url)
+
+                    else:
+                        return f"ERROR: Unsupported action '{act_type}' at step {idx+1}. Supported: click, fill, type, press, wait, navigate."
+
+                    res_str = str(res)
+                    if (
+                        res_str.startswith("ERROR:")
+                        or "### Error" in res_str
+                        or "TimeoutError" in res_str
+                        or "does not match any elements" in res_str
+                        or "Ref not found" in res_str
+                    ):
+                        snap_tool = self._raw_tools_by_name.get("browser_snapshot")
+                        snap = await snap_tool.coroutine(depth=8) if snap_tool else ""
+                        return (
+                            f"Action chain halted at step {idx+1}/{len(actions)} ({desc}): {res_str}\n"
+                            f"Steps executed successfully: {', '.join(executed) if executed else 'None'}\n\n"
+                            f"Current page snapshot:\n{snap}"
+                        )
+
+                    executed.append(desc)
+                    self._live_add_step(desc)
+                    await asyncio.sleep(0.3)
+
+                except Exception as e:
+                    snap_tool = self._raw_tools_by_name.get("browser_snapshot")
+                    snap = await snap_tool.coroutine(depth=8) if snap_tool else ""
+                    return (
+                        f"Action chain failed with exception at step {idx+1}/{len(actions)} ({desc}): {e}\n"
+                        f"Steps executed successfully: {', '.join(executed) if executed else 'None'}\n\n"
+                        f"Current page snapshot:\n{snap}"
+                    )
+
+        self._state["snapshot_fresh"] = True
+        snap_tool = self._raw_tools_by_name.get("browser_snapshot")
+        final_snap = await snap_tool.coroutine(depth=8) if snap_tool else ""
+        return (
+            f"Successfully executed all {len(actions)} actions: {', '.join(executed)}.\n\n"
+            f"Current page snapshot:\n{final_snap}"
+        )
 
     # Docstring below IS the tool description sent to the model on every
     # single call (see the StructuredTool.from_function registration a few
@@ -2173,6 +2370,12 @@ DEEPSEARCH_SYSTEM_PROMPT = (
     "- Base every factual claim strictly on text that literally appears in snapshots.\n"
     "- ACT AS A HUMAN USER: You navigate pages visually with snapshots, mouse clicks, and typing. "
     "Never attempt to inspect script tags, webpack bundles, or reverse-engineer backend APIs.\n"
+    "- COMPOUND ACTIONS FOR HUMAN SPEED: When interacting with forms, dialogs, or multiple connected steps "
+    "(e.g. accepting terms, clicking continue, and filling fields), use `browser_action_chain` to execute the whole sequence "
+    "in ONE turn. This runs smoothly and quickly like a human user instead of taking 10 separate round-trips.\n"
+    "- PREFER STABLE SELECTORS FOR REPEAT ACTIONS: Dynamic frameworks (Vue, React, Quasar) frequently change element refs "
+    "(e.g. e12, e900) when modals open or animations play. Prefer stable selectors like `role=button[name='...']`, "
+    "`role=checkbox`, `text='...'`, or CSS selectors (`button.q-btn`) which do not become stale when the page transitions.\n"
     "- FORM SUBMISSION: Modern single-page web apps (React, Next.js, Vue) frequently IGNORE the "
     "Enter key on input fields. NEVER rely on pressing Enter on an input field to submit a form. "
     "You MUST locate and click the visible submit or action button (e.g. button:has-text('Create Account'), "
@@ -2270,6 +2473,7 @@ def build_deepsearch_subagent(
         if match:
             session_row = await db.get_deepsearch_session(user.user_id, int(match.group(1)))
 
+        initial_resume_url = None
         if session_row:
             session_id = session_row["id"]
             task_title = session_row["title"]
@@ -2277,14 +2481,19 @@ def build_deepsearch_subagent(
                 prior_messages = messages_from_dict(json.loads(session_row["messages"]))
             except Exception:
                 prior_messages = []
+            initial_resume_url = _extract_last_target_url(prior_messages)
             remainder = _SESSION_REF_RE.sub("", last_text).strip(" .:-\n")
+            notice = f" (The browser was automatically reopened and navigated back to {initial_resume_url})." if initial_resume_url else ""
             follow_up = HumanMessage(
-                content=f"Continuing this task. Additional instruction: {remainder}"
-                if remainder else "Continue where you left off."
+                content=f"Continuing this task.{notice} Additional instruction: {remainder}"
+                if remainder else f"Continue where you left off.{notice}"
             )
             messages = [*prior_messages, follow_up]
             steps_so_far = session_row["steps_used"]
-            console.system(f"Deepsearch: resuming session #{session_id} ({len(prior_messages)} prior messages).")
+            console.system(
+                f"Deepsearch: resuming session #{session_id} ({len(prior_messages)} prior messages"
+                f"{f', auto-reopening {initial_resume_url}' if initial_resume_url else ''})."
+            )
         else:
             messages = list(incoming)
             task_title = (last_text.strip() or "Deepsearch task")[:255]
@@ -2356,6 +2565,7 @@ def build_deepsearch_subagent(
                 approval_gate, user_id=user.user_id, deepsearch_session_id=session_id, model=model,
                 messa_email=user.messa_email, task_title=task_title,
                 phone_number=user.phone_number, live_view_share_url=user.live_view_share_url,
+                initial_resume_url=initial_resume_url,
             )
             try:
                 async with provider:
