@@ -932,6 +932,29 @@ DEEPSEARCH_HUMAN_HELP_POLL_INTERVAL_SECONDS = int(
     os.environ.get("MESSA_DEEPSEARCH_HUMAN_HELP_POLL_INTERVAL_SECONDS", "5")
 )
 
+# ---- Email verification-code relay (migrations/028_deepsearch_otp_
+# expectations.sql, tools/deepsearch_tools.py's await_email_verification_
+# code) ----
+# A narrower, fully-automatic cousin of DEEPSEARCH_HUMAN_HELP_* above: when
+# deepsearch signs up for a site using the user's own Messa-assigned inbox
+# (generate_account_credential's default username), a verification code
+# lands somewhere no HUMAN can read either -- request_human_help's "wait for
+# a person to take over the live view" design can't help here at all, so
+# this polls a durable DB row instead, resolved by server.py's inbound-
+# email webhook the moment the real email arrives (usually a few seconds,
+# not minutes) rather than by page-fingerprint change. Deliberately its own
+# shorter timeout, not reusing DEEPSEARCH_HUMAN_HELP_MAX_TOTAL_SECONDS:
+# an OTP email either shows up within a few tens of seconds or it isn't
+# coming (bounced, filtered, wrong address) -- there's no reason to hold a
+# billed Browserbase session open for 5 minutes on the same one-size
+# ceiling a HUMAN needing to notice an SMS and go act was tuned for.
+DEEPSEARCH_OTP_WAIT_MAX_SECONDS = int(
+    os.environ.get("MESSA_DEEPSEARCH_OTP_WAIT_MAX_SECONDS", "90")
+)
+DEEPSEARCH_OTP_WAIT_POLL_INTERVAL_SECONDS = int(
+    os.environ.get("MESSA_DEEPSEARCH_OTP_WAIT_POLL_INTERVAL_SECONDS", "2")
+)
+
 # Belt-and-suspenders hard ceiling on one deepsearch run's total wall-clock
 # time (wraps inner_agent.ainvoke(...) in tools/deepsearch_tools.py's _run
 # with asyncio.wait_for), independent of DEEPSEARCH_MAX_STEPS (a step COUNT,

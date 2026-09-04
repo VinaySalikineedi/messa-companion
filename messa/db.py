@@ -1971,6 +1971,149 @@ async def timeout_human_help_request(request_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Email verification-code relay (migrations/028_deepsearch_otp_expectations.sql).
+# Additive/no-op-safe, same _has_table pattern as deepsearch_human_help_requests
+# above -- these all silently no-op until migration 028 has been applied.
+#
+# create_otp_expectation/get_otp_expectation/expire_otp_expectation are
+# called from inside the in-flight deepsearch tool call itself (see
+# tools/deepsearch_tools.py's await_email_verification_code); resolve_otp_
+# expectation_from_email is called from server.py's personal-email webhook,
+# a completely separate request -- the same "two different call sites"
+# split human_help already uses, and for the same reason: whichever inbound
+# email lands doesn't depend on the original tool call's async task still
+# being alive to see it arrive.
+# ---------------------------------------------------------------------------
+
+# Prefers a code that appears near an actual verification-code keyword
+# (catches "Your code is 482913" even when the email ALSO contains other
+# numbers -- an order number, a year, a support phone number) before
+# falling back to the first bare 4-8 digit run in the message. Deliberately
+# simple (no per-sender templates) -- OTP emails are short and this two-
+# tier heuristic has covered every real one seen in testing; a code that
+# slips past both patterns just means this returns None and the normal
+# "you got an email" notification flow runs instead, never a silent drop.
+_OTP_CODE_NEAR_KEYWORD_RE = re.compile(
+    r"(?:verification code|confirmation code|security code|one[- ]time (?:code|password|pass)|"
+    r"\bOTP\b|\bPIN\b|\bcode\b|\bpasscode\b)\D{0,20}(\d{4,8})",
+    re.IGNORECASE,
+)
+_OTP_CODE_STANDALONE_RE = re.compile(r"\b(\d{4,8})\b")
+
+
+def _extract_otp_code(subject: str | None, body_text: str | None) -> str | None:
+    text = f"{subject or ''}\n{body_text or ''}"
+    m = _OTP_CODE_NEAR_KEYWORD_RE.search(text)
+    if m:
+        return m.group(1)
+    m = _OTP_CODE_STANDALONE_RE.search(text)
+    return m.group(1) if m else None
+
+
+async def create_otp_expectation(
+    user_id: int, deepsearch_session_id: int | None, tab_marker: str, sender_filter: str | None,
+) -> dict[str, Any] | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "deepsearch_otp_expectations"):
+            return None
+        row = await conn.fetchrow(
+            """
+            INSERT INTO deepsearch_otp_expectations
+                (user_id, deepsearch_session_id, tab_marker, sender_filter)
+            VALUES ($1, $2, $3, $4) RETURNING *
+            """,
+            user_id, deepsearch_session_id, tab_marker, (sender_filter or "").strip() or None,
+        )
+        return dict(row) if row else None
+
+
+async def get_otp_expectation(expectation_id: int) -> dict[str, Any] | None:
+    """Polled every config.DEEPSEARCH_OTP_WAIT_POLL_INTERVAL_SECONDS by the
+    waiting tool call -- see that function's own docstring for why this is
+    a DB poll rather than an in-process signal (the resolving webhook call
+    and the waiting tool call are two separate requests, possibly with no
+    live reference to each other at all)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "deepsearch_otp_expectations"):
+            return None
+        row = await conn.fetchrow("SELECT * FROM deepsearch_otp_expectations WHERE id = $1", expectation_id)
+        return dict(row) if row else None
+
+
+async def expire_otp_expectation(expectation_id: int) -> None:
+    """Called by the waiting tool call itself once it gives up -- marks the
+    row so a LATER, unrelated email (a different site's code, or the same
+    site's retry) can never be mistaken for an answer to a wait that has
+    already ended. WHERE status = 'pending' guards the harmless race where
+    the row resolved in the instant between the tool's last poll and this
+    call -- never downgrade an already-resolved row back to expired."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "deepsearch_otp_expectations"):
+            return
+        await conn.execute(
+            "UPDATE deepsearch_otp_expectations SET status = 'expired', resolved_at = NOW() "
+            "WHERE id = $1 AND status = 'pending'",
+            expectation_id,
+        )
+
+
+async def resolve_otp_expectation_from_email(
+    user_id: int, from_address: str, subject: str | None, body_text: str | None,
+) -> dict[str, Any] | None:
+    """Called from server.py's personal-email webhook for every inbound
+    email, before it decides whether to start a normal notification turn.
+    Returns the newly-resolved row (now carrying the extracted code) if
+    this email answered a pending expectation for this user, else None --
+    a None return means "nothing was waiting, or nothing in this email
+    looked like a code," and the webhook's normal flow should proceed
+    exactly as if this function didn't exist.
+
+    Matching: among this user's still-'pending' rows (oldest first), prefer
+    one whose sender_filter appears in the from-address or subject; if none
+    match by filter, fall back to the oldest row that has NO filter at all
+    (a model that couldn't guess a keyword up front). A row with a filter
+    that matches nothing here is left pending -- it's still waiting for a
+    DIFFERENT email, not resolved by this one."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "deepsearch_otp_expectations"):
+            return None
+        pending = await conn.fetch(
+            "SELECT * FROM deepsearch_otp_expectations WHERE user_id = $1 AND status = 'pending' "
+            "ORDER BY created_at ASC",
+            user_id,
+        )
+        if not pending:
+            return None
+        code = _extract_otp_code(subject, body_text)
+        if not code:
+            return None
+        haystack = f"{from_address}\n{subject or ''}".lower()
+        chosen = None
+        for row in pending:
+            sf = (row["sender_filter"] or "").strip().lower()
+            if sf and sf in haystack:
+                chosen = row
+                break
+        if chosen is None:
+            for row in pending:
+                if not (row["sender_filter"] or "").strip():
+                    chosen = row
+                    break
+        if chosen is None:
+            return None
+        updated = await conn.fetchrow(
+            "UPDATE deepsearch_otp_expectations SET status = 'resolved', code = $2, resolved_at = NOW() "
+            "WHERE id = $1 RETURNING *",
+            chosen["id"], code,
+        )
+        return dict(updated) if updated else None
+
+
+# ---------------------------------------------------------------------------
 # Gmail connection requests (migrations/012_email_connection.sql) -- durable
 # state for "connect my email", same decoupled shape as the human-help block
 # above: request_email_connection (tools/email_tools.py) creates the row the

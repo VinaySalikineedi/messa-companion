@@ -1012,6 +1012,31 @@ async def personal_email_inbound_webhook(
     if logged is None:
         return JSONResponse({"status": "ignored (duplicate delivery)"})
 
+    # Email-verification-code relay (migrations/028_deepsearch_otp_
+    # expectations.sql): before treating this as an ordinary inbound email
+    # (which spawns a full Messa turn describing it to the user, see
+    # _process_inbound_personal_email below), check whether some deepsearch
+    # tab is actively waiting on THIS user's next verification email --
+    # see tools/deepsearch_tools.py's await_email_verification_code. The
+    # email is still durably logged above either way (db.log_inbound_
+    # personal_email already ran), so it still shows up in the user's
+    # live-view Emails/dashboard page -- this only decides whether it ALSO
+    # kicks off a separate "you got an email" SMS turn. A resolved match
+    # means a browser tab picks the code up on its own next poll (within
+    # config.DEEPSEARCH_OTP_WAIT_POLL_INTERVAL_SECONDS) with no text sent
+    # to the user at all -- the whole point being that this feels fully
+    # autonomous instead of asking the user to relay a code they can't
+    # even read (it went to Messa's own inbox, not theirs).
+    otp_match = await db.resolve_otp_expectation_from_email(
+        user["id"], from_address, payload.get("subject") or "", body_text,
+    )
+    if otp_match is not None:
+        console.system(
+            f"Personal-email: matched inbound email to OTP expectation #{otp_match['id']} "
+            f"for user #{user['id']} -- suppressing the normal notification turn."
+        )
+        return JSONResponse({"status": "accepted (resolved otp expectation)"})
+
     background_tasks.add_task(_process_inbound_personal_email, user["id"], logged, pdf_note)
     return JSONResponse({"status": "accepted"})
 

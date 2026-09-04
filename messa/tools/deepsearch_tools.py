@@ -114,7 +114,7 @@ from langchain.agents import create_agent
 from langchain.agents.middleware import SummarizationMiddleware
 from langchain_core.callbacks import AsyncCallbackHandler
 from langchain_core.language_models import BaseChatModel
-from langchain_core.messages import AIMessage, HumanMessage, messages_from_dict, messages_to_dict
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage, messages_from_dict, messages_to_dict
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import BaseTool, StructuredTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
@@ -712,6 +712,44 @@ def _extract_last_target_url(messages: list[Any]) -> str | None:
     return None
 
 
+def sanitize_tool_messages(messages: list[Any]) -> list[Any]:
+    """Heal a message list where an AIMessage's tool_calls were never
+    followed by a matching ToolMessage -- the shape a run leaves behind
+    whenever it's interrupted mid-tool-call: a crash, a cancellation, the
+    step limit or a timeout firing while a tool call was in flight, or an
+    unhandled exception inside provider._do(). Left unhealed, a message
+    list like that breaks the very next completion call that includes it
+    (OpenAI-style APIs reject an assistant tool_calls turn that isn't
+    immediately answered by a tool result for every one of its ids) --
+    which would otherwise surface as a hard failure the moment a paused
+    session is either resumed (see the `messages_from_dict(...)` call
+    building `prior_messages` above) or, before that, even just saved to
+    the DB with a dangling tool call baked into its stored JSON.
+
+    This only appends a synthetic ToolMessage for whichever specific
+    tool_call ids are missing a real response -- it never removes or
+    rewrites anything that already resolved correctly, so a healed session
+    still remembers everything about the run except that one interrupted
+    step.
+    """
+    healed: list[Any] = []
+    for i, msg in enumerate(messages):
+        healed.append(msg)
+        tool_calls = getattr(msg, "tool_calls", None)
+        if not tool_calls:
+            continue
+        responded_ids: set[str] = set()
+        j = i + 1
+        while j < len(messages) and isinstance(messages[j], ToolMessage):
+            responded_ids.add(messages[j].tool_call_id)
+            j += 1
+        for call in tool_calls:
+            call_id = call.get("id") if isinstance(call, dict) else getattr(call, "id", None)
+            if call_id and call_id not in responded_ids:
+                healed.append(ToolMessage(content="Action interrupted", tool_call_id=call_id))
+    return healed
+
+
 def _deepsearch_summarization_middleware(model: Any) -> SummarizationMiddleware | None:
     """Build the auto-compaction middleware deepsearch's own `create_agent`
     calls need explicitly -- unlike the four subagents built via deepagents'
@@ -1189,6 +1227,14 @@ class BrowserToolProvider:
             coroutine=self._request_human_help,
             name="request_human_help",
             description=(self._request_human_help.__doc__ or "").strip(),
+        ))
+        # Same "own Python method, given to every tab" reasoning as
+        # request_human_help just above -- a verification-code screen can
+        # turn up on any tab that's mid-signup, top-level or sub-worker.
+        self.tools.append(StructuredTool.from_function(
+            coroutine=self._await_email_verification_code,
+            name="await_email_verification_code",
+            description=(self._await_email_verification_code.__doc__ or "").strip(),
         ))
         # Same reasoning as request_human_help just above -- a signup or
         # login form can turn up on any tab, top-level or sub-worker. Neither
@@ -2036,6 +2082,98 @@ class BrowserToolProvider:
             f"Current page snapshot:\n{final_snap}"
         )
 
+    async def _await_email_verification_code(
+        self, sender_keyword: str = "", timeout_seconds: int | None = None
+    ) -> str:
+        """Model-facing tool: call this the moment you reach an email
+        verification/OTP screen DURING ACCOUNT CREATION, specifically when
+        the account was signed up using the user's own Messa email address
+        (generate_account_credential's default username) -- NOT when the
+        code went to the user's personal email or phone number, which only
+        the user can read (use request_human_help for those instead, since
+        there's a real human who can act on it).
+
+        Registers a wait for the verification email and keeps this tab's
+        browser session open while it waits. Messa's own inbound-email
+        webhook feeds the code back the moment the real email arrives --
+        usually within a few seconds -- with NO text sent to the user at
+        all; this is meant to be fully autonomous. Returns "RESOLVED: <the
+        code>" the moment it arrives, or "TIMEOUT: ..." if nothing showed
+        up within the wait window -- fall back to request_human_help if
+        that happens (e.g. the site actually sent it to the user's own
+        phone instead).
+
+        sender_keyword: a short, distinctive fragment of the sending
+        domain/address or subject you expect (e.g. "uber", "airbnb") --
+        narrows matching so a concurrent, unrelated verification email for
+        a DIFFERENT site/task doesn't get consumed by this wait. Leave
+        blank only if you genuinely have no better guess.
+
+        timeout_seconds: optional override, capped at
+        config.DEEPSEARCH_OTP_WAIT_MAX_SECONDS regardless -- most sites
+        send the email within 10-20s, so the default is already generous."""
+        if self._user_id is None:
+            return "ERROR: await_email_verification_code isn't available outside a real user session."
+        if not self._messa_email:
+            return (
+                "ERROR: this user has no Messa email address provisioned, so this tool can't "
+                "apply -- it only works for codes sent to the user's own Messa-assigned inbox. "
+                "If the code went to the user's personal email or phone instead, use "
+                "request_human_help."
+            )
+
+        await self._ensure_live_session()
+        await self._stop_reading_animation()
+
+        wait_seconds = config.DEEPSEARCH_OTP_WAIT_MAX_SECONDS
+        if timeout_seconds is not None:
+            try:
+                wait_seconds = max(10, min(int(timeout_seconds), config.DEEPSEARCH_OTP_WAIT_MAX_SECONDS))
+            except (TypeError, ValueError):
+                pass
+
+        console.system(
+            f"Deepsearch: awaiting email verification code on tab {self._tab_id} "
+            f"(sender_keyword={sender_keyword!r}, up to {wait_seconds}s)."
+        )
+        request_row = await db.create_otp_expectation(
+            self._user_id, self._deepsearch_session_id, self._tab_id, sender_keyword,
+        )
+        if request_row is None:
+            return (
+                "ERROR: verification-code waiting isn't available yet (migrations/028 hasn't been "
+                "applied) -- fall back to request_human_help instead."
+            )
+        expectation_id = request_row["id"]
+        self._live_set_waiting(f"Waiting for verification code ({sender_keyword or 'email'})")
+
+        try:
+            elapsed = 0
+            while elapsed < wait_seconds:
+                await asyncio.sleep(config.DEEPSEARCH_OTP_WAIT_POLL_INTERVAL_SECONDS)
+                elapsed += config.DEEPSEARCH_OTP_WAIT_POLL_INTERVAL_SECONDS
+                row = await db.get_otp_expectation(expectation_id)
+                if row and row.get("status") == "resolved" and row.get("code"):
+                    console.system(
+                        f"Deepsearch: verification code received on tab {self._tab_id} after {elapsed}s."
+                    )
+                    self._live_add_step("Received verification code")
+                    return f"RESOLVED: Received verification code {row['code']}. Enter it now."
+                if row and row.get("status") == "expired":
+                    # Extremely unlikely (nothing else expires this row while
+                    # we're the one still polling it) but handled for
+                    # completeness -- treat it exactly like a timeout below.
+                    break
+            await db.expire_otp_expectation(expectation_id)
+            return (
+                f"TIMEOUT: no verification email arrived within {wait_seconds}s. Take a fresh "
+                "browser_snapshot to check the page's current state, and consider whether the "
+                "code may have gone to the user's own phone/email instead -- if so, call "
+                "request_human_help."
+            )
+        finally:
+            self._live_mark_active()
+
     # Docstring below IS the tool description sent to the model on every
     # single call (see the StructuredTool.from_function registration a few
     # lines down: description=(self._request_human_help.__doc__ or
@@ -2431,6 +2569,25 @@ class BrowserToolProvider:
                     if isinstance(f, dict) and "target" in f and isinstance(f["target"], str):
                         f["target"] = self._resolve_target(f["target"])
 
+            # browser_snapshot EACCES fix: the model occasionally passes a
+            # filename (e.g. "ubereats_signup_page_snapshot.md"), presumably
+            # picked up from @playwright/mcp's own schema/examples, meaning
+            # "write the snapshot to this file and tell me where." In
+            # Docker/HF Spaces the working directory (/app) is read-only,
+            # so that write fails with EACCES and the model gets no
+            # snapshot at all -- effectively blind for that whole turn.
+            # Redirecting to /tmp (always writable, and nothing here ever
+            # reads the file back off disk -- the snapshot text itself
+            # comes back in the tool result either way) fixes the write
+            # without needing to strip the argument entirely, in case a
+            # future @playwright/mcp version starts relying on the file
+            # existing for something else. os.path.basename strips any
+            # directory component the model included, so this can never
+            # write outside /tmp regardless of what path shape it passes.
+            if name == "browser_snapshot" and kwargs.get("filename"):
+                safe_name = os.path.basename(str(kwargs["filename"])).strip() or "snapshot.md"
+                kwargs["filename"] = f"/tmp/{safe_name}"
+
             # A real action is about to happen -- if the "reading" scroll
             # animation is still playing from the previous browser_snapshot,
             # tell it to wind down now, before this call's own action, so
@@ -2637,6 +2794,11 @@ _SUBAGENT_SYSTEM_PROMPT = (
     "- Base every factual claim strictly on text that literally appears in snapshots.\n"
     "- If a tool result starts with 'BLOCKED:' or 'ERROR', don't retry the same action -- take "
     "a fresh snapshot or try a different approach.\n"
+    "- Hit an email verification/OTP screen right after signing up with generate_account_"
+    "credential's DEFAULT username (the user's own Messa email)? Call "
+    "await_email_verification_code, not request_human_help -- no human can read that inbox, "
+    "so waiting for one to act would never resolve. Only fall back to request_human_help if it "
+    "times out (the code may have gone to the user's own phone/personal email instead).\n"
     "- Hit a login wall, CAPTCHA, 2FA/one-time-code prompt, or any other block a real human "
     "would need to clear? First check get_account_credential(site_name) -- Messa may have "
     "already created this exact account for the user on an earlier task. Only call "
@@ -2703,6 +2865,11 @@ DEEPSEARCH_SYSTEM_PROMPT = (
     "immediately so the user can assist.\n"
     "- If a tool result starts with 'BLOCKED:' or 'ERROR', don't retry the same action -- take "
     "a fresh snapshot or try a different approach.\n"
+    "- Hit an email verification/OTP screen right after signing up with generate_account_"
+    "credential's DEFAULT username (the user's own Messa email)? Call "
+    "await_email_verification_code, not request_human_help -- no human can read that inbox, "
+    "so waiting for one to act would never resolve. Only fall back to request_human_help if it "
+    "times out (the code may have gone to the user's own phone/personal email instead).\n"
     "- Hit a login wall, CAPTCHA, 2FA/one-time-code prompt, or any other block a real human "
     "would need to clear? First check get_account_credential(site_name) -- Messa may have "
     "already created this exact account for the user on an earlier task. Only call "
@@ -2795,7 +2962,7 @@ def build_deepsearch_subagent(
             session_id = session_row["id"]
             task_title = session_row["title"]
             try:
-                prior_messages = messages_from_dict(json.loads(session_row["messages"]))
+                prior_messages = sanitize_tool_messages(messages_from_dict(json.loads(session_row["messages"])))
             except Exception:
                 prior_messages = []
             initial_resume_url = _extract_last_target_url(prior_messages)
@@ -2921,12 +3088,83 @@ def build_deepsearch_subagent(
                             middleware=[_summarization] if _summarization is not None else [],
                         )
                         status = "completed"
+                        # Set True only by the anti-hallucination gate below,
+                        # never by the step-limit (GraphRecursionError) path
+                        # further down -- distinguishes the two ways this run
+                        # can end up "active" so the header text below never
+                        # claims a warm, resumable browser session for a run
+                        # that in fact never opened one (no tool call ever
+                        # happened) or where GraphRecursionError already
+                        # decided independently whether the session is warm.
+                        gate_forced_active = False
                         try:
                             result = await asyncio.wait_for(
                                 inner_agent.ainvoke({"messages": messages}, config=run_config),
                                 timeout=config.DEEPSEARCH_MAX_SESSION_SECONDS,
                             )
                             final_messages = result["messages"]
+
+                            # Anti-hallucination completion gate: a reasoning model can
+                            # occasionally produce a plausible "done" summary without ever
+                            # calling a single tool -- no browser action, no search_web/
+                            # read_webpage call, nothing that could have produced real
+                            # information -- and this success path would otherwise trust
+                            # that completely, reporting fabricated completion back to the
+                            # user. The signal is whether THIS RUN's own new messages
+                            # contain even one tool call, anywhere -- deliberately not
+                            # provider._live_session_ready alone, since a task legitimately
+                            # answered entirely via search_web/read_webpage (zero browser
+                            # actions, by design -- see the "cost ZERO browser/session
+                            # time" system-prompt guidance above) is a perfectly real
+                            # result and must not trip this.
+                            new_messages = final_messages[len(messages):]
+                            had_any_tool_call = any(getattr(m, "tool_calls", None) for m in new_messages)
+                            if not had_any_tool_call:
+                                console.system(
+                                    f"Deepsearch: session #{session_id} reported completion "
+                                    "without ever calling a tool -- giving it one chance to "
+                                    "actually execute before trusting that."
+                                )
+                                try:
+                                    retry_result = await asyncio.wait_for(
+                                        inner_agent.ainvoke(
+                                            {"messages": [HumanMessage(content=(
+                                                "You reported this task as done without calling "
+                                                "any tool -- no browser action, no search, no page "
+                                                "read happened. That can't be a real result. Either "
+                                                "actually execute the tools needed to complete this "
+                                                "task now, or tell me honestly that you were not "
+                                                "able to do it and why."
+                                            ))]},
+                                            config=run_config,
+                                        ),
+                                        timeout=config.DEEPSEARCH_MAX_SESSION_SECONDS,
+                                    )
+                                    retry_messages = retry_result["messages"]
+                                    retry_new = retry_messages[len(final_messages):]
+                                    final_messages = retry_messages
+                                    if not any(getattr(m, "tool_calls", None) for m in retry_new):
+                                        status = "active"
+                                        gate_forced_active = True
+                                        console.system(
+                                            f"Deepsearch: session #{session_id} still called no "
+                                            "tool after one corrective nudge -- marking honestly "
+                                            "instead of trusting the claim."
+                                        )
+                                except (asyncio.TimeoutError, GraphRecursionError):
+                                    status = "active"
+                                    gate_forced_active = True
+                                    console.system(
+                                        f"Deepsearch: session #{session_id}'s corrective nudge "
+                                        "itself hit a limit -- marking honestly instead of "
+                                        "trusting the original claim."
+                                    )
+                                # Any OTHER exception here (a confirmed-dead session, too many
+                                # consecutive tool errors, cancellation) is deliberately not
+                                # caught -- it propagates to the exact same except blocks below
+                                # that already handle it for the original call, which still
+                                # ends this run honestly (never as a fabricated "completed").
+
                             # Finished successfully -- release warm session if previously cached
                             if session_id and session_id in _WARM_SESSION_PROVIDERS:
                                 old = _WARM_SESSION_PROVIDERS.pop(session_id, None)
@@ -2993,7 +3231,7 @@ def build_deepsearch_subagent(
                                 try:
                                     await db.update_deepsearch_session(
                                         session_id,
-                                        messages_json=json.dumps(messages_to_dict(final_messages), default=str),
+                                        messages_json=json.dumps(messages_to_dict(sanitize_tool_messages(final_messages)), default=str),
                                         status=status,
                                         summary="(cancelled by the user)",
                                         steps_used=steps_so_far + len(final_messages),
@@ -3026,13 +3264,28 @@ def build_deepsearch_subagent(
             if session_id:
                 await db.update_deepsearch_session(
                     session_id,
-                    messages_json=json.dumps(messages_to_dict(final_messages), default=str),
+                    messages_json=json.dumps(messages_to_dict(sanitize_tool_messages(final_messages)), default=str),
                     status=status,
                     summary=summary,
                     steps_used=steps_so_far + len(final_messages),
                     live_view_url=provider.live_view_url,
                 )
-                if status == "active":
+                if status == "active" and gate_forced_active:
+                    # The anti-hallucination gate, not the step limit,
+                    # forced this -- no browser session was necessarily ever
+                    # even opened (a run can reach this having called zero
+                    # tools at all), so "browser kept warm" would be a false
+                    # claim here. Still session-resumable either way (the
+                    # resume path re-derives a fresh session regardless --
+                    # see _run's own "open/close-per-task" resume handling
+                    # above), just without promising continuity that may
+                    # not exist.
+                    header = (
+                        f"[deepsearch session #{session_id} -- could not confirm this was actually "
+                        f"done (no tool/browser action happened). Say \"continue session #{session_id}\" "
+                        "to have it try again.]\n"
+                    )
+                elif status == "active":
                     header = (
                         f"[deepsearch session #{session_id} -- paused at step limit, browser kept warm. "
                         f"Say \"continue session #{session_id}\" to keep going.]\n"
