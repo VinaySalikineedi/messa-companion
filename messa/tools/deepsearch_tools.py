@@ -973,7 +973,17 @@ class BrowserToolProvider:
         actually triggers _ensure_live_session lazily on first real use, so
         this method itself never needs to know or care which of the three
         cases it's in -- it only ever writes schema-level tool objects."""
-        self.tools = [self._guard(name, description, args_schema) for name, description, args_schema in tool_specs]
+        EXCLUDED_MODEL_TOOLS = {
+            "browser_evaluate",
+            "browser_network_requests",
+            "browser_network_request",
+            "browser_run_code_unsafe",
+        }
+        self.tools = [
+            self._guard(name, description, args_schema)
+            for name, description, args_schema in tool_specs
+            if name not in EXCLUDED_MODEL_TOOLS
+        ]
         # request_human_help isn't a wrapped MCP tool -- it's our own Python
         # method, added directly to the model-facing toolset (unlike
         # _move_cursor_to/_start_reading_animation, which the model never
@@ -1271,7 +1281,10 @@ class BrowserToolProvider:
         if self._cursor_move_task is not None and not self._cursor_move_task.done():
             self._cursor_move_task.cancel()
         if self._session_cm is not None:
-            await self._session_cm.__aexit__(exc_type, exc, tb)
+            try:
+                await self._session_cm.__aexit__(exc_type, exc, tb)
+            except Exception as e:
+                console.system(f"Deepsearch: suppressed session teardown error ({type(e).__name__}): {e}")
         if not self._owns_server:
             # A sub-worker only closes its OWN client connection -- the
             # shared server process and the Browserbase session both belong
@@ -2158,6 +2171,16 @@ DEEPSEARCH_SYSTEM_PROMPT = (
     "wrong element if the page changed. Selector-style targets don't have this problem; "
     "Playwright resolves them fresh every time.\n"
     "- Base every factual claim strictly on text that literally appears in snapshots.\n"
+    "- ACT AS A HUMAN USER: You navigate pages visually with snapshots, mouse clicks, and typing. "
+    "Never attempt to inspect script tags, webpack bundles, or reverse-engineer backend APIs.\n"
+    "- FORM SUBMISSION: Modern single-page web apps (React, Next.js, Vue) frequently IGNORE the "
+    "Enter key on input fields. NEVER rely on pressing Enter on an input field to submit a form. "
+    "You MUST locate and click the visible submit or action button (e.g. button:has-text('Create Account'), "
+    "button:has-text('Sign Up'), button[type='submit'], text='Submit', role=button[name='Create account']). "
+    "If the page does not advance after filling a form, take a fresh snapshot, locate the button, and click it directly.\n"
+    "- EARLY ESCALATION: If a form fails to submit after 2 attempts, or displays an unhandled error or "
+    "unsolved CAPTCHA widget, do NOT loop or try to bypass it with scripts -- call request_human_help "
+    "immediately so the user can assist.\n"
     "- If a tool result starts with 'BLOCKED:' or 'ERROR', don't retry the same action -- take "
     "a fresh snapshot or try a different approach.\n"
     "- Hit a login wall, CAPTCHA, 2FA/one-time-code prompt, or any other block a real human "

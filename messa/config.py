@@ -761,7 +761,8 @@ DEEPSEARCH_ALLOWED_DOMAINS: list[str] = [
 # the orchestrator's own RECURSION_LIMIT -- deep research tasks legitimately
 # need many steps, and hitting this cap is expected/handled (the session is
 # saved and can be resumed) rather than an error condition.
-DEEPSEARCH_MAX_STEPS = int(os.environ.get("MESSA_DEEPSEARCH_MAX_STEPS", "100"))
+# 40 steps is optimal for fast, human-paced browsing without spinning indefinitely.
+DEEPSEARCH_MAX_STEPS = int(os.environ.get("MESSA_DEEPSEARCH_MAX_STEPS", "40"))
 
 # Deterministic backstop for snapshot-size discipline (the "reinforce/verify
 # the snapshot-size guidance" option flagged, unimplemented, in the speed
