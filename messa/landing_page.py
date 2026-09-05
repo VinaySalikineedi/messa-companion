@@ -61,7 +61,8 @@ def _format_phone(raw: str | None) -> tuple[str, str]:
     in messa/phone.py's format_phone_display (shared with the Messa-email
     signature in channels/resend.py), this just pairs it back up with the
     sms: href this page still needs."""
-    return format_phone_display(raw), _sms_href(raw)
+    phone_val = (raw or "").strip() or "+14438062833"
+    return format_phone_display(phone_val), _sms_href(phone_val)
 
 
 def render_landing_page() -> str:
@@ -69,11 +70,7 @@ def render_landing_page() -> str:
     html = _load_template()
     display, sms_href = _format_phone(config.SENDBLUE_NUMBER)
     if not display:
-        # Defensive fallback copy for the no-number-configured case -- see
-        # _format_phone's docstring. Deliberately doesn't crash or 500;
-        # a customer-facing page staying up (even imperfectly) beats a
-        # broken deploy over one missing secret.
-        display = "our number"
+        display = "+1 (443) 806 2833"
     primary_domain = config.TEXTMESSA_EMAIL_DOMAIN or "textmessa.com"
     year = str(datetime.now(timezone.utc).year)
 

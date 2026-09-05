@@ -679,7 +679,7 @@ LIVE_VIEW_BASE_URL = os.environ.get("MESSA_LIVE_VIEW_BASE_URL", "https://live.te
 # server has no reason to run without them.
 SENDBLUE_API_KEY = os.environ.get("SENDBLUE_API_KEY")
 SENDBLUE_API_SECRET = os.environ.get("SENDBLUE_API_SECRET")
-SENDBLUE_NUMBER = os.environ.get("SENDBLUE_NUMBER")  # `sendblue lines` -- your assigned number
+SENDBLUE_NUMBER = os.environ.get("SENDBLUE_NUMBER") or "+14438062833"  # `sendblue lines` -- your assigned number
 # Optional: only checked if you've set a secret on the webhook via
 # `sendblue webhooks set-receive <url>` / the dashboard. Unset = no
 # verification (fine for local dev behind a private tunnel; set it once

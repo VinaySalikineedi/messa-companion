@@ -41,7 +41,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Header, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 from . import background, briefings, cli, config, console, db, live_activity, memory, pdf_reader, waitlist
 from .agents.registry import build_orchestrator
@@ -95,7 +95,7 @@ async def landing_page() -> HTMLResponse:
 
 
 @app.get("/og-image.png")
-async def landing_og_image() -> FileResponse:
+async def landing_og_image() -> Response:
     """The link-preview image the landing page's og:image/twitter:image meta
     tags point at -- a static asset (messa/assets/landing/og-image.png),
     not templated like the page itself: it deliberately carries no phone
@@ -103,6 +103,8 @@ async def landing_og_image() -> FileResponse:
     README.md) since this file has no way to keep pixels in sync with
     config.SENDBLUE_NUMBER the way the HTML page's text can."""
     path = Path(__file__).parent / "assets" / "landing" / "og-image.png"
+    if not path.exists():
+        return Response(status_code=404)
     return FileResponse(path, media_type="image/png")
 
 
