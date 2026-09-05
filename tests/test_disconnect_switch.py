@@ -44,11 +44,20 @@ import os
 import sys
 import types
 
-sys.path.insert(0, "/home/claude/messa_build")
-os.environ.setdefault("OPENROUTER_API_KEY", "sk-test-dummy-not-real")
-os.environ.setdefault("DATABASE_URL", "postgresql://dummy:dummy@localhost:5432/dummy")
-os.environ.setdefault("BROWSERBASE_API_KEY", "bb-test-dummy-not-real")
-os.environ.setdefault("COMPOSIO_API_KEY", "comp-test-dummy-not-real")
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+if not (REPO_ROOT / ".env").exists():
+    # No real .env in this environment (e.g. a fresh cloud sandbox) --
+    # fall back to harmless dummy credentials so imports succeed and
+    # fake-pool/fake-model tests can run. A real .env (e.g. the actual
+    # dev machine/server) always wins untouched, since
+    # messa.config's own load_dotenv() never overrides an already-set var.
+    os.environ.setdefault("OPENROUTER_API_KEY", "sk-test-dummy-not-real")
+    os.environ.setdefault("DATABASE_URL", "postgresql://dummy:dummy@localhost:5432/dummy")
+    os.environ.setdefault("BROWSERBASE_API_KEY", "bb-test-dummy-not-real")
+    os.environ.setdefault("COMPOSIO_API_KEY", "comp-test-dummy-not-real")
 
 from messa import config, db  # noqa: E402
 from messa.approval import ApprovalGate, AutoApproveGate, DenyApprovalGate  # noqa: E402
@@ -280,7 +289,11 @@ class FakeEmailConnectedAccounts:
     def delete(self, connected_account_id, revoke_on_delete=False):
         self.delete_calls.append((connected_account_id, revoke_on_delete))
 
-    def list(self, **_kw):
+    def list(self, *, user_ids=None, statuses=None, **_kw):
+        # Usage-limits' max_connected_apps cap check (messa/usage.py) reads
+        # this live before generating a link -- empty is fine for every
+        # scenario in this file, well under any plan's cap, so it never
+        # changes what these tests are actually asserting.
         return []
 
 
@@ -486,7 +499,11 @@ class FakeIntegrationConnectedAccounts:
     def delete(self, connected_account_id, revoke_on_delete=False):
         self.delete_calls.append((connected_account_id, revoke_on_delete))
 
-    def list(self, **_kw):
+    def list(self, *, user_ids=None, statuses=None, **_kw):
+        # Usage-limits' max_connected_apps cap check (messa/usage.py) reads
+        # this live before generating a link -- empty is fine for every
+        # scenario in this file, well under any plan's cap, so it never
+        # changes what these tests are actually asserting.
         return []
 
 
@@ -677,8 +694,14 @@ def part5_prompts():
           "disconnect_email" in switch_para and "disconnect_integration_app" in switch_para)
     check("it tells Messa to say revocation is in progress, not confirmed complete",
           "in progress" in switch_para and "never" in switch_para)
+    # Post-compression (plans/glowing-forging-pumpkin.md Part 3): this
+    # reminder now lives with the rest of the calendar-specific routing
+    # rule (the "calendar:" bullet) rather than duplicated again in this
+    # generic switch/disconnect paragraph -- check the whole prompt, not
+    # just this one isolated paragraph.
     check("it tells Messa to warn about calendar events not carrying over before disconnecting",
-          "heads-up" in switch_para or "won't carry over" in switch_para)
+          "heads-up" in orchestrator_prompt or "won't carry over" in orchestrator_prompt
+          or "live only there" in orchestrator_prompt)
 
     integration_prompt = it.build_integration_system_prompt(user)
     check("integrations_agent's own prompt mentions switch_account=True",

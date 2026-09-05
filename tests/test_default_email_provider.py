@@ -31,10 +31,19 @@ import asyncio
 import os
 import sys
 
-sys.path.insert(0, "/home/claude/messa_build")
-os.environ.setdefault("OPENROUTER_API_KEY", "sk-test-dummy-not-real")
-os.environ.setdefault("DATABASE_URL", "postgresql://dummy:dummy@localhost:5432/dummy")
-os.environ.setdefault("BROWSERBASE_API_KEY", "bb-test-dummy-not-real")
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+if not (REPO_ROOT / ".env").exists():
+    # No real .env in this environment (e.g. a fresh cloud sandbox) --
+    # fall back to harmless dummy credentials so imports succeed and
+    # fake-pool/fake-model tests can run. A real .env (e.g. the actual
+    # dev machine/server) always wins untouched, since
+    # messa.config's own load_dotenv() never overrides an already-set var.
+    os.environ.setdefault("OPENROUTER_API_KEY", "sk-test-dummy-not-real")
+    os.environ.setdefault("DATABASE_URL", "postgresql://dummy:dummy@localhost:5432/dummy")
+    os.environ.setdefault("BROWSERBASE_API_KEY", "bb-test-dummy-not-real")
 
 from messa import cli, config, db  # noqa: E402
 from messa.agents import registry  # noqa: E402
@@ -217,8 +226,12 @@ def part5_system_prompt_still_carries_email_routing():
     per-turn field this whole file is about still actually flows through."""
     messa_default_user = _mk_user(default_email_provider="messa", email_connected=False)
     prompt = registry._build_system_prompt(messa_default_user)
-    check("system prompt always carries the Email routing guidance paragraph",
-          "Email routing" in prompt and "set_app_preference" in prompt)
+    # Post-compression (plans/glowing-forging-pumpkin.md Part 3): "Email
+    # routing" is no longer a standalone header -- email/calendar/tasks
+    # share one "Routing --" paragraph plus a per-category bullet.
+    check("system prompt always carries the routing guidance (shared paragraph + email bullet)",
+          "Routing --" in prompt and "email: personal_inbox_agent" in prompt
+          and "set_app_preference" in prompt)
     check("messa-default user, no app_preferences passed: known-about block still shows Messa's own address",
           "primary email: their own Messa address (personal_inbox_agent)" in prompt)
 

@@ -25,10 +25,19 @@ live-LLM way to test "the model routes correctly" without a real account.
 import os
 import sys
 
-sys.path.insert(0, "/home/claude/messa_build")
-os.environ.setdefault("OPENROUTER_API_KEY", "sk-test-dummy-not-real")
-os.environ.setdefault("DATABASE_URL", "postgresql://dummy:dummy@localhost:5432/dummy")
-os.environ.setdefault("BROWSERBASE_API_KEY", "bb-test-dummy-not-real")
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+if not (REPO_ROOT / ".env").exists():
+    # No real .env in this environment (e.g. a fresh cloud sandbox) --
+    # fall back to harmless dummy credentials so imports succeed and
+    # fake-pool/fake-model tests can run. A real .env (e.g. the actual
+    # dev machine/server) always wins untouched, since
+    # messa.config's own load_dotenv() never overrides an already-set var.
+    os.environ.setdefault("OPENROUTER_API_KEY", "sk-test-dummy-not-real")
+    os.environ.setdefault("DATABASE_URL", "postgresql://dummy:dummy@localhost:5432/dummy")
+    os.environ.setdefault("BROWSERBASE_API_KEY", "bb-test-dummy-not-real")
 
 from messa import config  # noqa: E402
 from messa.agents import registry  # noqa: E402
@@ -65,25 +74,22 @@ def part1_orchestrator_prompt():
     check("routing paragraph explicitly gives 'check Reddit' as a named-app example",
           "check Reddit" in prompt)
 
-    # Superseded by the primary-app preference system's own "Calendar
-    # routing" paragraph (see /tmp/test_app_preferences.py's Part 6 for
-    # the full generalized-across-categories coverage) -- the old
-    # "Google Calendar specifically:" heading is now just a short
-    # cross-reference note pointing at that paragraph, not a separate
-    # rule with its own content, so this file's own scope narrows to
-    # confirming the ORIGINAL fix's two claims (connect/manage requests
-    # go to integrations_agent, real toolkit slug named) still hold in
-    # the new paragraph.
-    check("a dedicated Calendar routing paragraph exists",
-          "Calendar routing --" in prompt)
-    gcal_para = prompt.split("Calendar routing --")[1].split("\n\n")[0]
-    check("that paragraph sends CONNECT/manage requests to integrations_agent, never executive_assistant",
+    # Post-compression (see plans/glowing-forging-pumpkin.md Part 3): email/
+    # calendar/tasks routing collapsed from three separately-headed
+    # paragraphs into one shared "Routing --" paragraph plus a compact
+    # per-category bullet -- same rules, terser text, so this now checks
+    # the calendar BULLET rather than a standalone "Calendar routing --"
+    # header. The old separate cross-reference paragraph pointing back at
+    # "Calendar routing" is gone entirely too -- it only existed to manage
+    # duplication between two separate calendar-routing locations, and
+    # there's only one now, so there's nothing left to cross-reference.
+    check("the calendar routing bullet exists",
+          "calendar: executive_assistant" in prompt)
+    gcal_para = prompt.split("calendar: executive_assistant")[1].split("\n")[0]
+    check("that bullet sends CONNECT/manage requests to integrations_agent, never executive_assistant",
           "goes to integrations_agent, never executive_assistant" in gcal_para)
-    check("that paragraph names the real Composio toolkit slug",
+    check("that bullet names the real Composio toolkit slug",
           "'googlecalendar'" in gcal_para)
-    check("the old heading now just cross-references the paragraph above rather than repeating "
-          "a separate, memory-less per-turn rule",
-          "covered above, under 'Calendar routing'" in prompt)
 
 
 def part2_executive_assistant_boundary():

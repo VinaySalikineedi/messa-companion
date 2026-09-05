@@ -110,28 +110,40 @@ def _parse_dt(value: Any, user_tz: str | None = None) -> datetime | None:
 # ---------------------------------------------------------------------------
 
 ONBOARDING_STEPS = [
-    "awaiting_name", "awaiting_location", "awaiting_email", "complete",
+    "awaiting_name", "complete",
 ]
-# Order is name -> city/zip -> email (deliberately in this order, not the
-# original name -> email -> city): location is the one onboarding answer
-# that's actually load-bearing (it drives timezone-correct scheduling/
-# reminders/weather), so it comes right after name rather than after the
-# skippable email question. There used to be a 4th step here,
-# "awaiting_email_connect" (an explicit "want me to connect your Gmail?"
-# yes/no gate before onboarding could reach "complete") -- removed by
-# request: it added a full extra back-and-forth before the user ever saw
-# what Messa actually is (see cli.py's onboarding-complete reveal message,
-# sent the moment this reaches "complete"), for a capability Messa can
-# already offer conversationally any time ("connect my gmail") -- see
-# agents/registry.py's `known_str` ("Gmail is NOT connected yet ... can
-# send them a connect link on request"), which was true before this change
-# and still is. Nothing about actually connecting Gmail changed -- only
-# that it's no longer a gate onboarding has to pass through first.
+# Name is the ONLY real onboarding gate now -- matches the "onboarded in a
+# single text" promise, and gets the user to Messa's own onboarding-complete
+# reveal (her email address + live-view link, see cli.py's
+# _onboarding_complete_messages) as fast as possible. City and email used to
+# be sequential gated steps here (awaiting_location -> awaiting_email ->
+# complete) -- removed by request: forcing two more back-and-forth answers
+# before onboarding could ever "complete" both contradicted the single-text
+# promise and, worse, meant the model reliably dropped the ask altogether
+# (a two-sentence step instruction buried in a long system prompt loses to
+# the user's actual question almost every time) which is exactly the bug
+# that prompted this change. City and email are still valuable and still
+# asked -- just conversationally, any time, tied to a real moment they're
+# actually useful for (see agents/registry.py's profile-enrichment prompt
+# block), the same way connecting Gmail already worked before this change
+# (see the now-removed "awaiting_email_connect" step's history below).
+# `save_profile_field` reflects this: only field == "name" still advances
+# onboarding_step; city/email write their columns unconditionally,
+# regardless of onboarding_step, since there's no step left for them to be
+# gated on.
+#
+# (Historical note, kept for context: there used to be a 4th step here,
+# "awaiting_email_connect", an explicit "want me to connect your Gmail?"
+# yes/no gate before onboarding could reach "complete" -- removed even
+# earlier than this change, for the same underlying reason: it added a full
+# extra back-and-forth before the user ever saw what Messa actually is, for
+# a capability Messa can already offer conversationally any time ("connect
+# my gmail") -- see agents/registry.py's `known_str`.)
 
 
 def _initial_onboarding_step(name: str | None) -> str:
     """Where a brand-new user's onboarding starts, given what we already know."""
-    return "awaiting_location" if name else "awaiting_name"
+    return "complete" if name else "awaiting_name"
 
 
 async def get_or_create_user(
@@ -579,12 +591,23 @@ async def list_calendar_events_for_range(user_id: int, start: datetime, end: dat
 
 
 async def save_profile_field(user_id: int, field: str, value: str) -> dict[str, Any]:
-    """Save one onboarding field (name/city/email) and advance onboarding_step.
+    """Save one profile field (name/city/email).
 
-    `value` may be the literal string 'skip' for the optional email step --
-    still advances onboarding without writing anything (Messa's own address
-    covers signups/accounts either way, see cli.py's onboarding-complete
-    reveal message).
+    Only `field == "name"` still gates onboarding_step (awaiting_name ->
+    complete, see ONBOARDING_STEPS) -- city and email are no longer
+    sequential onboarding steps at all (see that constant's own comment for
+    why), so they write their column any time, at any onboarding_step,
+    conversationally, whenever the user actually gives one.
+
+    `value` may be the literal string 'skip' for city or email -- nothing
+    gets written, but migrations/031_profile_prompt_skips.sql's
+    city_prompt_skipped/email_prompt_skipped flag is set instead (when that
+    migration's applied; a no-op pre-migration, same graceful-degrade shape
+    as everywhere else in this file), so agents/registry.py's
+    profile-enrichment prompt block knows not to keep suggesting a field the
+    user already explicitly declined. Skipping 'name' just does nothing
+    (name isn't skippable -- there's no flag for it and it's the one thing
+    onboarding actually needs to complete).
 
     For `field == "city"`, this also resolves and stores the user's real
     timezone (via timeutil.resolve_timezone) instead of leaving it on
@@ -604,25 +627,28 @@ async def save_profile_field(user_id: int, field: str, value: str) -> dict[str, 
     if field not in ("name", "email", "city"):
         raise ValueError(f"Unknown profile field: {field}")
 
+    is_skip = bool(value) and value.strip().lower() == "skip"
+    skip_flag_column = {"city": "city_prompt_skipped", "email": "email_prompt_skipped"}.get(field)
+
     pool = await get_pool()
     async with pool.acquire() as conn:
-        if field == "email" and not await _has_column(conn, "users", "email"):
-            # Migration 003 not applied yet -- skip storing, still advance.
+        if is_skip and skip_flag_column:
+            if await _has_column(conn, "users", skip_flag_column):
+                await conn.execute(f"UPDATE users SET {skip_flag_column} = TRUE WHERE id = $1", user_id)
+        elif field == "email" and not await _has_column(conn, "users", "email"):
+            # Migration 003 not applied yet -- skip storing.
             pass
-        elif value and value.strip().lower() != "skip":
+        elif value and not is_skip:
             await conn.execute(f"UPDATE users SET {field} = $2 WHERE id = $1", user_id, value.strip())
 
         row = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
-        current_step = row["onboarding_step"]
-        step_for_field = {
-            "name": "awaiting_name",
-            "city": "awaiting_location",
-            "email": "awaiting_email",
-        }[field]
-        if current_step == step_for_field:
-            next_step = ONBOARDING_STEPS[ONBOARDING_STEPS.index(step_for_field) + 1]
-            await conn.execute("UPDATE users SET onboarding_step = $2 WHERE id = $1", user_id, next_step)
-            row = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
+
+        if field == "name":
+            current_step = row["onboarding_step"]
+            if current_step == "awaiting_name":
+                next_step = ONBOARDING_STEPS[ONBOARDING_STEPS.index("awaiting_name") + 1]
+                await conn.execute("UPDATE users SET onboarding_step = $2 WHERE id = $1", user_id, next_step)
+                row = await conn.fetchrow("SELECT * FROM users WHERE id = $1", user_id)
 
     if field == "name" and value and value.strip().lower() != "skip":
         # User just gave their name! Provision their <username>@textmessa.com address immediately.

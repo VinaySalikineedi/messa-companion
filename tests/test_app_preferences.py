@@ -14,10 +14,19 @@ import asyncio
 import os
 import sys
 
-sys.path.insert(0, "/home/claude/messa_build")
-os.environ.setdefault("OPENROUTER_API_KEY", "sk-test-dummy-not-real")
-os.environ.setdefault("DATABASE_URL", "postgresql://dummy:dummy@localhost:5432/dummy")
-os.environ.setdefault("BROWSERBASE_API_KEY", "bb-test-dummy-not-real")
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+if not (REPO_ROOT / ".env").exists():
+    # No real .env in this environment (e.g. a fresh cloud sandbox) --
+    # fall back to harmless dummy credentials so imports succeed and
+    # fake-pool/fake-model tests can run. A real .env (e.g. the actual
+    # dev machine/server) always wins untouched, since
+    # messa.config's own load_dotenv() never overrides an already-set var.
+    os.environ.setdefault("OPENROUTER_API_KEY", "sk-test-dummy-not-real")
+    os.environ.setdefault("DATABASE_URL", "postgresql://dummy:dummy@localhost:5432/dummy")
+    os.environ.setdefault("BROWSERBASE_API_KEY", "bb-test-dummy-not-real")
 
 from messa import config, db, server  # noqa: E402
 from messa.agents import registry  # noqa: E402
@@ -310,15 +319,21 @@ def part6_system_prompt_generalization():
         user, ["gmail", "googlecalendar", "todoist"],
         {"email": "gmail", "calendar": "googlecalendar", "tasks": "todoist"},
     )
-    check("Calendar routing paragraph exists", "Calendar routing --" in prompt_connected)
-    check("Tasks routing paragraph exists", "Tasks routing --" in prompt_connected)
+    # Post-compression (see plans/glowing-forging-pumpkin.md Part 3): email/
+    # calendar/tasks routing is now one shared "Routing --" paragraph plus a
+    # compact per-category bullet, rather than three separately-headed
+    # paragraphs -- same rules, terser text. Check for the category bullets
+    # and the shared mechanism instead of the old standalone headers.
+    check("shared Routing paragraph exists", "Routing --" in prompt_connected)
+    check("calendar category bullet exists", "calendar: executive_assistant" in prompt_connected)
+    check("tasks category bullet exists", "tasks: executive_assistant" in prompt_connected)
     check("reminders are explicitly carved out of tasks routing", "Reminders are NOT part of this" in prompt_connected)
     check("known-state line shows googlecalendar as primary calendar, connected",
           "primary calendar: their connected googlecalendar (integrations_agent)" in prompt_connected)
     check("known-state line shows todoist as primary tasks, connected",
           "primary tasks: their connected todoist (integrations_agent)" in prompt_connected)
-    check("email routing still mentions set_app_preference (not the old set_default_email_provider)",
-          "set_app_preference('email'" in prompt_connected)
+    check("routing still mentions set_app_preference (not the old set_default_email_provider)",
+          "set_app_preference(category, value)" in prompt_connected)
     check("old set_default_email_provider tool name is gone from the prompt",
           "set_default_email_provider" not in prompt_connected)
 

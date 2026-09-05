@@ -1,11 +1,20 @@
 """Tests for Messa's executive assistant voice & persona across outbound emails
 sent from the user's Messa address (@textmessa.com).
 """
+import os
 import sys
+from pathlib import Path
 
-from messa import config
-from messa.agents import registry
-from messa.tools import personal_inbox_tools
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+if not (REPO_ROOT / ".env").exists():
+    os.environ.setdefault("OPENROUTER_API_KEY", "sk-test-dummy-not-real")
+    os.environ.setdefault("DATABASE_URL", "postgresql://dummy:dummy@localhost:5432/dummy")
+    os.environ.setdefault("BROWSERBASE_API_KEY", "bb-test-dummy-not-real")
+
+from messa import config  # noqa: E402
+from messa.agents import registry  # noqa: E402
+from messa.tools import personal_inbox_tools  # noqa: E402
 
 failures = []
 
@@ -65,15 +74,19 @@ def test_system_prompts():
         messa_email_local_part="vinay",
     )
 
+    # Post-compression (plans/glowing-forging-pumpkin.md Part 3): the old
+    # 4-bullet "VOICE & PERSONA IN EMAILS (STRICT EXECUTIVE ASSISTANT RULE)"
+    # block is now one short paragraph -- same rules (third person, no
+    # first-person impersonation, no name sign-off), reworded/compressed.
     inbox_prompt = personal_inbox_tools.build_personal_inbox_system_prompt(user)
-    check("personal_inbox_agent prompt carries STRICT EXECUTIVE ASSISTANT RULE",
-          "VOICE & PERSONA IN EMAILS (STRICT EXECUTIVE ASSISTANT RULE)" in inbox_prompt)
-    check("personal_inbox_agent prompt mentions writing on behalf of user",
-          "I'm reaching out on behalf of Vinay" in inbox_prompt)
+    check("personal_inbox_agent prompt carries the voice-in-the-body rule",
+          "Voice in the body: you're Messa, Vinay's assistant, writing on their behalf" in inbox_prompt)
+    check("personal_inbox_agent prompt gives a concrete third-person example",
+          "Vinay asked me to follow up" in inbox_prompt)
     check("personal_inbox_agent prompt forbids first-person impersonation",
-          "NEVER write in the first person pretending to be the user" in inbox_prompt)
+          "never first-person as Vinay" in inbox_prompt)
     check("personal_inbox_agent prompt forbids user name sign-off",
-          "NEVER sign off with the user's name" in inbox_prompt)
+          "never sign off with Vinay's name" in inbox_prompt)
 
     # Nameless user fallback
     nameless_user = config.UserContext(
@@ -85,12 +98,16 @@ def test_system_prompts():
     )
     nameless_prompt = personal_inbox_tools.build_personal_inbox_system_prompt(nameless_user)
     check("Nameless user falls back cleanly to 'the user'",
-          "personal assistant to the user" in nameless_prompt)
+          "Messa, the user's assistant" in nameless_prompt)
 
-    # Orchestrator prompt
+    # Orchestrator prompt: post-compression, this lives in the shared
+    # email/calendar/tasks "Routing --" paragraph's email bullet now, not a
+    # standalone assistant-voice sentence.
     orch_prompt = registry._build_system_prompt(user)
-    check("Orchestrator prompt carries assistant voice instruction for personal_inbox_agent",
-          "Messa ALWAYS writes as the user's executive assistant on their behalf" in orch_prompt)
+    check("Orchestrator prompt tells Messa to write third-person on the user's behalf "
+          "from their Messa address",
+          "always write third-person on their behalf" in orch_prompt
+          and "never sign off with their name" in orch_prompt)
 
 
 def main():

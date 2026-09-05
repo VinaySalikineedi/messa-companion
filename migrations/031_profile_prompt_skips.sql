@@ -1,0 +1,23 @@
+-- Migration 031: profile-enrichment skip flags for city/email.
+--
+-- Context: migration behind the change that turned onboarding's old rigid
+-- "awaiting_location -> awaiting_email -> complete" step-gate into a fast
+-- single-question onboarding (name only -> complete, see db.py's
+-- ONBOARDING_STEPS comment) plus ongoing, conversational "profile
+-- enrichment" for city/email -- asked opportunistically whenever they're
+-- actually relevant to what the user needs (a location-dependent request,
+-- something that needs emailing), never as a blocking checklist.
+--
+-- The gap that creates: without a dedicated onboarding step to structurally
+-- "use up" an explicit decline, there needs to be somewhere to record that
+-- the user was ASKED and said no/skip, so Messa's profile-enrichment prompt
+-- (agents/registry.py) stops suggesting it -- otherwise a user who
+-- genuinely declined to share their email would just get asked again the
+-- next time it seemed relevant, forever. These two boolean flags are that
+-- record. Same `is_admin`/migration 029-style plain boolean columns, same
+-- `_has_column` graceful-degrade read pattern as everywhere else in this
+-- project -- an un-migrated DB just never sets/reads these and behaves as
+-- it did before this migration (keeps asking; no crash, no silent data
+-- loss, just misses this one refinement).
+ALTER TABLE users ADD COLUMN IF NOT EXISTS city_prompt_skipped BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_prompt_skipped BOOLEAN NOT NULL DEFAULT false;

@@ -4,15 +4,22 @@ prompt engineering, edge-case sanitization, and end-to-end tool execution.
 import asyncio
 import os
 import sys
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from dotenv import load_dotenv
 
-load_dotenv()
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+load_dotenv(REPO_ROOT / ".env")
+if not (REPO_ROOT / ".env").exists():
+    os.environ.setdefault("OPENROUTER_API_KEY", "sk-test-dummy-not-real")
+    os.environ.setdefault("DATABASE_URL", "postgresql://dummy:dummy@localhost:5432/dummy")
+    os.environ.setdefault("BROWSERBASE_API_KEY", "bb-test-dummy-not-real")
 
-from messa import config
-from messa.agents import registry
-from messa.tools import personal_inbox_tools
+from messa import config  # noqa: E402
+from messa.agents import registry  # noqa: E402
+from messa.tools import personal_inbox_tools  # noqa: E402
 
 failures = []
 
@@ -184,17 +191,24 @@ def test_system_prompt_profiles():
 
         target_name = name or "the user"
 
-        # Check subagent prompt
+        # Post-compression (plans/glowing-forging-pumpkin.md Part 3): same
+        # rules (third person, no first-person impersonation, no name
+        # sign-off), now stated in one short "Voice in the body:" paragraph
+        # rather than the old separate bulleted lines -- see personal_inbox_
+        # tools.py's build_personal_inbox_system_prompt.
         check(f"Inbox prompt carries assistant persona for name={name!r}",
-              f"You are Messa, the personal assistant to {target_name}" in inbox_prompt)
+              f"Voice in the body: you're Messa, {target_name}'s assistant, writing on "
+              "their behalf" in inbox_prompt)
         check(f"Inbox prompt carries third-person rules for name={name!r}",
-              f"I'm reaching out on behalf of {target_name}" in inbox_prompt)
+              f"{target_name} asked me to follow up" in inbox_prompt)
         check(f"Inbox prompt carries prohibition on first person for name={name!r}",
-              "NEVER write in the first person pretending to be the user" in inbox_prompt)
+              f"never first-person as {target_name}" in inbox_prompt)
 
-        # Check orchestrator prompt
+        # Check orchestrator prompt -- this now lives in the shared email/
+        # calendar/tasks "Routing --" paragraph's email bullet.
         check(f"Orchestrator carries personal_inbox assistant instruction for name={name!r}",
-              "Messa ALWAYS writes as the user's executive assistant on their behalf" in orch_prompt)
+              "always write third-person on their behalf" in orch_prompt
+              and "never sign off with their name" in orch_prompt)
 
 
 # ============================================================================
@@ -209,6 +223,7 @@ async def test_tool_executions():
         name="Vinay",
         timezone="America/New_York",
         messa_email_local_part="vinay",
+        is_admin=True,
     )
 
     from messa.approval import AutoApproveGate

@@ -65,7 +65,7 @@ def _require(name: str) -> str:
 # pinning the dated snapshot (`deepseek/deepseek-v4-pro-0813`) via
 # MESSA_MODEL, no code change needed either way.
 OPENROUTER_API_KEY = _require("OPENROUTER_API_KEY")
-ORCHESTRATOR_MODEL_NAME = os.environ.get("MESSA_MODEL", "~deepseek/deepseek-v4-pro")
+ORCHESTRATOR_MODEL_NAME = os.environ.get("MESSA_MODEL", "deepseek/deepseek-v4-pro")
 SUBAGENT_MODEL_NAME = os.environ.get("MESSA_SUBAGENT_MODEL", "~deepseek/deepseek-v4-flash-latest")
 
 # A pool of OpenRouter API keys deepsearch's concurrent delegate_website_task
@@ -1270,6 +1270,14 @@ class UserContext:
     name: str | None = None
     email: str | None = None
     city: str | None = None
+    # From users.city_prompt_skipped/email_prompt_skipped
+    # (migrations/031_profile_prompt_skips.sql): set when the user explicitly
+    # said 'skip' to a profile-enrichment ask (db.save_profile_field) --
+    # agents/registry.py's profile-enrichment prompt block checks these so
+    # it never keeps re-suggesting a field someone already declined. False
+    # (never skipped) on an un-migrated DB, same as everywhere else.
+    city_prompt_skipped: bool = False
+    email_prompt_skipped: bool = False
     timezone: str = DEFAULT_TIMEZONE
     # Whether `timezone` was actually derived from something the user told
     # us (their city/zip, via timeutil.resolve_timezone) as opposed to

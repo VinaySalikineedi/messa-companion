@@ -16,6 +16,8 @@ from langchain_core.messages import HumanMessage
 from . import background, config, console, db, session_store, usage
 from .agents.registry import build_orchestrator
 from .approval import CLIApprovalGate
+from .channels import sendblue
+from .channels.sendblue import SendblueError
 
 # Heuristic backstop for the "empty promise" failure mode (see run_turn's
 # docstring): the system prompt explicitly tells Messa to open with a short
@@ -34,6 +36,59 @@ _STALL_PATTERN = re.compile(
     r"\bon it\b|sending (?:this|that|it) (?:to|over|back)|working on it)\b",
     re.IGNORECASE,
 )
+
+# Pre-send guardrail (see agents/registry.py's persona block, which asks for
+# this same shape in the prompt -- this is the deterministic backstop for
+# when prompting alone isn't enough): flags leftover markdown/bullet-list
+# formatting, or a reply that's grown too long for a text message.
+_MARKDOWN_ARTIFACT_PATTERN = re.compile(
+    r"(\*\*[^*\n]+\*\*|^\s*#{1,6}\s|^\s*[-*]\s|^\s*\d+\.\s|```)",
+    re.MULTILINE,
+)
+_GUARDRAIL_LENGTH_THRESHOLD = 320  # ~2 SMS segments -- tunable.
+
+
+async def _apply_reply_guardrail(msg_text: str) -> str:
+    """Deterministic, mechanical pass over a model-drafted reply right
+    before it's persisted/sent. Both checks below are cheap/synchronous and
+    the common case (a short, clean reply) costs nothing extra -- only a
+    reply that actually trips one of them pays for a follow-up model call.
+
+    That follow-up call asks the cheaper SUBAGENT_MODEL_NAME to rewrite the
+    reply -- not truncate it -- into a short, human, plain-paragraph text
+    that keeps every fact that matters, only staying as long as the
+    original if shortening it would genuinely lose necessary meaning. If
+    that call itself fails for any reason, the original msg_text is
+    returned unchanged: a guardrail must never be the reason a real reply
+    never reaches the user."""
+    is_long = len(msg_text) > _GUARDRAIL_LENGTH_THRESHOLD
+    has_markdown = bool(_MARKDOWN_ARTIFACT_PATTERN.search(msg_text))
+    if not is_long and not has_markdown:
+        return msg_text
+    try:
+        model = config.build_model(
+            config.SUBAGENT_MODEL_NAME, api_key=config.api_key_for_agent("reply_guardrail"),
+        )
+        result = await model.ainvoke([
+            {
+                "role": "system",
+                "content": (
+                    "Rewrite the following text-message reply to be short and human: plain "
+                    "paragraphs separated by a blank line, no bullet points, no numbered "
+                    "lists, no markdown (**bold**, #headers, code fences) at all. Keep every "
+                    "fact, name, and number that matters -- don't drop real information. Only "
+                    "stay as long as the original if shortening it would genuinely lose "
+                    "necessary meaning; otherwise make it meaningfully shorter. Reply with "
+                    "ONLY the rewritten text, nothing else -- no preamble, no explanation."
+                ),
+            },
+            {"role": "user", "content": msg_text},
+        ])
+        rewritten = (getattr(result, "content", None) or "").strip()
+        return rewritten or msg_text
+    except Exception as e:  # noqa: BLE001 -- guardrail failure must never suppress a real reply
+        console.system(f"[reply guardrail] compression call failed, sending original: {e}")
+        return msg_text
 
 
 async def _context_from_row(user_row: dict, channel: str, message_handle: str | None = None) -> config.UserContext:
@@ -73,6 +128,8 @@ async def _context_from_row(user_row: dict, channel: str, message_handle: str | 
         name=user_row["name"],
         email=user_row.get("email"),
         city=user_row.get("city"),
+        city_prompt_skipped=bool(user_row.get("city_prompt_skipped", False)),
+        email_prompt_skipped=bool(user_row.get("email_prompt_skipped", False)),
         timezone=user_row["timezone"],
         timezone_confirmed=bool(user_row.get("timezone_confirmed", False)),
         onboarding_step=user_row["onboarding_step"],
@@ -546,6 +603,8 @@ async def run_message(user: config.UserContext, agent, text: str, send=None) -> 
         if not msg_text:
             return  # nothing to say and no link to attach -- e.g. a silent, non-deepsearch delegation
 
+        msg_text = await _apply_reply_guardrail(msg_text)
+
         if not user.is_admin:
             # The pre-agent gate in run_message only catches a user who was
             # ALREADY over their limit before this turn started -- a turn
@@ -577,9 +636,27 @@ async def run_message(user: config.UserContext, agent, text: str, send=None) -> 
     # to the model. Sent (and persisted) as its own follow-up, after
     # whatever the model itself said this turn (typically a short
     # acknowledgment of the just-answered email question).
-    for onboarding_msg in await _onboarding_complete_messages(user):
+    reveal_messages = await _onboarding_complete_messages(user)
+    for i, onboarding_msg in enumerate(reveal_messages):
         sent_texts.append(onboarding_msg)
         await db.append_message(user.user_id, "assistant", onboarding_msg, channel=user.channel)
+        # The completion moment gets Apple's 'confetti' effect on a real
+        # iMessage thread (same user.message_handle gate react_to_message
+        # already uses -- SMS/RCS has no Apple effects support) -- fired
+        # deterministically here, on the FIRST reveal message, rather than
+        # left to the model, same "don't trust free-text output for
+        # something that must always happen exactly right" reasoning as the
+        # rest of this reveal (see _onboarding_complete_messages' own
+        # docstring). Sent directly via sendblue.send_message rather than
+        # the generic `send` callback since `send_style` is Sendblue-
+        # specific and this reveal also fires over the personal-email/CLI
+        # paths, which have no such concept.
+        if i == 0 and user.message_handle:
+            try:
+                await sendblue.send_message(user.phone_number, onboarding_msg, send_style="confetti")
+                continue
+            except SendblueError as e:
+                console.system(f"[onboarding confetti] send failed, falling back to plain send: {e}")
         if send:
             await send(onboarding_msg)
 
