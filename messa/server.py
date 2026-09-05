@@ -1138,7 +1138,9 @@ async def _process_inbound_personal_email(
         "autonomy policy: reply yourself with personal_inbox_agent's reply_to_email (this "
         "thread_id, autonomous=True) only if it's clearly low-stakes; otherwise tell me "
         "who it's from and what it says, and wait for me to tell you what to do -- you can "
-        "send it with reply_to_email (autonomous=False) once I have."
+        "send it with reply_to_email (autonomous=False) once I have. Remember: when replying or "
+        "proposing a reply from your Messa address, always speak as my assistant on my behalf in "
+        "the third person (e.g. '<Name> asked me to...'), never in the first person pretending to be me."
     )
 
     try:
