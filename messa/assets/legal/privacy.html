@@ -6,7 +6,7 @@
 <title>Privacy Policy - Messa</title>
 <meta name="description" content="How Messa collects, uses, shares, and protects your information.">
 <meta name="theme-color" content="#ffffff">
-<meta name="robots" content="noindex, follow">
+<meta name="robots" content="index, follow">
 <link rel="canonical" href="https://__PRIMARY_DOMAIN__/privacy">
 
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%23157F45'/%3E%3Cpath d='M17 21c0-2.2 1.8-4 4-4h22c2.2 0 4 1.8 4 4v16c0 2.2-1.8 4-4 4H29l-8 7v-7h-0c-2.2 0-4-1.8-4-4V21z' fill='%23ffffff'/%3E%3Ccircle cx='25' cy='29' r='2.4' fill='%23157F45'/%3E%3Ccircle cx='32' cy='29' r='2.4' fill='%23157F45'/%3E%3Ccircle cx='39' cy='29' r='2.4' fill='%23157F45'/%3E%3C/svg%3E">
@@ -89,13 +89,6 @@
   .tldr li:last-child{ margin-bottom: 0; }
   .tldr strong{ color: var(--green-strong); }
 
-  .placeholder-note{
-    background: var(--amber-soft); border: 1px solid rgba(154,91,10,0.25);
-    border-radius: var(--radius-md); padding: 16px 20px; margin: 28px 0;
-    font-size: 14.5px; color: var(--amber);
-  }
-  .placeholder-note strong{ color: var(--amber); }
-
   /* ---------------- Body ---------------- */
   main.doc{ padding: 12px 0 80px; }
   section.sec{ padding: 34px 0 0; }
@@ -162,15 +155,12 @@
       <ul>
         <li>By texting, emailing, or otherwise chatting with Messa, you agree to this policy.</li>
         <li>We collect what Messa actually needs to do what you ask: your phone number and name, and whatever you tell her in conversation -- your city, your email, your requests, the tasks you hand her.</li>
-        <li>Everything she does for you -- reading your calendar, browsing a website, sending an email -- runs through a small set of named service providers, listed below, that do that specific job. We do <strong>not</strong> sell your personal information, and we don't use your conversations to serve you ads.</li>
+        <li>Everything she does for you -- reading your calendar, browsing a website, sending an email -- runs through a small set of named service providers, listed below, that do that specific job. We do <strong>not</strong> sell your personal information, we don't use your conversations to train public AI models, and we don't use your conversations to serve you advertising.</li>
+        <li><strong>Mobile privacy:</strong> your phone number and SMS opt-in consent are never shared with third parties or affiliates for marketing. Standard carrier message and data rates may apply; text <strong>STOP</strong> to cancel or <strong>HELP</strong> for assistance anytime.</li>
         <li>Any account you connect (Gmail, Google Calendar, Todoist, and 1,400+ others) stays under your control -- Messa only acts within the permissions you grant, and you can disconnect any of them at any time by simply telling her.</li>
         <li>If you ask Messa to generate or remember a password for a website, it's encrypted before it's ever stored -- we can't read it back in plain text.</li>
         <li>You can ask to see, correct, or delete your data at any time, either by telling Messa directly or by emailing <a href="mailto:__PRIVACY_EMAIL__">__PRIVACY_EMAIL__</a>.</li>
       </ul>
-    </div>
-
-    <div class="placeholder-note">
-      <strong>Before this page goes live:</strong> this document should be reviewed by a lawyer before publishing -- it is not a substitute for legal advice.
     </div>
 
     <nav class="toc" aria-label="Table of contents">
@@ -223,6 +213,9 @@
 
       <h3>2.5 Credentials you ask Messa to manage</h3>
       <p>If you ask Messa to generate or store a login/password for a specific website (not one of the OAuth-connected apps above), it is encrypted before it's ever written to our database -- see Section 6.</p>
+
+      <h3>2.6 Website and technical log data</h3>
+      <p>When you visit our website (textmessa.com) or view a public live-view link, our web servers automatically record standard technical log data (such as your IP address, browser user-agent, and request timestamp). We use this information strictly to maintain security, detect and prevent abuse, and enforce fair-use limits.</p>
     </section>
 
     <section class="sec" id="how-we-use">
@@ -236,6 +229,7 @@
         <li>Communicate with you about your account or the service itself.</li>
       </ul>
       <p><strong>We do not sell your personal information, and we do not use your conversations with Messa to serve you advertising.</strong></p>
+      <p><strong>We do not use your personal messages, conversation history, or private documents to train public foundation AI models</strong>, and we configure our AI model provider integrations to opt out of training where supported.</p>
     </section>
 
     <section class="sec" id="who-we-share-with">
@@ -260,6 +254,10 @@
         </table>
       </div>
       <p>We may also disclose information if required by law, to protect the rights and safety of our users or the public, or as part of a merger, acquisition, or sale of assets (in which case you'd be notified).</p>
+
+      <h3>4.1 Mobile messaging and carrier terms</h3>
+      <p><strong>No mobile information will be shared with third parties or affiliates for marketing or promotional purposes.</strong> All the above categories exclude text messaging originator opt-in data and consent; this information will not be shared with any third parties.</p>
+      <p>Message and data rates may apply. Message frequency varies based on your conversation and active routines with Messa. You can text <strong>STOP</strong> at any time to pause or opt out of text messaging, or text <strong>HELP</strong> (or email <a href="mailto:__PRIVACY_EMAIL__">__PRIVACY_EMAIL__</a>) for support.</p>
     </section>
 
     <section class="sec" id="retention">
@@ -287,12 +285,12 @@
         <li><strong>Request a copy, correction, or deletion of your data</strong> by emailing <a href="mailto:__PRIVACY_EMAIL__">__PRIVACY_EMAIL__</a>. We will verify your identity (typically via the phone number or email on file) before acting on the request.</li>
         <li><strong>Stop using Messa at any time</strong> -- simply stop texting/emailing her, or ask us to delete your account entirely.</li>
       </ul>
-      <p>If you are a resident of California, the European Economic Area, the UK, or another jurisdiction with its own data protection law, you may have additional rights under laws such as the CCPA or GDPR (for example, to access, correct, delete, or port your data, or to object to certain processing). We honor requests consistent with the law that applies to you -- contact us at <a href="mailto:__PRIVACY_EMAIL__">__PRIVACY_EMAIL__</a> to exercise any of these rights.</p>
+      <p>If you are a resident of California, the European Economic Area, the UK, or another jurisdiction with its own data protection law, you may have additional rights under laws such as the CCPA or GDPR (for example, to access, correct, delete, or port your data, or to object to certain processing). We honor requests consistent with the law that applies to you -- contact us at <a href="mailto:__PRIVACY_EMAIL__">__PRIVACY_EMAIL__</a> to exercise any of these rights. We will acknowledge and respond to verified requests within 30 days (or within the timeframe required by applicable law).</p>
     </section>
 
     <section class="sec" id="children">
       <h2>8. Children's privacy</h2>
-      <p>Messa is not directed at children, and we do not knowingly collect personal information from anyone under 13 (or the relevant minimum age in your jurisdiction). If you believe a child has provided us with personal information, please contact us at <a href="mailto:__PRIVACY_EMAIL__">__PRIVACY_EMAIL__</a> so we can delete it.</p>
+      <p>Messa is not directed at children, and we do not knowingly collect personal information from anyone under 13 (or under 16 where required by local law in your jurisdiction). If you believe a child has provided us with personal information, please contact us at <a href="mailto:__PRIVACY_EMAIL__">__PRIVACY_EMAIL__</a> so we can delete it.</p>
     </section>
 
     <section class="sec" id="international">
