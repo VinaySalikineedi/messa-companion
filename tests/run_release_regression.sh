@@ -25,6 +25,7 @@ set -uo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
 TESTS=(
+  tests/test_privacy_page.py
   tests/test_onboarding_and_email_db.py
   tests/test_onboarding_and_deepsearch_msg.py
   tests/test_onboarding_email_provisioning.py
@@ -37,11 +38,6 @@ TESTS=(
   tests/test_default_email_provider.py
 )
 
-PYTHON="${PYTHON:-./venv/bin/python3}"
-if [ ! -f "$PYTHON" ]; then
-  PYTHON="python3"
-fi
-
 PASSED=()
 FAILED=()
 
@@ -50,7 +46,7 @@ for t in "${TESTS[@]}"; do
   echo "=================================================================="
   echo "RUNNING: $t"
   echo "=================================================================="
-  if "$PYTHON" "$t"; then
+  if python3 "$t"; then
     PASSED+=("$t")
   else
     FAILED+=("$t")
@@ -60,12 +56,8 @@ done
 echo ""
 echo "=================================================================="
 echo "SUMMARY: ${#PASSED[@]} passed, ${#FAILED[@]} failed"
-if [ ${#PASSED[@]} -gt 0 ]; then
-  for t in "${PASSED[@]}"; do echo "  [PASS] $t"; done
-fi
-if [ ${#FAILED[@]} -gt 0 ]; then
-  for t in "${FAILED[@]}"; do echo "  [FAIL] $t"; done
-fi
+for t in "${PASSED[@]}"; do echo "  [PASS] $t"; done
+for t in "${FAILED[@]}"; do echo "  [FAIL] $t"; done
 echo "=================================================================="
 
 if [ "${#FAILED[@]}" -gt 0 ]; then

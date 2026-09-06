@@ -464,6 +464,14 @@ CREDENTIALS_ENCRYPTION_KEY = os.environ.get("MESSA_CREDENTIALS_ENCRYPTION_KEY")
 TEXTMESSA_EMAIL_DOMAIN = os.environ.get("MESSA_TEXTMESSA_EMAIL_DOMAIN", "textmessa.com")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY")
 
+# ---- Contact info for the public Privacy Policy page (GET /privacy, see
+# privacy_page.py) ----
+# Messa is currently operated as a sole proprietorship, not a registered
+# company -- there's no separate "legal entity" to name, and deliberately
+# no personal name or home address published on that page either (by
+# request). Email is the only contact info this page discloses.
+PRIVACY_CONTACT_EMAIL = os.environ.get("MESSA_PRIVACY_CONTACT_EMAIL", f"privacy@{TEXTMESSA_EMAIL_DOMAIN}")
+
 # Cap on a PDF (or any other file) attached to an outbound Messa-email send/
 # reply (tools/document_tools.py's generate_pdf -> tools/personal_inbox_tools.py's
 # send_email/reply_to_email -> channels/resend.py). Resend's own hard limit is

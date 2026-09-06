@@ -41,7 +41,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Header, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from . import background, briefings, cli, config, console, db, live_activity, memory, pdf_reader, waitlist
 from .agents.registry import build_orchestrator
@@ -50,6 +50,7 @@ from .channels import browserbase, sendblue
 from .channels.sendblue import SendblueError
 from .landing_page import render_landing_page
 from .live_view_page import render_live_view_page
+from .privacy_page import render_privacy_page
 from .tools import email_tools, integration_tools
 from .tools.routines_tools import ONE_SHOT_SENTINEL, compute_next_run
 
@@ -94,8 +95,19 @@ async def landing_page() -> HTMLResponse:
     return HTMLResponse(render_landing_page())
 
 
+@app.get("/privacy")
+async def privacy_page() -> HTMLResponse:
+    """The public Privacy Policy at textmessa.com/privacy -- linked from
+    the landing page's footer. See messa/privacy_page.py for the render
+    logic and messa/assets/legal/privacy.html for the actual policy text;
+    config.LEGAL_ENTITY_NAME/BUSINESS_MAILING_ADDRESS/PRIVACY_CONTACT_EMAIL
+    are the only per-deployment values, same pattern as landing_page.py's
+    phone number/domain."""
+    return HTMLResponse(render_privacy_page())
+
+
 @app.get("/og-image.png")
-async def landing_og_image() -> Response:
+async def landing_og_image() -> FileResponse:
     """The link-preview image the landing page's og:image/twitter:image meta
     tags point at -- a static asset (messa/assets/landing/og-image.png),
     not templated like the page itself: it deliberately carries no phone
@@ -103,8 +115,6 @@ async def landing_og_image() -> Response:
     README.md) since this file has no way to keep pixels in sync with
     config.SENDBLUE_NUMBER the way the HTML page's text can."""
     path = Path(__file__).parent / "assets" / "landing" / "og-image.png"
-    if not path.exists():
-        return Response(status_code=404)
     return FileResponse(path, media_type="image/png")
 
 
@@ -1140,9 +1150,7 @@ async def _process_inbound_personal_email(
         "autonomy policy: reply yourself with personal_inbox_agent's reply_to_email (this "
         "thread_id, autonomous=True) only if it's clearly low-stakes; otherwise tell me "
         "who it's from and what it says, and wait for me to tell you what to do -- you can "
-        "send it with reply_to_email (autonomous=False) once I have. Remember: when replying or "
-        "proposing a reply from your Messa address, always speak as my assistant on my behalf in "
-        "the third person (e.g. '<Name> asked me to...'), never in the first person pretending to be me."
+        "send it with reply_to_email (autonomous=False) once I have."
     )
 
     try:
