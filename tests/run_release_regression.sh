@@ -36,6 +36,8 @@ TESTS=(
   tests/test_routing_boundaries.py
   tests/test_disconnect_switch.py
   tests/test_default_email_provider.py
+  tests/test_fth_upgrades.py
+  tests/test_fth_consent_and_form_js_live.py
 )
 
 PASSED=()

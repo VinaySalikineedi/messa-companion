@@ -321,6 +321,14 @@ _SNAPSHOT_REF_RE = re.compile(r"^e\d+$")
 # approximate.
 _CURSOR_OVERLAY_SCRIPT_PATH = Path(__file__).resolve().parent.parent / "assets" / "cursor_overlay.js"
 CURSOR_ANIMATED_TOOLS = {"browser_click", "browser_type", "browser_hover", "browser_select_option"}
+
+# "Faster Than Human" branch (faster-than-human.md, Upgrade 4): cookie/
+# consent banner auto-dismiss, injected the same --init-script way as
+# cursor_overlay.js above, independently toggled by
+# config.DEEPSEARCH_AUTO_DISMISS_CONSENT -- see that constant's own comment
+# and assets/deepsearch_enhancements.js's module docstring for the full
+# design and why it's deliberately conservative about what it'll click.
+_CONSENT_DISMISS_SCRIPT_PATH = Path(__file__).resolve().parent.parent / "assets" / "deepsearch_enhancements.js"
 _CURSOR_MOVE_FN = (
     "(element) => {"
     "const rect = element.getBoundingClientRect();"
@@ -369,6 +377,29 @@ _CURSOR_MOVE_TYPE_FN = (
 # call is still in flight.
 _READING_ANIMATION_START_FN = "() => window.__messaReader ? window.__messaReader.start(6) : undefined"
 _READING_ANIMATION_STOP_FN = "() => { if (window.__messaReader) window.__messaReader.stop(); }"
+
+# "Faster Than Human" branch (faster-than-human.md, Upgrade 5): a targeted,
+# cheap DOM scan for common form-validation-error markers, used by
+# check_form_errors below instead of making the model spot an error message
+# by eye inside a full browser_snapshot. Same JSON.stringify + raw
+# browser_evaluate + _extract_eval_result_json pattern already proven by
+# _SET_OF_MARKS_FN/_browser_get_interactive_elements just below -- this is
+# model-facing (unlike the cursor/reading-animation FNs above), so it goes
+# through the normal (guarded, approval-gated-if-configured) tool path, not
+# the raw one.
+_FORM_ERROR_CHECK_FN = (
+    "() => {"
+    "const sel = '[aria-invalid=\"true\"], .error, .error-message, .field-error, "
+    "[role=\"alert\"], .toast-error, .invalid-feedback, .form-error, .Toastify__toast--error';"
+    "const seen = new Set(); const results = [];"
+    "document.querySelectorAll(sel).forEach((el) => {"
+    "const text = (el.innerText || el.textContent || '').trim().replace(/\\s+/g, ' ');"
+    "if (!text || text.length > 200 || seen.has(text)) return;"
+    "seen.add(text); results.push(text);"
+    "});"
+    "return JSON.stringify(results.slice(0, 8));"
+    "}"
+)
 
 # Human-in-the-loop pause (login wall/CAPTCHA/2FA) -- see request_human_help
 # below and README's "Human-in-the-loop pause" section for the full design.
@@ -1120,6 +1151,7 @@ class BrowserToolProvider:
         # flag (set once here, at the ONE process every tab -- top-level and
         # every delegated sub-worker alike -- ultimately connects through),
         # so every tab gets it automatically with no per-tab plumbing.
+        init_scripts: list[str] = []
         if (
             config.DEEPSEARCH_CURSOR_OVERLAY
             or config.DEEPSEARCH_READING_ANIMATION
@@ -1127,7 +1159,16 @@ class BrowserToolProvider:
             or config.DEEPSEARCH_TYPING_HIGHLIGHT
             or config.DEEPSEARCH_PAGE_TRANSITION_FLASH
         ):
-            mcp_args += ["--init-script", str(_CURSOR_OVERLAY_SCRIPT_PATH)]
+            init_scripts.append(str(_CURSOR_OVERLAY_SCRIPT_PATH))
+        if config.DEEPSEARCH_AUTO_DISMISS_CONSENT:
+            init_scripts.append(str(_CONSENT_DISMISS_SCRIPT_PATH))
+        if init_scripts:
+            # --init-script takes multiple paths (confirmed via `npx
+            # @playwright/mcp@latest --help`: "<path...>", a variadic
+            # option) -- one flag, every enabled script listed after it, so
+            # cursor_overlay.js and deepsearch_enhancements.js can each be
+            # toggled independently without stepping on each other.
+            mcp_args += ["--init-script", *init_scripts]
 
         # env=dict(os.environ): a spawned subprocess does NOT inherit the
         # parent process's environment by default (deliberately -- so an
@@ -1264,6 +1305,15 @@ class BrowserToolProvider:
             coroutine=self._await_email_verification_code,
             name="await_email_verification_code",
             description=(self._await_email_verification_code.__doc__ or "").strip(),
+        ))
+        # Same "own Python method, given to every tab" reasoning again -- a
+        # form can be submitted on any tab, top-level or sub-worker. See
+        # _check_form_errors's own docstring (faster-than-human.md's
+        # "Upgrade 5").
+        self.tools.append(StructuredTool.from_function(
+            coroutine=self._check_form_errors,
+            name="check_form_errors",
+            description=(self._check_form_errors.__doc__ or "").strip(),
         ))
         # Same reasoning as request_human_help just above -- a signup or
         # login form can turn up on any tab, top-level or sub-worker. Neither
@@ -2231,6 +2281,44 @@ class BrowserToolProvider:
         finally:
             self._live_mark_active()
 
+    async def _check_form_errors(self) -> str:
+        """Model-facing tool: call this immediately after clicking a form's
+        submit/continue/create-account button, BEFORE taking a full
+        browser_snapshot to see whether it worked. Runs one small, targeted
+        DOM scan for common validation-error markers (aria-invalid fields,
+        .error/.field-error classes, role="alert" toasts) and returns just
+        their text -- much cheaper and more reliable than spotting an error
+        message by eye inside a whole-page snapshot, and it catches errors
+        some sites show without moving focus or changing the URL at all.
+
+        Returns "NO_ERRORS_FOUND: ..." if nothing matched (the submission
+        likely went through, or this site doesn't surface errors this way --
+        take a normal browser_snapshot next to confirm either way), or
+        "FORM_ERRORS: " followed by the matched text if something turned up
+        -- fix what it describes and resubmit. Per the EARLY ESCALATION
+        rule: if you see the SAME error again after already trying to fix
+        it, stop and call request_human_help instead of retrying a third
+        time."""
+        evaluate_tool = self._raw_tools_by_name.get("browser_evaluate")
+        if evaluate_tool is None:
+            return "NO_ERRORS_FOUND: form-error checking isn't available on this session -- take a browser_snapshot instead."
+        try:
+            raw = await evaluate_tool.coroutine(element="the page", function=_FORM_ERROR_CHECK_FN)
+        except Exception as e:  # noqa: BLE001 - falls back to the normal snapshot path, never blocks the agent
+            console.system(f"Deepsearch: check_form_errors evaluate failed (non-fatal): {e}")
+            return "NO_ERRORS_FOUND: the check itself failed -- take a browser_snapshot instead."
+
+        parsed = _extract_eval_result_json(raw)
+        if isinstance(parsed, str):
+            try:
+                parsed = json.loads(parsed)
+            except Exception:  # noqa: BLE001
+                parsed = []
+        errors = [str(e).strip() for e in parsed if isinstance(parsed, list) and e and str(e).strip()] if isinstance(parsed, list) else []
+        if not errors:
+            return "NO_ERRORS_FOUND: no validation-error markers detected on the page right now."
+        return "FORM_ERRORS: " + " | ".join(errors)
+
     # Docstring below IS the tool description sent to the model on every
     # single call (see the StructuredTool.from_function registration a few
     # lines down: description=(self._request_human_help.__doc__ or
@@ -2934,10 +3022,13 @@ DEEPSEARCH_SYSTEM_PROMPT = (
     "Enter key on input fields. NEVER rely on pressing Enter on an input field to submit a form. "
     "You MUST locate and click the visible submit or action button (e.g. button:has-text('Create Account'), "
     "button:has-text('Sign Up'), button[type='submit'], text='Submit', role=button[name='Create account']). "
-    "If the page does not advance after filling a form, take a fresh snapshot, locate the button, and click it directly.\n"
-    "- EARLY ESCALATION: If a form fails to submit after 2 attempts, or displays an unhandled error or "
-    "unsolved CAPTCHA widget, do NOT loop or try to bypass it with scripts -- call request_human_help "
-    "immediately so the user can assist.\n"
+    "Right after clicking it, call check_form_errors FIRST -- it's a small, fast, targeted check, cheaper "
+    "than a full snapshot -- to see if the site rejected the submission. If it comes back NO_ERRORS_FOUND, "
+    "take a fresh snapshot to confirm the page actually advanced (some sites neither error nor navigate "
+    "visibly). If check_form_errors returns FORM_ERRORS, fix exactly what it describes and resubmit.\n"
+    "- EARLY ESCALATION: If check_form_errors reports the SAME error twice in a row, or a form otherwise "
+    "fails to submit after 2 attempts, or displays an unsolved CAPTCHA widget, do NOT loop or try to bypass "
+    "it with scripts -- call request_human_help immediately so the user can assist.\n"
     "- If a tool result starts with 'BLOCKED:' or 'ERROR', don't retry the same action -- take "
     "a fresh snapshot or try a different approach.\n"
     "- Hit an email verification/OTP screen right after signing up with generate_account_"
@@ -2999,6 +3090,29 @@ def build_deepsearch_subagent(
                 "Live web browsing/research isn't available on your account yet -- it's in a "
                 "limited beta right now while we get it fully ready for everyone. I can still "
                 "help with everything else!"
+            ))]}
+
+        # Per-USER concurrent-session cap (faster-than-human.md's "cost
+        # controls" upgrade -- config.DEEPSEARCH_MAX_CONCURRENT_SESSIONS_PER_
+        # USER, layered UNDER the global cap a few lines down, which only
+        # bounds the process-wide total). Checked before even the
+        # usage-limits consumption below -- deepsearch_control.active_count
+        # is a pure in-memory read (no DB round trip, no model call), so
+        # it's the cheapest possible thing to check first, and a user who's
+        # already at their own cap shouldn't have a usage-limits unit
+        # consumed for a request that's about to be declined anyway. Reads
+        # the count of THIS user's own already-registered tasks -- this
+        # request hasn't called deepsearch_control.register() yet at this
+        # point (that happens further down), so the count here reflects
+        # only genuinely concurrent OTHER requests, not this one.
+        if deepsearch_control.active_count(user.user_id) >= config.DEEPSEARCH_MAX_CONCURRENT_SESSIONS_PER_USER:
+            console.system(
+                f"Deepsearch: declined for user #{user.user_id} -- already at their own "
+                f"concurrent-session cap ({config.DEEPSEARCH_MAX_CONCURRENT_SESSIONS_PER_USER})."
+            )
+            return {"messages": [AIMessage(content=(
+                "You've already got a browsing session or two running -- let one of those finish "
+                "(or tell me to stop it) before starting another."
             ))]}
 
         # One usage-limits unit per top-level browsing session opened here

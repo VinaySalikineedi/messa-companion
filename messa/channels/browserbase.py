@@ -77,9 +77,15 @@ async def create_session(context_id: str | None) -> dict[str, Any]:
     config.BROWSERBASE_SESSION_TIMEOUT_SECONDS -- see that constant's own
     comment for the real bug this fixes (sessions silently inheriting a low
     dashboard-configured project default instead of our own, much longer,
-    intended session length)."""
+    intended session length). `blockAds` follows config.DEEPSEARCH_BLOCK_ADS
+    -- see that constant's own comment (faster-than-human.md's "Upgrade 1")
+    for why this is a plain pass-through of a native Browserbase feature,
+    not something built here."""
     body: dict[str, Any] = {
-        "browserSettings": {"viewport": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT}},
+        "browserSettings": {
+            "viewport": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+            "blockAds": config.DEEPSEARCH_BLOCK_ADS,
+        },
         "timeout": config.BROWSERBASE_SESSION_TIMEOUT_SECONDS,
     }
     if context_id:

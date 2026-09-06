@@ -557,6 +557,60 @@ BROWSERBASE_SESSION_TIMEOUT_SECONDS = int(
     os.environ.get("MESSA_BROWSERBASE_SESSION_TIMEOUT_SECONDS", "1800")
 )
 
+# ---- "Faster Than Human" branch: low-risk deepsearch speed/robustness
+# upgrades that don't depend on which browser-automation engine drives the
+# page (Playwright MCP today, possibly Stagehand later -- see
+# faster-than-human.md). Each is independently toggleable so a live-test
+# regression can isolate which one, if any, is the cause.
+
+# Browserbase's own `browserSettings.blockAds` (a plain boolean the session-
+# create call passes straight through -- see channels/browserbase.py) strips
+# third-party ad/tracker network requests before they ever load, which is
+# both a real page-load speedup and a cleaner Live View for the user
+# watching. No uBlock/EasyList list-management needed on our side -- this is
+# a native Browserbase feature, not something we're building. Confirmed in
+# Browserbase's own API reference (docs.browserbase.com/reference/api/
+# create-a-session); default true since there's no known cost to it (it
+# doesn't block same-origin app functionality, only recognized third-party
+# ad/tracker domains) -- flip off per-deploy only if a live test finds a
+# site whose actual login/checkout flow depends on a blocked domain.
+DEEPSEARCH_BLOCK_ADS = os.environ.get("MESSA_DEEPSEARCH_BLOCK_ADS", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+# Auto-dismiss cookie/consent banners the moment they mount, via a small
+# heuristic script injected through @playwright/mcp's --init-script flag
+# (same mechanism cursor_overlay.js already uses -- see
+# tools/deepsearch_tools.py's _spawn_mcp_http_server). Deliberately
+# conservative: only clicks elements whose visible text matches a known
+# cookie-consent vocabulary ("accept all", "i agree", etc.) inside something
+# that looks like a banner/dialog, never a bare "accept"/"x" anywhere on the
+# page -- a false positive here (clicking the wrong thing) is worse than
+# leaving a real banner up for the agent to handle the normal way. See
+# assets/deepsearch_enhancements.js for the actual matching logic and its
+# own safety notes. Default true; the live-test branch is exactly what
+# should catch a site where this heuristic misfires.
+DEEPSEARCH_AUTO_DISMISS_CONSENT = os.environ.get(
+    "MESSA_DEEPSEARCH_AUTO_DISMISS_CONSENT", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+
+# Per-USER concurrent top-level deepsearch sessions, layered UNDER (not
+# instead of) DEEPSEARCH_MAX_CONCURRENT_SESSIONS just below, which only caps
+# the process-wide total across every user. Without this, a single user
+# firing off several browsing requests in a row can occupy a large chunk of
+# the whole container's global cap by themselves, starving everyone else --
+# exactly the "50 concurrent users, cost controls" scenario faster-than-
+# human.md calls out. Enforced in tools/deepsearch_tools.py's
+# build_deepsearch_subagent._run via deepsearch_control.active_count(), which
+# already exists (built for the "cancel my active search" feature) and
+# happens to be exactly the count this needs too -- no new tracking
+# structure required. 2 matches the doc's own suggested default: high enough
+# that "look this up, then also check that" (two legitimate concurrent asks)
+# isn't blocked, low enough that one user can't monopolize the global cap.
+DEEPSEARCH_MAX_CONCURRENT_SESSIONS_PER_USER = int(
+    os.environ.get("MESSA_DEEPSEARCH_MAX_CONCURRENT_SESSIONS_PER_USER", "2")
+)
+
 # ---- Jina Reader (tools/jina_reader.py) -- a JS-capable page read that
 # costs no Browserbase session time, sitting between a plain HTTP fetch
 # (web_search_tools.fetch_page_text, no JS at all) and a real deepsearch
