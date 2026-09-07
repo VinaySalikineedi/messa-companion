@@ -50,13 +50,16 @@ STAGEHAND_SYSTEM_PROMPT = (
     "You do NOT need to snapshot the DOM or hunt for cryptic element IDs -- `browser_act` does the "
     "locating, scrolling, clicking, and typing for you!\n\n"
     "CRITICAL EFFICIENCY RULES (MINIMIZE TURNS & LATENCY):\n"
-    "1. TRUST SUCCESSFUL ACTIONS: When `browser_act` returns a success message, TRUST IT. "
-    "DO NOT call `browser_observe` or `browser_extract` to verify every single click or keystroke! "
-    "Immediately proceed to the next required action.\n"
-    "2. CHAIN ACTIONS: Combine atomic steps into single complete instructions (e.g. "
-    "'type Anker USB-C hub in search bar and press Enter' or 'enter zip code 90210 and click Apply').\n"
-    "3. USE OBSERVE/EXTRACT SPARINGLY: Use `browser_observe` ONLY if an action fails or you are genuinely stuck. "
-    "Use `browser_extract` when you need to read final summary data (like cart totals or specific facts).\n\n"
+    "1. NEVER OBSERVE BEFORE ACTING: `browser_act` already finds and interacts with elements by description directly. "
+    "DO NOT call `browser_observe` to find products, search results, buttons, or inputs! "
+    "Simply call `browser_act` with your intent (e.g. `browser_act('click on the first search result')` or "
+    "`browser_act('click Add to Cart on the first Hydro Flask product')`).\n"
+    "2. TRUST SUCCESSFUL ACTIONS: When `browser_act` returns a success message, TRUST IT. "
+    "DO NOT verify every single click with observe/extract. Immediately proceed to your next step.\n"
+    "3. CHAIN ACTIONS: Combine atomic steps into single complete instructions (e.g. "
+    "'search for Hydro Flask in the search bar and press Enter', 'type zip code 94105 and click Apply').\n"
+    "4. USE EXTRACT ONLY AT THE END: Use `browser_extract` only when you need to read final summary data "
+    "(like cart totals or order confirmation).\n\n"
     "EFFICIENCY & COST CONTROLS:\n"
     "- If you just need general facts, links, or background info, call `search_web` first -- it is "
     "instant (<1s) and costs ZERO browser time. Never navigate to google.com or a search engine tab.\n"
@@ -221,12 +224,12 @@ class StagehandToolProvider:
                 coroutine=self._browser_act,
                 name="browser_act",
                 description=(
-                    "Execute a high-level natural language action on the current page using Stagehand v4. "
-                    "Use this to click buttons, fill forms, search, select options, add items to cart, etc. "
+                    "Execute a natural language action directly. Stagehand automatically finds and interacts with elements "
+                    "by description -- you do NOT need to observe first. "
                     "Examples: "
-                    "browser_act(instruction='search for Gurunanda toothbrush in search bar and press enter'), "
-                    "browser_act(instruction='click Add to Cart on the first toothbrush in search results'), "
-                    "browser_act(instruction='type 32256 in the zip code field and click Apply')."
+                    "browser_act(instruction='search for Hydro Flask water bottle and press Enter'), "
+                    "browser_act(instruction='click Add to Cart on the first search result'), "
+                    "browser_act(instruction='click the delivery location button, enter 94105 in zip code, and click Apply')."
                 ),
             ),
             StructuredTool.from_function(
