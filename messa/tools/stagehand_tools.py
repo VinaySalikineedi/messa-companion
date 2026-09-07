@@ -93,12 +93,15 @@ STAGEHAND_SYSTEM_PROMPT = (
     "EFFICIENCY & COST CONTROLS:\n"
     "- If you just need general facts, links, or background info, call `search_web` first -- it is "
     "instant (<1s) and costs ZERO browser time. Never navigate to google.com or a search engine tab.\n"
-    "- Use `read_webpage(url)` to read articles or static pages without spending browser minutes.\n\n"
+    "- Use `read_webpage(url)` to read articles or static pages without spending browser minutes.\n"
+    "- CLOSE BROWSER EARLY: The moment your browsing tasks are finished, or if you hit a CAPTCHA and decide "
+    "to switch to `search_web`, you MUST call `close_browser()` immediately! Never leave the remote browser open "
+    "while you do web searches or write your response. Calling `close_browser()` immediately stops billing.\n\n"
     "CAPTCHA & HUMAN ESCALATION (CUT RETRIES TO 2):\n"
     "- Hit an unsolved CAPTCHA or bot verification? You are permitted AT MOST 2 attempts to solve or click it. "
     "CAPTCHAs are hard to pass automatically. If it does not clear after 2 attempts, STOP RETRYING immediately! "
-    "Call `request_human_help(reason)` so the user can assist via their live view, or fall back to `search_web` "
-    "and conclude your findings without this site.\n"
+    "Call `close_browser()` and switch to `search_web` to find the information, or call `request_human_help(reason)` "
+    "if you need the user to solve it.\n"
     "- Hit a 2FA prompt or login wall you don't have credentials for? "
     "First check `get_account_credential(site_name)`. If none is stored, call `request_human_help(reason)` "
     "immediately so the user can assist via their live view.\n"
@@ -242,21 +245,30 @@ class StagehandToolProvider:
                 except Exception as e:
                     logger.warning(f"Failed to auto-reopen initial_resume_url: {e}")
 
-    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+    async def _close_browser(self) -> str:
+        """Immediately close and release the remote browser session to stop Browserbase billing."""
         if self._is_subagent:
-            return
+            return "Sub-workers run in shared tabs and cannot close the browser session."
 
-        console.system(f"Deepsearch (Stagehand v4): releasing session #{self._deepsearch_session_id}...")
+        if self.browser is None and self.stagehand is None:
+            return "Browser session is already closed (no billing active)."
+
+        console.system(f"Deepsearch (Stagehand v4): releasing browser session #{self._deepsearch_session_id} to stop billing...")
         if self.stagehand is not None:
             try:
                 await self.stagehand.close()
             except Exception as e:
                 logger.debug(f"Stagehand close exception: {e}")
+            self.stagehand = None
+
         if self.browser is not None:
             try:
                 await self.browser.close()
             except Exception as e:
                 logger.debug(f"Browser close exception: {e}")
+            self.browser = None
+
+        self._page = None
 
         if self._user_id is not None:
             try:
@@ -264,6 +276,13 @@ class StagehandToolProvider:
                 live_activity.clear(self._user_id)
             except Exception as e:
                 logger.debug(f"Clear live activity exception: {e}")
+
+        return "Remote browser session closed successfully. Browserbase billing stopped."
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if self._is_subagent:
+            return
+        await self._close_browser()
 
     async def get_active_page(self) -> stagehand.Page:
         if self._page is not None:
@@ -367,6 +386,15 @@ class StagehandToolProvider:
                 description=(
                     "Fetch and read a web page's text content instantly without using the browser session. "
                     "Costs ZERO browser time."
+                ),
+            ),
+            StructuredTool.from_function(
+                coroutine=self._close_browser,
+                name="close_browser",
+                description=(
+                    "Immediately close the remote browser session to STOP Browserbase billing. "
+                    "Call this the MOMENT you finish your browsing tasks, when switching to web search, "
+                    "or before drafting your final response. Once closed, you can still use search_web or format your output."
                 ),
             ),
         ]
@@ -708,6 +736,11 @@ class StagehandToolProvider:
             return f"Error decrypting credential: {e}"
 
     async def _search_web(self, query: str) -> str:
+        # If the browser is open and we hit a CAPTCHA limit, shut down the browser
+        # immediately so we don't pay for idle browser time while searching!
+        if not self._is_subagent and self.browser is not None and self._captcha_attempts >= config.DEEPSEARCH_CAPTCHA_MAX_RETRIES:
+            console.system("Deepsearch (Stagehand v4): auto-closing browser session on fallback to search_web to eliminate idle billing...")
+            await self._close_browser()
         return await unified_web_search(query)
 
     async def _read_webpage(self, url: str) -> str:

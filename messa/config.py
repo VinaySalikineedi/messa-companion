@@ -1149,7 +1149,7 @@ DEEPSEARCH_MAX_SUBAGENTS = int(os.environ.get("MESSA_DEEPSEARCH_MAX_SUBAGENTS", 
 # tight (your explicit ask: "I don't want these sessions to go longer") --
 # enough for navigate -> snapshot -> a couple of actions -> a final read, not
 # a multi-page exploration.
-DEEPSEARCH_SUBAGENT_MAX_STEPS = int(os.environ.get("MESSA_DEEPSEARCH_SUBAGENT_MAX_STEPS", "8"))
+DEEPSEARCH_SUBAGENT_MAX_STEPS = int(os.environ.get("MESSA_DEEPSEARCH_SUBAGENT_MAX_STEPS", "14"))
 
 # Second backstop under DEEPSEARCH_MAX_SESSION_SECONDS (1200s), added after a
 # real production incident: a Browserbase session that died mid-run (user
