@@ -29,12 +29,29 @@ from langchain_core.messages import HumanMessage
 from langchain_core.tools import BaseTool, StructuredTool
 import stagehand
 
+from urllib.parse import urlparse
+
 from .. import config, console, credentials, db, live_activity
 from ..approval import ApprovalGate
 from ..channels import browserbase
 from .search_engine import unified_web_read, unified_web_search
 
 logger = logging.getLogger(__name__)
+
+
+def _get_domain(url: str) -> str:
+    if not url:
+        return "default"
+    try:
+        parsed = urlparse(url if "://" in url else f"https://{url}")
+        host = parsed.netloc or parsed.path
+        if ":" in host:
+            host = host.split(":")[0]
+        if host.startswith("www."):
+            host = host[4:]
+        return host.lower() or "default"
+    except Exception:
+        return "default"
 
 _CAPTCHA_KEYWORDS = (
     "captcha",
@@ -133,6 +150,7 @@ class StagehandToolProvider:
         stagehand_instance: Any = None,
         browser_instance: Any = None,
         is_subagent: bool = False,
+        captcha_tracker: dict[str, int] | None = None,
     ):
         self._approval_gate = approval_gate
         self._user_id = user_id
@@ -154,7 +172,7 @@ class StagehandToolProvider:
         self.live_view_url: str | None = None
         self.tools: list[BaseTool] = []
         self._page = page
-        self._captcha_attempts: int = 0
+        self._captcha_tracker: dict[str, int] = captcha_tracker if captcha_tracker is not None else {}
         self._session_lock: asyncio.Lock = asyncio.Lock()
 
     async def __aenter__(self) -> StagehandToolProvider:
@@ -453,6 +471,7 @@ class StagehandToolProvider:
                 stagehand_instance=self.stagehand,
                 browser_instance=self.browser,
                 is_subagent=True,
+                captcha_tracker=self._captcha_tracker,
             )
             async with sub_provider as worker:
                 sub_agent = create_agent(
@@ -519,6 +538,8 @@ class StagehandToolProvider:
         await self._ensure_session()
         try:
             page = await self.get_active_page()
+            curr_url = await self._get_url(page)
+            domain = _get_domain(curr_url or self._current_url)
 
             # Check if this action targets a CAPTCHA or if current page is blocked by one
             inst_lower = instruction.lower()
@@ -532,21 +553,22 @@ class StagehandToolProvider:
                     pass
 
             if is_captcha_target:
-                self._captcha_attempts += 1
-                if self._captcha_attempts > config.DEEPSEARCH_CAPTCHA_MAX_RETRIES:
+                domain_attempts = self._captcha_tracker.get(domain, 0) + 1
+                self._captcha_tracker[domain] = domain_attempts
+                if domain_attempts > config.DEEPSEARCH_CAPTCHA_MAX_RETRIES:
                     console.system(
-                        f"Deepsearch (Stagehand v4): CAPTCHA retry limit reached "
-                        f"({self._captcha_attempts} > {config.DEEPSEARCH_CAPTCHA_MAX_RETRIES}) on {self._tab_id}."
+                        f"Deepsearch (Stagehand v4): CAPTCHA retry limit reached for {domain} "
+                        f"({domain_attempts} > {config.DEEPSEARCH_CAPTCHA_MAX_RETRIES}) across session."
                     )
                     if not self._is_subagent:
                         return (
-                            f"BLOCKED: CAPTCHA retry limit reached ({config.DEEPSEARCH_CAPTCHA_MAX_RETRIES} attempts). "
+                            f"BLOCKED: CAPTCHA retry limit reached for {domain} ({config.DEEPSEARCH_CAPTCHA_MAX_RETRIES} attempts). "
                             "CAPTCHAs are hard to pass automatically. Do NOT retry solving this CAPTCHA again. "
-                            "Call request_human_help so the user can assist via their live view, or proceed to search_web / wrap up without this site."
+                            "Call close_browser() and switch to search_web, or call request_human_help if manual user intervention is needed."
                         )
                     else:
                         return (
-                            f"BLOCKED: CAPTCHA retry limit reached ({config.DEEPSEARCH_CAPTCHA_MAX_RETRIES} attempts). "
+                            f"BLOCKED: CAPTCHA retry limit reached for {domain} ({config.DEEPSEARCH_CAPTCHA_MAX_RETRIES} attempts). "
                             "CAPTCHAs are hard to pass automatically. Do NOT retry solving this CAPTCHA. "
                             "Stop retrying: report this website as blocked by CAPTCHA and conclude your summary."
                         )
@@ -554,6 +576,7 @@ class StagehandToolProvider:
             console.system(f"Deepsearch (Stagehand v4): executing act: {instruction!r}")
             res = await self.stagehand.act(instruction, page=page)
             curr_url = await self._get_url(page)
+            domain = _get_domain(curr_url or self._current_url)
             msg = getattr(res.data, "message", "Action performed successfully")
             console.system(f"Deepsearch (Stagehand v4): act completed ({msg})")
 
@@ -567,16 +590,16 @@ class StagehandToolProvider:
                 kw in f"{curr_url} {title}".lower()
                 for kw in ("captcha", "robot or human", "verify you are human", "press and hold", "challenge", "just a moment")
             )
-            if not page_looks_like_captcha and self._captcha_attempts > 0:
-                self._captcha_attempts = 0
+            if not page_looks_like_captcha and self._captcha_tracker.get(domain, 0) > 0:
+                self._captcha_tracker[domain] = 0
 
             # If this was a CAPTCHA attempt and we reached the retry cap, inform the agent to stop retrying
-            if is_captcha_target and self._captcha_attempts >= config.DEEPSEARCH_CAPTCHA_MAX_RETRIES:
+            if is_captcha_target and self._captcha_tracker.get(domain, 0) >= config.DEEPSEARCH_CAPTCHA_MAX_RETRIES:
                 msg += (
-                    f"\n\n[CAPTCHA NOTICE: You have attempted this CAPTCHA {self._captcha_attempts} time(s). "
+                    f"\n\n[CAPTCHA NOTICE: You have attempted this CAPTCHA for {domain} {self._captcha_tracker[domain]} time(s). "
                     f"Maximum allowed retries is {config.DEEPSEARCH_CAPTCHA_MAX_RETRIES}. "
                     "CAPTCHAs are hard to pass automatically. Do NOT attempt to solve this CAPTCHA again. "
-                    + ("Call request_human_help or conclude without this site.]" if not self._is_subagent else "Report this site is blocked by CAPTCHA and finish summary.]")
+                    + ("Call close_browser() and switch to search_web, or call request_human_help.]" if not self._is_subagent else "Report this site is blocked by CAPTCHA and finish summary.]")
                 )
 
             return f"Action Result: {msg}\nCurrent Page: {curr_url}"
@@ -588,8 +611,9 @@ class StagehandToolProvider:
         await self._ensure_session()
         try:
             page = await self.get_active_page()
-            if self._captcha_attempts >= config.DEEPSEARCH_CAPTCHA_MAX_RETRIES:
-                curr_url = await self._get_url(page)
+            curr_url = await self._get_url(page)
+            domain = _get_domain(curr_url or self._current_url)
+            if self._captcha_tracker.get(domain, 0) >= config.DEEPSEARCH_CAPTCHA_MAX_RETRIES:
                 try:
                     title = await page.title()
                 except Exception:
@@ -599,9 +623,9 @@ class StagehandToolProvider:
                     for kw in ("captcha", "robot or human", "verify you are human", "challenge", "just a moment")
                 ):
                     return (
-                        f"BLOCKED: The page is currently displaying an unsolved CAPTCHA (retry limit of "
+                        f"BLOCKED: The page on {domain} is currently displaying an unsolved CAPTCHA (retry limit of "
                         f"{config.DEEPSEARCH_CAPTCHA_MAX_RETRIES} reached). Do not retry. "
-                        + ("Call request_human_help or conclude report." if not self._is_subagent else "Report site blocked by CAPTCHA.")
+                        + ("Call close_browser() and switch to search_web." if not self._is_subagent else "Report site blocked by CAPTCHA.")
                     )
 
             console.system(f"Deepsearch (Stagehand v4): executing extract: {instruction!r}")
@@ -617,8 +641,9 @@ class StagehandToolProvider:
         await self._ensure_session()
         try:
             page = await self.get_active_page()
-            if self._captcha_attempts >= config.DEEPSEARCH_CAPTCHA_MAX_RETRIES:
-                curr_url = await self._get_url(page)
+            curr_url = await self._get_url(page)
+            domain = _get_domain(curr_url or self._current_url)
+            if self._captcha_tracker.get(domain, 0) >= config.DEEPSEARCH_CAPTCHA_MAX_RETRIES:
                 try:
                     title = await page.title()
                 except Exception:
@@ -628,9 +653,9 @@ class StagehandToolProvider:
                     for kw in ("captcha", "robot or human", "verify you are human", "challenge", "just a moment")
                 ):
                     return (
-                        f"BLOCKED: The page is displaying an unsolved CAPTCHA (retry limit of "
+                        f"BLOCKED: The page on {domain} is displaying an unsolved CAPTCHA (retry limit of "
                         f"{config.DEEPSEARCH_CAPTCHA_MAX_RETRIES} reached). Do not retry. "
-                        + ("Call request_human_help or conclude report." if not self._is_subagent else "Report site blocked by CAPTCHA.")
+                        + ("Call close_browser() and switch to search_web." if not self._is_subagent else "Report site blocked by CAPTCHA.")
                     )
 
             inst = instruction.strip() or None
@@ -736,9 +761,10 @@ class StagehandToolProvider:
             return f"Error decrypting credential: {e}"
 
     async def _search_web(self, query: str) -> str:
-        # If the browser is open and we hit a CAPTCHA limit, shut down the browser
+        # If the browser is open and ANY domain hit a CAPTCHA limit, shut down the browser
         # immediately so we don't pay for idle browser time while searching!
-        if not self._is_subagent and self.browser is not None and self._captcha_attempts >= config.DEEPSEARCH_CAPTCHA_MAX_RETRIES:
+        any_blocked = any(count >= config.DEEPSEARCH_CAPTCHA_MAX_RETRIES for count in self._captcha_tracker.values())
+        if not self._is_subagent and self.browser is not None and any_blocked:
             console.system("Deepsearch (Stagehand v4): auto-closing browser session on fallback to search_web to eliminate idle billing...")
             await self._close_browser()
         return await unified_web_search(query)
