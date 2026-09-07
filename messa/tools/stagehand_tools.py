@@ -152,6 +152,7 @@ class StagehandToolProvider:
         self.tools: list[BaseTool] = []
         self._page = page
         self._captcha_attempts: int = 0
+        self._session_lock: asyncio.Lock = asyncio.Lock()
 
     async def __aenter__(self) -> StagehandToolProvider:
         if self._is_subagent:
@@ -175,67 +176,71 @@ class StagehandToolProvider:
         All browser-touching tools call this before doing any real work.
         Non-browser tools (search_web, read_webpage, credentials) skip this
         entirely so they stay zero-cost even when no tab is ever needed.
-        Idempotent: subsequent calls return immediately.
+        Idempotent and concurrency-safe: subsequent calls return immediately.
         """
         if self.browser is not None:
             # Session already open — fast path.
             return
 
-        context_id = None
-        if self._user_id is not None:
-            context_id = await db.get_browserbase_context_id(self._user_id)
+        async with self._session_lock:
+            if self.browser is not None:
+                return
 
-        browser_settings: dict[str, Any] = {
-            "block_ads": config.DEEPSEARCH_BLOCK_ADS,
-            "solve_captchas": True,
-            "viewport": {"width": 1280, "height": 800},
-        }
-        if context_id:
-            browser_settings["context"] = {"id": context_id, "persist": True}
+            context_id = None
+            if self._user_id is not None:
+                context_id = await db.get_browserbase_context_id(self._user_id)
 
-        console.system("Deepsearch (Stagehand v4): launching remote Browserbase browser (first browser tool call)...")
-        self.browser = await stagehand.browserbase.launch(
-            api_key=config.BROWSERBASE_API_KEY,
-            browser_settings=browser_settings,
-            timeout=float(config.BROWSERBASE_SESSION_TIMEOUT_SECONDS),
-        )
-        self._bb_session_id = self.browser.session_id
-        console.system(f"Deepsearch (Stagehand v4): session started (ID: {self._bb_session_id}).")
+            browser_settings: dict[str, Any] = {
+                "block_ads": config.DEEPSEARCH_BLOCK_ADS,
+                "solve_captchas": True,
+                "viewport": {"width": 1280, "height": 800},
+            }
+            if context_id:
+                browser_settings["context"] = {"id": context_id, "persist": True}
 
-        # Fetch live view debugger link
-        try:
-            self.live_view_url = await browserbase.get_live_view_url(self._bb_session_id)
-            if self.live_view_url:
-                console.system(f"Deepsearch (Stagehand v4): Live View debugger -> {self.live_view_url}")
-        except Exception as e:
-            logger.warning(f"Could not fetch live view URL: {e}")
-            self.live_view_url = None
+            console.system("Deepsearch (Stagehand v4): launching remote Browserbase browser (first browser tool call)...")
+            self.browser = await stagehand.browserbase.launch(
+                api_key=config.BROWSERBASE_API_KEY,
+                browser_settings=browser_settings,
+                timeout=float(config.BROWSERBASE_SESSION_TIMEOUT_SECONDS),
+            )
+            self._bb_session_id = self.browser.session_id
+            console.system(f"Deepsearch (Stagehand v4): session started (ID: {self._bb_session_id}).")
 
-        if self._user_id is not None:
-            live_activity.set_session_id(self._user_id, self._bb_session_id)
-            if self.live_view_url:
-                live_activity.set_url(self._user_id, self.live_view_url)
-                await db.set_live_browser_active(
-                    self._user_id, self.live_view_url, self._task_title or "Deepsearch"
-                )
-
-        # Create Stagehand instance
-        sh_kwargs: dict[str, Any] = {"browser": self.browser}
-        if config.STAGEHAND_MODEL:
-            sh_kwargs["model"] = config.STAGEHAND_MODEL
-
-        self.stagehand = await stagehand.Stagehand.create(**sh_kwargs)
-        console.system("Deepsearch (Stagehand v4): Stagehand engine initialized.")
-
-        # Initialize active page
-        self._page = await self.get_active_page()
-
-        if self._initial_resume_url and self._page:
+            # Fetch live view debugger link
             try:
-                await self._page.goto(self._initial_resume_url)
-                self._current_url = self._initial_resume_url
+                self.live_view_url = await browserbase.get_live_view_url(self._bb_session_id)
+                if self.live_view_url:
+                    console.system(f"Deepsearch (Stagehand v4): Live View debugger -> {self.live_view_url}")
             except Exception as e:
-                logger.warning(f"Failed to auto-reopen initial_resume_url: {e}")
+                logger.warning(f"Could not fetch live view URL: {e}")
+                self.live_view_url = None
+
+            if self._user_id is not None:
+                live_activity.set_session_id(self._user_id, self._bb_session_id)
+                if self.live_view_url:
+                    live_activity.set_url(self._user_id, self.live_view_url)
+                    await db.set_live_browser_active(
+                        self._user_id, self.live_view_url, self._task_title or "Deepsearch"
+                    )
+
+            # Create Stagehand instance
+            sh_kwargs: dict[str, Any] = {"browser": self.browser}
+            if config.STAGEHAND_MODEL:
+                sh_kwargs["model"] = config.STAGEHAND_MODEL
+
+            self.stagehand = await stagehand.Stagehand.create(**sh_kwargs)
+            console.system("Deepsearch (Stagehand v4): Stagehand engine initialized.")
+
+            # Initialize active page
+            self._page = await self.get_active_page()
+
+            if self._initial_resume_url and self._page:
+                try:
+                    await self._page.goto(self._initial_resume_url)
+                    self._current_url = self._initial_resume_url
+                except Exception as e:
+                    logger.warning(f"Failed to auto-reopen initial_resume_url: {e}")
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         if self._is_subagent:
