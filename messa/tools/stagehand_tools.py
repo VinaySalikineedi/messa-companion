@@ -24,6 +24,8 @@ import time
 import uuid
 from typing import Any
 
+from langchain.agents import create_agent
+from langchain_core.messages import HumanMessage
 from langchain_core.tools import BaseTool, StructuredTool
 import stagehand
 
@@ -33,6 +35,15 @@ from ..channels import browserbase
 from .search_engine import unified_web_read, unified_web_search
 
 logger = logging.getLogger(__name__)
+
+STAGEHAND_SUBAGENT_SYSTEM_PROMPT = (
+    "You are a deepsearch sub-worker powered by Stagehand v4, delegated to work on exactly ONE website: {url}. "
+    "You have your OWN browser tab, separate from other sub-workers running at the same time.\n"
+    "- Perform the assigned instructions directly and efficiently using `browser_navigate`, `browser_act`, and `browser_extract`.\n"
+    "- Use `browser_act` with high-level natural language instructions (e.g. 'search for Nespresso Vertuo and press Enter', 'click Add to Cart on the top result').\n"
+    "- Use `browser_extract` to pull structured facts, prices, ratings, or delivery information.\n"
+    "- When your goal is achieved, reply with a concise, clear summary of what you found or completed.\n"
+)
 
 STAGEHAND_SYSTEM_PROMPT = (
     "You are deepsearch, Messa's fast, autonomous browser automation agent powered by Stagehand v4. "
@@ -45,6 +56,10 @@ STAGEHAND_SYSTEM_PROMPT = (
     "  * 'open delivery location modal, enter zip code 78701, and click Apply'\n"
     "  * 'fill in the form and click Submit'\n"
     "  * 'click Proceed to Checkout'\n\n"
+    "MULTI-SITE DELEGATION (PARALLEL TABS):\n"
+    "- If a task asks you to compare, check, or research MULTIPLE websites or stores (e.g. Target and Walmart):\n"
+    "  Call `delegate_website_task(url, instructions)` for EACH website ALL IN THE SAME TURN! "
+    "  Both sub-workers will run simultaneously in parallel tabs within the same browser session and return their findings.\n\n"
     "CRITICAL SPEED RULES (AVOID SPLIT TURNS & DELAYS):\n"
     "1. CHAIN FILL AND SUBMIT: When filling any form, search input, or modal, ALWAYS combine the input and the submit/apply button into ONE `browser_act` instruction!\n"
     "   * Example: `browser_act('type 78701 in the zip code field and click Apply')`\n"
@@ -87,6 +102,10 @@ class StagehandToolProvider:
         phone_number: str | None = None,
         live_view_share_url: str | None = None,
         initial_resume_url: str | None = None,
+        page: Any = None,
+        stagehand_instance: Any = None,
+        browser_instance: Any = None,
+        is_subagent: bool = False,
     ):
         self._approval_gate = approval_gate
         self._user_id = user_id
@@ -100,15 +119,20 @@ class StagehandToolProvider:
         self._initial_resume_url = initial_resume_url
         self._current_url: str = initial_resume_url or ""
         self._tab_id = f"tab-{uuid.uuid4().hex[:10]}"
+        self._is_subagent = is_subagent
 
-        self.browser: stagehand.StagehandBrowser | None = None
-        self.stagehand: stagehand.Stagehand | None = None
+        self.browser = browser_instance
+        self.stagehand = stagehand_instance
         self._bb_session_id: str | None = None
         self.live_view_url: str | None = None
         self.tools: list[BaseTool] = []
-        self._page: stagehand.Page | None = None
+        self._page = page
 
     async def __aenter__(self) -> StagehandToolProvider:
+        if self._is_subagent:
+            self._build_tools()
+            return self
+
         if not config.BROWSERBASE_API_KEY:
             raise RuntimeError("BROWSERBASE_API_KEY is not set in environment.")
 
@@ -170,6 +194,9 @@ class StagehandToolProvider:
         return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        if self._is_subagent:
+            return
+
         console.system(f"Deepsearch (Stagehand v4): releasing session #{self._deepsearch_session_id}...")
         if self.stagehand is not None:
             try:
@@ -294,6 +321,90 @@ class StagehandToolProvider:
                 ),
             ),
         ]
+
+        if not self._is_subagent:
+            self.tools.append(
+                StructuredTool.from_function(
+                    coroutine=self._delegate_website_task,
+                    name="delegate_website_task",
+                    description=(
+                        "Delegate independent browsing work on ONE website to a fresh sub-worker with its "
+                        "OWN browser tab in the SAME shared browser session. Call this MULTIPLE TIMES IN THE SAME TURN "
+                        "for independent multi-site tasks (e.g. comparing prices on Target and Walmart simultaneously). "
+                        "Example: delegate_website_task(url='https://www.target.com', instructions='search for Nespresso Vertuo and find the price')."
+                    ),
+                )
+            )
+
+    async def _delegate_website_task(self, url: str, instructions: str) -> str:
+        """Delegate independent work on ONE website to a fresh sub-worker with its
+        OWN browser tab in the SAME shared Browserbase session."""
+        if self._is_subagent:
+            return "ERROR: delegate_website_task cannot be called from within a sub-worker (no recursive delegation)."
+        if self._model is None:
+            return "ERROR: delegate_website_task isn't available in this context."
+
+        url = url.strip()
+        if not url.startswith(("http://", "https://")):
+            url = f"https://{url}"
+
+        console.system(f"Deepsearch (Stagehand v4): delegating sub-worker to {url}...")
+        task_start = time.monotonic()
+        try:
+            if self.browser is None:
+                raise RuntimeError("Browser session not open.")
+            sub_page = await self.browser.context.new_page()
+        except Exception as e:
+            return f"[{url}] ERROR: failed to open tab: {e}"
+
+        tab_id = f"tab-{uuid.uuid4().hex[:8]}"
+        if self._user_id is not None:
+            live_activity.set_tab(self._user_id, tab_id, url)
+
+        try:
+            sub_provider = StagehandToolProvider(
+                approval_gate=self._approval_gate,
+                user_id=self._user_id,
+                deepsearch_session_id=self._deepsearch_session_id,
+                model=self._model,
+                messa_email=self._messa_email,
+                user_email=self._user_email,
+                task_title=self._task_title,
+                phone_number=self._phone_number,
+                page=sub_page,
+                stagehand_instance=self.stagehand,
+                browser_instance=self.browser,
+                is_subagent=True,
+            )
+            async with sub_provider as worker:
+                sub_agent = create_agent(
+                    model=self._model,
+                    tools=worker.tools,
+                    system_prompt=STAGEHAND_SUBAGENT_SYSTEM_PROMPT.format(url=url),
+                )
+                try:
+                    result = await asyncio.wait_for(
+                        sub_agent.ainvoke(
+                            {"messages": [HumanMessage(content=f"Navigate to {url}, then: {instructions}")]},
+                            config={"recursion_limit": config.DEEPSEARCH_SUBAGENT_MAX_STEPS},
+                        ),
+                        timeout=config.DEEPSEARCH_MAX_SESSION_SECONDS,
+                    )
+                    messages = result.get("messages", [])
+                    summary = messages[-1].content if messages else "(no output)"
+                except Exception as e:
+                    console.tool_error("DEEPSEARCH", "stagehand_subagent", str(e))
+                    summary = f"(sub-worker error: {e})"
+        finally:
+            if self._user_id is not None:
+                live_activity.clear_tab(self._user_id, tab_id)
+            try:
+                await sub_page.close()
+            except Exception:
+                pass
+            console.system(f"Deepsearch (Stagehand v4): sub-worker for {url} completed in {time.monotonic() - task_start:.1f}s.")
+
+        return f"[{url}] {summary}"
 
     async def _get_url(self, page: Any) -> str:
         try:
