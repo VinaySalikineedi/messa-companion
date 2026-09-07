@@ -682,6 +682,20 @@ SCRATCHPAD_AND_SKILLS_ENABLED = os.environ.get("MESSA_SCRATCHPAD_AND_SKILLS_ENAB
 ACTIVE_TASK_ARTIFACT_RETENTION_DAYS = int(os.environ.get("MESSA_ACTIVE_TASK_ARTIFACT_RETENTION_DAYS", "7"))
 ACTIVE_TASK_ROW_RETENTION_DAYS = int(os.environ.get("MESSA_ACTIVE_TASK_ROW_RETENTION_DAYS", "60"))
 
+# Safety net for the completion half of the lifecycle: agents are expected
+# to call the complete_task tool themselves (tools/scratchpad_tools.py),
+# but nothing stops a task from getting abandoned mid-flow (agent crash,
+# user goes quiet, delegation never returns). Without a fallback, such a
+# task would sit in 'in_progress'/'waiting_user_input' forever, keep being
+# injected into unrelated future conversations, and never become eligible
+# for the retention purge above. purge_stale_active_tasks auto-transitions
+# any task stuck past this many days to a new terminal 'abandoned' status,
+# which then flows through the exact same artifact-wipe/row-delete steps
+# as a normally completed task. Deliberately shorter than
+# ACTIVE_TASK_ARTIFACT_RETENTION_DAYS -- this is a "something went wrong"
+# cutoff, not a normal task lifetime.
+ACTIVE_TASK_ABANDON_AFTER_DAYS = int(os.environ.get("MESSA_ACTIVE_TASK_ABANDON_AFTER_DAYS", "3"))
+
 # Skills playbook caps -- the two halves of "how does this stay fast/sane
 # as skills grow exponentially across users": SKILLS_MAX_PER_DOMAIN bounds
 # what's ever STORED for one (agent_type, domain) pair (write-time
@@ -703,6 +717,18 @@ SKILLS_MAX_PER_QUERY = int(os.environ.get("MESSA_SKILLS_MAX_PER_QUERY", "8"))
 # size of anything an adversarial save_skill call could try to smuggle in.
 SKILL_PROBLEM_PATTERN_MAX_CHARS = int(os.environ.get("MESSA_SKILL_PROBLEM_PATTERN_MAX_CHARS", "80"))
 SKILL_SOLUTION_RECIPE_MAX_CHARS = int(os.environ.get("MESSA_SKILL_SOLUTION_RECIPE_MAX_CHARS", "300"))
+
+# Guardrails on the scratchpad side (update_task_scratchpad), separate from
+# the skill caps above: a scratchpad `fields` dict is agent-authored
+# free-form working memory, not screened for banned phrases the way skills
+# are (it's per-task/per-user, never injected into another user's prompt),
+# but it's still unbounded input from a tool call and needs its own size
+# ceiling so one runaway agent can't balloon a single active_tasks row (and
+# therefore every future prompt that reloads it) without limit. Caps are
+# per this segment's review: ~2000 chars per field value, ~10000 chars for
+# the whole serialized payload.
+SCRATCHPAD_FIELD_MAX_CHARS = int(os.environ.get("MESSA_SCRATCHPAD_FIELD_MAX_CHARS", "2000"))
+SCRATCHPAD_TOTAL_MAX_CHARS = int(os.environ.get("MESSA_SCRATCHPAD_TOTAL_MAX_CHARS", "10000"))
 
 # How often server.py's _production_scratchpad_cleanup_loop sweeps
 # db.purge_stale_active_tasks -- coarse on purpose (default every 6h, same

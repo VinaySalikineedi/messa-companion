@@ -14,11 +14,18 @@ CompiledSubAgent (deepsearch, email_agent, executive_assistant) attaches it
 inside its own inner _run the same way -- rather than any single subagent
 module wiring this up for itself.
 
-Three tools:
+Four tools:
   - update_task_scratchpad(fields): merge structured facts (spreadsheet_id,
     pitch_draft, recipients, ...) into the CURRENT active task so they
     survive message-history truncation/compaction/summarization. Starts a
-    task automatically if none is open yet.
+    task automatically if none is open yet. Size-capped (config.
+    SCRATCHPAD_FIELD_MAX_CHARS per field, SCRATCHPAD_TOTAL_MAX_CHARS total)
+    so one runaway agent can't balloon a single row without limit.
+  - complete_task(summary): mark the current active task 'completed' once
+    it's actually done. This is the PRIMARY way a task leaves 'in_progress'
+    -- without it, a task only ever clears via the time-based auto-abandon
+    safety net in db.purge_stale_active_tasks, which exists for crashes/
+    dropped threads, not as the normal completion path.
   - save_skill(domain, problem_pattern, solution_recipe): persist a short,
     reusable lesson to the GLOBAL, cross-user skills playbook -- a tool's
     real parameter shape, a site's navigation quirk, a deprecated action to
@@ -126,6 +133,35 @@ def _screen_skill_text(problem_pattern: str, solution_recipe: str) -> str | None
     return None
 
 
+def _validate_scratchpad_fields(fields: dict[str, Any]) -> str | None:
+    """None if `fields` passes the size guardrails, else a short
+    human-readable rejection reason returned directly to the calling agent
+    (never a silent drop, never a raised exception -- same contract as
+    _screen_skill_text above). Caps a single field's *value* (stringified)
+    at config.SCRATCHPAD_FIELD_MAX_CHARS, and the whole payload
+    (stringified) at config.SCRATCHPAD_TOTAL_MAX_CHARS, so one field with a
+    huge scraped blob or a `fields` dict with many merged calls over time
+    can't grow a single active_tasks row -- and therefore every future
+    prompt that reloads it -- without limit."""
+    total_len = 0
+    for key, value in fields.items():
+        value_str = value if isinstance(value, str) else repr(value)
+        total_len += len(str(key)) + len(value_str)
+        if len(value_str) > config.SCRATCHPAD_FIELD_MAX_CHARS:
+            return (
+                f"field {key!r} is too long ({len(value_str)} chars, max "
+                f"{config.SCRATCHPAD_FIELD_MAX_CHARS}) -- store a summary or "
+                "id, not the full content."
+            )
+    if total_len > config.SCRATCHPAD_TOTAL_MAX_CHARS:
+        return (
+            f"fields payload too large ({total_len} chars, max "
+            f"{config.SCRATCHPAD_TOTAL_MAX_CHARS}) -- trim old fields you no "
+            "longer need before adding new ones."
+        )
+    return None
+
+
 def _format_task_block(task: dict[str, Any] | None) -> str:
     """Shared prompt text appended to the orchestrator's AND every
     subagent's system prompt (see this module's own docstring for the full
@@ -140,7 +176,11 @@ def _format_task_block(task: dict[str, Any] | None) -> str:
         "something a multi-step task will need again (an id, a draft, a recipient "
         "list) -- not at the end. Never ask the user to re-paste something you "
         "already produced earlier in this same task; check the artifacts below "
-        "first.",
+        "first. Keep field values short (ids/summaries, not full scraped "
+        "content) -- oversized fields are rejected.",
+        "complete_task(summary): call this once the current task is actually "
+        "done, so it stops being carried into unrelated future conversations. "
+        "Don't leave a finished task open.",
         "search_skills(domain) / save_skill(domain, problem_pattern, solution_recipe): "
         "call search_skills for a toolkit or website BEFORE working with it, "
         "especially right after a confusing error -- someone (you or another "
@@ -199,6 +239,9 @@ def build_scratchpad_tools(
         explicitly overwrite."""
         if not config.SCRATCHPAD_AND_SKILLS_ENABLED:
             return "Scratchpad is currently disabled."
+        rejection = _validate_scratchpad_fields(fields)
+        if rejection:
+            return f"Not saved: {rejection}"
         task = await db.get_active_task(user.user_id)
         if task is None:
             task = await db.start_active_task(user.user_id, task_type=agent_type)
@@ -208,6 +251,24 @@ def build_scratchpad_tools(
         if updated is None:
             return "Failed to save to the task scratchpad -- proceeding without it."
         return f"Saved. Current task artifacts: {updated['artifacts']}"
+
+    @tool
+    async def complete_task(summary: str = "") -> str:
+        """Call this once the CURRENT active task is actually finished, so
+        it stops being carried into future, unrelated conversations as
+        still-open work. `summary` is optional, short, free text (not
+        stored beyond this call today) -- pass a one-line note on what was
+        accomplished if useful, or leave it blank. Safe to call even if no
+        task is open. This is the primary way a task leaves 'in_progress';
+        a time-based fallback exists for crashes/dropped threads, but it's
+        not a substitute for calling this."""
+        if not config.SCRATCHPAD_AND_SKILLS_ENABLED:
+            return "Scratchpad is currently disabled."
+        task = await db.get_active_task(user.user_id)
+        if task is None:
+            return "No active task is open -- nothing to complete."
+        await db.set_active_task_status(task["task_id"], "completed")
+        return "Task marked complete." + (f" ({summary})" if summary.strip() else "")
 
     @tool
     async def save_skill(domain: str, problem_pattern: str, solution_recipe: str) -> str:
@@ -264,6 +325,7 @@ def build_scratchpad_tools(
 
     return [
         trace_tool(update_task_scratchpad, f"{agent_type}:update_task_scratchpad"),
+        trace_tool(complete_task, f"{agent_type}:complete_task"),
         trace_tool(save_skill, f"{agent_type}:save_skill"),
         trace_tool(search_skills, f"{agent_type}:search_skills"),
     ]

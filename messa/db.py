@@ -3865,14 +3865,19 @@ async def update_active_task_artifacts(task_id: str, fields: dict[str, Any]) -> 
 
 
 async def set_active_task_status(task_id: str, status: str) -> None:
-    """status in {'in_progress', 'waiting_user_input', 'completed', 'failed'}.
-    'completed'/'failed' also stamp completed_at, which
-    purge_stale_active_tasks (below) uses as its retention clock."""
+    """status in {'in_progress', 'waiting_user_input', 'completed', 'failed',
+    'abandoned'}. The last three are terminal and stamp completed_at, which
+    purge_stale_active_tasks (below) uses as its retention clock --
+    'abandoned' is what purge_stale_active_tasks itself sets on a task
+    nobody ever explicitly completed (see that function's own docstring
+    for why this exists: without it, get_active_task would keep injecting
+    a long-dead task's artifacts into every future, unrelated conversation
+    forever)."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         if not await _has_table(conn, "active_tasks"):
             return
-        if status in ("completed", "failed"):
+        if status in ("completed", "failed", "abandoned"):
             await conn.execute(
                 "UPDATE active_tasks SET status = $2, completed_at = NOW(), updated_at = NOW() WHERE task_id = $1",
                 task_id, status,
@@ -3891,15 +3896,42 @@ async def purge_stale_active_tasks() -> dict[str, int]:
     is wiped after config.ACTIVE_TASK_ARTIFACT_RETENTION_DAYS, then the
     whole row is dropped after config.ACTIVE_TASK_ROW_RETENTION_DAYS.
     Called from server.py's _production_scratchpad_cleanup_loop, same
-    daily-loop shape as the existing memory batch job (migration 027)."""
+    daily-loop shape as the existing memory batch job (migration 027).
+
+    STEP 0, before any of that: auto-abandon tasks nobody ever explicitly
+    completed. tools/scratchpad_tools.py exposes a complete_task tool so an
+    agent CAN mark a task done, but an agent forgetting to call it (or a
+    conversation that just trails off) must not leave that task
+    'in_progress'/'waiting_user_input' forever -- get_active_task has no
+    time limit on what counts as "current", so an indefinitely-open task
+    would keep getting injected into every future, completely unrelated
+    conversation with that user, and would never become eligible for the
+    completed/failed purge below either (real bug found in review: the
+    original v1 of this function only ever purged 'completed'/'failed'
+    rows, and nothing ever transitioned a task OUT of 'in_progress' on its
+    own, so in practice no row was ever purged). config.
+    ACTIVE_TASK_ABANDON_AFTER_DAYS (default 3 -- deliberately shorter than
+    the artifact/row retention windows, since "stop treating this as the
+    user's current task" is a much lower bar than "this data is old enough
+    to delete") is the cutoff; abandoned tasks then flow through the exact
+    same artifact-wipe/row-delete steps as a normally completed one."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         if not await _has_table(conn, "active_tasks"):
-            return {"artifacts_purged": 0, "rows_deleted": 0}
+            return {"artifacts_purged": 0, "rows_deleted": 0, "abandoned": 0}
+        abandon_res = await conn.execute(
+            """
+            UPDATE active_tasks
+            SET status = 'abandoned', completed_at = NOW(), updated_at = NOW()
+            WHERE status IN ('in_progress', 'waiting_user_input')
+              AND updated_at < NOW() - ($1 || ' days')::interval
+            """,
+            str(config.ACTIVE_TASK_ABANDON_AFTER_DAYS),
+        )
         purge_res = await conn.execute(
             """
             UPDATE active_tasks SET artifacts = '{}'
-            WHERE status IN ('completed', 'failed')
+            WHERE status IN ('completed', 'failed', 'abandoned')
               AND completed_at < NOW() - ($1 || ' days')::interval
               AND artifacts != '{}'
             """,
@@ -3908,20 +3940,23 @@ async def purge_stale_active_tasks() -> dict[str, int]:
         delete_res = await conn.execute(
             """
             DELETE FROM active_tasks
-            WHERE status IN ('completed', 'failed')
+            WHERE status IN ('completed', 'failed', 'abandoned')
               AND completed_at < NOW() - ($1 || ' days')::interval
             """,
             str(config.ACTIVE_TASK_ROW_RETENTION_DAYS),
         )
-        try:
-            artifacts_purged = int(purge_res.split(" ")[-1])
-        except Exception:
-            artifacts_purged = 0
-        try:
-            rows_deleted = int(delete_res.split(" ")[-1])
-        except Exception:
-            rows_deleted = 0
-        return {"artifacts_purged": artifacts_purged, "rows_deleted": rows_deleted}
+
+        def _count(res: str) -> int:
+            try:
+                return int(res.split(" ")[-1])
+            except Exception:
+                return 0
+
+        return {
+            "abandoned": _count(abandon_res),
+            "artifacts_purged": _count(purge_res),
+            "rows_deleted": _count(delete_res),
+        }
 
 
 async def _evict_excess_skills(conn: asyncpg.Connection, agent_type: str, domain: str) -> None:
@@ -3929,15 +3964,30 @@ async def _evict_excess_skills(conn: asyncpg.Connection, agent_type: str, domain
     config.SKILLS_MAX_PER_DOMAIN -- without this, a single busy domain
     (e.g. "amazon.com" under deepsearch) could grow unbounded over months.
     Evicts the WEAKEST rows first (lowest success_count, then oldest
-    last_used_at), never the strongest. Enforced inline on every write
-    (called from upsert_skill), not a separate cron job, so the cap holds
-    even if a cleanup job is ever late or fails to run."""
+    last_used_at), never the strongest.
+
+    ORDER BY ... DESC + OFFSET is deliberate, not a typo: sorting STRONGEST
+    first and skipping the first SKILLS_MAX_PER_DOMAIN rows means the
+    SELECT returns everything AFTER the cap in that strongest-first
+    ordering -- i.e. exactly the weakest excess rows, which the DELETE then
+    removes. An earlier version of this query sorted ASC (weakest first)
+    with the same OFFSET, which inverted this: OFFSET skipped the weakest
+    rows instead and deleted the STRONGEST ones -- caught in code review
+    before merge, not by the original unit tests (those only asserted the
+    query string contained "DELETE FROM agent_skills", never actual sort
+    direction against real row data -- see
+    test_scratchpad_and_skills.py's part4_eviction_direction_with_real_rows
+    for the regression test that would have caught it).
+
+    Enforced inline on every write (called from upsert_skill), not a
+    separate cron job, so the cap holds even if a cleanup job is ever late
+    or fails to run."""
     await conn.execute(
         """
         DELETE FROM agent_skills WHERE skill_id IN (
             SELECT skill_id FROM agent_skills
             WHERE agent_type = $1 AND domain = $2
-            ORDER BY success_count ASC, last_used_at ASC
+            ORDER BY success_count DESC, last_used_at DESC
             OFFSET $3
         )
         """,

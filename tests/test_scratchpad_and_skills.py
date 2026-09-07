@@ -12,9 +12,10 @@
     (_screen_skill_text) -- the security-critical piece: banned-phrase/
     override language, URL/email rejection, length caps, and that benign
     factual lessons pass.
-  - tools/scratchpad_tools.py's three tools (update_task_scratchpad,
-    save_skill, search_skills) end to end against monkeypatched db
-    functions, including the feature-flag kill switch.
+  - tools/scratchpad_tools.py's four tools (update_task_scratchpad,
+    complete_task, save_skill, search_skills) end to end against
+    monkeypatched db functions, including the feature-flag kill switch and
+    the update_task_scratchpad size guardrails.
   - The generic wiring into registry.py (declarative subagents +
     orchestrator) and into the three CompiledSubAgent modules (deepsearch,
     email_agent, executive_assistant) -- verified structurally (source
@@ -146,7 +147,7 @@ async def part1_active_tasks_pre_migration_degrade():
     result = await db.purge_stale_active_tasks()
     check(
         "purge_stale_active_tasks no-ops cleanly pre-migration",
-        result == {"artifacts_purged": 0, "rows_deleted": 0},
+        result == {"artifacts_purged": 0, "rows_deleted": 0, "abandoned": 0},
     )
 
 
@@ -203,6 +204,10 @@ async def part2_active_task_lifecycle():
     install_fake_pool(conn2)
     await db.set_active_task_status(task_id, "waiting_user_input")
     check("set_active_task_status(waiting_user_input) does NOT stamp completed_at", "completed_at" not in conn2.calls[-1][1])
+    conn3 = FakeConn(has_tables=True)
+    install_fake_pool(conn3)
+    await db.set_active_task_status(task_id, "abandoned")
+    check("set_active_task_status(abandoned) is also terminal and stamps completed_at", "completed_at = NOW()" in conn3.calls[-1][1])
 
 
 # ---------------------------------------------------------------------------
@@ -210,18 +215,26 @@ async def part2_active_task_lifecycle():
 # ---------------------------------------------------------------------------
 
 async def part3_purge_stale_active_tasks():
-    conn = FakeConn(has_tables=True, execute_results=["UPDATE 3", "DELETE 2"])
+    # Three conn.execute() calls now, in order: (0) auto-abandon UPDATE,
+    # (1) artifact-wipe UPDATE, (2) row-delete DELETE.
+    conn = FakeConn(has_tables=True, execute_results=["UPDATE 1", "UPDATE 3", "DELETE 2"])
     install_fake_pool(conn)
     result = await db.purge_stale_active_tasks()
+    check("purge_stale_active_tasks reports the parsed abandon count", result["abandoned"] == 1)
     check("purge_stale_active_tasks reports the parsed UPDATE count", result["artifacts_purged"] == 3)
     check("purge_stale_active_tasks reports the parsed DELETE count", result["rows_deleted"] == 2)
     check(
-        "the artifact-purge query uses config.ACTIVE_TASK_ARTIFACT_RETENTION_DAYS window",
-        str(config.ACTIVE_TASK_ARTIFACT_RETENTION_DAYS) in str(conn.calls[0][2]),
+        "the auto-abandon query uses config.ACTIVE_TASK_ABANDON_AFTER_DAYS window and targets in_progress/waiting_user_input",
+        str(config.ACTIVE_TASK_ABANDON_AFTER_DAYS) in str(conn.calls[0][2])
+        and "in_progress" in conn.calls[0][1] and "waiting_user_input" in conn.calls[0][1],
     )
     check(
-        "the row-delete query uses the (longer) config.ACTIVE_TASK_ROW_RETENTION_DAYS window",
-        str(config.ACTIVE_TASK_ROW_RETENTION_DAYS) in str(conn.calls[1][2]),
+        "the artifact-purge query uses config.ACTIVE_TASK_ARTIFACT_RETENTION_DAYS window and includes 'abandoned'",
+        str(config.ACTIVE_TASK_ARTIFACT_RETENTION_DAYS) in str(conn.calls[1][2]) and "abandoned" in conn.calls[1][1],
+    )
+    check(
+        "the row-delete query uses the (longer) config.ACTIVE_TASK_ROW_RETENTION_DAYS window and includes 'abandoned'",
+        str(config.ACTIVE_TASK_ROW_RETENTION_DAYS) in str(conn.calls[2][2]) and "abandoned" in conn.calls[2][1],
     )
 
 
@@ -258,6 +271,59 @@ async def part4_upsert_skill_dedup_and_eviction():
     conn2 = FakeConn(has_tables=False)
     install_fake_pool(conn2)
     check("upsert_skill returns None pre-migration", await db.upsert_skill("x", "y", "z", "w") is None)
+
+
+def part4_eviction_direction_with_real_rows():
+    """Regression test for the inverted-ORDER-BY bug caught in review: the
+    original _evict_excess_skills sorted success_count/last_used_at ASC
+    (weakest first) with the same OFFSET, which deleted the STRONGEST rows
+    and kept the weakest -- the exact opposite of the intended eviction
+    policy. part4_upsert_skill_dedup_and_eviction above only asserts the
+    query string shape (mocked FakeConn), which can't catch a logical
+    ordering bug -- this test runs the actual corrected SQL against real
+    row data (sqlite3 stdlib, same DELETE ... WHERE skill_id IN (SELECT ...
+    ORDER BY ... OFFSET ...) shape as the real Postgres query in db.py,
+    translated only for sqlite's LIMIT -1 OFFSET n syntax) and asserts the
+    weakest rows -- not the strongest -- are the ones actually removed."""
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE agent_skills (skill_id INTEGER PRIMARY KEY, success_count INTEGER, last_used_at INTEGER)")
+    cap = config.SKILLS_MAX_PER_DOMAIN
+    total_rows = cap + 5
+    # success_count and last_used_at both increase with skill_id, so
+    # skill_id 0 is the single weakest row and skill_id (total_rows - 1) is
+    # the single strongest -- no ties, so the expected kept/evicted sets
+    # are unambiguous.
+    conn.executemany(
+        "INSERT INTO agent_skills (skill_id, success_count, last_used_at) VALUES (?, ?, ?)",
+        [(i, i, i) for i in range(total_rows)],
+    )
+    conn.commit()
+
+    # The actual corrected query from db.py's _evict_excess_skills, same
+    # ORDER BY DESC + OFFSET shape (sqlite needs an explicit LIMIT -1 to
+    # allow an OFFSET with no row cap; Postgres's OFFSET alone is
+    # equivalent to this).
+    conn.execute(
+        """
+        DELETE FROM agent_skills WHERE skill_id IN (
+            SELECT skill_id FROM agent_skills
+            ORDER BY success_count DESC, last_used_at DESC
+            LIMIT -1 OFFSET ?
+        )
+        """,
+        (cap,),
+    )
+    conn.commit()
+
+    remaining = {row[0] for row in conn.execute("SELECT skill_id FROM agent_skills").fetchall()}
+    check(f"eviction keeps exactly {cap} rows", len(remaining) == cap)
+    expected_kept = set(range(5, total_rows))  # skill_ids 5..(cap+4): the strongest `cap` rows
+    expected_evicted = set(range(0, 5))  # skill_ids 0..4: the weakest 5 rows
+    check("eviction keeps the STRONGEST rows (highest success_count/last_used_at)", remaining == expected_kept)
+    check("eviction removes the WEAKEST rows, not the strongest", remaining.isdisjoint(expected_evicted))
+    conn.close()
 
 
 async def part5_search_skills():
@@ -337,7 +403,7 @@ def part6_skill_content_screening():
 
 
 # ---------------------------------------------------------------------------
-# Part 7: the three tools end-to-end, via monkeypatched db functions.
+# Part 7: the four tools end-to-end, via monkeypatched db functions.
 # ---------------------------------------------------------------------------
 
 class FakeUser:
@@ -349,10 +415,10 @@ async def part7_tools_end_to_end():
     user = FakeUser(1)
     tools = scratchpad_tools.build_scratchpad_tools(user, "integrations_agent")
     by_name = {t.name: t for t in tools}
-    check("build_scratchpad_tools returns exactly 3 tools", len(tools) == 3)
+    check("build_scratchpad_tools returns exactly 4 tools", len(tools) == 4)
     check(
-        "the three tools are named update_task_scratchpad/save_skill/search_skills",
-        set(by_name.keys()) == {"update_task_scratchpad", "save_skill", "search_skills"},
+        "the four tools are named update_task_scratchpad/complete_task/save_skill/search_skills",
+        set(by_name.keys()) == {"update_task_scratchpad", "complete_task", "save_skill", "search_skills"},
     )
 
     # --- update_task_scratchpad ---
@@ -378,6 +444,46 @@ async def part7_tools_end_to_end():
     check("update_task_scratchpad starts a task when none is open", calls["start"] == 1)
     check("update_task_scratchpad saves the given fields", calls["update"] == [("t1", {"spreadsheet_id": "abc123"})])
     check("update_task_scratchpad reports success back to the agent", "Saved" in result)
+
+    # --- update_task_scratchpad: size guardrails reject BEFORE touching the DB ---
+    calls["update"].clear()
+    oversized_field_result = await by_name["update_task_scratchpad"].coroutine(
+        fields={"pitch_draft": "x" * (config.SCRATCHPAD_FIELD_MAX_CHARS + 1)}
+    )
+    check("an oversized single field is rejected", "Not saved" in oversized_field_result)
+    check("a rejected oversized field never reaches db.update_active_task_artifacts", len(calls["update"]) == 0)
+
+    oversized_total_result = await by_name["update_task_scratchpad"].coroutine(
+        fields={f"k{i}": "x" * 500 for i in range(30)}  # well under the per-field cap, over the total cap
+    )
+    check("an oversized total payload is rejected even with no single field over the per-field cap", "Not saved" in oversized_total_result)
+    check("a rejected oversized total payload never reaches db.update_active_task_artifacts", len(calls["update"]) == 0)
+
+    # A normal-sized payload still goes through fine.
+    ok_size_result = await by_name["update_task_scratchpad"].coroutine(fields={"note": "short and fine"})
+    check("a normal-sized fields payload is still saved", "Saved" in ok_size_result and len(calls["update"]) == 1)
+
+    # --- complete_task ---
+    status_calls = []
+
+    async def fake_get_active_task_for_complete(uid):
+        return {"task_id": "t1", "artifacts": {}}
+
+    async def fake_set_active_task_status(task_id, status):
+        status_calls.append((task_id, status))
+
+    db.get_active_task = fake_get_active_task_for_complete
+    db.set_active_task_status = fake_set_active_task_status
+    complete_result = await by_name["complete_task"].coroutine(summary="sent the pitch deck")
+    check("complete_task marks the open task completed via db.set_active_task_status", status_calls == [("t1", "completed")])
+    check("complete_task reports success back to the agent", "complete" in complete_result.lower())
+
+    async def fake_get_active_task_none(uid):
+        return None
+
+    db.get_active_task = fake_get_active_task_none
+    no_task_result = await by_name["complete_task"].coroutine(summary="")
+    check("complete_task is a safe no-op when no task is open", "No active task" in no_task_result)
 
     # --- save_skill: rejected content never reaches the DB ---
     upsert_calls = []
@@ -437,6 +543,7 @@ async def part8_feature_flag_kill_switch():
     db.get_active_task = poison
     db.start_active_task = poison
     db.update_active_task_artifacts = poison
+    db.set_active_task_status = poison
     db.upsert_skill = poison
     db.search_skills = poison
 
@@ -446,9 +553,11 @@ async def part8_feature_flag_kill_switch():
         tools = scratchpad_tools.build_scratchpad_tools(user, "integrations_agent")
         by_name = {t.name: t for t in tools}
         r1 = await by_name["update_task_scratchpad"].coroutine(fields={"x": 1})
+        r1b = await by_name["complete_task"].coroutine(summary="")
         r2 = await by_name["save_skill"].coroutine(domain="d", problem_pattern="p", solution_recipe="s")
         r3 = await by_name["search_skills"].coroutine(domain="d")
         check("update_task_scratchpad reports disabled and touches no DB fn", "disabled" in r1.lower())
+        check("complete_task reports disabled and touches no DB fn", "disabled" in r1b.lower())
         check("save_skill reports disabled and touches no DB fn", "disabled" in r2.lower())
         check("search_skills reports disabled and touches no DB fn", "disabled" in r3.lower())
         check("no DB function was ever called while the flag was off", len(touched) == 0)
@@ -579,6 +688,7 @@ async def main() -> None:
     await part2_active_task_lifecycle()
     await part3_purge_stale_active_tasks()
     await part4_upsert_skill_dedup_and_eviction()
+    part4_eviction_direction_with_real_rows()
     await part5_search_skills()
     part6_skill_content_screening()
     await part7_tools_end_to_end()
