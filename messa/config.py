@@ -1264,6 +1264,46 @@ DEEPSEARCH_MAX_CONSECUTIVE_TOOL_ERRORS = int(
     os.environ.get("MESSA_DEEPSEARCH_MAX_CONSECUTIVE_TOOL_ERRORS", "6")
 )
 
+# Reliability hardening (docs/smart_autonomous_agent_architecture.md) --
+# the Stagehand engine's own general circuit breaker, since
+# DEEPSEARCH_MAX_CONSECUTIVE_TOOL_ERRORS above only ever applied to the
+# legacy Playwright-MCP engine and only counts THROWN EXCEPTIONS (a
+# browser_act that "succeeds" against a dead-end refusal modal with no
+# exception is invisible to it). tools/browser_circuit_breaker.py's
+# StagehandZeroDeltaMiddleware fingerprints (url, title) before/after every
+# browser_act/browser_navigate/browser_execute_script call and raises once
+# this many consecutive calls produce an IDENTICAL fingerprint. Small on
+# purpose (3, not 6) -- the doc's own incident showed 10+ blind retries
+# across 6 separate cloud sessions, so this is meant to trip fast, well
+# before that kind of runaway cost -- while still tolerating one or two
+# legitimately slow reloads that happen to report the same title/URL twice.
+DEEPSEARCH_ZERO_DELTA_MAX_REPEATS = int(
+    os.environ.get("MESSA_DEEPSEARCH_ZERO_DELTA_MAX_REPEATS", "3")
+)
+
+# integrations_agent's first-ever per-delegation step budget (see
+# registry.py's "integrations_agent" subagent dict) -- before this it had
+# NO recursion_limit/step budget of any kind, unlike every other subagent
+# in this file. Generous on purpose: a real integrations task is typically
+# a handful of search/describe/execute calls, not an open-ended research
+# loop, so this exists as a backstop against a genuinely runaway
+# self-healing loop (describe -> retry -> fail -> describe -> retry -> ...),
+# not a tight first-resort brake.
+INTEGRATIONS_AGENT_MAX_MODEL_CALLS = int(
+    os.environ.get("MESSA_INTEGRATIONS_AGENT_MAX_MODEL_CALLS", "25")
+)
+
+# tools/integration_circuit_breaker.py's IntegrationRetryLoopMiddleware --
+# how many times execute_integration_tool may fail with the EXACT SAME
+# (slug, arguments) before that identical call is short-circuited without
+# reaching Composio again. 2, not 1: a single failure is often a real
+# transient (a brief rate limit, a momentary auth hiccup), so this allows
+# one natural retry before treating repetition as a loop rather than
+# tripping on the very first bump.
+INTEGRATION_RETRY_LOOP_MAX_IDENTICAL_ATTEMPTS = int(
+    os.environ.get("MESSA_INTEGRATION_RETRY_LOOP_MAX_IDENTICAL_ATTEMPTS", "2")
+)
+
 # Step budget for executive_assistant (tasks/reminders/notes/contacts/
 # calendar), deliberately small and separate from DEEPSEARCH_MAX_STEPS --
 # see tools/executive_tools.py's build_executive_subagent docstring. This

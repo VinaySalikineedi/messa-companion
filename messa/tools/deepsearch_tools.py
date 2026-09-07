@@ -128,6 +128,7 @@ from ..channels import browserbase, sendblue
 from ..channels.browserbase import BrowserbaseError
 from ..channels.sendblue import SendblueError
 from ..config import UserContext
+from .browser_circuit_breaker import StagehandZeroDeltaMiddleware
 from .scratchpad_tools import build_scratchpad_tools, scratchpad_prompt_block
 from .search_engine import unified_web_read as _unified_web_read
 from .search_engine import unified_web_search as _unified_web_search
@@ -3339,11 +3340,26 @@ def build_deepsearch_subagent(
                                 user, "deepsearch", approval_gate
                             )
                             _active_system_prompt = _active_system_prompt + await scratchpad_prompt_block(user)
+                        # Zero-delta circuit breaker (docs/smart_autonomous_
+                        # agent_architecture.md, System 6) -- only for the
+                        # Stagehand engine, which had no general breaker of
+                        # any kind before this (the legacy Playwright-MCP
+                        # engine's own consecutive_errors counter lives
+                        # inside BrowserToolProvider's tool-wrapping loop
+                        # instead, further up this file). Listed first so it
+                        # sees the raw tool result before _summarization can
+                        # truncate/compact it (middleware compose outermost
+                        # -> innermost in list order).
+                        _run_middleware: list[Any] = []
+                        if _use_stagehand:
+                            _run_middleware.append(StagehandZeroDeltaMiddleware(provider))
+                        if _summarization is not None:
+                            _run_middleware.append(_summarization)
                         inner_agent = create_agent(
                             model=model, tools=_deepsearch_tools,
                             system_prompt=_active_system_prompt,
                             checkpointer=checkpointer,
-                            middleware=[_summarization] if _summarization is not None else [],
+                            middleware=_run_middleware,
                         )
                         status = "completed"
                         # Set True only by the anti-hallucination gate below,

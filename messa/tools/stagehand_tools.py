@@ -44,6 +44,7 @@ from urllib.parse import urlparse
 from .. import config, console, credentials, db, live_activity
 from ..approval import ApprovalGate
 from ..channels import browserbase
+from .browser_circuit_breaker import StagehandZeroDeltaMiddleware
 from .search_engine import unified_web_read, unified_web_search
 
 logger = logging.getLogger(__name__)
@@ -116,14 +117,22 @@ STAGEHAND_SYSTEM_PROMPT = (
     "(e.g. `browser_navigate('https://www.amazon.com/s?k=Kindle+Paperwhite')`) to instantly load results in 1 turn!\n"
     "3. NEVER OBSERVE BEFORE ACTING: `browser_act` finds elements by description automatically. "
     "DO NOT call `browser_observe` before clicking or adding to cart. Simply call `browser_act('click Add to Cart on the top result')` directly.\n"
-    "4. TRUST SUCCESSFUL ACTIONS: When `browser_act` completes, proceed immediately to the next task step without redundant intermediate verification.\n\n"
+    "4. TRUST SUCCESSFUL ACTIONS: When `browser_act` completes, proceed immediately to the next task step without redundant intermediate verification.\n"
+    "5. MULTI-BOX OTP / MULTI-FIELD FORMS -- USE `browser_execute_script`, NOT N SEPARATE `browser_act` CALLS: "
+    "if a form has multiple separate single-character boxes (a common OTP pattern) or several fields to fill at once, "
+    "call `browser_execute_script` ONCE with a short JS snippet that finds all the inputs and dispatches native "
+    "'input'/'change' events for each of them, instead of one `browser_act` per box/field. "
+    "This requires user confirmation first, so only reach for it when it genuinely saves multiple `browser_act` round trips.\n\n"
     "EFFICIENCY & COST CONTROLS:\n"
     "- If you just need general facts, links, or background info, call `search_web` first -- it is "
     "instant (<1s) and costs ZERO browser time. Never navigate to google.com or a search engine tab.\n"
     "- Use `read_webpage(url)` to read articles or static pages without spending browser minutes.\n"
     "- CLOSE BROWSER EARLY: The moment your browsing tasks are finished, or if you hit a CAPTCHA and decide "
-    "to switch to `search_web`, you MUST call `close_browser()` immediately! Never leave the remote browser open "
-    "while you do web searches or write your response. Calling `close_browser()` immediately stops billing.\n\n"
+    "to switch to `search_web`, you MUST call `close_browser()` immediately (UNLESS you are still waiting on "
+    "`await_email_verification_code` or `request_human_help` -- close_browser will refuse while either is in "
+    "progress, since closing then would wipe session storage and invalidate the code/verification you're "
+    "waiting on)! Never leave the remote browser open while you do web searches or write your response. "
+    "Calling `close_browser()` immediately stops billing.\n\n"
     "CAPTCHA & HUMAN ESCALATION (CUT RETRIES TO 2):\n"
     "- Hit an unsolved CAPTCHA or bot verification? You are permitted AT MOST 2 attempts to solve or click it. "
     "CAPTCHAs are hard to pass automatically. If it does not clear after 2 attempts, STOP RETRYING immediately! "
@@ -307,6 +316,22 @@ class StagehandToolProvider:
         self._page = page
         self._captcha_tracker: dict[str, int] = captcha_tracker if captcha_tracker is not None else {}
         self._session_lock: asyncio.Lock = asyncio.Lock()
+        # Reliability hardening (docs/smart_autonomous_agent_architecture.md):
+        # True for the exact duration of _await_email_verification_code /
+        # _request_human_help -- both are blocking poll loops that can run
+        # for minutes. This is the fix for a real production incident: the
+        # system prompt's own unconditional "close the browser the MOMENT
+        # you're done" instruction (below) gave the model no exception for
+        # an in-flight OTP wait, and a model with parallel tool-calling can
+        # (and did) dispatch await_email_verification_code and close_browser
+        # in the SAME turn -- LangGraph's ToolNode runs multiple tool calls
+        # from one turn concurrently, so whichever finishes first (usually
+        # close_browser, since it's fast) can close the session WHILE the
+        # OTP wait is still polling, wiping session storage and invalidating
+        # the very code the wait is trying to retrieve. _close_browser
+        # checks this flag and refuses -- code-enforced, not just a prompt
+        # request the model can ignore or race.
+        self._wait_gate_active: bool = False
 
     async def __aenter__(self) -> StagehandToolProvider:
         if self._is_subagent:
@@ -413,6 +438,15 @@ class StagehandToolProvider:
         if self._is_subagent:
             return "Sub-workers run in shared tabs and cannot close the browser session."
 
+        if self._wait_gate_active:
+            # The actual OTP-invalidation fix -- see self._wait_gate_active's
+            # own comment in __init__ for the exact race this closes.
+            return (
+                "BLOCKED: cannot close the browser while awaiting an email verification code "
+                "or human help -- closing now would wipe session storage and invalidate the "
+                "OTP/verification you're waiting on. Wait for it to finish or time out first."
+            )
+
         if self.browser is None and self.stagehand is None:
             return "Browser session is already closed (no billing active)."
 
@@ -505,6 +539,21 @@ class StagehandToolProvider:
                 coroutine=self._browser_screenshot,
                 name="browser_screenshot",
                 description="Capture a visual screenshot of the current page.",
+            ),
+            StructuredTool.from_function(
+                coroutine=self._browser_execute_script,
+                name="browser_execute_script",
+                description=(
+                    "Run raw JavaScript in the page and return its result, for cases browser_act "
+                    "can't handle in ONE natural-language instruction -- e.g. a multi-box OTP form "
+                    "(find all digit inputs and distribute the code in one script, instead of one "
+                    "browser_act per digit) or a multi-field form fill. Requires user confirmation "
+                    "before running, same as other destructive actions. Example: "
+                    "browser_execute_script(script=\"const inputs = document.querySelectorAll("
+                    "'input[maxlength=\\\"1\\\"]'); const code = '123456'; inputs.forEach((el, i) => { "
+                    "el.value = code[i] || ''; el.dispatchEvent(new Event('input', {bubbles: true})); "
+                    "el.dispatchEvent(new Event('change', {bubbles: true})); }); return inputs.length;\")."
+                ),
             ),
             StructuredTool.from_function(
                 coroutine=self._request_human_help,
@@ -619,10 +668,17 @@ class StagehandToolProvider:
                 captcha_tracker=self._captcha_tracker,
             )
             async with sub_provider as worker:
+                # Sub-workers run real browser_act calls in their own tab and
+                # can get stuck against the exact same terminal-block cases
+                # (an anti-fraud modal, a dead end) as the main provider --
+                # give them the same zero-delta breaker rather than leaving
+                # this one path uncovered. See browser_circuit_breaker.py's
+                # own module docstring for the full design.
                 sub_agent = create_agent(
                     model=self._model,
                     tools=worker.tools,
                     system_prompt=STAGEHAND_SUBAGENT_SYSTEM_PROMPT.format(url=url),
+                    middleware=[StagehandZeroDeltaMiddleware(worker)],
                 )
                 try:
                     result = await asyncio.wait_for(
@@ -827,6 +883,41 @@ class StagehandToolProvider:
         except Exception as e:
             return f"Failed to capture screenshot: {e}"
 
+    async def _browser_execute_script(self, script: str) -> str:
+        """Code-as-action (docs/smart_autonomous_agent_architecture.md,
+        System 3) -- lets the model batch a multi-box OTP fill or a
+        multi-field form into ONE call instead of N `browser_act` round
+        trips. Wraps Stagehand's own `Page.evaluate` (already used
+        internally in this file for navigation -- this is just the first
+        time it's exposed as a model-facing tool).
+
+        This is also the first real call site for self._approval_gate in
+        this whole file -- every other "destructive" browser action here
+        gates itself only through the CAPTCHA-retry/zero-delta breaker, not
+        a user-confirmation gate. Raw script execution is different in
+        kind (arbitrary JS, not a scoped natural-language instruction), so
+        it goes through the same confirm() flow the legacy Playwright-MCP
+        engine's own browser_evaluate/browser_run_code_unsafe tools use."""
+        gate = self._approval_gate
+        allowed = False
+        if gate is not None:
+            try:
+                allowed = await gate.confirm("deepsearch", "browser_execute_script", {"script": script})
+            except Exception as e:
+                console.tool_error("DEEPSEARCH", "stagehand_execute_script_gate", str(e))
+                return f"Error requesting confirmation to run this script: {e}"
+        if not allowed:
+            return "BLOCKED: user declined to run browser_execute_script (or no approval gate is configured)."
+
+        await self._ensure_session()
+        try:
+            page = await self.get_active_page()
+            result = await page.evaluate(script)
+            return f"Script result: {json.dumps(result, default=str) if result is not None else 'null'}"
+        except Exception as e:
+            console.tool_error("DEEPSEARCH", "stagehand_execute_script", str(e))
+            return f"Error executing script: {e}"
+
     async def _request_human_help(self, reason: str) -> str:
         if self._user_id is None:
             return "ERROR: request_human_help requires an active user session."
@@ -836,6 +927,7 @@ class StagehandToolProvider:
         )
         request_id = request_row["id"] if request_row else None
         live_activity.set_waiting_for_human(self._user_id, reason)
+        self._wait_gate_active = True
 
         try:
             await self._ensure_session()
@@ -859,6 +951,7 @@ class StagehandToolProvider:
             return "BLOCKED: Human help timed out. Wrap up and report what help is needed."
         finally:
             live_activity.clear_waiting_for_human(self._user_id)
+            self._wait_gate_active = False
 
     async def _await_email_verification_code(self, sender_keyword: str = "") -> str:
         if self._user_id is None:
@@ -866,17 +959,21 @@ class StagehandToolProvider:
         if not self._messa_email:
             return "ERROR: No Messa email provisioned for this user."
         console.system(f"Deepsearch (Stagehand v4): awaiting OTP code on {self._messa_email}")
-        # Immediate lookback: code may have arrived during LLM planning
-        recent = await db.find_recent_otp_in_inbox(self._user_id, sender_keyword, max_age_seconds=180)
-        if recent and recent.get("code"):
-            return f"VERIFICATION_CODE_RECEIVED: {recent['code']}"
-        start = time.monotonic()
-        while time.monotonic() - start < config.DEEPSEARCH_OTP_WAIT_MAX_SECONDS:
-            await asyncio.sleep(config.DEEPSEARCH_OTP_WAIT_POLL_INTERVAL_SECONDS)
-            recent = await db.find_recent_otp_in_inbox(self._user_id, sender_keyword, max_age_seconds=120)
+        self._wait_gate_active = True
+        try:
+            # Immediate lookback: code may have arrived during LLM planning
+            recent = await db.find_recent_otp_in_inbox(self._user_id, sender_keyword, max_age_seconds=180)
             if recent and recent.get("code"):
                 return f"VERIFICATION_CODE_RECEIVED: {recent['code']}"
-        return "TIMEOUT: No verification code received within timeout window."
+            start = time.monotonic()
+            while time.monotonic() - start < config.DEEPSEARCH_OTP_WAIT_MAX_SECONDS:
+                await asyncio.sleep(config.DEEPSEARCH_OTP_WAIT_POLL_INTERVAL_SECONDS)
+                recent = await db.find_recent_otp_in_inbox(self._user_id, sender_keyword, max_age_seconds=120)
+                if recent and recent.get("code"):
+                    return f"VERIFICATION_CODE_RECEIVED: {recent['code']}"
+            return "TIMEOUT: No verification code received within timeout window."
+        finally:
+            self._wait_gate_active = False
 
     async def _generate_account_credential(self, site_name: str, username: str | None = None) -> str:
         if self._user_id is None:

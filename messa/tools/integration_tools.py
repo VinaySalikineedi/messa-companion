@@ -89,6 +89,7 @@ called out again in the README.
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any, Callable
 
 from langchain_core.tools import BaseTool, tool
@@ -689,13 +690,40 @@ def build_integration_tools(
         return any(keyword in slug_upper for keyword in config.INTEGRATION_WRITE_ACTION_KEYWORDS)
 
     @tool
+    async def describe_integration_tool(slug: str) -> str:
+        """Look up the REAL parameter schema for one Composio tool/action by
+        its exact slug (from search_integration_tools' results). Call this
+        BEFORE execute_integration_tool if a previous call to this exact
+        slug already failed with a parameter/argument-shaped error, or if
+        search_integration_tools' one-line description wasn't enough to
+        know what `arguments` this action actually expects -- don't guess
+        the argument shape a second time when you can just look it up.
+        Read-only, no side effects."""
+        try:
+            client = _get_client()
+        except _NotConfigured as e:
+            return str(e)
+
+        def _describe_sync() -> Any:
+            return client.tools.get_raw_composio_tool_by_slug(slug)
+
+        try:
+            tool_obj = await asyncio.to_thread(_describe_sync)
+        except Exception as e:  # noqa: BLE001 - surfaced to the model, not raised
+            return f"Couldn't look up the schema for {slug!r}: {e}."
+        schema = getattr(tool_obj, "input_parameters", None) or {}
+        desc = getattr(tool_obj, "description", "") or ""
+        return f"{slug}: {desc}\nParameters (JSON schema): {json.dumps(schema, default=str)}"
+
+    @tool
     async def execute_integration_tool(slug: str, arguments: dict) -> str:
         """Run one specific Composio tool/action by its exact slug (from
         search_integration_tools' results -- e.g. 'TODOIST_CREATE_TASK'),
         with `arguments` as the keyword arguments that action needs (check
         the description search_integration_tools returned for what it
-        expects). Only works for an app the user has already connected --
-        if it's not connected, use connect_integration_app first.
+        expects, or call describe_integration_tool for the real schema).
+        Only works for an app the user has already connected -- if it's
+        not connected, use connect_integration_app first.
 
         Read-only actions (list/get/fetch/search) run immediately.
         Anything that creates, updates, deletes, sends, posts, or
@@ -730,12 +758,37 @@ def build_integration_tools(
         try:
             result = await asyncio.to_thread(_execute_sync)
         except Exception as e:  # noqa: BLE001 - surfaced to the model, not raised
-            return f"'{slug}' failed: {e}. Don't retry with the exact same arguments."
+            # Self-healing: before surfacing the raw error, check whether
+            # this agent (or another user's, since agent_skills is GLOBAL --
+            # see tools/scratchpad_tools.py) already learned a fix for this
+            # toolkit. Code-triggered, not voluntary -- the very first retry
+            # attempt already has any previously-learned lesson, instead of
+            # depending on the model remembering to call search_skills
+            # itself. Reuses _guess_toolkit_slug (the same heuristic
+            # search_integration_tools already uses to label results) and
+            # the exact agent_skills table/db.search_skills function
+            # tools/scratchpad_tools.py's Active Task Scratchpad + Skills
+            # Playbook feature already shipped -- zero new tables.
+            hint = ""
+            if config.SCRATCHPAD_AND_SKILLS_ENABLED:
+                try:
+                    toolkit_guess = _guess_toolkit_slug(slug, None)
+                    hits = await db.search_skills("integrations_agent", toolkit_guess, limit=2)
+                    if hits:
+                        lessons = "; ".join(h["solution_recipe"] for h in hits)
+                        hint = f" Known lessons for {toolkit_guess!r}: {lessons}"
+                except Exception:
+                    pass  # a skills lookup must never be why the real error doesn't get reported
+            return (
+                f"'{slug}' failed: {e}.{hint} Don't retry with the exact same arguments -- "
+                f"call describe_integration_tool({slug!r}) to check the real parameter schema, "
+                "or adjust your arguments."
+            )
         return str(result)
 
     raw_tools: list[BaseTool] = [
-        search_integration_tools, connect_integration_app, queue_app_connections,
-        disconnect_integration_app, execute_integration_tool,
+        search_integration_tools, describe_integration_tool, connect_integration_app,
+        queue_app_connections, disconnect_integration_app, execute_integration_tool,
     ]
 
     def _destructive_check_for(name: str) -> Callable[..., bool] | None:

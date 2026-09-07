@@ -57,6 +57,8 @@ from deepagents import GeneralPurposeSubagentProfile, HarnessProfile, create_dee
 from langchain_core.tools import BaseTool, tool
 
 from .. import config, console, db, deepsearch_control, live_activity, memory, timeutil
+from langchain.agents.middleware import ModelCallLimitMiddleware
+
 from ..approval import ApprovalGate, CLIApprovalGate
 from ..channels import sendblue
 from ..channels.sendblue import SendblueError
@@ -66,6 +68,7 @@ from ..tools.common import trace_all
 from ..tools.document_tools import build_document_system_prompt, build_document_tools
 from ..tools.email_tools import build_email_subagent
 from ..tools.executive_tools import _format_contact_line, build_executive_subagent
+from ..tools.integration_circuit_breaker import IntegrationRetryLoopMiddleware
 from ..tools.integration_tools import app_category_for_toolkit, build_integration_system_prompt, build_integration_tools
 from ..tools.personal_inbox_tools import build_personal_inbox_system_prompt, build_personal_inbox_tools
 from ..tools.routines_tools import ROUTINES_SYSTEM_PROMPT, build_routines_tools
@@ -1110,6 +1113,27 @@ async def build_orchestrator(
             "system_prompt": build_integration_system_prompt(user),
             "tools": build_integration_tools(user, approval_gate),
             "model": _subagent_model_for("integrations_agent"),
+            # Reliability hardening (docs/smart_autonomous_agent_architecture.md):
+            # integrations_agent had NO retry protection or step budget of any
+            # kind before this -- every other tool's failure just returned a
+            # "don't retry with the exact same arguments" STRING the model
+            # could ignore. ModelCallLimitMiddleware is this subagent's first
+            # real per-delegation step budget, ever, via deepagents' own
+            # supported `middleware` field on a declarative SubAgent dict
+            # (confirmed additive, not a restructuring -- see
+            # deepagents/middleware/subagents.py). IntegrationRetryLoopMiddleware
+            # (tools/integration_circuit_breaker.py) is a generalized,
+            # code-enforced version of that same "don't retry identically"
+            # rule for execute_integration_tool specifically. Fresh instances
+            # every call -- build_orchestrator itself runs fresh every turn
+            # (see cli.py's per-turn call site), so this state never needs to
+            # outlive one turn, same as _summarization in deepsearch_tools.py.
+            "middleware": [
+                ModelCallLimitMiddleware(
+                    run_limit=config.INTEGRATIONS_AGENT_MAX_MODEL_CALLS, exit_behavior="end"
+                ),
+                IntegrationRetryLoopMiddleware(),
+            ],
         },
     ]
 
