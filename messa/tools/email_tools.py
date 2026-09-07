@@ -68,6 +68,7 @@ from .. import config, console, db, pdf_reader, usage
 from ..approval import ApprovalGate
 from ..channels.sendblue import SendblueError, send_message
 from .common import last_ai_text, trace_tool
+from .scratchpad_tools import build_scratchpad_tools, scratchpad_prompt_block
 
 LABEL = "email_agent"
 
@@ -781,9 +782,17 @@ def build_email_subagent(
     async def _run(state: dict[str, Any]) -> dict[str, Any]:
         messages = list(state["messages"])
         tools = build_email_tools(user, approval_gate)
+        system_prompt = _build_system_prompt(user)
+        # Active Task Scratchpad + Skills Playbook -- see tools/
+        # scratchpad_tools.py's own module docstring; attached here (not by
+        # registry.py) since this is a CompiledSubAgent that builds its own
+        # inner agent fresh on every delegation.
+        if config.SCRATCHPAD_AND_SKILLS_ENABLED:
+            tools = tools + build_scratchpad_tools(user, "email_agent", approval_gate)
+            system_prompt = system_prompt + await scratchpad_prompt_block(user)
         run_config = {"recursion_limit": config.EMAIL_RECURSION_LIMIT}
         inner_agent = create_agent(
-            model=model, tools=tools, system_prompt=_build_system_prompt(user),
+            model=model, tools=tools, system_prompt=system_prompt,
         )
         result = await inner_agent.ainvoke({"messages": messages}, config=run_config)
         return {"messages": [AIMessage(content=last_ai_text(result["messages"]))]}

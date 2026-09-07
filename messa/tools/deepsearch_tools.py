@@ -128,6 +128,7 @@ from ..channels import browserbase, sendblue
 from ..channels.browserbase import BrowserbaseError
 from ..channels.sendblue import SendblueError
 from ..config import UserContext
+from .scratchpad_tools import build_scratchpad_tools, scratchpad_prompt_block
 from .search_engine import unified_web_read as _unified_web_read
 from .search_engine import unified_web_search as _unified_web_search
 from .stagehand_tools import STAGEHAND_SYSTEM_PROMPT, StagehandToolProvider
@@ -3321,8 +3322,25 @@ def build_deepsearch_subagent(
                             if _use_stagehand
                             else DEEPSEARCH_SYSTEM_PROMPT + user_identity_prompt
                         )
+                        # Active Task Scratchpad + Skills Playbook (see
+                        # tools/scratchpad_tools.py's own module docstring)
+                        # -- this is the flagship use case the feature was
+                        # designed around: a site-navigation lesson learned
+                        # on one Amazon run (a selector, a checkout quirk)
+                        # persists and speeds up every future deepsearch
+                        # run against amazon.com, for every user, without
+                        # re-deriving it from the model each time. Attached
+                        # here rather than by registry.py since this whole
+                        # subagent is a CompiledSubAgent that builds its own
+                        # inner agent fresh on every delegation.
+                        _deepsearch_tools = provider.tools
+                        if config.SCRATCHPAD_AND_SKILLS_ENABLED:
+                            _deepsearch_tools = _deepsearch_tools + build_scratchpad_tools(
+                                user, "deepsearch", approval_gate
+                            )
+                            _active_system_prompt = _active_system_prompt + await scratchpad_prompt_block(user)
                         inner_agent = create_agent(
-                            model=model, tools=provider.tools,
+                            model=model, tools=_deepsearch_tools,
                             system_prompt=_active_system_prompt,
                             checkpointer=checkpointer,
                             middleware=[_summarization] if _summarization is not None else [],

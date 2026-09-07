@@ -660,6 +660,59 @@ REACTION_CLASSIFIER_TIMEOUT_SECONDS = float(
     os.environ.get("MESSA_REACTION_CLASSIFIER_TIMEOUT_SECONDS", "6")
 )
 
+# ---- Active Task Scratchpad + Skills Playbook (docs/autonomous_
+# integrations_and_task_memory_spec.md, migration 033) -- one on/off
+# switch for the whole feature, same shape as INBOUND_REACTIONS_ENABLED
+# above: this ships on its own branch specifically so it can be tested
+# hard before touching production, and flipped off instantly (no redeploy)
+# if anything looks wrong once it is live. When false, every scratchpad/
+# skill tool self-reports disabled and registry.py doesn't even attach the
+# tools or prompt block, so this is a true kill switch, not a soft no-op.
+SCRATCHPAD_AND_SKILLS_ENABLED = os.environ.get("MESSA_SCRATCHPAD_AND_SKILLS_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+# Retention for active_tasks (explicit product decision -- neither "keep
+# forever" nor "delete the moment it's done"): a finished task keeps its
+# row (task_id/status/timestamps -- cheap, useful for support/debugging)
+# but its `artifacts` payload -- the actual PII: pitch drafts, recipient
+# emails, spreadsheet IDs -- is wiped after this many days, then the whole
+# row is dropped after the longer window. See db.purge_stale_active_tasks,
+# run daily from server.py's _production_scratchpad_cleanup_loop.
+ACTIVE_TASK_ARTIFACT_RETENTION_DAYS = int(os.environ.get("MESSA_ACTIVE_TASK_ARTIFACT_RETENTION_DAYS", "7"))
+ACTIVE_TASK_ROW_RETENTION_DAYS = int(os.environ.get("MESSA_ACTIVE_TASK_ROW_RETENTION_DAYS", "60"))
+
+# Skills playbook caps -- the two halves of "how does this stay fast/sane
+# as skills grow exponentially across users": SKILLS_MAX_PER_DOMAIN bounds
+# what's ever STORED for one (agent_type, domain) pair (write-time
+# eviction of the weakest rows, db._evict_excess_skills, enforced inline
+# on every write -- not a separate cron job); SKILLS_MAX_PER_QUERY bounds
+# what's ever LOADED into one prompt (read-time, db.search_skills). Total
+# table size can grow indefinitely across many domains -- that's fine,
+# every lookup is scoped to one exact (agent_type, domain) pair via an
+# index (migration 033's agent_skills_lookup_idx), so per-call cost never
+# grows with the table.
+SKILLS_MAX_PER_DOMAIN = int(os.environ.get("MESSA_SKILLS_MAX_PER_DOMAIN", "50"))
+SKILLS_MAX_PER_QUERY = int(os.environ.get("MESSA_SKILLS_MAX_PER_QUERY", "8"))
+
+# Hard length caps on what a single skill can even contain -- the first,
+# cheapest layer of the content-safety screening in tools/scratchpad_
+# tools.py's _screen_skill_text (banned-phrase/URL/email matching does the
+# rest). Short by design: a skill is a 1-2 sentence lesson, never a
+# paragraph of scraped page/email text -- which also happens to shrink the
+# size of anything an adversarial save_skill call could try to smuggle in.
+SKILL_PROBLEM_PATTERN_MAX_CHARS = int(os.environ.get("MESSA_SKILL_PROBLEM_PATTERN_MAX_CHARS", "80"))
+SKILL_SOLUTION_RECIPE_MAX_CHARS = int(os.environ.get("MESSA_SKILL_SOLUTION_RECIPE_MAX_CHARS", "300"))
+
+# How often server.py's _production_scratchpad_cleanup_loop sweeps
+# db.purge_stale_active_tasks -- coarse on purpose (default every 6h, same
+# "this is a retention sweep, not urgent" reasoning as
+# MEMORY_BATCH_POLL_INTERVAL_SECONDS' own daily cadence just being a poll
+# interval, not the actual run frequency).
+SCRATCHPAD_CLEANUP_POLL_INTERVAL_SECONDS = int(
+    os.environ.get("MESSA_SCRATCHPAD_CLEANUP_POLL_INTERVAL_SECONDS", str(6 * 3600))
+)
+
 # ---- Jina Reader (tools/jina_reader.py) -- a JS-capable page read that
 # costs no Browserbase session time, sitting between a plain HTTP fetch
 # (web_search_tools.fetch_page_text, no JS at all) and a real deepsearch

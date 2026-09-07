@@ -2091,6 +2091,31 @@ async def _production_memory_batch_loop() -> None:
         await asyncio.sleep(config.MEMORY_BATCH_POLL_INTERVAL_SECONDS)
 
 
+async def _production_scratchpad_cleanup_loop() -> None:
+    """Retention sweep for the Active Task Scratchpad (docs/autonomous_
+    integrations_and_task_memory_spec.md, migration 033) -- explicit
+    product decision to neither keep finished tasks' artifacts forever
+    (accumulates PII: pitch drafts, recipient emails, spreadsheet IDs) nor
+    delete them the instant a task completes (loses debugging/support
+    ability for an immediate follow-up). db.purge_stale_active_tasks does
+    the actual two-stage purge (wipe artifacts after
+    config.ACTIVE_TASK_ARTIFACT_RETENTION_DAYS, drop the row after
+    config.ACTIVE_TASK_ROW_RETENTION_DAYS) -- this loop just calls it on a
+    coarse interval (config.SCRATCHPAD_CLEANUP_POLL_INTERVAL_SECONDS,
+    default every 6h). A no-op, harmless call if the migration hasn't
+    landed yet (same _has_table graceful-degrade every other additive
+    feature here relies on)."""
+    while True:
+        try:
+            if config.SCRATCHPAD_AND_SKILLS_ENABLED:
+                result = await db.purge_stale_active_tasks()
+                if result["artifacts_purged"] or result["rows_deleted"]:
+                    console.system(f"[scratchpad cleanup] {result}")
+        except Exception as e:  # noqa: BLE001 - a background loop must never die silently mid-process
+            console.system(f"[scratchpad cleanup poller error] {e}")
+        await asyncio.sleep(config.SCRATCHPAD_CLEANUP_POLL_INTERVAL_SECONDS)
+
+
 @app.on_event("startup")
 async def _startup() -> None:
     global _bg_tasks
@@ -2104,10 +2129,11 @@ async def _startup() -> None:
         asyncio.create_task(_production_email_connection_poll_loop()),
         asyncio.create_task(_production_app_connection_poll_loop()),
         asyncio.create_task(_production_memory_batch_loop()),
+        asyncio.create_task(_production_scratchpad_cleanup_loop()),
     ]
     console.system(
         "Started production reminder/cron/briefing/digest/broadcast/deepsearch-pause/"
-        "email-connection/app-connection/memory-batch delivery pollers."
+        "email-connection/app-connection/memory-batch/scratchpad-cleanup delivery pollers."
     )
 
 

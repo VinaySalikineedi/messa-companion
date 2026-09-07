@@ -43,6 +43,7 @@ TESTS=(
   tests/test_contact_sharing.py
   tests/test_fth_upgrades.py
   tests/test_fth_consent_and_form_js_live.py
+  tests/test_scratchpad_and_skills.py
 )
 
 PASSED=()

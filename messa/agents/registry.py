@@ -69,6 +69,7 @@ from ..tools.executive_tools import _format_contact_line, build_executive_subage
 from ..tools.integration_tools import app_category_for_toolkit, build_integration_system_prompt, build_integration_tools
 from ..tools.personal_inbox_tools import build_personal_inbox_system_prompt, build_personal_inbox_tools
 from ..tools.routines_tools import ROUTINES_SYSTEM_PROMPT, build_routines_tools
+from ..tools.scratchpad_tools import build_scratchpad_tools, scratchpad_prompt_block
 from ..tools.web_search_tools import build_web_search_tools
 
 ORCHESTRATOR_LABEL = "messa"
@@ -1130,10 +1131,33 @@ async def build_orchestrator(
             "model": _subagent_model_for("admin_agent"),
         })
 
+    # Active Task Scratchpad + Skills Playbook (docs/autonomous_
+    # integrations_and_task_memory_spec.md) -- attached generically here,
+    # AFTER every declarative subagent dict above (including the
+    # admin-only one) has been assembled, rather than each subagent module
+    # wiring this up for itself. Only mutates dict-shaped subagents that
+    # actually carry their own "tools"/"system_prompt" keys -- the three
+    # CompiledSubAgent entries (deepsearch, executive_assistant,
+    # email_agent) instead carry a "runnable" closure that builds ITS OWN
+    # tools/prompt fresh on every delegation, so they attach this same
+    # helper themselves, inside that closure (see deepsearch_tools.py's
+    # build_deepsearch_subagent, executive_tools.py's
+    # build_executive_subagent, email_tools.py's build_email_subagent).
+    orchestrator_tools = build_orchestrator_tools(user)
+    orchestrator_system_prompt = _build_system_prompt(user, connected_slugs, app_preferences)
+    if config.SCRATCHPAD_AND_SKILLS_ENABLED:
+        task_block = await scratchpad_prompt_block(user)
+        orchestrator_tools = orchestrator_tools + build_scratchpad_tools(user, "messa_orchestrator", approval_gate)
+        orchestrator_system_prompt = orchestrator_system_prompt + task_block
+        for sub in subagents:
+            if "tools" in sub and "system_prompt" in sub:
+                sub["tools"] = sub["tools"] + build_scratchpad_tools(user, sub["name"], approval_gate)
+                sub["system_prompt"] = sub["system_prompt"] + task_block
+
     agent = create_deep_agent(
         model=model,
-        tools=build_orchestrator_tools(user),
-        system_prompt=_build_system_prompt(user, connected_slugs, app_preferences),
+        tools=orchestrator_tools,
+        system_prompt=orchestrator_system_prompt,
         subagents=subagents,
     )
     return agent

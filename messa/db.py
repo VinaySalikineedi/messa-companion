@@ -3752,3 +3752,262 @@ async def get_usage_count(user_id: int, feature: str, day: Any) -> int:
     except Exception as e:  # noqa: BLE001 - usage metering must never break a real tool call
         console.system(f"get_usage_count: DB unavailable, failing open ({feature}): {e}")
         return 0
+
+
+# ---------------------------------------------------------------------------
+# Active Task Scratchpad + Skills Playbook
+# (docs/autonomous_integrations_and_task_memory_spec.md, migration 033).
+# Additive tables, same _has_table graceful-degrade shape as projects/
+# deepsearch_sessions above: a process running before this migration has
+# landed just gets no scratchpad/skills (every function below returns
+# None/[] rather than crashing), same as this codebase's every other
+# additive feature.
+#
+# This file stays a "thin repository, no policy" layer per its own module
+# docstring: content-safety screening for save_skill (banned phrases,
+# length caps, no URLs/credentials -- see the spec doc's security section)
+# lives in tools/scratchpad_tools.py, which must call it BEFORE ever
+# reaching upsert_skill below. Nothing here second-guesses that -- if it's
+# called, it's trusted to already be screened.
+# ---------------------------------------------------------------------------
+
+async def get_active_task(user_id: int) -> dict[str, Any] | None:
+    """The user's current in_progress/waiting_user_input task, if any -- at
+    most one is expected open per user at a time (see start_active_task).
+    `artifacts` comes back already json.loads'd into a dict, never a raw
+    JSON string, so callers (registry.py's prompt injection, the
+    update_task_scratchpad tool) never have to think about the TEXT-column
+    storage detail."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "active_tasks"):
+            return None
+        row = await conn.fetchrow(
+            """
+            SELECT * FROM active_tasks
+            WHERE user_id = $1 AND status IN ('in_progress', 'waiting_user_input')
+            ORDER BY updated_at DESC LIMIT 1
+            """,
+            user_id,
+        )
+        if not row:
+            return None
+        d = dict(row)
+        try:
+            d["artifacts"] = json.loads(d["artifacts"] or "{}")
+        except Exception:
+            d["artifacts"] = {}
+        return d
+
+
+async def start_active_task(user_id: int, task_type: str) -> dict[str, Any] | None:
+    """Opens a new active task, UNLESS the user already has one open, in
+    which case that existing row is returned untouched -- "one open task
+    per user at a time" is the intended model (spec doc 3.1); a caller that
+    genuinely wants to abandon the current one should call
+    set_active_task_status(..., 'failed'/'completed') first."""
+    existing = await get_active_task(user_id)
+    if existing is not None:
+        return existing
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "active_tasks"):
+            return None
+        task_id = str(uuid.uuid4())
+        row = await conn.fetchrow(
+            """
+            INSERT INTO active_tasks (task_id, user_id, task_type, status, artifacts)
+            VALUES ($1, $2, $3, 'in_progress', '{}')
+            RETURNING *
+            """,
+            task_id, user_id, task_type,
+        )
+        d = dict(row)
+        d["artifacts"] = {}
+        return d
+
+
+async def update_active_task_artifacts(task_id: str, fields: dict[str, Any]) -> dict[str, Any] | None:
+    """Atomically MERGES `fields` into the task's artifacts in a single SQL
+    statement -- cast through ::jsonb only for the merge itself
+    (COALESCE(artifacts,'{}')::jsonb || $new::jsonb), cast straight back to
+    ::text for storage, keeping the column itself TEXT per this project's
+    convention (see migration 033's own comment on this exact choice).
+    Relies on Postgres's own per-row lock during the UPDATE for atomicity
+    -- no read-modify-write race in application code even if two
+    subagents/sub-workers touch the same task concurrently, no new asyncpg
+    jsonb codec needed. Also bumps updated_at, and flips a
+    'waiting_user_input' task back to 'in_progress' -- a fresh artifact
+    write is itself evidence real progress resumed."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "active_tasks"):
+            return None
+        row = await conn.fetchrow(
+            """
+            UPDATE active_tasks
+            SET artifacts = (COALESCE(artifacts, '{}')::jsonb || $2::jsonb)::text,
+                updated_at = NOW(),
+                status = CASE WHEN status = 'waiting_user_input' THEN 'in_progress' ELSE status END
+            WHERE task_id = $1
+            RETURNING *
+            """,
+            task_id, json.dumps(fields),
+        )
+        if not row:
+            return None
+        d = dict(row)
+        try:
+            d["artifacts"] = json.loads(d["artifacts"] or "{}")
+        except Exception:
+            d["artifacts"] = {}
+        return d
+
+
+async def set_active_task_status(task_id: str, status: str) -> None:
+    """status in {'in_progress', 'waiting_user_input', 'completed', 'failed'}.
+    'completed'/'failed' also stamp completed_at, which
+    purge_stale_active_tasks (below) uses as its retention clock."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "active_tasks"):
+            return
+        if status in ("completed", "failed"):
+            await conn.execute(
+                "UPDATE active_tasks SET status = $2, completed_at = NOW(), updated_at = NOW() WHERE task_id = $1",
+                task_id, status,
+            )
+        else:
+            await conn.execute(
+                "UPDATE active_tasks SET status = $2, updated_at = NOW() WHERE task_id = $1",
+                task_id, status,
+            )
+
+
+async def purge_stale_active_tasks() -> dict[str, int]:
+    """Retention policy (explicit product decision, not "keep forever" or
+    "delete the moment it's done"): a finished task's `artifacts` payload
+    -- the actual PII (pitch drafts, recipient emails, spreadsheet IDs) --
+    is wiped after config.ACTIVE_TASK_ARTIFACT_RETENTION_DAYS, then the
+    whole row is dropped after config.ACTIVE_TASK_ROW_RETENTION_DAYS.
+    Called from server.py's _production_scratchpad_cleanup_loop, same
+    daily-loop shape as the existing memory batch job (migration 027)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "active_tasks"):
+            return {"artifacts_purged": 0, "rows_deleted": 0}
+        purge_res = await conn.execute(
+            """
+            UPDATE active_tasks SET artifacts = '{}'
+            WHERE status IN ('completed', 'failed')
+              AND completed_at < NOW() - ($1 || ' days')::interval
+              AND artifacts != '{}'
+            """,
+            str(config.ACTIVE_TASK_ARTIFACT_RETENTION_DAYS),
+        )
+        delete_res = await conn.execute(
+            """
+            DELETE FROM active_tasks
+            WHERE status IN ('completed', 'failed')
+              AND completed_at < NOW() - ($1 || ' days')::interval
+            """,
+            str(config.ACTIVE_TASK_ROW_RETENTION_DAYS),
+        )
+        try:
+            artifacts_purged = int(purge_res.split(" ")[-1])
+        except Exception:
+            artifacts_purged = 0
+        try:
+            rows_deleted = int(delete_res.split(" ")[-1])
+        except Exception:
+            rows_deleted = 0
+        return {"artifacts_purged": artifacts_purged, "rows_deleted": rows_deleted}
+
+
+async def _evict_excess_skills(conn: asyncpg.Connection, agent_type: str, domain: str) -> None:
+    """Caps stored skills per (agent_type, domain) at
+    config.SKILLS_MAX_PER_DOMAIN -- without this, a single busy domain
+    (e.g. "amazon.com" under deepsearch) could grow unbounded over months.
+    Evicts the WEAKEST rows first (lowest success_count, then oldest
+    last_used_at), never the strongest. Enforced inline on every write
+    (called from upsert_skill), not a separate cron job, so the cap holds
+    even if a cleanup job is ever late or fails to run."""
+    await conn.execute(
+        """
+        DELETE FROM agent_skills WHERE skill_id IN (
+            SELECT skill_id FROM agent_skills
+            WHERE agent_type = $1 AND domain = $2
+            ORDER BY success_count ASC, last_used_at ASC
+            OFFSET $3
+        )
+        """,
+        agent_type, domain, config.SKILLS_MAX_PER_DOMAIN,
+    )
+
+
+async def upsert_skill(
+    agent_type: str,
+    domain: str,
+    problem_pattern: str,
+    solution_recipe: str,
+    source_user_id: int | None = None,
+    source_task_id: str | None = None,
+) -> dict[str, Any] | None:
+    """INSERT ... ON CONFLICT DO UPDATE on (agent_type, domain,
+    problem_pattern) -- the ENTIRE dedup mechanism (see the spec doc's "how
+    reliably will this happen" discussion): two agents, or the same one
+    twice, discovering the same fix bump success_count/last_used_at on the
+    SAME row instead of creating a duplicate -- atomically, no read-then-
+    write race, no application-level locking. Caller (tools/scratchpad_
+    tools.py's save_skill) is responsible for content-safety screening
+    BEFORE calling this -- see this section's own header comment."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "agent_skills"):
+            return None
+        agent_type = agent_type.lower().strip()
+        domain = domain.lower().strip()
+        skill_id = str(uuid.uuid4())
+        row = await conn.fetchrow(
+            """
+            INSERT INTO agent_skills
+                (skill_id, agent_type, domain, problem_pattern, solution_recipe,
+                 success_count, source_user_id, source_task_id)
+            VALUES ($1, $2, $3, $4, $5, 1, $6, $7)
+            ON CONFLICT (agent_type, domain, problem_pattern) DO UPDATE SET
+                solution_recipe = EXCLUDED.solution_recipe,
+                success_count = agent_skills.success_count + 1,
+                last_used_at = NOW()
+            RETURNING *
+            """,
+            skill_id, agent_type, domain, problem_pattern.strip(), solution_recipe.strip(),
+            source_user_id, source_task_id,
+        )
+        if row is None:
+            return None
+        result = dict(row)
+        await _evict_excess_skills(conn, agent_type, domain)
+        return result
+
+
+async def search_skills(agent_type: str, domain: str, limit: int | None = None) -> list[dict[str, Any]]:
+    """Top skills for this exact (agent_type, domain) pair, ranked by
+    success_count then recency. This is the read-time half of "how does
+    this stay fast as skills grow exponentially": always a narrow, indexed
+    lookup (agent_skills_lookup_idx) scoped to one pair, never a full-table
+    scan, no matter how many other domains/agent_types exist."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "agent_skills"):
+            return []
+        rows = await conn.fetch(
+            """
+            SELECT * FROM agent_skills
+            WHERE agent_type = $1 AND domain = $2
+            ORDER BY success_count DESC, last_used_at DESC
+            LIMIT $3
+            """,
+            agent_type.lower().strip(), domain.lower().strip(),
+            limit or config.SKILLS_MAX_PER_QUERY,
+        )
+        return _rows(rows)

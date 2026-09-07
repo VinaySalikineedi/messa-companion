@@ -40,6 +40,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from .. import config, db, timeutil
 from ..config import UserContext
 from .common import last_ai_text, trace_all
+from .scratchpad_tools import build_scratchpad_tools, scratchpad_prompt_block
 
 LABEL = "executive_assistant"
 
@@ -377,6 +378,17 @@ def build_executive_subagent(user: UserContext, model: BaseChatModel) -> dict[st
         messages = list(state["messages"])
         written: list[tuple[str, datetime]] = []
         tools = build_executive_tools(user, written)
+        system_prompt = _build_system_prompt(user)
+        # Active Task Scratchpad + Skills Playbook -- see tools/
+        # scratchpad_tools.py's own module docstring. Attached here (built
+        # fresh on every delegation, same as `tools`/`system_prompt` above)
+        # rather than by registry.py, since this whole subagent is a
+        # CompiledSubAgent that builds its own inner agent from scratch
+        # each call -- registry.py's own generic wiring only reaches
+        # subagents that carry a plain "tools"/"system_prompt" dict.
+        if config.SCRATCHPAD_AND_SKILLS_ENABLED:
+            tools = tools + build_scratchpad_tools(user, "executive_assistant")
+            system_prompt = system_prompt + await scratchpad_prompt_block(user)
 
         checkpointer = MemorySaver()
         run_config = {
@@ -384,7 +396,7 @@ def build_executive_subagent(user: UserContext, model: BaseChatModel) -> dict[st
             "recursion_limit": config.EXECUTIVE_RECURSION_LIMIT,
         }
         inner_agent = create_agent(
-            model=model, tools=tools, system_prompt=_build_system_prompt(user),
+            model=model, tools=tools, system_prompt=system_prompt,
             checkpointer=checkpointer,
         )
         result = await inner_agent.ainvoke({"messages": messages}, config=run_config)
