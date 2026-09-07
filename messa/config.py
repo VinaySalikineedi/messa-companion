@@ -581,6 +581,13 @@ DEEPSEARCH_ENGINE = os.environ.get("MESSA_DEEPSEARCH_ENGINE", "stagehand").strip
 # Model for Stagehand in-browser reasoning (empty string uses Browserbase model gateway auto-routing)
 STAGEHAND_MODEL = os.environ.get("MESSA_STAGEHAND_MODEL", "").strip()
 
+# Maximum attempts/retries when encountering or attempting to solve a CAPTCHA.
+# CAPTCHAs are generally hard to pass autonomously, so capping attempts at 2 prevents
+# burning expensive remote browser minutes and agent turn budget.
+DEEPSEARCH_CAPTCHA_MAX_RETRIES = int(
+    os.environ.get("MESSA_DEEPSEARCH_CAPTCHA_MAX_RETRIES", "2")
+)
+
 DEEPSEARCH_BLOCK_ADS = os.environ.get("MESSA_DEEPSEARCH_BLOCK_ADS", "true").strip().lower() in (
     "1", "true", "yes", "on",
 )

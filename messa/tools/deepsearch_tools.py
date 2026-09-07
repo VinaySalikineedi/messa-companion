@@ -2899,11 +2899,11 @@ class BrowserToolProvider:
                 # "one corrective nudge into the same graph thread" shape
                 # already proven for executive_assistant's own quality
                 # check, not a new mechanism.
-                if state["consecutive_errors"] >= 2 and _looks_like_auth_wall(state["last_snapshot_text"]):
+                if state["consecutive_errors"] >= config.DEEPSEARCH_CAPTCHA_MAX_RETRIES and _looks_like_auth_wall(state["last_snapshot_text"]):
                     msg += (
-                        " This looks like it might be a login/verification page you can't get "
-                        "past on your own -- if so, call request_human_help with a short reason "
-                        "instead of retrying again."
+                        f" This looks like it might be a login/verification/CAPTCHA page you can't get "
+                        f"past on your own (limit of {config.DEEPSEARCH_CAPTCHA_MAX_RETRIES} attempts reached) -- "
+                        "if so, call request_human_help with a short reason instead of retrying again."
                     )
                 return msg
 

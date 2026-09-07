@@ -36,12 +36,32 @@ from .search_engine import unified_web_read, unified_web_search
 
 logger = logging.getLogger(__name__)
 
+_CAPTCHA_KEYWORDS = (
+    "captcha",
+    "robot",
+    "human verification",
+    "verify you are human",
+    "press and hold",
+    "press & hold",
+    "security check",
+    "security challenge",
+    "bot detection",
+    "turnstile",
+    "cloudflare",
+    "arkose",
+    "recaptcha",
+    "hcaptcha",
+)
+
 STAGEHAND_SUBAGENT_SYSTEM_PROMPT = (
     "You are a deepsearch sub-worker powered by Stagehand v4, delegated to work on exactly ONE website: {url}. "
     "You have your OWN browser tab, separate from other sub-workers running at the same time.\n"
     "- Perform the assigned instructions directly and efficiently using `browser_navigate`, `browser_act`, and `browser_extract`.\n"
     "- Use `browser_act` with high-level natural language instructions (e.g. 'search for Nespresso Vertuo and press Enter', 'click Add to Cart on the top result').\n"
     "- Use `browser_extract` to pull structured facts, prices, ratings, or delivery information.\n"
+    "- CAPTCHA POLICY (CUT RETRIES TO 2): If you encounter a CAPTCHA or robot challenge, attempt to solve it AT MOST 2 times. "
+    "If it still blocks you after 2 attempts, STOP retrying immediately. CAPTCHAs are hard to pass automatically. "
+    "Report that the website is blocked by CAPTCHA and summarize whatever data was already found (or fall back to search_web).\n"
     "- When your goal is achieved, reply with a concise, clear summary of what you found or completed.\n"
 )
 
@@ -74,8 +94,12 @@ STAGEHAND_SYSTEM_PROMPT = (
     "- If you just need general facts, links, or background info, call `search_web` first -- it is "
     "instant (<1s) and costs ZERO browser time. Never navigate to google.com or a search engine tab.\n"
     "- Use `read_webpage(url)` to read articles or static pages without spending browser minutes.\n\n"
-    "HUMAN ESCALATION & SECURITY:\n"
-    "- Hit an unsolved CAPTCHA, 2FA prompt, or login wall you don't have credentials for? "
+    "CAPTCHA & HUMAN ESCALATION (CUT RETRIES TO 2):\n"
+    "- Hit an unsolved CAPTCHA or bot verification? You are permitted AT MOST 2 attempts to solve or click it. "
+    "CAPTCHAs are hard to pass automatically. If it does not clear after 2 attempts, STOP RETRYING immediately! "
+    "Call `request_human_help(reason)` so the user can assist via their live view, or fall back to `search_web` "
+    "and conclude your findings without this site.\n"
+    "- Hit a 2FA prompt or login wall you don't have credentials for? "
     "First check `get_account_credential(site_name)`. If none is stored, call `request_human_help(reason)` "
     "immediately so the user can assist via their live view.\n"
     "- Hit an email verification code screen after signup? Call `await_email_verification_code`.\n"
@@ -127,6 +151,7 @@ class StagehandToolProvider:
         self.live_view_url: str | None = None
         self.tools: list[BaseTool] = []
         self._page = page
+        self._captcha_attempts: int = 0
 
     async def __aenter__(self) -> StagehandToolProvider:
         if self._is_subagent:
@@ -459,11 +484,66 @@ class StagehandToolProvider:
         await self._ensure_session()
         try:
             page = await self.get_active_page()
+
+            # Check if this action targets a CAPTCHA or if current page is blocked by one
+            inst_lower = instruction.lower()
+            is_captcha_target = any(kw in inst_lower for kw in _CAPTCHA_KEYWORDS)
+            if not is_captcha_target:
+                try:
+                    title = await page.title()
+                    if any(kw in title.lower() for kw in ("robot or human", "just a moment", "captcha", "security check", "human verification", "bot verification", "security challenge")):
+                        is_captcha_target = True
+                except Exception:
+                    pass
+
+            if is_captcha_target:
+                self._captcha_attempts += 1
+                if self._captcha_attempts > config.DEEPSEARCH_CAPTCHA_MAX_RETRIES:
+                    console.system(
+                        f"Deepsearch (Stagehand v4): CAPTCHA retry limit reached "
+                        f"({self._captcha_attempts} > {config.DEEPSEARCH_CAPTCHA_MAX_RETRIES}) on {self._tab_id}."
+                    )
+                    if not self._is_subagent:
+                        return (
+                            f"BLOCKED: CAPTCHA retry limit reached ({config.DEEPSEARCH_CAPTCHA_MAX_RETRIES} attempts). "
+                            "CAPTCHAs are hard to pass automatically. Do NOT retry solving this CAPTCHA again. "
+                            "Call request_human_help so the user can assist via their live view, or proceed to search_web / wrap up without this site."
+                        )
+                    else:
+                        return (
+                            f"BLOCKED: CAPTCHA retry limit reached ({config.DEEPSEARCH_CAPTCHA_MAX_RETRIES} attempts). "
+                            "CAPTCHAs are hard to pass automatically. Do NOT retry solving this CAPTCHA. "
+                            "Stop retrying: report this website as blocked by CAPTCHA and conclude your summary."
+                        )
+
             console.system(f"Deepsearch (Stagehand v4): executing act: {instruction!r}")
             res = await self.stagehand.act(instruction, page=page)
             curr_url = await self._get_url(page)
             msg = getattr(res.data, "message", "Action performed successfully")
             console.system(f"Deepsearch (Stagehand v4): act completed ({msg})")
+
+            # Check if page cleared the CAPTCHA
+            try:
+                title = await page.title()
+            except Exception:
+                title = ""
+
+            page_looks_like_captcha = any(
+                kw in f"{curr_url} {title}".lower()
+                for kw in ("captcha", "robot or human", "verify you are human", "press and hold", "challenge", "just a moment")
+            )
+            if not page_looks_like_captcha and self._captcha_attempts > 0:
+                self._captcha_attempts = 0
+
+            # If this was a CAPTCHA attempt and we reached the retry cap, inform the agent to stop retrying
+            if is_captcha_target and self._captcha_attempts >= config.DEEPSEARCH_CAPTCHA_MAX_RETRIES:
+                msg += (
+                    f"\n\n[CAPTCHA NOTICE: You have attempted this CAPTCHA {self._captcha_attempts} time(s). "
+                    f"Maximum allowed retries is {config.DEEPSEARCH_CAPTCHA_MAX_RETRIES}. "
+                    "CAPTCHAs are hard to pass automatically. Do NOT attempt to solve this CAPTCHA again. "
+                    + ("Call request_human_help or conclude without this site.]" if not self._is_subagent else "Report this site is blocked by CAPTCHA and finish summary.]")
+                )
+
             return f"Action Result: {msg}\nCurrent Page: {curr_url}"
         except Exception as e:
             console.tool_error("DEEPSEARCH", "stagehand_act", str(e))
@@ -473,6 +553,22 @@ class StagehandToolProvider:
         await self._ensure_session()
         try:
             page = await self.get_active_page()
+            if self._captcha_attempts >= config.DEEPSEARCH_CAPTCHA_MAX_RETRIES:
+                curr_url = await self._get_url(page)
+                try:
+                    title = await page.title()
+                except Exception:
+                    title = ""
+                if any(
+                    kw in f"{curr_url} {title}".lower()
+                    for kw in ("captcha", "robot or human", "verify you are human", "challenge", "just a moment")
+                ):
+                    return (
+                        f"BLOCKED: The page is currently displaying an unsolved CAPTCHA (retry limit of "
+                        f"{config.DEEPSEARCH_CAPTCHA_MAX_RETRIES} reached). Do not retry. "
+                        + ("Call request_human_help or conclude report." if not self._is_subagent else "Report site blocked by CAPTCHA.")
+                    )
+
             console.system(f"Deepsearch (Stagehand v4): executing extract: {instruction!r}")
             res = await self.stagehand.extract(instruction, page=page)
             extracted = getattr(res.data, "extraction", str(res.data))
@@ -486,6 +582,22 @@ class StagehandToolProvider:
         await self._ensure_session()
         try:
             page = await self.get_active_page()
+            if self._captcha_attempts >= config.DEEPSEARCH_CAPTCHA_MAX_RETRIES:
+                curr_url = await self._get_url(page)
+                try:
+                    title = await page.title()
+                except Exception:
+                    title = ""
+                if any(
+                    kw in f"{curr_url} {title}".lower()
+                    for kw in ("captcha", "robot or human", "verify you are human", "challenge", "just a moment")
+                ):
+                    return (
+                        f"BLOCKED: The page is displaying an unsolved CAPTCHA (retry limit of "
+                        f"{config.DEEPSEARCH_CAPTCHA_MAX_RETRIES} reached). Do not retry. "
+                        + ("Call request_human_help or conclude report." if not self._is_subagent else "Report site blocked by CAPTCHA.")
+                    )
+
             inst = instruction.strip() or None
             console.system(f"Deepsearch (Stagehand v4): observing page (intent={inst!r})")
             res = await self.stagehand.observe(inst, page=page)
