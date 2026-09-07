@@ -211,7 +211,13 @@ def _build_stagehand_openrouter_callback(model_name: str, api_key: str):
             text_out = resp.choices[0].message.content or "{}"
             try:
                 parsed = json.loads(text_out)
-            except Exception:
+            except Exception as e:
+                # A malformed/non-JSON structured-output response from the model
+                # silently became `{}` here with no trace -- logged now so a
+                # real parse failure is visible instead of just showing up
+                # downstream as "the agent got an empty extract/observe result"
+                # with nothing to explain why.
+                logger.warning(f"Stagehand structured-output JSON parse failed: {e}; raw={text_out[:300]!r}")
                 parsed = {}
 
             # Sanitize elementId if present to guarantee it matches Stagehand's ^\d+-\d+$ regex

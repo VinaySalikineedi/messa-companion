@@ -59,6 +59,25 @@ app = FastAPI(title="Messa Sendblue webhook")
 # Populated by `_startup` below, cancelled by `_shutdown`.
 _bg_tasks: list[asyncio.Task] = []
 
+# Short-lived, per-request fire-and-forget tasks (e.g. _share_contact_profile_safely
+# below) -- unlike _bg_tasks above, these come and go throughout the process's
+# life rather than living for its whole duration. asyncio.create_task() does NOT
+# keep its own strong reference: if nothing else does, the event loop is free to
+# garbage-collect the task mid-await, silently dropping it. This set is that
+# reference; each task removes itself the instant it finishes via the
+# add_done_callback below, so this never grows unbounded.
+_fire_and_forget_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro) -> asyncio.Task:
+    """asyncio.create_task, but safe from the "task disappeared" GC bug --
+    see _fire_and_forget_tasks' comment just above. Use this (not a bare
+    asyncio.create_task) for anything started and never awaited."""
+    task = asyncio.create_task(coro)
+    _fire_and_forget_tasks.add(task)
+    task.add_done_callback(_fire_and_forget_tasks.discard)
+    return task
+
 # iMessage/SMS both map to the same subagent behavior today; the distinction
 # is only surfaced to Messa's system prompt as the channel string in case a
 # future prompt tweak wants to tell them apart (e.g. media support differs).
@@ -1042,7 +1061,7 @@ async def _process_inbound(
     # is shared with this recipient. Sendblue automatically deduplicates requests
     # within 24h so this is a zero-cost background no-op for returning users.
     if message_handle:
-        asyncio.create_task(_share_contact_profile_safely(from_number))
+        _spawn_background(_share_contact_profile_safely(from_number))
 
     try:
         await sendblue.send_typing_indicator(from_number)
