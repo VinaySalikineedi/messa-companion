@@ -574,6 +574,13 @@ BROWSERBASE_SESSION_TIMEOUT_SECONDS = int(
 # doesn't block same-origin app functionality, only recognized third-party
 # ad/tracker domains) -- flip off per-deploy only if a live test finds a
 # site whose actual login/checkout flow depends on a blocked domain.
+# Deepsearch automation engine: "stagehand" (Stagehand v4 macro-actions via WebMCP)
+# or "playwright" (@playwright/mcp micro-actions). Defaults to "stagehand" on feature/stagehand-v4.
+DEEPSEARCH_ENGINE = os.environ.get("MESSA_DEEPSEARCH_ENGINE", "stagehand").strip().lower()
+
+# Model for Stagehand in-browser reasoning (empty string uses Browserbase model gateway auto-routing)
+STAGEHAND_MODEL = os.environ.get("MESSA_STAGEHAND_MODEL", "").strip()
+
 DEEPSEARCH_BLOCK_ADS = os.environ.get("MESSA_DEEPSEARCH_BLOCK_ADS", "true").strip().lower() in (
     "1", "true", "yes", "on",
 )

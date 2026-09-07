@@ -130,6 +130,7 @@ from ..channels.sendblue import SendblueError
 from ..config import UserContext
 from .search_engine import unified_web_read as _unified_web_read
 from .search_engine import unified_web_search as _unified_web_search
+from .stagehand_tools import STAGEHAND_SYSTEM_PROMPT, StagehandToolProvider
 
 LABEL = "deepsearch"
 
@@ -3257,38 +3258,49 @@ def build_deepsearch_subagent(
             # opens (possibly well after this point now that opening is
             # lazy -- see that method's own docstring), instead of this
             # function doing it eagerly right after __aenter__ like before.
-            # Warm session management: reap expired cached sessions first
-            await _cleanup_expired_warm_sessions()
+            # Engine routing: Stagehand v4 (macro-actions) or Playwright MCP (micro-actions)
+            _use_stagehand = config.DEEPSEARCH_ENGINE == "stagehand"
 
-            # Check if this session already has an active warm browser provider
-            provider = None
-            if session_id and session_id in _WARM_SESSION_PROVIDERS:
-                candidate = _WARM_SESSION_PROVIDERS.get(session_id)
-                if (
-                    candidate is not None
-                    and candidate._mcp_proc is not None
-                    and candidate._mcp_proc.returncode is None
-                ):
-                    console.system(
-                        f"Deepsearch: REUSING active warm browser session #{session_id} "
-                        f"(preserving live tab, modal state, and form inputs!)."
-                    )
-                    provider = candidate
-                    provider._approval_gate = approval_gate
-                    provider._is_warm = False
-                    _WARM_SESSION_PROVIDERS.pop(session_id, None)
-                    _WARM_SESSION_EXPIRY.pop(session_id, None)
-                else:
-                    _WARM_SESSION_PROVIDERS.pop(session_id, None)
-                    _WARM_SESSION_EXPIRY.pop(session_id, None)
-
-            if provider is None:
-                provider = BrowserToolProvider(
-                    approval_gate, user_id=user.user_id, deepsearch_session_id=session_id, model=model,
+            if _use_stagehand:
+                # Stagehand v4: no warm-session cache (no subprocess to preserve)
+                provider = StagehandToolProvider(
+                    approval_gate, user_id=user.user_id, deepsearch_session_id=session_id,
+                    model=model,
                     messa_email=user.messa_email, user_email=user.email, task_title=task_title,
                     phone_number=user.phone_number, live_view_share_url=user.live_view_share_url,
                     initial_resume_url=initial_resume_url,
                 )
+            else:
+                # Playwright MCP: warm-session cache (preserves subprocess + tab state)
+                await _cleanup_expired_warm_sessions()
+                provider = None
+                if session_id and session_id in _WARM_SESSION_PROVIDERS:
+                    candidate = _WARM_SESSION_PROVIDERS.get(session_id)
+                    if (
+                        candidate is not None
+                        and candidate._mcp_proc is not None
+                        and candidate._mcp_proc.returncode is None
+                    ):
+                        console.system(
+                            f"Deepsearch: REUSING active warm browser session #{session_id} "
+                            f"(preserving live tab, modal state, and form inputs!)."
+                        )
+                        provider = candidate
+                        provider._approval_gate = approval_gate
+                        provider._is_warm = False
+                        _WARM_SESSION_PROVIDERS.pop(session_id, None)
+                        _WARM_SESSION_EXPIRY.pop(session_id, None)
+                    else:
+                        _WARM_SESSION_PROVIDERS.pop(session_id, None)
+                        _WARM_SESSION_EXPIRY.pop(session_id, None)
+
+                if provider is None:
+                    provider = BrowserToolProvider(
+                        approval_gate, user_id=user.user_id, deepsearch_session_id=session_id, model=model,
+                        messa_email=user.messa_email, user_email=user.email, task_title=task_title,
+                        phone_number=user.phone_number, live_view_share_url=user.live_view_share_url,
+                        initial_resume_url=initial_resume_url,
+                    )
 
             try:
                 async with provider:
@@ -3304,9 +3316,14 @@ def build_deepsearch_subagent(
                             f"NEVER invent, guess, or type fictional/dummy email addresses (such as dummy @gmail.com or @space addresses). "
                             f"Any signup with a made-up address will fail verification."
                         )
+                        _active_system_prompt = (
+                            STAGEHAND_SYSTEM_PROMPT + user_identity_prompt
+                            if _use_stagehand
+                            else DEEPSEARCH_SYSTEM_PROMPT + user_identity_prompt
+                        )
                         inner_agent = create_agent(
                             model=model, tools=provider.tools,
-                            system_prompt=DEEPSEARCH_SYSTEM_PROMPT + user_identity_prompt,
+                            system_prompt=_active_system_prompt,
                             checkpointer=checkpointer,
                             middleware=[_summarization] if _summarization is not None else [],
                         )
@@ -3404,10 +3421,12 @@ def build_deepsearch_subagent(
                                 f"saving progress to session #{session_id} for later."
                             )
                             # Keep provider warm in memory so continuing retains form inputs and modal state
+                            # (Playwright MCP only -- Stagehand has no subprocess to preserve)
                             if (
-                                session_id
-                                and provider._live_session_ready
-                                and provider._mcp_proc is not None
+                                not _use_stagehand
+                                and session_id
+                                and getattr(provider, "_live_session_ready", False)
+                                and getattr(provider, "_mcp_proc", None) is not None
                                 and provider._mcp_proc.returncode is None
                             ):
                                 provider._is_warm = True
