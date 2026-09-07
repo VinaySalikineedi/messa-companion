@@ -21,6 +21,7 @@ import asyncio
 import inspect
 import json
 import logging
+import re
 import time
 import uuid
 from typing import Any
@@ -212,6 +213,30 @@ def _build_stagehand_openrouter_callback(model_name: str, api_key: str):
                 parsed = json.loads(text_out)
             except Exception:
                 parsed = {}
+
+            # Sanitize elementId if present to guarantee it matches Stagehand's ^\d+-\d+$ regex
+            def _clean_ids(obj: Any) -> Any:
+                if isinstance(obj, dict):
+                    res = {}
+                    for k, v in obj.items():
+                        if k == "elementId" and isinstance(v, str):
+                            m = re.search(r"\d+-\d+", v)
+                            if m:
+                                res[k] = m.group(0)
+                            elif v.strip().isdigit():
+                                res[k] = f"0-{v.strip()}"
+                            else:
+                                res[k] = v
+                        else:
+                            res[k] = _clean_ids(v)
+                    return res
+                elif isinstance(obj, list):
+                    return [_clean_ids(x) for x in obj]
+                return obj
+
+            if isinstance(parsed, (dict, list)):
+                parsed = _clean_ids(parsed)
+                text_out = json.dumps(parsed)
 
             return LLMStructuredGenerateResult(
                 role="assistant",
