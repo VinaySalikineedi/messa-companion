@@ -18,6 +18,7 @@ Equips the Deepsearch agent with macro-action tools:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 import uuid
@@ -295,6 +296,20 @@ class StagehandToolProvider:
             ),
         ]
 
+    async def _get_url(self, page: Any) -> str:
+        try:
+            url_attr = getattr(page, "url", "")
+            if callable(url_attr):
+                res = url_attr()
+                if inspect.isawaitable(res):
+                    return str(await res)
+                return str(res)
+            if inspect.isawaitable(url_attr):
+                return str(await url_attr)
+            return str(url_attr)
+        except Exception:
+            return ""
+
     async def _browser_navigate(self, url: str) -> str:
         url = url.strip()
         if not url.startswith(("http://", "https://")):
@@ -303,7 +318,7 @@ class StagehandToolProvider:
             page = await self.get_active_page()
             console.system(f"Deepsearch (Stagehand v4): navigating to {url}")
             await page.goto(url)
-            self._current_url = page.url() if callable(page.url) else str(page.url)
+            self._current_url = await self._get_url(page)
             title = await page.title()
             if self._user_id is not None:
                 live_activity.set_url(self._user_id, self._current_url)
@@ -316,7 +331,7 @@ class StagehandToolProvider:
             page = await self.get_active_page()
             console.system(f"Deepsearch (Stagehand v4): executing act: {instruction!r}")
             res = await self.stagehand.act(instruction, page=page)
-            curr_url = page.url() if callable(page.url) else str(page.url)
+            curr_url = await self._get_url(page)
             msg = getattr(res.data, "message", "Action performed successfully")
             console.system(f"Deepsearch (Stagehand v4): act completed ({msg})")
             return f"Action Result: {msg}\nCurrent Page: {curr_url}"
@@ -374,12 +389,12 @@ class StagehandToolProvider:
 
         try:
             page = await self.get_active_page()
-            start_url = page.url() if callable(page.url) else str(page.url)
+            start_url = await self._get_url(page)
             elapsed = 0
             while elapsed < config.DEEPSEARCH_HUMAN_HELP_MAX_TOTAL_SECONDS:
                 await asyncio.sleep(config.DEEPSEARCH_HUMAN_HELP_POLL_INTERVAL_SECONDS)
                 elapsed += config.DEEPSEARCH_HUMAN_HELP_POLL_INTERVAL_SECONDS
-                curr_url = page.url() if callable(page.url) else str(page.url)
+                curr_url = await self._get_url(page)
                 if curr_url != start_url:
                     if request_id is not None:
                         await db.resolve_human_help_request(request_id)
