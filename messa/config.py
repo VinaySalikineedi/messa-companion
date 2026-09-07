@@ -578,8 +578,16 @@ BROWSERBASE_SESSION_TIMEOUT_SECONDS = int(
 # or "playwright" (@playwright/mcp micro-actions). Defaults to "stagehand" on feature/stagehand-v4.
 DEEPSEARCH_ENGINE = os.environ.get("MESSA_DEEPSEARCH_ENGINE", "stagehand").strip().lower()
 
-# Model for Stagehand in-browser reasoning (empty string uses Browserbase model gateway auto-routing)
-STAGEHAND_MODEL = os.environ.get("MESSA_STAGEHAND_MODEL", "").strip()
+# Model for Stagehand in-browser reasoning (act, observe, extract).
+# Defaults to "google/gemini-2.5-flash" via OpenRouter (fast, low cost, native vision & structured outputs).
+# Can be changed anytime via MESSA_STAGEHAND_MODEL (e.g. "openai/gpt-4o-mini", "anthropic/claude-3-5-haiku").
+STAGEHAND_MODEL = os.environ.get("MESSA_STAGEHAND_MODEL", "google/gemini-2.5-flash").strip()
+
+# Optional direct provider API key (e.g. direct OpenAI or Anthropic key).
+# If unset, Stagehand automatically routes through OpenRouter using OPENROUTER_API_KEY,
+# which eliminates Browserbase Model Gateway markup completely ($0.00 Browserbase model spend).
+STAGEHAND_MODEL_API_KEY = os.environ.get("MESSA_STAGEHAND_MODEL_API_KEY", "").strip()
+
 
 # Maximum attempts/retries when encountering or attempting to solve a CAPTCHA.
 # CAPTCHAs are generally hard to pass autonomously, so capping attempts at 2 prevents

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import time
 import uuid
@@ -27,7 +28,15 @@ from typing import Any
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage
 from langchain_core.tools import BaseTool, StructuredTool
+from openai import AsyncOpenAI
 import stagehand
+from stagehand._generated.models import (
+    LLMStructuredGenerateParams,
+    LLMMessageGenerateParams,
+    LLMStructuredGenerateResult,
+    LLMMessageGenerateResult,
+    LLMTextContent,
+)
 
 from urllib.parse import urlparse
 
@@ -127,6 +136,99 @@ STAGEHAND_SYSTEM_PROMPT = (
     "Never invent passwords or expose them in your final summary.\n"
     "- When your goal is achieved, reply with a concise, clear summary of what you did and found.\n"
 )
+
+
+def _build_stagehand_openrouter_callback(model_name: str, api_key: str):
+    """Bridges Stagehand v4 in-browser reasoning requests to OpenRouter via client LLM callback.
+
+    This routes all DOM extraction, action planning (act), and observation (observe)
+    through OpenRouter using the user's OPENROUTER_API_KEY, completely bypassing
+    Browserbase's Model Gateway ($0.00 Browserbase model spend).
+    """
+    client = AsyncOpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=api_key,
+    )
+
+    async def _callback(params: LLMStructuredGenerateParams | LLMMessageGenerateParams):
+        is_structured = isinstance(params, LLMStructuredGenerateParams)
+        openai_messages = []
+        if params.system_prompt:
+            openai_messages.append({"role": "system", "content": params.system_prompt})
+
+        d = params.model_dump()
+        for m in d.get("messages", []):
+            role = m.get("role")
+            raw_content = m.get("content")
+            if isinstance(raw_content, str):
+                openai_messages.append({"role": role, "content": raw_content})
+            elif isinstance(raw_content, dict):
+                if raw_content.get("type") == "text":
+                    openai_messages.append({"role": role, "content": raw_content.get("text", "")})
+                elif raw_content.get("type") == "image":
+                    mime = raw_content.get("mime_type", "image/png")
+                    b64 = raw_content.get("data", "")
+                    openai_messages.append({
+                        "role": role,
+                        "content": [{"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}]
+                    })
+            elif isinstance(raw_content, list):
+                parts = []
+                for part in raw_content:
+                    if part.get("type") == "text":
+                        parts.append({"type": "text", "text": part.get("text", "")})
+                    elif part.get("type") == "image":
+                        mime = part.get("mime_type", "image/png")
+                        b64 = part.get("data", "")
+                        parts.append({"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}})
+                openai_messages.append({"role": role, "content": parts})
+            else:
+                openai_messages.append({"role": role, "content": str(raw_content)})
+
+        kwargs: dict[str, Any] = {
+            "model": model_name,
+            "messages": openai_messages,
+        }
+        if params.temperature is not None:
+            kwargs["temperature"] = params.temperature
+
+        if is_structured:
+            rf = d.get("response_format")
+            if rf and rf.get("schema_"):
+                kwargs["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": rf.get("name") or "Response",
+                        "schema": rf.get("schema_"),
+                        "strict": True,
+                    }
+                }
+            else:
+                kwargs["response_format"] = {"type": "json_object"}
+
+            resp = await client.chat.completions.create(**kwargs)
+            text_out = resp.choices[0].message.content or "{}"
+            try:
+                parsed = json.loads(text_out)
+            except Exception:
+                parsed = {}
+
+            return LLMStructuredGenerateResult(
+                role="assistant",
+                content=[LLMTextContent(type="text", text=text_out)],
+                output_format="json_schema",
+                structured_content=parsed,
+            )
+        else:
+            resp = await client.chat.completions.create(**kwargs)
+            text_out = resp.choices[0].message.content or ""
+            return LLMMessageGenerateResult(
+                role="assistant",
+                content=[LLMTextContent(type="text", text=text_out)],
+                output_format="text",
+            )
+
+    return _callback
 
 
 class StagehandToolProvider:
@@ -245,10 +347,22 @@ class StagehandToolProvider:
                         self._user_id, self.live_view_url, self._task_title or "Deepsearch"
                     )
 
-            # Create Stagehand instance
+            # Create Stagehand instance with configured LLM
             sh_kwargs: dict[str, Any] = {"browser": self.browser}
-            if config.STAGEHAND_MODEL:
+
+            if config.STAGEHAND_MODEL_API_KEY:
+                # Direct provider API key supplied (e.g. direct OpenAI or Anthropic key)
                 sh_kwargs["model"] = config.STAGEHAND_MODEL
+                sh_kwargs["model_api_key"] = config.STAGEHAND_MODEL_API_KEY
+                console.system(f"Deepsearch (Stagehand v4): using direct model provider {config.STAGEHAND_MODEL}.")
+            else:
+                # Route through OpenRouter via client LLM callback (default, $0 Browserbase model spend)
+                sh_model = config.STAGEHAND_MODEL or "google/gemini-2.5-flash"
+                sh_kwargs["model"] = _build_stagehand_openrouter_callback(
+                    model_name=sh_model,
+                    api_key=config.OPENROUTER_API_KEY,
+                )
+                console.system(f"Deepsearch (Stagehand v4): routing browser reasoning through OpenRouter ({sh_model}) - $0 Browserbase model spend.")
 
             self.stagehand = await stagehand.Stagehand.create(**sh_kwargs)
             console.system("Deepsearch (Stagehand v4): Stagehand engine initialized.")
