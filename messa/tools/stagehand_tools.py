@@ -35,25 +35,28 @@ from .search_engine import unified_web_read, unified_web_search
 logger = logging.getLogger(__name__)
 
 STAGEHAND_SYSTEM_PROMPT = (
-    "You are deepsearch, Messa's browser automation and research agent powered by Stagehand v4. "
+    "You are deepsearch, Messa's fast, autonomous browser automation agent powered by Stagehand v4. "
     "You perform web browsing and research tasks delegated to you by Messa. You control a real "
     "remote browser on Browserbase using high-level macro-actions.\n\n"
-    "HOW TO BROWSE (MACRO-ACTIONS):\n"
+    "HOW TO BROWSE WITH MAXIMUM SPEED (MACRO-ACTIONS):\n"
     "- Use `browser_navigate(url)` to open a website.\n"
     "- Use `browser_act(instruction)` to perform actions using natural language! "
     "Stagehand runs inside the browser and understands instructions like:\n"
-    "  * 'type 32256 in the zip code field and click apply'\n"
-    "  * 'search for Gurunanda toothbrush in the search bar'\n"
+    "  * 'search for Gurunanda toothbrush in the search bar and press Enter'\n"
     "  * 'click Add to Cart on the first toothbrush in the search results'\n"
+    "  * 'click the delivery location button, type 90210 in the zip code field, and click Apply'\n"
     "  * 'select size Large and click Add to Cart'\n"
     "  * 'click Proceed to Checkout'\n"
     "You do NOT need to snapshot the DOM or hunt for cryptic element IDs -- `browser_act` does the "
-    "locating, scrolling, clicking, and typing for you!\n"
-    "- Use `browser_extract(instruction)` to extract specific information from the current page "
-    "(e.g. 'extract the cart items, subtotal, and estimated delivery date' or 'extract the price "
-    "and rating of this product'). This gives you clean, concise facts without bloating your context.\n"
-    "- Use `browser_observe(instruction)` if you want to inspect what candidate actions or buttons "
-    "are available on the page before deciding what to do.\n\n"
+    "locating, scrolling, clicking, and typing for you!\n\n"
+    "CRITICAL EFFICIENCY RULES (MINIMIZE TURNS & LATENCY):\n"
+    "1. TRUST SUCCESSFUL ACTIONS: When `browser_act` returns a success message, TRUST IT. "
+    "DO NOT call `browser_observe` or `browser_extract` to verify every single click or keystroke! "
+    "Immediately proceed to the next required action.\n"
+    "2. CHAIN ACTIONS: Combine atomic steps into single complete instructions (e.g. "
+    "'type Anker USB-C hub in search bar and press Enter' or 'enter zip code 90210 and click Apply').\n"
+    "3. USE OBSERVE/EXTRACT SPARINGLY: Use `browser_observe` ONLY if an action fails or you are genuinely stuck. "
+    "Use `browser_extract` when you need to read final summary data (like cart totals or specific facts).\n\n"
     "EFFICIENCY & COST CONTROLS:\n"
     "- If you just need general facts, links, or background info, call `search_web` first -- it is "
     "instant (<1s) and costs ZERO browser time. Never navigate to google.com or a search engine tab.\n"
@@ -241,7 +244,7 @@ class StagehandToolProvider:
                 name="browser_observe",
                 description=(
                     "Inspect the current page to discover interactive elements or candidate actions matching an intent. "
-                    "Example: browser_observe(instruction='find buttons related to checkout or shipping')."
+                    "Use ONLY when stuck, when an action fails, or on an unfamiliar UI. Do NOT call after standard successful actions."
                 ),
             ),
             StructuredTool.from_function(
