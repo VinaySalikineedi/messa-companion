@@ -136,6 +136,26 @@ class StagehandToolProvider:
         if not config.BROWSERBASE_API_KEY:
             raise RuntimeError("BROWSERBASE_API_KEY is not set in environment.")
 
+        # Do NOT open the Browserbase session here. Instead, build the tools
+        # immediately so the agent can start (and think), and defer the actual
+        # browser launch to _ensure_session(), which is called lazily by the
+        # first browser tool that the LLM actually invokes. This way we don't
+        # pay for idle Browserbase time while the LLM is deciding what to do.
+        self._build_tools()
+        return self
+
+    async def _ensure_session(self) -> None:
+        """Open the Browserbase session on the first browser tool call.
+
+        All browser-touching tools call this before doing any real work.
+        Non-browser tools (search_web, read_webpage, credentials) skip this
+        entirely so they stay zero-cost even when no tab is ever needed.
+        Idempotent: subsequent calls return immediately.
+        """
+        if self.browser is not None:
+            # Session already open — fast path.
+            return
+
         context_id = None
         if self._user_id is not None:
             context_id = await db.get_browserbase_context_id(self._user_id)
@@ -148,7 +168,7 @@ class StagehandToolProvider:
         if context_id:
             browser_settings["context"] = {"id": context_id, "persist": True}
 
-        console.system("Deepsearch (Stagehand v4): launching remote Browserbase browser...")
+        console.system("Deepsearch (Stagehand v4): launching remote Browserbase browser (first browser tool call)...")
         self.browser = await stagehand.browserbase.launch(
             api_key=config.BROWSERBASE_API_KEY,
             browser_settings=browser_settings,
@@ -189,9 +209,6 @@ class StagehandToolProvider:
                 self._current_url = self._initial_resume_url
             except Exception as e:
                 logger.warning(f"Failed to auto-reopen initial_resume_url: {e}")
-
-        self._build_tools()
-        return self
 
     async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         if self._is_subagent:
@@ -348,11 +365,12 @@ class StagehandToolProvider:
         if not url.startswith(("http://", "https://")):
             url = f"https://{url}"
 
+        # Ensure the Browserbase session is open before opening sub-tabs.
+        await self._ensure_session()
+
         console.system(f"Deepsearch (Stagehand v4): delegating sub-worker to {url}...")
         task_start = time.monotonic()
         try:
-            if self.browser is None:
-                raise RuntimeError("Browser session not open.")
             sub_page = await self.browser.context.new_page()
         except Exception as e:
             return f"[{url}] ERROR: failed to open tab: {e}"
@@ -424,6 +442,7 @@ class StagehandToolProvider:
         url = url.strip()
         if not url.startswith(("http://", "https://")):
             url = f"https://{url}"
+        await self._ensure_session()
         try:
             page = await self.get_active_page()
             console.system(f"Deepsearch (Stagehand v4): navigating to {url}")
@@ -437,6 +456,7 @@ class StagehandToolProvider:
             return f"Navigation to {url} failed: {e}"
 
     async def _browser_act(self, instruction: str) -> str:
+        await self._ensure_session()
         try:
             page = await self.get_active_page()
             console.system(f"Deepsearch (Stagehand v4): executing act: {instruction!r}")
@@ -450,6 +470,7 @@ class StagehandToolProvider:
             return f"Error executing action {instruction!r}: {e}"
 
     async def _browser_extract(self, instruction: str) -> str:
+        await self._ensure_session()
         try:
             page = await self.get_active_page()
             console.system(f"Deepsearch (Stagehand v4): executing extract: {instruction!r}")
@@ -462,6 +483,7 @@ class StagehandToolProvider:
             return f"Error extracting {instruction!r}: {e}"
 
     async def _browser_observe(self, instruction: str = "") -> str:
+        await self._ensure_session()
         try:
             page = await self.get_active_page()
             inst = instruction.strip() or None
@@ -480,6 +502,7 @@ class StagehandToolProvider:
             return f"Error observing page: {e}"
 
     async def _browser_screenshot(self) -> str:
+        await self._ensure_session()
         try:
             page = await self.get_active_page()
             img_bytes = await page.screenshot()
@@ -498,6 +521,7 @@ class StagehandToolProvider:
         live_activity.set_waiting_for_human(self._user_id, reason)
 
         try:
+            await self._ensure_session()
             page = await self.get_active_page()
             start_url = await self._get_url(page)
             elapsed = 0
