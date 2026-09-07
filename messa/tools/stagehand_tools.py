@@ -205,6 +205,8 @@ class StagehandToolProvider:
         # Fetch live view debugger link
         try:
             self.live_view_url = await browserbase.get_live_view_url(self._bb_session_id)
+            if self.live_view_url:
+                console.system(f"Deepsearch (Stagehand v4): Live View debugger -> {self.live_view_url}")
         except Exception as e:
             logger.warning(f"Could not fetch live view URL: {e}")
             self.live_view_url = None
