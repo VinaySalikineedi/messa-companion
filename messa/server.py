@@ -118,6 +118,21 @@ async def landing_og_image() -> FileResponse:
     return FileResponse(path, media_type="image/png")
 
 
+@app.get("/contact-photo.png")
+async def contact_profile_photo() -> FileResponse:
+    """A stable, permanent public URL for Messa's Sendblue Contact Sharing
+    profile photo (see channels/sendblue.py's set_contact_profile and
+    scripts/publish_contact_profile.py) -- a static asset (messa/assets/
+    landing/contact-photo.png), same "just a static file, no templating"
+    pattern as landing_og_image right above. Deliberately its OWN route/
+    file rather than reusing og-image.png: the two serve different
+    purposes (a social link-preview card vs. a square contact photo) and
+    may need different crops/sizes even though they happen to start from
+    the same source image today."""
+    path = Path(__file__).parent / "assets" / "landing" / "contact-photo.png"
+    return FileResponse(path, media_type="image/png")
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     return {"status": "ok", "service": "messa-sendblue-webhook"}

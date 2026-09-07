@@ -40,6 +40,7 @@ TESTS=(
   tests/test_message_splitting.py
   tests/test_inbound_reactions.py
   tests/test_minimal_questions_prompt.py
+  tests/test_contact_sharing.py
 )
 
 PASSED=()
