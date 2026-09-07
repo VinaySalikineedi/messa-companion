@@ -557,6 +557,33 @@ BROWSERBASE_SESSION_TIMEOUT_SECONDS = int(
     os.environ.get("MESSA_BROWSERBASE_SESSION_TIMEOUT_SECONDS", "1800")
 )
 
+# ---- Contextual inbound reactions (server.py's _react_to_inbound / _pick_
+# contextual_reaction) -- a new-user-facing ask: react to an incoming text
+# with a single contextual emoji (a bed for a mattress question, a salute
+# for a task Messa is about to go do -- later swapped to a checkmark once
+# that turn finishes) instead of only ever replying with a text bubble.
+# iMessage-only (Sendblue's send-reaction needs a message_handle, same gate
+# react_to_message already uses) -- a plain SMS/RCS thread or the CLI simply
+# never triggers this, same as every other tapback in this project.
+# One flag to kill the whole feature instantly (a misbehaving classifier
+# reacting to the wrong things, or an unexpected Sendblue cost/rate issue)
+# without a deploy.
+INBOUND_REACTIONS_ENABLED = os.environ.get("MESSA_INBOUND_REACTIONS_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+# The classifier call runs in its own background asyncio.create_task,
+# started the moment a message comes in and awaited only after the real
+# agent turn already finished -- so under normal conditions this never adds
+# a single millisecond of user-visible latency to Messa's actual reply (see
+# server.py's _process_inbound for exactly where). This timeout exists
+# purely so a hung/slow OpenRouter call can't leave that background task
+# (and the awaited handle for it) dangling indefinitely; short on purpose --
+# a reaction that shows up late reads as buggy, so a classifier this slow
+# should just be skipped rather than eventually finishing.
+REACTION_CLASSIFIER_TIMEOUT_SECONDS = float(
+    os.environ.get("MESSA_REACTION_CLASSIFIER_TIMEOUT_SECONDS", "6")
+)
+
 # ---- Jina Reader (tools/jina_reader.py) -- a JS-capable page read that
 # costs no Browserbase session time, sitting between a plain HTTP fetch
 # (web_search_tools.fetch_page_text, no JS at all) and a real deepsearch

@@ -1,0 +1,34 @@
+-- Migration 032: onboarding app-connect question + sequential connect queue.
+--
+-- Context: a new user-facing feature -- once onboarding completes, Messa
+-- asks (once, deterministically, see cli.py's _onboarding_complete_messages)
+-- what apps the user uses day to day (Gmail, Slack, Google Calendar, Notion,
+-- Todoist, etc.) that she could connect for them. If they answer with a
+-- list, tools/integration_tools.py's queue_app_connections tool sends the
+-- FIRST app's connect link immediately and stores the rest here; server.py's
+-- existing _production_app_connection_poll_loop (which already detects a
+-- connection going ACTIVE to send the "you're connected!" text) pops the
+-- next queued app and sends ITS link right after, so the user is never
+-- handed a wall of OAuth links at once -- one at a time, each only once the
+-- previous one actually finishes.
+--
+-- apps_onboarding_asked: set the moment Messa asks the question (regardless
+-- of the answer -- even "no thanks" counts), so it's never asked a second
+-- time. Same `_has_column` graceful-degrade read pattern as every other
+-- column in this project -- an un-migrated DB just never sets/reads it and
+-- the question is skipped entirely rather than crashing (see
+-- _onboarding_complete_messages' own read of this column).
+--
+-- pending_app_connect_queue: a plain JSON array of Composio toolkit slugs
+-- still waiting to be offered, in order (e.g. ["slack", "notion"]), TEXT not
+-- JSONB -- matching this project's own established convention (see db.py's
+-- module docstring: "payload columns are TEXT (JSON-serialized)... not
+-- JSONB, so we json.dumps/json.loads by hand at the boundary", same as
+-- cron_jobs.meta in migration 024). NULL/empty means nothing queued.
+-- Deliberately a column on `users` rather than a new table -- this is a
+-- short, ephemeral, single-user list (never joined, never queried across
+-- users), so a dedicated table would be pure overhead for no real benefit,
+-- unlike deepsearch_otp_expectations (migration 028), which genuinely needs
+-- row-level polling/expiry across many concurrent users at once.
+ALTER TABLE users ADD COLUMN IF NOT EXISTS apps_onboarding_asked BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_app_connect_queue TEXT;

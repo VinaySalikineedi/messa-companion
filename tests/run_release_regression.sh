@@ -36,6 +36,10 @@ TESTS=(
   tests/test_routing_boundaries.py
   tests/test_disconnect_switch.py
   tests/test_default_email_provider.py
+  tests/test_app_connect_queue.py
+  tests/test_message_splitting.py
+  tests/test_inbound_reactions.py
+  tests/test_minimal_questions_prompt.py
 )
 
 PASSED=()

@@ -855,6 +855,109 @@ def _sms_send_factory(from_number: str):
     return _send
 
 
+# Sent immediately for a message that asks Messa to DO something (book,
+# send, remind, schedule, etc.) -- _react_to_inbound recognizes its own
+# reaction came back as exactly this so _process_inbound knows to swap it
+# for a checkmark once the turn that actually does the task finishes. Not
+# user-configurable (unlike the emoji the classifier picks for everything
+# else) -- the checkmark-swap logic below depends on recognizing this exact
+# value.
+_TASK_REACTION_EMOJI = "🫡"
+
+
+async def _pick_contextual_reaction(text: str) -> str | None:
+    """Best-effort, single-purpose LLM classifier: read one inbound message
+    and return either a single emoji that genuinely fits its content (a bed
+    for a mattress question, a plane for travel, a birthday cake for a
+    birthday mention, and so on) or None when nothing fits well. A message
+    that asks Messa to DO something -- book, send, remind, schedule, buy,
+    cancel, look up, email, text, call, order, pay, renew, or any other
+    actionable request -- always gets _TASK_REACTION_EMOJI specifically, so
+    _react_to_inbound below can recognize "this was a task" and swap the
+    reaction for a checkmark once that turn actually finishes.
+
+    Runs the cheaper SUBAGENT_MODEL_NAME (same model cli.py's own
+    _apply_reply_guardrail uses for its own single-purpose rewrite call)
+    under a hard timeout -- see config.REACTION_CLASSIFIER_TIMEOUT_SECONDS'
+    own comment for why that matters here specifically. Returns None on ANY
+    failure (timeout, malformed reply, API error) -- a missing or wrong
+    tapback is purely cosmetic, never worth a retry or a user-visible
+    error, matching this whole feature's "must never affect the real reply"
+    design (see _react_to_inbound's own docstring)."""
+    if not text or not text.strip():
+        return None
+    try:
+        model = config.build_model(
+            config.SUBAGENT_MODEL_NAME, api_key=config.api_key_for_agent("reaction_classifier"),
+        )
+        result = await asyncio.wait_for(
+            model.ainvoke([
+                {
+                    "role": "system",
+                    "content": (
+                        "You choose a single tapback emoji reaction for an incoming text "
+                        "message, the way a person quickly reacting to a friend's text would. "
+                        f"If the message asks the assistant to DO something -- book, send, "
+                        "schedule, remind, buy, cancel, look up, email, text, call, order, pay, "
+                        f"renew, or any other actionable request -- reply with EXACTLY "
+                        f"'{_TASK_REACTION_EMOJI}' and nothing else. Otherwise, if a single "
+                        "emoji genuinely fits the message's topic (a bed for mattress talk, a "
+                        "birthday cake for a birthday, a plane for travel, etc.), reply with "
+                        "EXACTLY that one emoji and nothing else. If nothing fits well, reply "
+                        "with EXACTLY the word NONE. Never explain your choice. Never reply "
+                        "with more than one emoji, punctuation, or any other text."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ]),
+            timeout=config.REACTION_CLASSIFIER_TIMEOUT_SECONDS,
+        )
+        raw = (getattr(result, "content", None) or "").strip()
+    except Exception as e:  # noqa: BLE001 - a missed/wrong reaction is cosmetic, never worth surfacing
+        console.system(f"[inbound reaction] classifier call failed, skipping: {e}")
+        return None
+    if not raw or raw.upper() == "NONE":
+        return None
+    if len(raw) > 8:
+        # Defensive: a model that ignores "exactly one emoji, nothing else"
+        # and appends words anyway (a stray "Sure, here: 🛏️") shouldn't
+        # crash or send a garbled reaction string to Sendblue -- just skip
+        # this one rather than guess at extracting the real emoji.
+        console.system(f"[inbound reaction] classifier reply too long, skipping: {raw!r}")
+        return None
+    return raw
+
+
+async def _react_to_inbound(number: str, message_handle: str | None, text: str) -> bool:
+    """Started as its own asyncio.create_task the moment an inbound
+    message's content is known (see _process_inbound below), running
+    concurrently with -- never blocking -- the real agent turn: classifying
+    a tapback reaction has nothing to do with mark_read (fired separately,
+    immediately, right before this is even scheduled) or with how fast
+    Messa's actual reply goes out, so it must never sit in front of either.
+
+    Returns True only when the task-salute reaction (_TASK_REACTION_EMOJI)
+    was actually sent -- _process_inbound awaits this AFTER cli.run_message
+    finishes and, only on True, swaps that reaction for a checkmark,
+    matching the ask: react with a salute the moment a task comes in, then
+    flip it to done once Messa's actually finished it. Every other outcome
+    (reactions disabled, no message_handle -- SMS/RCS/CLI have no tapback
+    support at all, the classifier found nothing worth reacting to, or the
+    Sendblue call itself failed) returns False and is handled identically
+    by the caller: nothing further to do."""
+    if not config.INBOUND_REACTIONS_ENABLED or not message_handle:
+        return False
+    reaction = await _pick_contextual_reaction(text)
+    if not reaction:
+        return False
+    try:
+        await sendblue.send_reaction(number, message_handle, reaction)
+    except SendblueError as e:
+        console.system(f"[inbound reaction] send failed (non-fatal): {e}")
+        return False
+    return reaction == _TASK_REACTION_EMOJI
+
+
 async def _process_inbound(
     from_number: str,
     content: str,
@@ -889,6 +992,26 @@ async def _process_inbound(
         # different path than a genuinely empty payload.
         return
 
+    # Read receipt fires HERE, before any of the actual work below -- not
+    # after the full (potentially multi-minute, for a deepsearch delegation)
+    # agent turn like it used to. A read receipt is about acknowledging the
+    # message arrived, not that Messa is done with it; sending it this late
+    # made every single inbound text look unread for as long as its reply
+    # took, which is exactly backwards from how a person's iMessage read
+    # receipts actually behave.
+    try:
+        await sendblue.mark_read(from_number)
+    except SendblueError:
+        pass  # cosmetic only
+
+    # Contextual tapback reaction (see _react_to_inbound's own docstring):
+    # started as its own background task right alongside the read receipt,
+    # so classifying it never adds latency to the real reply below. Awaited
+    # only after that reply is fully sent -- if it comes back True (the
+    # task-salute went out), the salute is swapped for a checkmark right
+    # after, so the reaction's own lifecycle visibly tracks the task's.
+    reaction_task = asyncio.create_task(_react_to_inbound(from_number, message_handle, effective_content))
+
     try:
         await sendblue.send_typing_indicator(from_number)
     except SendblueError as e:
@@ -907,10 +1030,28 @@ async def _process_inbound(
             "in a moment?"
         )
 
+    # Give the reaction classifier a little more room than its own internal
+    # timeout to actually finish and send (it may still be mid-flight if the
+    # agent turn above was very fast) -- but never block this webhook's
+    # background task forever on it; a reaction is cosmetic, the reply
+    # above has already gone out either way.
     try:
-        await sendblue.mark_read(from_number)
-    except SendblueError:
-        pass  # cosmetic only
+        was_task = await asyncio.wait_for(
+            reaction_task, timeout=config.REACTION_CLASSIFIER_TIMEOUT_SECONDS + 3,
+        )
+    except Exception as e:  # noqa: BLE001 - see _react_to_inbound's own docstring: cosmetic, never fatal
+        console.system(f"[inbound reaction] awaiting classifier task failed (non-fatal): {e}")
+        was_task = False
+    if was_task and message_handle:
+        try:
+            # Sendblue's own "-" prefix removes a previously-sent reaction
+            # (verified against their real API docs -- see migrations/032's
+            # sibling reaction feature notes) -- so the salute is actually
+            # replaced, not just joined by a second tapback on the same text.
+            await sendblue.send_reaction(from_number, message_handle, f"-{_TASK_REACTION_EMOJI}")
+            await sendblue.send_reaction(from_number, message_handle, "✅")
+        except SendblueError as e:
+            console.system(f"[inbound reaction] checkmark swap failed (non-fatal): {e}")
 
 
 @app.post("/webhooks/personal-email/inbound")
@@ -1814,6 +1955,22 @@ async def _production_app_connection_poll_loop() -> None:
                         await sendblue.send_message(req["phone_number"], text)
                     except SendblueError as e:
                         console.system(f"[app connection notify failed] request=#{req['id']}: {e}")
+                    # Onboarding app-connect queue (migrations/032_app_connect_queue.sql):
+                    # if this user answered "what apps do you use" with several names,
+                    # queue_app_connections sent the first link and stashed the rest here.
+                    # Now that THIS one actually finished connecting, send the next queued
+                    # app's link -- one at a time, never a wall of OAuth links at once. A
+                    # user with nothing queued (the overwhelmingly common case: a single
+                    # ad-hoc connect via connect_integration_app, not the onboarding flow)
+                    # just gets None back and nothing else happens here.
+                    try:
+                        next_slug = await db.pop_next_pending_app_connect(req["user_id"])
+                        if next_slug:
+                            next_user = await cli.load_user_context_by_id(req["user_id"])
+                            if next_user is not None:
+                                await integration_tools.send_connect_link(next_user, next_slug)
+                    except Exception as e:  # noqa: BLE001 - this user's own connection above already fully succeeded; a queue hiccup must never look like that failed
+                        console.system(f"[app connect queue advance failed] request=#{req['id']}: {e}")
                 elif status in ("FAILED", "EXPIRED", "REVOKED"):
                     await db.expire_app_connection_request(req["id"])
                     try:

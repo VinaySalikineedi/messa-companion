@@ -267,6 +267,95 @@ async def get_connection_status(connected_account_id: str) -> str | None:
     return account.status
 
 
+async def send_connect_link(user: config.UserContext, toolkit_slug: str) -> str:
+    """Starts a fresh Composio OAuth connect flow for `toolkit_slug` and
+    texts the link straight to `user` -- the SAME steps
+    connect_integration_app (the model-facing tool below) performs for a
+    normal, first-time, non-switch connect. Factored out as its own
+    standalone, non-tool function (rather than reused by having
+    connect_integration_app call it, which would touch that already-working
+    tool's code path) so it can ALSO be called from two places that have no
+    `@tool`-decorated function or model turn in the loop at all: server.py's
+    _production_app_connection_poll_loop, sending the NEXT queued app's link
+    the moment the CURRENT one finishes connecting (see migrations/032_
+    app_connect_queue.sql's header for the full design), and
+    queue_app_connections just below, sending the FIRST queued app's link
+    immediately.
+
+    Deliberately does NOT handle switch_account (disconnect current, then
+    reconnect) -- every caller here is always a first-time connect offer,
+    never a switch, so that extra branch (and its own failure modes) simply
+    doesn't apply to this path. Yes, this duplicates a chunk of
+    connect_integration_app's own body rather than sharing one
+    implementation -- an accepted, deliberate trade-off: it keeps this
+    change from touching that tool's existing, already-tested code at all,
+    which mattered more here than avoiding the duplication. If the two ever
+    need to change in lockstep, that's a sign it's worth revisiting."""
+    try:
+        client = _get_client()
+    except _NotConfigured as e:
+        return str(e)
+
+    composio_user_id = _composio_user_id(user)
+    toolkit_slug = (toolkit_slug or "").strip().lower()
+    if not toolkit_slug:
+        return "No app named -- nothing to connect."
+
+    def _list_connected_sync() -> set[str]:
+        result = client.connected_accounts.list(user_ids=[composio_user_id], statuses=["ACTIVE"])
+        items = getattr(result, "items", result)
+        connected: set[str] = set()
+        for account in items:
+            toolkit = getattr(account, "toolkit", None)
+            slug = toolkit if isinstance(toolkit, str) else (
+                getattr(toolkit, "slug", None) or getattr(toolkit, "name", None)
+            )
+            if slug:
+                connected.add(str(slug).lower())
+        return connected
+
+    try:
+        live_connected = await asyncio.to_thread(_list_connected_sync)
+    except Exception as e:  # noqa: BLE001 - surfaced to the model/caller, not raised
+        return f"Couldn't check current connections before starting {toolkit_slug}: {e}"
+
+    cap_result = usage.check_connected_apps_cap(user, len(live_connected))
+    if not cap_result.allowed:
+        return cap_result.upgrade_message
+
+    def _start_link():
+        auth_config_id = _get_or_create_auth_config_id(client, toolkit_slug)
+        return client.connected_accounts.link(
+            user_id=composio_user_id,
+            auth_config_id=auth_config_id,
+            callback_url=config.COMPOSIO_CALLBACK_URL,
+        )
+
+    from composio import exceptions as composio_exceptions
+
+    try:
+        connection_request = await asyncio.to_thread(_start_link)
+    except composio_exceptions.ComposioMultipleConnectedAccountsError:
+        return f"The user's {toolkit_slug} is already connected."
+    except Exception as e:  # noqa: BLE001 - surfaced to the model/caller, not raised
+        return f"Couldn't start the {toolkit_slug} connection: {e}"
+
+    await db.create_app_connection_request(user.user_id, toolkit_slug, connection_request.id)
+
+    link = connection_request.redirect_url
+    if not link:
+        return "Composio didn't return a connect link -- something's misconfigured."
+
+    if user.channel == "cli":
+        return f"Connect link (CLI/dev mode -- would normally be texted directly): {link}"
+
+    try:
+        await send_message(user.phone_number, f"Connect your {toolkit_slug} here: {link}")
+    except SendblueError as e:
+        return f"Generated the connect link but couldn't text it (Sendblue error: {e})."
+    return f"Sent the {toolkit_slug} connect link."
+
+
 def build_integration_tools(
     user: config.UserContext, approval_gate: ApprovalGate | None = None
 ) -> list[BaseTool]:
@@ -497,6 +586,48 @@ def build_integration_tools(
         )
 
     @tool
+    async def queue_app_connections(toolkit_slugs: list[str]) -> str:
+        """The user just named SEVERAL apps they want connected at once
+        (e.g. answering Messa's own 'what apps do you use day to day'
+        onboarding question, or unprompted -- 'connect Slack, Notion, and
+        Todoist'). Resolve each one to its Composio toolkit slug yourself
+        (same resolution you'd already do for a single connect_
+        integration_app call -- e.g. 'gmail', 'slack', 'notion', 'todoist',
+        'googlecalendar') and pass the whole list here in ONE call, instead
+        of calling connect_integration_app once per app.
+
+        Sends the FIRST app's connect link right away, exactly like
+        connect_integration_app would, and queues the rest to be sent
+        automatically, one at a time, each only once the previous one
+        actually finishes connecting -- so the user gets one OAuth link to
+        deal with at a time instead of being handed several at once. Tell
+        the user their first link just went out and that you'll send the
+        next one once that's connected -- don't repeat any URL yourself.
+
+        For a single app, just use connect_integration_app directly -- this
+        tool is specifically for a LIST of more than one."""
+        seen: set[str] = set()
+        slugs: list[str] = []
+        for raw in toolkit_slugs or []:
+            slug = (raw or "").strip().lower()
+            if slug and slug not in seen:
+                seen.add(slug)
+                slugs.append(slug)
+        if not slugs:
+            return "Nothing to queue -- no app names came through."
+
+        first, rest = slugs[0], slugs[1:]
+        if rest:
+            await db.set_pending_app_connect_queue(user.user_id, rest)
+        first_result = await send_connect_link(user, first)
+        if rest:
+            return (
+                f"{first_result} Queued the rest ({', '.join(rest)}) to send automatically, one "
+                "at a time, as each previous one finishes connecting."
+            )
+        return first_result
+
+    @tool
     async def disconnect_integration_app(toolkit_slug: str) -> str:
         """Disconnect the user's currently-connected account for this app
         (e.g. 'googlecalendar', 'todoist') WITHOUT connecting a new one --
@@ -603,8 +734,8 @@ def build_integration_tools(
         return str(result)
 
     raw_tools: list[BaseTool] = [
-        search_integration_tools, connect_integration_app, disconnect_integration_app,
-        execute_integration_tool,
+        search_integration_tools, connect_integration_app, queue_app_connections,
+        disconnect_integration_app, execute_integration_tool,
     ]
 
     def _destructive_check_for(name: str) -> Callable[..., bool] | None:
@@ -658,6 +789,13 @@ def build_integration_system_prompt(user: config.UserContext) -> str:
         "- If the app isn't connected yet: tell the user, and only call "
         "connect_integration_app(toolkit_slug) if they actually want to connect it right now -- "
         "don't send a connect link unprompted just because a search turned one up.\n"
+        "- If the user names SEVERAL apps to connect at once (e.g. answering 'what apps do you "
+        "use' with a list), do NOT call connect_integration_app once per app -- that fires every "
+        "OAuth link at the same time and buries them. Resolve each name to its Composio toolkit "
+        "slug yourself (search_integration_tools if any are unclear) and call "
+        "queue_app_connections(toolkit_slugs) ONCE with the whole list. It sends the first app's "
+        "link immediately and queues the rest to go out automatically, one at a time, as each "
+        "previous one finishes connecting.\n"
         "- If the app IS already connected and the user wants a DIFFERENT account instead "
         "('switch my Google Calendar to my other account', 'use my other Todoist'), call "
         "connect_integration_app(toolkit_slug, switch_account=True) -- it disconnects the "

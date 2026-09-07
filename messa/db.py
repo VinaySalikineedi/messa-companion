@@ -2671,6 +2671,73 @@ async def expire_app_connection_request(request_id: int) -> None:
         )
 
 
+async def mark_apps_onboarding_asked(user_id: int) -> None:
+    """Records that Messa has asked (once, deterministically, see cli.py's
+    _onboarding_complete_messages) what apps this user uses day to day --
+    set the moment the question is ASKED, regardless of how (or whether)
+    the user answers, so it's never repeated. migrations/032_app_connect_
+    queue.sql; graceful no-op pre-migration, same _has_column pattern as
+    everywhere else in this file."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_column(conn, "users", "apps_onboarding_asked"):
+            return
+        await conn.execute("UPDATE users SET apps_onboarding_asked = TRUE WHERE id = $1", user_id)
+
+
+async def set_pending_app_connect_queue(user_id: int, toolkit_slugs: list[str]) -> None:
+    """Overwrites this user's queued-apps-to-offer list (see migrations/032's
+    header for the full "ask once, connect one at a time" design) --
+    tools/integration_tools.py's queue_app_connections calls this with
+    every app AFTER the first one (the first is connected/linked
+    immediately, not queued). TEXT column, hand JSON-encoded, matching
+    this project's own convention (see this module's docstring) rather
+    than JSONB. Graceful no-op pre-migration."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_column(conn, "users", "pending_app_connect_queue"):
+            return
+        await conn.execute(
+            "UPDATE users SET pending_app_connect_queue = $2 WHERE id = $1",
+            user_id, json.dumps(toolkit_slugs),
+        )
+
+
+async def pop_next_pending_app_connect(user_id: int) -> str | None:
+    """Atomically pops and returns the FRONT toolkit slug of this user's
+    queued-apps list, or None if nothing's queued (or the migration hasn't
+    run). Called by server.py's _production_app_connection_poll_loop right
+    after it notices the user's CURRENT app connection go ACTIVE -- see
+    migrations/032's header for the full one-at-a-time design. A plain
+    SELECT-then-UPDATE rather than a single atomic SQL expression: this is
+    read/written by exactly one background poll loop per process, never
+    concurrently for the same user (a user only ever has one connection
+    request in flight at a time), so there's no real race to guard against
+    here the way there would be for, say, deepsearch_otp_expectations."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_column(conn, "users", "pending_app_connect_queue"):
+            return None
+        row = await conn.fetchrow(
+            "SELECT pending_app_connect_queue FROM users WHERE id = $1", user_id,
+        )
+        raw = row["pending_app_connect_queue"] if row else None
+        if not raw:
+            return None
+        try:
+            queue = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+        if not queue:
+            return None
+        next_slug, rest = queue[0], queue[1:]
+        await conn.execute(
+            "UPDATE users SET pending_app_connect_queue = $2 WHERE id = $1",
+            user_id, json.dumps(rest),
+        )
+        return next_slug
+
+
 async def get_active_connected_toolkits(user_id: int) -> list[str]:
     """Toolkit slugs this user has an 'active' app_connection_requests row
     for (e.g. ['reddit', 'todoist']) -- a cheap, LOCAL-ONLY read used to

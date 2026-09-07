@@ -47,6 +47,66 @@ _MARKDOWN_ARTIFACT_PATTERN = re.compile(
 )
 _GUARDRAIL_LENGTH_THRESHOLD = 320  # ~2 SMS segments -- tunable.
 
+# Long-reply splitter (separate from the guardrail above, and applied AFTER
+# it): the guardrail's own job is to try to make a reply SHORTER without
+# losing meaning; this handles what's left once that's genuinely done --
+# content that's still long because shortening it further would lose real
+# information (e.g. several distinct facts the user asked for at once).
+# Rather than send that as one long wall-of-text bubble, break it into a
+# few separate texts in a row, the way a person actually texts several
+# short messages back to back instead of one giant paragraph. Target/max
+# are deliberately different constants from the guardrail's threshold above
+# -- this is about how big each individual OUTGOING bubble should read, not
+# the trigger for the compression rewrite.
+_SPLIT_TARGET_CHARS = 200  # ~one comfortable text-message bubble
+_SPLIT_MAX_PARTS = 4  # a message needing more pieces than this should have been shortened upstream instead
+_SENTENCE_BOUNDARY_PATTERN = re.compile(r"(?<=[.!?])\s+")
+
+
+def _split_into_texts(msg_text: str) -> list[str]:
+    """Splits a long reply into a handful of shorter texts of roughly even
+    size, or returns it as a single-item list unchanged when it's already
+    short -- the common case, which is the overwhelming majority of
+    replies, costs nothing here (one length check, no regex work at all).
+
+    Splits on blank-line paragraph breaks first (the same "short paragraphs
+    separated by a blank line" shape the persona prompt already asks the
+    model to write in -- see agents/registry.py), which are already the
+    natural seams a person texting several bubbles in a row would break at.
+    Falls back to sentence boundaries only when there are no such breaks to
+    use (a single dense paragraph), so a reply still gets broken up
+    sensibly rather than not split at all. Never splits mid-sentence or
+    mid-word. Caps at _SPLIT_MAX_PARTS pieces -- past that, re-merges the
+    tail into the last chunk rather than fragmenting into a long stream of
+    texts, since a reply needing that many pieces means the guardrail
+    should have compressed it harder upstream, not that splitting should
+    keep going indefinitely."""
+    if not msg_text or len(msg_text) <= _GUARDRAIL_LENGTH_THRESHOLD:
+        return [msg_text] if msg_text else []
+
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", msg_text) if p.strip()]
+    if len(paragraphs) <= 1:
+        paragraphs = [s.strip() for s in _SENTENCE_BOUNDARY_PATTERN.split(msg_text) if s.strip()]
+    if len(paragraphs) <= 1:
+        return [msg_text]  # nothing to sensibly break on -- one sentence/word, send as-is
+
+    chunks: list[str] = []
+    current = ""
+    for part in paragraphs:
+        candidate = f"{current} {part}".strip() if current else part
+        if current and len(candidate) > _SPLIT_TARGET_CHARS:
+            chunks.append(current)
+            current = part
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+
+    if len(chunks) > _SPLIT_MAX_PARTS:
+        head, tail = chunks[: _SPLIT_MAX_PARTS - 1], chunks[_SPLIT_MAX_PARTS - 1 :]
+        chunks = head + [" ".join(tail)]
+    return chunks or [msg_text]
+
 
 async def _apply_reply_guardrail(msg_text: str) -> str:
     """Deterministic, mechanical pass over a model-drafted reply right
@@ -388,6 +448,27 @@ async def _onboarding_complete_messages(user: config.UserContext) -> list[str]:
     if reveal_parts:
         messages.append("\n".join(reveal_parts))
 
+    # New, deterministic third reveal message (migrations/032_app_connect_
+    # queue.sql): asks once what apps the user uses day to day, so
+    # tools/integration_tools.py's queue_app_connections has something to
+    # act on if they answer with a list. Code-authored (not left to the
+    # model to remember to ask) for the exact same reason the email/
+    # live-view reveal above is: this whole function already only ever
+    # fires once per user (gated by onboarding_step above), so
+    # apps_onboarding_asked is a belt-and-suspenders idempotency guard, not
+    # the thing actually preventing repeats -- but checking it here means
+    # this can never double-ask even if that guarantee is ever loosened
+    # later, and it's what agents/registry.py's profile-enrichment prompt
+    # could check too, if a future change wants the model aware of it.
+    if not fresh.get("apps_onboarding_asked", False):
+        messages.append(
+            "One more thing -- what apps do you use day to day that I could help with? "
+            "Think Gmail, Slack, Google Calendar, Notion, Todoist, that kind of thing -- "
+            "just name whichever ones you actually use and I'll get them connected for "
+            "you, one at a time."
+        )
+        await db.mark_apps_onboarding_asked(user.user_id)
+
     return messages
 
 
@@ -605,29 +686,40 @@ async def run_message(user: config.UserContext, agent, text: str, send=None) -> 
 
         msg_text = await _apply_reply_guardrail(msg_text)
 
-        if not user.is_admin:
-            # The pre-agent gate in run_message only catches a user who was
-            # ALREADY over their limit before this turn started -- a turn
-            # that sends several messages in a row (an ack plus a
-            # delegation summary, say) can still cross the daily cap
-            # partway through. Same rule applies here: consume one unit
-            # for the message about to go out, and if that pushes the
-            # user over, either send today's one notice (if nobody's
-            # claimed it yet) or drop this message silently.
-            text_result = await usage.check_and_consume(user, usage.FEATURE_NUMBER_OF_TEXTS)
-            if not text_result.allowed:
-                notice = await _send_limit_notice_once(
-                    user, usage.FEATURE_NUMBER_OF_TEXTS, text_result, send,
-                    marker_context="mid-conversation",
-                )
-                if notice:
-                    sent_texts.append(notice)
-                return  # this particular message is dropped either way
+        # A message still long after the guardrail's own compression attempt
+        # goes out as a few separate texts instead of one long bubble (see
+        # _split_into_texts' own docstring) -- the common, short-reply case
+        # returns a single-item list here and behaves EXACTLY as before this
+        # existed: one usage unit consumed, one DB row, one send() call.
+        for chunk in _split_into_texts(msg_text):
+            if not user.is_admin:
+                # The pre-agent gate in run_message only catches a user who was
+                # ALREADY over their limit before this turn started -- a turn
+                # that sends several messages in a row (an ack plus a
+                # delegation summary, say -- or now, several split pieces of
+                # the same reply) can still cross the daily cap partway
+                # through. Same rule applies here: consume one unit per real
+                # outgoing text, and if that pushes the user over, either
+                # send today's one notice (if nobody's claimed it yet) or
+                # drop the rest silently -- a partially-delivered split reply
+                # (the first chunk or two, then a stop) is an acceptable
+                # trade-off for the same reason dropping a single message
+                # over-limit already was: the alternative is silently
+                # billing/serving past the user's own plan limit.
+                text_result = await usage.check_and_consume(user, usage.FEATURE_NUMBER_OF_TEXTS)
+                if not text_result.allowed:
+                    notice = await _send_limit_notice_once(
+                        user, usage.FEATURE_NUMBER_OF_TEXTS, text_result, send,
+                        marker_context="mid-conversation",
+                    )
+                    if notice:
+                        sent_texts.append(notice)
+                    return  # this message (remaining chunks included) is dropped either way
 
-        sent_texts.append(msg_text)
-        await db.append_message(user.user_id, "assistant", msg_text, channel=user.channel)
-        if send:
-            await send(msg_text)
+            sent_texts.append(chunk)
+            await db.append_message(user.user_id, "assistant", chunk, channel=user.channel)
+            if send:
+                await send(chunk)
 
     final = await run_turn(agent, history, on_ai_message=_on_ai_message)
 

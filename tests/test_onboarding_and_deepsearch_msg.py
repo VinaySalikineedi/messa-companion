@@ -240,12 +240,26 @@ async def part3_has_prior_deepsearch_session():
 
 async def part4_onboarding_reveal():
     orig_get_user_by_id = db.get_user_by_id
+    orig_mark_apps_asked = db.mark_apps_onboarding_asked
 
     def make_user(onboarding_step="complete", **kw):
         return config.UserContext(
             user_id=1, phone_number="+15551234567",
             onboarding_step=onboarding_step, **kw,
         )
+
+    # Post-migration-032: unless a fake row already says apps_onboarding_
+    # asked=True, the reveal also appends its new 3rd message (see cli.py's
+    # _onboarding_complete_messages) and calls db.mark_apps_onboarding_asked
+    # -- mocked here (never a real DB call) purely to track it happened,
+    # same "assert on the interesting call, not the real DB" approach as
+    # every other fake in this file.
+    apps_asked_calls = []
+
+    async def fake_mark_apps_asked(uid):
+        apps_asked_calls.append(uid)
+
+    db.mark_apps_onboarding_asked = fake_mark_apps_asked
 
     # Already complete before this turn -- no DB call, no messages.
     calls = []
@@ -273,10 +287,14 @@ async def part4_onboarding_reveal():
         check("no reveal when onboarding step hasn't reached complete yet", msgs == [])
 
         # Transition detected: onboarding just completed this turn.
+        # apps_onboarding_asked is absent here (defaults False, same as a
+        # real un-migrated/not-yet-asked row) -- migrations/032's new 3rd
+        # reveal message (the "what apps do you use" ask) fires too.
         async def fake_just_completed(uid):
             return {"onboarding_step": "complete", "name": "Jane", "messa_email_local_part": "jane123"}
 
         db.get_user_by_id = fake_just_completed
+        apps_asked_calls.clear()
         user = make_user(
             onboarding_step="awaiting_name",
             name=None,  # stale pre-turn value -- greeting should use the FRESH row's name
@@ -285,12 +303,17 @@ async def part4_onboarding_reveal():
         config.LIVE_VIEW_BASE_URL = "https://example.com"
         user.live_view_token = "tok_abc"
         msgs = await cli._onboarding_complete_messages(user)
-        check("reveal fires exactly 2 messages when messa_email + live view are both available", len(msgs) == 2)
+        check("reveal fires exactly 3 messages when messa_email + live view are both available "
+              "and the apps question hasn't been asked yet (migrations/032)", len(msgs) == 3)
         check("greeting uses the freshly-fetched name, not the stale pre-turn None", "Jane" in msgs[0])
         check("not your typical chatbot framing is present", "chatbot" in msgs[0].lower())
         check("messa email address is included verbatim", "jane123@" in msgs[1])
         check("live view link is included", "https://example.com/live/tok_abc" in msgs[1])
         check("gmail hint ('just say the word') is present", "just say the word" in msgs[1])
+        check("the 3rd reveal message is the new 'what apps do you use' onboarding question",
+              "what apps do you use day to day" in msgs[2])
+        check("db.mark_apps_onboarding_asked is called once the question is asked",
+              apps_asked_calls == [1])
 
         # Graceful degrade: no messa_email, no live view -- still get msg 1.
         # (name=None here too, not just on the stale pre-turn UserContext --
@@ -301,12 +324,37 @@ async def part4_onboarding_reveal():
             return {"onboarding_step": "complete", "name": None, "messa_email_local_part": None}
 
         db.get_user_by_id = fake_degrade
+        apps_asked_calls.clear()
         user2 = make_user(onboarding_step="awaiting_name", name=None, messa_email_local_part=None)
         user2.live_view_token = None
         msgs2 = await cli._onboarding_complete_messages(user2)
-        check("graceful degrade: still sends message 1 with no messa_email/live_view", len(msgs2) == 1)
+        check("graceful degrade: still sends message 1 with no messa_email/live_view, plus the "
+              "apps question (2 total) since that's independent of the email/live-view reveal",
+              len(msgs2) == 2)
+        check("the apps question still fires even with no messa_email/live_view to reveal",
+              "what apps do you use day to day" in msgs2[1])
+
+        # apps_onboarding_asked already True -- the question is never
+        # repeated, reveal goes back to exactly 2 messages like before
+        # migrations/032 existed.
+        async def fake_already_asked(uid):
+            return {
+                "onboarding_step": "complete", "name": "Jane",
+                "messa_email_local_part": "jane123", "apps_onboarding_asked": True,
+            }
+
+        db.get_user_by_id = fake_already_asked
+        apps_asked_calls.clear()
+        user3 = make_user(onboarding_step="awaiting_name", name=None, messa_email_local_part="jane123")
+        user3.live_view_token = "tok_abc"
+        msgs3 = await cli._onboarding_complete_messages(user3)
+        check("once already asked, the reveal is back to exactly 2 messages (no 3rd apps question)",
+              len(msgs3) == 2)
+        check("db.mark_apps_onboarding_asked is NOT called again once already asked",
+              apps_asked_calls == [])
     finally:
         db.get_user_by_id = orig_get_user_by_id
+        db.mark_apps_onboarding_asked = orig_mark_apps_asked
 
 
 # ---------------------------------------------------------------------------
