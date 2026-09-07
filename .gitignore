@@ -13,3 +13,4 @@ cloudflare/personal-email-worker/node_modules/
 .wrangler/
 Claude outputs/
 error.txt
+scratch/
