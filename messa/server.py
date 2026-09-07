@@ -973,6 +973,17 @@ async def _react_to_inbound(number: str, message_handle: str | None, text: str) 
     return reaction == _TASK_REACTION_EMOJI
 
 
+async def _share_contact_profile_safely(number: str) -> None:
+    """Best-effort background task: ensures this user's direct iMessage
+    thread receives the Contact Sharing profile card ("Messa AI" + logo).
+    Sendblue automatically deduplicates requests within 24h, so this is a
+    cheap/silent no-op after the first time."""
+    try:
+        await sendblue.share_contact_profile(number)
+    except Exception as e:  # noqa: BLE001 - non-fatal cosmetic feature
+        console.system(f"[contact sharing auto-share failed] {number}: {e}")
+
+
 async def _process_inbound(
     from_number: str,
     content: str,
@@ -1026,6 +1037,12 @@ async def _process_inbound(
     # task-salute went out), the salute is swapped for a checkmark right
     # after, so the reaction's own lifecycle visibly tracks the task's.
     reaction_task = asyncio.create_task(_react_to_inbound(from_number, message_handle, effective_content))
+
+    # For iMessage chats, asynchronously ensure the contact card ("Messa AI" + logo)
+    # is shared with this recipient. Sendblue automatically deduplicates requests
+    # within 24h so this is a zero-cost background no-op for returning users.
+    if message_handle:
+        asyncio.create_task(_share_contact_profile_safely(from_number))
 
     try:
         await sendblue.send_typing_indicator(from_number)
