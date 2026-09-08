@@ -1,0 +1,26 @@
+-- Migration 034: store generated-document-share content directly in
+-- Postgres (BYTEA), not just a path on the container's local disk.
+--
+-- The problem: production runs inside a Docker container on Hugging Face
+-- Spaces (live.textmessa.com). generated_document_shares.file_path
+-- (migrations/018) points at a file under the container's LOCAL outputs/
+-- folder. That folder is ephemeral and per-replica -- if the container
+-- restarts between share creation and Sendblue actually fetching
+-- media_url, or if HF routes that fetch to a different replica than the
+-- one that generated the file, server.py's GET /files/{token} 404s on a
+-- file that only ever existed on one now-unreachable disk. Both the
+-- worker (wherever a PDF/screenshot is generated) and the web server
+-- (server.py) already share the same Neon Postgres, so storing the bytes
+-- there removes the disk dependency for SERVING entirely.
+--
+-- Additive, not a replacement: file_path/filename stay NOT NULL and keep
+-- being written exactly as before (useful for local dev/debugging, and as
+-- the fallback for any row where a bytes-read failed or wasn't
+-- attempted). file_bytes is nullable specifically so a pre-migration
+-- deployment, or a row written by code that hasn't been updated to
+-- consider bytes, degrades to the original disk-serving behavior instead
+-- of breaking. media_type is stored explicitly at share-creation time
+-- (the creator always knows the real content type) rather than server.py
+-- guessing it from the filename extension after the fact.
+ALTER TABLE generated_document_shares ADD COLUMN IF NOT EXISTS file_bytes BYTEA;
+ALTER TABLE generated_document_shares ADD COLUMN IF NOT EXISTS media_type VARCHAR(100);

@@ -28,7 +28,6 @@ import logging
 import re
 import time
 import uuid
-from pathlib import Path
 from typing import Any
 
 from langchain.agents import create_agent
@@ -937,7 +936,11 @@ class StagehandToolProvider:
         attachment on their own Messa thread -- the visual counterpart to
         agents/registry.py's send_pdf_over_text, scoped to whatever deepsearch is
         looking at right now. Reuses the exact same public-share-token mechanism
-        (a fresh unguessable /files/{token} URL is minted, Sendblue fetches it).
+        (a fresh unguessable /files/{token} URL is minted, Sendblue fetches it) --
+        the screenshot bytes go straight into Postgres (migrations/034_document_
+        share_bytes.sql), never touching this container's local disk, since
+        production runs on Hugging Face Spaces where that disk is ephemeral and
+        not guaranteed to be the same replica Sendblue's fetch later lands on.
 
         USE THIS SPARINGLY. Only send a screenshot for a genuine high-value
         moment: a cart fully built with items and prices, a final confirmation/
@@ -975,19 +978,31 @@ class StagehandToolProvider:
         except Exception as e:
             return f"Error capturing screenshot: {e}"
 
-        out_dir = Path(config.OUTPUTS_DIR)
-        try:
-            out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = out_dir / f"deepsearch_screenshot_{uuid.uuid4().hex[:12]}.png"
-            out_path.write_bytes(img_bytes)
-        except OSError as e:
-            return f"Error saving screenshot: {e}"
+        if len(img_bytes) > config.MAX_SMS_ATTACHMENT_BYTES:
+            return (
+                f"Error: this screenshot is too large to text ({len(img_bytes)} bytes, limit "
+                f"{config.MAX_SMS_ATTACHMENT_BYTES})."
+            )
 
-        token = await db.create_document_share(self._user_id, str(out_path), out_path.name)
+        # No local disk write -- migrations/034_document_share_bytes.sql lets
+        # create_document_share store the bytes directly in Postgres. The
+        # file_path passed here is a nominal name only (nothing is ever
+        # written to it); it exists purely so the share row has a sensible
+        # filename/extension on record, matching every other generated-
+        # document share, in case anything ever needs to fall back to it.
+        filename = f"deepsearch_screenshot_{uuid.uuid4().hex[:12]}.png"
+        token = await db.create_document_share(
+            self._user_id,
+            f"{config.OUTPUTS_DIR.rstrip('/')}/{filename}",
+            filename,
+            file_bytes=img_bytes,
+            media_type="image/png",
+        )
         if not token:
             return (
                 "Texting a screenshot isn't set up on this deployment yet "
-                "(run migrations/018_generated_document_shares.sql)."
+                "(run migrations/018_generated_document_shares.sql and "
+                "migrations/034_document_share_bytes.sql)."
             )
         media_url = f"{config.LIVE_VIEW_BASE_URL}/files/{token}"
         try:

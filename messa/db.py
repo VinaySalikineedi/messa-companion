@@ -10,10 +10,12 @@ and translate results into tool-call strings.
 from __future__ import annotations
 
 import json
+import mimetypes
 import re
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
@@ -3633,37 +3635,108 @@ async def list_email_threads(
 
 
 # ---------------------------------------------------------------------------
-# Generated-document shares (migrations/018_generated_document_shares.sql):
+# Generated-document shares (migrations/018_generated_document_shares.sql,
+# migrations/034_document_share_bytes.sql):
 # a public, unguessable-token URL for a file Messa generated, so it can be
 # attached to an outbound TEXT message via Sendblue's media_url (which
 # needs a URL it can fetch, not raw bytes -- see agents/registry.py's
-# send_pdf_over_text and server.py's GET /files/{token}).
+# send_pdf_over_text, tools/stagehand_tools.py's send_screenshot, and
+# server.py's GET /files/{token}).
+#
+# Migration 034 added file_bytes/media_type so serving never depends on
+# the container's local disk (see that migration's own header for the
+# full production incident this fixes -- Hugging Face's ephemeral,
+# per-replica filesystem). This module is the ONLY place that decides
+# whether a share is bytes-backed: create_document_share opportunistically
+# reads file_path into file_bytes right here (this call always runs on
+# the SAME container/process that just generated the file, before any
+# cross-replica risk exists), so existing path-only callers like
+# send_pdf_over_text get bytes-backed storage with no call-site changes.
+# A caller that already has the bytes in memory (send_screenshot never
+# writes to disk at all) can pass file_bytes directly instead.
 # ---------------------------------------------------------------------------
 
-async def create_document_share(user_id: int, file_path: str, filename: str) -> str | None:
+async def create_document_share(
+    user_id: int,
+    file_path: str,
+    filename: str,
+    *,
+    file_bytes: bytes | None = None,
+    media_type: str | None = None,
+) -> str | None:
     """Mints a fresh unguessable token for `file_path` and records it.
     Same token-generation approach as get_or_create_live_share_token
     (secrets.token_urlsafe) -- not sequential/enumerable. Returns None
     (no-op) if migration 018 hasn't been applied yet, same pattern as
-    every other optional-table function in this module."""
+    every other optional-table function in this module.
+
+    file_bytes: pass this when the caller already has the content in
+    memory (tools/stagehand_tools.py's send_screenshot -- it never writes
+    the PNG to disk at all, so there is no file_path to read back). When
+    omitted, this function tries to read `file_path` itself, right here,
+    on the assumption that whatever process just called this is the SAME
+    one that just generated the file (true for every current caller) --
+    a read failure (missing file, permission error) or an oversized file
+    is swallowed, not raised, and the share still gets created path-only,
+    degrading to the pre-migration-034 disk-serving behavior rather than
+    failing the whole operation over what is, for those files, a nice-to-
+    have upgrade.
+
+    media_type: stored explicitly when the caller knows it (send_screenshot
+    always passes "image/png"). Guessed from `filename`'s extension when
+    omitted, same fallback server.py's route already used before this
+    migration."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         if not await _has_table(conn, "generated_document_shares"):
             return None
         token = secrets.token_urlsafe(24)
-        await conn.execute(
-            "INSERT INTO generated_document_shares (user_id, token, file_path, filename) "
-            "VALUES ($1, $2, $3, $4)",
-            user_id, token, file_path, filename,
-        )
+        has_bytes_col = await _has_column(conn, "generated_document_shares", "file_bytes")
+
+        resolved_bytes = file_bytes
+        if resolved_bytes is None and has_bytes_col:
+            # Sanity cap on how large a file gets inlined into a Postgres
+            # row -- reuses the existing outbound-MMS attachment cap (the
+            # only realistic consumer of these bytes is Sendblue's
+            # media_url fetch, which has the same practical ceiling)
+            # rather than inventing a separate number. An oversized file
+            # just falls back to file_path/disk-serving below instead of
+            # failing the whole share.
+            try:
+                data = Path(file_path).read_bytes()
+                if len(data) <= config.MAX_SMS_ATTACHMENT_BYTES:
+                    resolved_bytes = data
+            except OSError:
+                resolved_bytes = None
+
+        if not media_type:
+            media_type = mimetypes.guess_type(filename)[0]
+
+        if has_bytes_col:
+            await conn.execute(
+                "INSERT INTO generated_document_shares "
+                "(user_id, token, file_path, filename, file_bytes, media_type) "
+                "VALUES ($1, $2, $3, $4, $5, $6)",
+                user_id, token, file_path, filename, resolved_bytes, media_type,
+            )
+        else:
+            # Pre-migration-034 deployment -- degrade to the original
+            # path-only row rather than erroring.
+            await conn.execute(
+                "INSERT INTO generated_document_shares (user_id, token, file_path, filename) "
+                "VALUES ($1, $2, $3, $4)",
+                user_id, token, file_path, filename,
+            )
         return token
 
 
 async def get_document_share_by_token(token: str) -> dict[str, Any] | None:
-    """Looked up by server.py's public GET /files/{token} route -- that
-    route re-validates file_path against config.OUTPUTS_DIR itself before
-    serving anything (see config.resolve_output_file), this function is
-    just the lookup."""
+    """Looked up by server.py's public GET /files/{token} route, which
+    prefers the row's file_bytes (migrations/034) when present -- serving
+    straight from Postgres with zero dependency on this container's local
+    disk -- and only falls back to re-validating file_path against
+    config.OUTPUTS_DIR (config.resolve_output_file) for a row with no
+    bytes stored. This function is just the lookup either way."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         if not await _has_table(conn, "generated_document_shares"):

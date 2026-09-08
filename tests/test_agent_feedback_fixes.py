@@ -293,8 +293,8 @@ async def item3_send_screenshot_happy_path(tmp_outputs_dir):
 
     share_calls = []
 
-    async def fake_create_document_share(user_id, file_path, filename):
-        share_calls.append((user_id, file_path, filename))
+    async def fake_create_document_share(user_id, file_path, filename, *, file_bytes=None, media_type=None):
+        share_calls.append((user_id, file_path, filename, file_bytes, media_type))
         return "tok_abc123"
 
     sent_messages = []
@@ -311,8 +311,13 @@ async def item3_send_screenshot_happy_path(tmp_outputs_dir):
 
     result = await provider._send_screenshot(caption="Cart ready, $34.20 total")
     check("send_screenshot captures a screenshot from the active page", page.screenshot_calls == 1)
-    check("send_screenshot writes the PNG under config.OUTPUTS_DIR", len(share_calls) == 1 and share_calls[0][1].endswith(".png"))
+    check("send_screenshot uses a .png nominal filename", len(share_calls) == 1 and share_calls[0][1].endswith(".png") and share_calls[0][2].endswith(".png"))
     check("send_screenshot creates a document share for the saved file", share_calls[0][0] == 1)
+    check(
+        "send_screenshot passes the raw PNG bytes directly -- no local disk write (migration 034)",
+        share_calls[0][3] == b"fake-png-bytes",
+    )
+    check("send_screenshot passes media_type='image/png' explicitly", share_calls[0][4] == "image/png")
     check("send_screenshot sends via sendblue with the caption", sent_messages and sent_messages[0][1] == "Cart ready, $34.20 total")
     check(
         "send_screenshot's media_url points at the /files/{token} route with the real token",
@@ -326,7 +331,7 @@ async def item3_send_screenshot_default_caption():
     page = _FakeScreenshotPage()
     provider = _make_screenshot_provider(page)
 
-    async def fake_create_document_share(user_id, file_path, filename):
+    async def fake_create_document_share(user_id, file_path, filename, *, file_bytes=None, media_type=None):
         return "tok_xyz"
 
     sent_messages = []
@@ -347,7 +352,7 @@ async def item3_send_screenshot_enforces_the_spam_cap():
     tracker = {"count": 0}
     provider = _make_screenshot_provider(page, screenshot_tracker=tracker)
 
-    async def fake_create_document_share(user_id, file_path, filename):
+    async def fake_create_document_share(user_id, file_path, filename, *, file_bytes=None, media_type=None):
         return "tok_cap"
 
     async def fake_send_message(number, content, *, media_url=None, send_style=None):
@@ -384,7 +389,7 @@ async def item3_screenshot_cap_is_shared_across_sub_worker_tracker():
         parent._screenshot_tracker is sub_worker._screenshot_tracker,
     )
 
-    async def fake_create_document_share(user_id, file_path, filename):
+    async def fake_create_document_share(user_id, file_path, filename, *, file_bytes=None, media_type=None):
         return "tok_shared"
 
     async def fake_send_message(number, content, *, media_url=None, send_style=None):

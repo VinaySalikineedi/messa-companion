@@ -42,7 +42,7 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, Header, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 from . import background, briefings, cli, config, console, db, live_activity, memory, pdf_reader, waitlist
 from .agents.registry import build_orchestrator
@@ -754,31 +754,57 @@ async def download_shared_file(token: str):
     (agents/registry.py's send_pdf_over_text, tools/stagehand_tools.py's
     send_screenshot): Sendblue's media_url has to be a URL its own servers
     can fetch, not raw bytes, so this route is what Sendblue actually
-    calls. See migrations/018_generated_document_shares.sql and
+    calls. See migrations/018_generated_document_shares.sql,
+    migrations/034_document_share_bytes.sql, and
     db.create_document_share/get_document_share_by_token.
 
-    Re-validates the share's file_path against config.OUTPUTS_DIR again
-    HERE, at serve time -- not just trusting that it was valid when the
-    share row was created (config.resolve_output_file, same defense-in-
-    depth posture as channels/resend.py's outbound-email attachment path).
-    404 for an unknown token OR a file that's since gone missing/moved
-    outside the outputs directory -- never a 500 that might leak a path.
+    PREFERS THE ROW'S file_bytes (migration 034) -- streamed straight from
+    Postgres, with ZERO dependency on this container's local disk. This is
+    the actual fix for production running on Hugging Face Spaces: the
+    container filesystem is ephemeral and per-replica, so a file_path that
+    was only ever written to the container that GENERATED it can vanish or
+    become unreachable by the time Sendblue's servers actually fetch this
+    URL (a restart, a redeploy, or the request simply landing on a
+    different replica). Both the worker and this web server share the
+    same Neon Postgres, so bytes stored there are reachable regardless of
+    which replica handles this request.
 
-    media_type is guessed from the shared filename's extension (originally
-    always ".pdf" -- this route now also serves send_screenshot's ".png"
-    files) rather than hardcoded, falling back to "application/pdf" for
-    anything mimetypes doesn't recognize -- preserves the exact prior
-    behavior for every existing PDF share while correctly resolving a
-    screenshot's content type too."""
+    Falls back to disk (re-validating file_path against config.OUTPUTS_DIR
+    right here, at serve time -- config.resolve_output_file, same defense-
+    in-depth posture as channels/resend.py's outbound-email attachment
+    path) only for a row with no file_bytes: a pre-migration-034 share, or
+    one where the bytes-read failed or the file was too large to inline at
+    creation time (see db.create_document_share). 404 for an unknown token
+    OR a file that's since gone missing/moved outside the outputs
+    directory -- never a 500 that might leak a path.
+
+    media_type is read straight off the row when migration 034 stored it
+    explicitly, else guessed from the shared filename's extension
+    (originally always ".pdf" -- this route also serves send_screenshot's
+    ".png" files), falling back to "application/pdf" for anything
+    mimetypes doesn't recognize -- preserves the exact prior behavior for
+    every existing PDF share while correctly resolving a screenshot's
+    content type too."""
     share = await db.get_document_share_by_token(token)
     if share is None:
         return JSONResponse({"error": "not found"}, status_code=404)
+
+    guessed_type, _ = mimetypes.guess_type(share["filename"])
+    media_type = share.get("media_type") or guessed_type or "application/pdf"
+
+    file_bytes = share.get("file_bytes")
+    if file_bytes:
+        return Response(
+            content=bytes(file_bytes),
+            media_type=media_type,
+            headers={"Content-Disposition": f'inline; filename="{share["filename"]}"'},
+        )
+
     try:
         resolved = config.resolve_output_file(share["file_path"])
     except ValueError:
         return JSONResponse({"error": "not found"}, status_code=404)
-    guessed_type, _ = mimetypes.guess_type(share["filename"])
-    return FileResponse(resolved, filename=share["filename"], media_type=guessed_type or "application/pdf")
+    return FileResponse(resolved, filename=share["filename"], media_type=media_type)
 
 
 @app.post("/webhook/sendblue")
