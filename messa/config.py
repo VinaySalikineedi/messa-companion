@@ -1304,6 +1304,20 @@ INTEGRATION_RETRY_LOOP_MAX_IDENTICAL_ATTEMPTS = int(
     os.environ.get("MESSA_INTEGRATION_RETRY_LOOP_MAX_IDENTICAL_ATTEMPTS", "2")
 )
 
+# agent-feedback.md item 3 -- deepsearch's send_screenshot tool. This is the
+# code-level enforcement backing the "zero-spam" rules in STAGEHAND_SYSTEM_
+# PROMPT: the prompt tells the model when a screenshot is warranted, this is
+# the hard backstop for when it doesn't listen. Shared across one deepsearch
+# delegation and all its delegate_website_task sub-workers (see
+# StagehandToolProvider's screenshot_tracker param), not per-tab, so the cap
+# is genuinely "per task" rather than trivially bypassed by delegating to a
+# sub-worker. Generous enough to cover a couple of milestones plus a blocker
+# or reassurance ping in one task, tight enough that it can never turn into
+# a text-spam incident.
+DEEPSEARCH_MAX_SCREENSHOTS_PER_SESSION = int(
+    os.environ.get("MESSA_DEEPSEARCH_MAX_SCREENSHOTS_PER_SESSION", "6")
+)
+
 # Step budget for executive_assistant (tasks/reminders/notes/contacts/
 # calendar), deliberately small and separate from DEEPSEARCH_MAX_STEPS --
 # see tools/executive_tools.py's build_executive_subagent docstring. This

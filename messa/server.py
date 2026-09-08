@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import mimetypes
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -749,18 +750,26 @@ async def live_view_email_thread(token: str, thread_id: str) -> JSONResponse:
 @app.get("/files/{token}")
 async def download_shared_file(token: str):
     """Public, unguessable-token file download -- the mechanism that lets
-    a locally-generated PDF be attached to an outbound TEXT message
-    (agents/registry.py's send_pdf_over_text): Sendblue's media_url has to
-    be a URL its own servers can fetch, not raw bytes, so this route is
-    what Sendblue actually calls. See migrations/018_generated_document_shares.sql
-    and db.create_document_share/get_document_share_by_token.
+    a locally-generated file be attached to an outbound TEXT message
+    (agents/registry.py's send_pdf_over_text, tools/stagehand_tools.py's
+    send_screenshot): Sendblue's media_url has to be a URL its own servers
+    can fetch, not raw bytes, so this route is what Sendblue actually
+    calls. See migrations/018_generated_document_shares.sql and
+    db.create_document_share/get_document_share_by_token.
 
     Re-validates the share's file_path against config.OUTPUTS_DIR again
     HERE, at serve time -- not just trusting that it was valid when the
     share row was created (config.resolve_output_file, same defense-in-
     depth posture as channels/resend.py's outbound-email attachment path).
     404 for an unknown token OR a file that's since gone missing/moved
-    outside the outputs directory -- never a 500 that might leak a path."""
+    outside the outputs directory -- never a 500 that might leak a path.
+
+    media_type is guessed from the shared filename's extension (originally
+    always ".pdf" -- this route now also serves send_screenshot's ".png"
+    files) rather than hardcoded, falling back to "application/pdf" for
+    anything mimetypes doesn't recognize -- preserves the exact prior
+    behavior for every existing PDF share while correctly resolving a
+    screenshot's content type too."""
     share = await db.get_document_share_by_token(token)
     if share is None:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -768,7 +777,8 @@ async def download_shared_file(token: str):
         resolved = config.resolve_output_file(share["file_path"])
     except ValueError:
         return JSONResponse({"error": "not found"}, status_code=404)
-    return FileResponse(resolved, filename=share["filename"], media_type="application/pdf")
+    guessed_type, _ = mimetypes.guess_type(share["filename"])
+    return FileResponse(resolved, filename=share["filename"], media_type=guessed_type or "application/pdf")
 
 
 @app.post("/webhook/sendblue")

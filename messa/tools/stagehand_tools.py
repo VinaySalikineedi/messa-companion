@@ -14,6 +14,10 @@ Equips the Deepsearch agent with macro-action tools:
   - `await_email_verification_code`: Automated OTP verification listener.
   - `generate_account_credential` / `get_account_credential`: Credential vault.
   - `search_web` / `read_webpage`: Fast zero-browser search & scrape waterfall.
+  - `send_screenshot`: Texts a screenshot of the current page to the user as proof
+    of a high-value milestone (cart built, confirmation page, new account) or a
+    genuine blocker -- rate-limited (config.DEEPSEARCH_MAX_SCREENSHOTS_PER_SESSION)
+    to keep it from becoming spam (agent-feedback.md item 3).
 """
 from __future__ import annotations
 
@@ -24,6 +28,7 @@ import logging
 import re
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 
 from langchain.agents import create_agent
@@ -43,7 +48,8 @@ from urllib.parse import urlparse
 
 from .. import config, console, credentials, db, live_activity
 from ..approval import ApprovalGate
-from ..channels import browserbase
+from ..channels import browserbase, sendblue
+from ..channels.sendblue import SendblueError
 from .browser_circuit_breaker import StagehandZeroDeltaMiddleware
 from .search_engine import unified_web_read, unified_web_search
 
@@ -132,7 +138,11 @@ STAGEHAND_SYSTEM_PROMPT = (
     "`await_email_verification_code` or `request_human_help` -- close_browser will refuse while either is in "
     "progress, since closing then would wipe session storage and invalidate the code/verification you're "
     "waiting on)! Never leave the remote browser open while you do web searches or write your response. "
-    "Calling `close_browser()` immediately stops billing.\n\n"
+    "Calling `close_browser()` immediately stops billing. IMPORTANT: your browser session is torn down "
+    "automatically the instant you stop working -- whether or not you called `close_browser()` yourself -- so "
+    "simply ending your turn mid-task has the SAME destructive effect as calling `close_browser()` early. "
+    "Never end your turn (reply with a summary, hand back to Messa) while something is genuinely still in "
+    "progress on the page, most importantly an in-flight `await_email_verification_code` wait.\n\n"
     "CAPTCHA & HUMAN ESCALATION (CUT RETRIES TO 2):\n"
     "- Hit an unsolved CAPTCHA or bot verification? You are permitted AT MOST 2 attempts to solve or click it. "
     "CAPTCHAs are hard to pass automatically. If it does not clear after 2 attempts, STOP RETRYING immediately! "
@@ -141,10 +151,33 @@ STAGEHAND_SYSTEM_PROMPT = (
     "- Hit a 2FA prompt or login wall you don't have credentials for? "
     "First check `get_account_credential(site_name)`. If none is stored, call `request_human_help(reason)` "
     "immediately so the user can assist via their live view.\n"
-    "- Hit an email verification code screen after signup? Call `await_email_verification_code`.\n"
+    "- Hit an email verification code screen after signup? Call `await_email_verification_code` "
+    "IMMEDIATELY AND STAY IN THIS TURN UNTIL IT RESOLVES. Do NOT end your turn, reply with a "
+    "summary, or hand this back to Messa while that screen is showing -- your browser session "
+    "is automatically closed the moment you stop working (even if you never call "
+    "`close_browser()` yourself), which wipes the session and invalidates the very code you're "
+    "waiting on. If Messa re-delegates this task to you later with the code in hand, a fresh "
+    "browser session will open on an already-expired verification -- there is no way to "
+    "recover from that. The only correct sequence on an OTP screen is: call "
+    "`await_email_verification_code` yourself, wait for it to return the code, type it in, and "
+    "finish the signup -- all in this same turn.\n"
     "- When creating accounts, use `generate_account_credential(site_name)` to generate a secure password. "
     "Never invent passwords or expose them in your final summary.\n"
-    "- When your goal is achieved, reply with a concise, clear summary of what you did and found.\n"
+    "- When your goal is achieved, reply with a concise, clear summary of what you did and found.\n\n"
+    "SMART SCREENSHOT SHARING (`send_screenshot`) -- ZERO-SPAM RULES:\n"
+    "You can text the user a screenshot of the current page with `send_screenshot(caption)` as visual "
+    "proof of progress. This is a PRIVILEGE, not something to reach for often -- only call it for:\n"
+    "1. HIGH-VALUE MILESTONES: a cart fully built with items and prices, a final confirmation/receipt/"
+    "submission page, or a newly created account's landing dashboard right after signup.\n"
+    "2. LONG-RUNNING REASSURANCE: if a genuinely in-depth task has been running for 90-120+ seconds, "
+    "one screenshot with a short status note is welcome so the user knows you're still working.\n"
+    "3. BLOCKERS / HUMAN-IN-THE-LOOP: a CAPTCHA, 2FA screen, or an ambiguous choice where a human's "
+    "eyes would genuinely help (this can accompany `request_human_help`, not replace it).\n"
+    "4. STRICTLY FORBIDDEN otherwise: never send a screenshot for typing into a field, clicking an "
+    "ordinary button, scrolling, an intermediate loading state, or any other micro-action -- that is "
+    "spam, not proof of progress. If in doubt, don't send it.\n"
+    "There is also a hard cap on how many screenshots you can send in one task -- once you hit it, "
+    "`send_screenshot` will refuse and tell you so; at that point just finish with a text summary.\n"
 )
 
 
@@ -293,6 +326,7 @@ class StagehandToolProvider:
         browser_instance: Any = None,
         is_subagent: bool = False,
         captcha_tracker: dict[str, int] | None = None,
+        screenshot_tracker: dict[str, int] | None = None,
     ):
         self._approval_gate = approval_gate
         self._user_id = user_id
@@ -315,6 +349,15 @@ class StagehandToolProvider:
         self.tools: list[BaseTool] = []
         self._page = page
         self._captcha_tracker: dict[str, int] = captcha_tracker if captcha_tracker is not None else {}
+        # agent-feedback.md item 3 (send_screenshot) -- shared by reference with
+        # every sub-worker tab the SAME way self._captcha_tracker already is
+        # (see _delegate_website_task below), so the spam cap below applies to
+        # the whole task across all tabs, not just whichever tab happens to
+        # call it. A single-key dict rather than a plain int specifically so
+        # it can be passed by reference like captcha_tracker already is.
+        self._screenshot_tracker: dict[str, int] = (
+            screenshot_tracker if screenshot_tracker is not None else {"count": 0}
+        )
         self._session_lock: asyncio.Lock = asyncio.Lock()
         # Reliability hardening (docs/smart_autonomous_agent_architecture.md):
         # True for the exact duration of _await_email_verification_code /
@@ -541,6 +584,11 @@ class StagehandToolProvider:
                 description="Capture a visual screenshot of the current page.",
             ),
             StructuredTool.from_function(
+                coroutine=self._send_screenshot,
+                name="send_screenshot",
+                description=(self._send_screenshot.__doc__ or "").strip(),
+            ),
+            StructuredTool.from_function(
                 coroutine=self._browser_execute_script,
                 name="browser_execute_script",
                 description=(
@@ -666,6 +714,7 @@ class StagehandToolProvider:
                 browser_instance=self.browser,
                 is_subagent=True,
                 captcha_tracker=self._captcha_tracker,
+                screenshot_tracker=self._screenshot_tracker,
             )
             async with sub_provider as worker:
                 # Sub-workers run real browser_act calls in their own tab and
@@ -882,6 +931,77 @@ class StagehandToolProvider:
             return f"Screenshot captured successfully ({len(img_bytes)} bytes)."
         except Exception as e:
             return f"Failed to capture screenshot: {e}"
+
+    async def _send_screenshot(self, caption: str = "") -> str:
+        """Text the CURRENT browser page to the user as an MMS/iMessage screenshot
+        attachment on their own Messa thread -- the visual counterpart to
+        agents/registry.py's send_pdf_over_text, scoped to whatever deepsearch is
+        looking at right now. Reuses the exact same public-share-token mechanism
+        (a fresh unguessable /files/{token} URL is minted, Sendblue fetches it).
+
+        USE THIS SPARINGLY. Only send a screenshot for a genuine high-value
+        moment: a cart fully built with items and prices, a final confirmation/
+        receipt/submission page, a newly created account's landing dashboard, a
+        real blocker where a human's eyes would help (CAPTCHA, 2FA, an ambiguous
+        choice), or a short progress update on a task that has genuinely been
+        running a while. NEVER call this for routine intermediate steps -- typing
+        into a field, clicking an ordinary button, scrolling, an in-progress page
+        load. Sending too many screenshots is spam, not helpfulness, and this
+        tool enforces a hard cap on how many it will send for one task -- once
+        you hit it, stop calling this and just finish with a text summary.
+
+        caption: a short, specific note describing what the screenshot shows
+        (e.g. "Cart ready -- 2 items, $34.20 total" or "Stuck on a CAPTCHA here,
+        can you help?"). Don't just say "here's a screenshot" -- say what's in
+        it, since the user may glance at their phone without opening the image
+        right away."""
+        if self._user_id is None or not self._phone_number:
+            return "ERROR: send_screenshot isn't available outside a real user session with a phone number on file."
+        if not (config.SENDBLUE_API_KEY and config.SENDBLUE_API_SECRET and config.SENDBLUE_NUMBER):
+            return "Texting isn't configured on this deployment yet."
+
+        sent_so_far = self._screenshot_tracker.get("count", 0)
+        if sent_so_far >= config.DEEPSEARCH_MAX_SCREENSHOTS_PER_SESSION:
+            return (
+                f"BLOCKED: already sent {sent_so_far} screenshot(s) for this task -- that's the "
+                f"limit ({config.DEEPSEARCH_MAX_SCREENSHOTS_PER_SESSION}) for one task. Sending "
+                "more would be spam. Finish the task and report the rest as text."
+            )
+
+        await self._ensure_session()
+        try:
+            page = await self.get_active_page()
+            img_bytes = await page.screenshot()
+        except Exception as e:
+            return f"Error capturing screenshot: {e}"
+
+        out_dir = Path(config.OUTPUTS_DIR)
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / f"deepsearch_screenshot_{uuid.uuid4().hex[:12]}.png"
+            out_path.write_bytes(img_bytes)
+        except OSError as e:
+            return f"Error saving screenshot: {e}"
+
+        token = await db.create_document_share(self._user_id, str(out_path), out_path.name)
+        if not token:
+            return (
+                "Texting a screenshot isn't set up on this deployment yet "
+                "(run migrations/018_generated_document_shares.sql)."
+            )
+        media_url = f"{config.LIVE_VIEW_BASE_URL}/files/{token}"
+        try:
+            await sendblue.send_message(
+                self._phone_number, caption or "Here's a screenshot from your task.", media_url=media_url,
+            )
+        except SendblueError as e:
+            return f"Couldn't send that screenshot over text: {e}"
+
+        self._screenshot_tracker["count"] = sent_so_far + 1
+        return (
+            f"Screenshot sent to {self._phone_number} as a text attachment "
+            f"({self._screenshot_tracker['count']}/{config.DEEPSEARCH_MAX_SCREENSHOTS_PER_SESSION} used this task)."
+        )
 
     async def _browser_execute_script(self, script: str) -> str:
         """Code-as-action (docs/smart_autonomous_agent_architecture.md,

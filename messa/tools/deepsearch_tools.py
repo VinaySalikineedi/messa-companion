@@ -583,6 +583,35 @@ def _looks_like_auth_wall(snapshot_text: str | None) -> bool:
     return any(kw in lowered for kw in _AUTH_WALL_KEYWORDS)
 
 
+# agent-feedback.md item 2 -- code-level backstop for the OTP-invalidation
+# bug, same "one corrective nudge" pattern as the anti-hallucination
+# completion gate in `_run` below, just triggered by a different signal.
+# The live-tested failure mode was NOT an explicit close_browser() call --
+# it was the run ending its turn (a "done"/summary reply) while genuinely
+# sitting on an OTP/verification screen, without ever calling
+# await_email_verification_code. STAGEHAND_SYSTEM_PROMPT/
+# DEEPSEARCH_SYSTEM_PROMPT now say explicitly not to do this, but a prompt
+# is not enforcement on its own -- this is checked against the run's own
+# FINAL message text (what's about to be reported back to Messa), not a
+# live page read, so it costs no extra browser round trip. Deliberately a
+# short, generic keyword list for the same reason _AUTH_WALL_KEYWORDS is:
+# this only needs to catch the obvious "I'm on a verification screen"
+# phrasing, not every possible wording.
+_OTP_SCREEN_KEYWORDS = (
+    "verification code", "one-time code", "one-time passcode", "otp",
+    "enter the code", "check your email for", "check your inbox for",
+    "confirmation code", "code sent to", "6-digit code", "4-digit code",
+    "verify your email",
+)
+
+
+def _looks_like_pending_otp(text: str | None) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(kw in lowered for kw in _OTP_SCREEN_KEYWORDS)
+
+
 _SNAPSHOT_SIZE_NUDGE = (
     "\n\n(This snapshot was large. Next time, prefer browser_find(text=...) for one "
     "specific element, or browser_snapshot(depth=...) for a shallower tree, instead of a "
@@ -3036,9 +3065,16 @@ DEEPSEARCH_SYSTEM_PROMPT = (
     "a fresh snapshot or try a different approach.\n"
     "- Hit an email verification/OTP screen right after signing up with generate_account_"
     "credential's DEFAULT username (the user's own Messa email)? Call "
-    "await_email_verification_code, not request_human_help -- no human can read that inbox, "
-    "so waiting for one to act would never resolve. Only fall back to request_human_help if it "
-    "times out (the code may have gone to the user's own phone/personal email instead).\n"
+    "await_email_verification_code IMMEDIATELY AND STAY IN THIS TURN UNTIL IT RESOLVES, not "
+    "request_human_help -- no human can read that inbox, so waiting for one to act would never "
+    "resolve. Only fall back to request_human_help if it times out (the code may have gone to "
+    "the user's own phone/personal email instead). Do NOT end your turn, reply with a summary, "
+    "or hand this back to Messa while that screen is showing -- your browser session is torn "
+    "down the moment you stop working, even if you never explicitly close it, which wipes the "
+    "session and invalidates the very code you're waiting on. A later re-delegation with the "
+    "code in hand would only open a fresh, already-expired session -- there is no recovering "
+    "from that. Call await_email_verification_code yourself, wait for it to return the code, "
+    "type it in, and finish the signup -- all in this same turn.\n"
     "- Hit a login wall, CAPTCHA, 2FA/one-time-code prompt, or any other block a real human "
     "would need to clear? First check get_account_credential(site_name) -- Messa may have "
     "already created this exact account for the user on an earlier task. Only call "
@@ -3438,6 +3474,58 @@ def build_deepsearch_subagent(
                                 # caught -- it propagates to the exact same except blocks below
                                 # that already handle it for the original call, which still
                                 # ends this run honestly (never as a fabricated "completed").
+                            elif not any(
+                                isinstance(tc, dict) and tc.get("name") == "await_email_verification_code"
+                                for m in new_messages
+                                for tc in (getattr(m, "tool_calls", None) or [])
+                            ) and _looks_like_pending_otp(
+                                getattr(final_messages[-1], "content", None) if final_messages else None
+                            ):
+                                # agent-feedback.md item 2 -- OTP early-return backstop. This
+                                # run DID call tools (had_any_tool_call is True, so the
+                                # anti-hallucination gate above didn't fire), but its own final
+                                # message reads like it's sitting on an OTP/verification screen
+                                # and it never called await_email_verification_code. Ending the
+                                # turn here would fall through to "Finished successfully" below,
+                                # exit `async with provider:`, and tear down the browser --
+                                # invalidating the very code a later re-delegation would need.
+                                # Same "one corrective nudge" shape as the hallucination gate
+                                # above, just a different trigger signal.
+                                console.system(
+                                    f"Deepsearch: session #{session_id} appears to be ending its "
+                                    "turn on an OTP/verification screen without calling "
+                                    "await_email_verification_code -- nudging it to stay and wait "
+                                    "instead of letting the browser close underneath it."
+                                )
+                                try:
+                                    retry_result = await asyncio.wait_for(
+                                        inner_agent.ainvoke(
+                                            {"messages": [HumanMessage(content=(
+                                                "Your last message reads like you're on an email "
+                                                "verification/OTP screen, but you never called "
+                                                "await_email_verification_code. Do NOT end this turn "
+                                                "or hand this back -- your browser session closes the "
+                                                "moment you stop, and that will invalidate the code. "
+                                                "Call await_email_verification_code right now and wait "
+                                                "for it, finish entering the code, or explain honestly "
+                                                "why that tool doesn't apply to what's on screen."
+                                            ))]},
+                                            config=run_config,
+                                        ),
+                                        timeout=config.DEEPSEARCH_MAX_SESSION_SECONDS,
+                                    )
+                                    final_messages = retry_result["messages"]
+                                except (asyncio.TimeoutError, GraphRecursionError):
+                                    status = "active"
+                                    gate_forced_active = True
+                                    console.system(
+                                        f"Deepsearch: session #{session_id}'s OTP nudge itself hit "
+                                        "a limit -- marking active honestly rather than closing the "
+                                        "browser on what may still be a live verification wait."
+                                    )
+                                # Any OTHER exception propagates to the same except blocks below
+                                # that already handle a dead session/too-many-errors/cancellation
+                                # honestly -- never a silent crash, same as the gate above.
 
                             # Finished successfully -- release warm session if previously cached
                             if session_id and session_id in _WARM_SESSION_PROVIDERS:
