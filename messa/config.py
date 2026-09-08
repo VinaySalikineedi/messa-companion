@@ -739,6 +739,72 @@ SCRATCHPAD_CLEANUP_POLL_INTERVAL_SECONDS = int(
     os.environ.get("MESSA_SCRATCHPAD_CLEANUP_POLL_INTERVAL_SECONDS", str(6 * 3600))
 )
 
+# ---- Voice and image input (messa/media_understanding.py) -- lets a user
+# text Messa a voice memo or a photo and have it actually understood,
+# instead of the SMS/iMessage path silently ignoring anything that isn't a
+# PDF (see _maybe_read_inbound_pdf above). Deliberately NOT implemented by
+# swapping the main orchestrator's model to a multimodal one -- every
+# subagent in this project (including the orchestrator) is a ChatOpenAI
+# instance routed through OpenRouter, and deepagents' harness-profile
+# tool-stripping is registered once at import time keyed off that exact
+# LangChain provider class; risking that (and paying a different model's
+# latency/cost on every plain-text message) for a capability only a
+# minority of messages need isn't worth it. Instead this is a THIRD
+# instance of the same isolated-preprocessing-call pattern
+# _maybe_read_inbound_pdf and _pick_contextual_reaction already use: one
+# bounded, timeout-guarded side call that turns media into text and splices
+# it into effective_content, leaving the orchestrator and every other Messa
+# code path untouched. Ships OFF by default, same "test hard on this
+# branch, flip on without a redeploy" shape as SCRATCHPAD_AND_SKILLS_ENABLED
+# above.
+MEDIA_UNDERSTANDING_ENABLED = os.environ.get("MESSA_MEDIA_UNDERSTANDING_ENABLED", "false").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+# google/gemini-2.5-flash via OpenRouter -- natively multimodal (vision +
+# audio), and already a proven combination in this codebase: STAGEHAND_MODEL
+# above reaches this exact model the exact same way (ChatOpenAI + OpenRouter)
+# for Stagehand's own in-browser vision calls. No new LLM client dependency:
+# build_model() already speaks OpenAI-style content blocks, which is all
+# both image understanding (image_url, reusing the same shape
+# tools/stagehand_tools.py's _build_stagehand_openrouter_callback already
+# sends) and audio understanding (input_audio) need.
+MEDIA_UNDERSTANDING_MODEL_NAME = os.environ.get(
+    "MESSA_MEDIA_UNDERSTANDING_MODEL_NAME", "google/gemini-2.5-flash"
+).strip()
+
+# How long a single image-description or audio-transcription OpenRouter
+# call is allowed to hang before this app gives up on it -- same
+# "safety-net ceiling, not a normal-path limit" reasoning as
+# LLM_REQUEST_TIMEOUT_SECONDS above, just a tighter number since this call
+# sits in the middle of an inbound webhook turn a real person is waiting on
+# (see _process_inbound), not a background task.
+MEDIA_UNDERSTANDING_TIMEOUT_SECONDS = float(
+    os.environ.get("MESSA_MEDIA_UNDERSTANDING_TIMEOUT_SECONDS", "30")
+)
+
+# A separate, shorter ceiling on the ffmpeg transcode subprocess
+# media_understanding.py runs on an inbound iMessage voice memo (.caf --
+# not in Gemini's or OpenRouter's supported audio format list) before
+# transcoding it to .m4a/.wav. Run via asyncio.create_subprocess_exec so a
+# slow transcode can never block the event loop; this timeout is the
+# fallback for a transcode that hangs outright.
+MEDIA_TRANSCODE_TIMEOUT_SECONDS = float(
+    os.environ.get("MESSA_MEDIA_TRANSCODE_TIMEOUT_SECONDS", "20")
+)
+
+# Raw file size caps before any download is even parsed, same "a hostile or
+# just enormous attachment shouldn't be downloaded/decoded at all" reasoning
+# as MAX_PDF_READ_BYTES above. Comfortably under Gemini's ~20MB combined
+# inline-base64 request cap, leaving headroom for base64's own ~33% size
+# overhead once encoded.
+MAX_IMAGE_READ_BYTES = int(
+    os.environ.get("MESSA_MAX_IMAGE_READ_BYTES", str(15 * 1024 * 1024))
+)
+MAX_AUDIO_READ_BYTES = int(
+    os.environ.get("MESSA_MAX_AUDIO_READ_BYTES", str(15 * 1024 * 1024))
+)
+
 # ---- Jina Reader (tools/jina_reader.py) -- a JS-capable page read that
 # costs no Browserbase session time, sitting between a plain HTTP fetch
 # (web_search_tools.fetch_page_text, no JS at all) and a real deepsearch

@@ -44,7 +44,7 @@ import httpx
 from fastapi import BackgroundTasks, FastAPI, Header, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
-from . import background, briefings, cli, config, console, db, live_activity, memory, pdf_reader, waitlist
+from . import background, briefings, cli, config, console, db, live_activity, media_understanding, memory, pdf_reader, waitlist
 from .agents.registry import build_orchestrator
 from .approval import AutoApproveGate, DenyApprovalGate
 from .channels import browserbase, sendblue
@@ -889,6 +889,61 @@ async def _maybe_read_inbound_pdf(media_url: str) -> str | None:
     return f"[The user just sent a PDF over text{trunc_note}. Its text content:]\n{text}"
 
 
+async def _maybe_understand_inbound_media(media_url: str) -> tuple[str | None, bool]:
+    """The single dispatch point for every inbound MMS/iMessage attachment
+    kind this project understands. Downloads media_url ONCE, classifies it
+    (media_understanding.classify_attachment), and routes to whichever
+    handler actually applies -- PDF handling is untouched and reused
+    exactly as-is (_maybe_read_inbound_pdf keeps its own independent
+    download, since it already has its own PDF-specific magic-byte check
+    and there's no shared benefit to threading one download through both
+    paths for what is, in practice, an infrequent double-fetch).
+
+    Returns (text_to_splice_or_None, is_audio_failure). The second element
+    exists purely so _process_inbound can apply the deliberately
+    asymmetric fallback contract described in config.py's own comment
+    above MEDIA_UNDERSTANDING_ENABLED: a failed AUDIO transcription must
+    still produce non-empty effective_content (a voice memo is a
+    deliberate act; silently dropping it would leave the user with no
+    reply at all), while a failed image description is allowed to fall
+    through to today's tolerant "nothing to act on" behavior."""
+    if not config.MEDIA_UNDERSTANDING_ENABLED:
+        pdf_note = await _maybe_read_inbound_pdf(media_url)
+        return pdf_note, False
+
+    downloaded = await media_understanding.download_attachment(media_url)
+    if downloaded is None:
+        # Download itself failed -- fall through to the PDF path's own
+        # independent download/error-handling rather than guessing.
+        pdf_note = await _maybe_read_inbound_pdf(media_url)
+        return pdf_note, False
+    content_type, data = downloaded
+    kind = media_understanding.classify_attachment(content_type, media_url, data)
+
+    if kind is media_understanding.AttachmentKind.IMAGE:
+        described = await media_understanding.describe_inbound_image(
+            media_url, _prefetched=(content_type, data),
+        )
+        return described, False
+
+    if kind is media_understanding.AttachmentKind.AUDIO:
+        transcript = await media_understanding.transcribe_inbound_audio(
+            media_url, _prefetched=(content_type, data),
+        )
+        # is_audio_failure=True on a miss tells _process_inbound to splice
+        # in ITS OWN fixed fallback text rather than treating None here as
+        # "nothing to act on" -- see this function's own docstring and
+        # config.py's comment above MEDIA_UNDERSTANDING_ENABLED for why a
+        # voice memo specifically must never be silently dropped.
+        return transcript, transcript is None
+
+    # Not an image or audio we recognized -- most likely a PDF (or a plain
+    # photo/unsupported format that isn't a PDF either, in which case this
+    # correctly returns None, same as today).
+    pdf_note = await _maybe_read_inbound_pdf(media_url)
+    return pdf_note, False
+
+
 def _sms_send_factory(from_number: str):
     """Builds the `send` callback cli.run_message expects: called
     immediately for every AI message Messa produces a turn, not just the
@@ -1062,9 +1117,17 @@ async def _process_inbound(
 
     effective_content = content
     if media_url:
-        pdf_note = await _maybe_read_inbound_pdf(media_url)
-        if pdf_note:
-            effective_content = f"{content}\n\n{pdf_note}".strip() if content else pdf_note
+        media_note, is_audio_failure = await _maybe_understand_inbound_media(media_url)
+        if media_note:
+            effective_content = f"{content}\n\n{media_note}".strip() if content else media_note
+        elif is_audio_failure:
+            # Asymmetric fallback contract (see config.py's own comment
+            # above MEDIA_UNDERSTANDING_ENABLED): a voice memo that
+            # couldn't be transcribed must still produce non-empty
+            # effective_content, so the guard right below can't silently
+            # swallow a deliberate voice memo the way it's fine to
+            # silently swallow a captionless, undescribable photo.
+            effective_content = content or "[Voice memo received but couldn't be transcribed]"
     if not effective_content:
         # A captionless MMS that wasn't a PDF either (a plain photo, most
         # likely) -- nothing here for Messa to act on. Same "silently

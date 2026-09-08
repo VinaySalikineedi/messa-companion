@@ -25,8 +25,15 @@ RUN useradd -m -u 1000 user
 # (see messa/tools/deepsearch_tools.py), which needs a real Node runtime.
 # Debian bookworm's own `nodejs` package is too old for it, so pull current
 # LTS from NodeSource instead.
+#
+# ffmpeg -- messa/media_understanding.py shells out to it to transcode an
+# inbound iMessage voice memo (.caf, a container neither Gemini nor
+# OpenRouter accept natively) to .m4a before sending it for transcription.
+# Only reached when MESSA_MEDIA_UNDERSTANDING_ENABLED=true (see config.py);
+# installed unconditionally here since flipping that flag on shouldn't
+# require a new image build.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl ca-certificates gnupg \
+        curl ca-certificates gnupg ffmpeg \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
