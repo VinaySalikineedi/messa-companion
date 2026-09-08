@@ -95,7 +95,7 @@ STAGEHAND_SUBAGENT_SYSTEM_PROMPT = (
     "- Use `browser_extract` to pull structured facts, prices, ratings, or delivery information.\n"
     "- CAPTCHA POLICY (CUT RETRIES TO 2): If you encounter a CAPTCHA or robot challenge, attempt to solve it AT MOST 2 times. "
     "If it still blocks you after 2 attempts, STOP retrying immediately. CAPTCHAs are hard to pass automatically. "
-    "Report that the website is blocked by CAPTCHA and summarize whatever data was already found (or fall back to search_web).\n"
+    "Call `send_screenshot('Blocked by CAPTCHA')` to text visual proof, then report that the website is blocked by CAPTCHA and summarize whatever data was already found (or fall back to search_web).\n"
     "- When your goal is achieved, reply with a concise, clear summary of what you found or completed.\n"
 )
 
@@ -146,7 +146,7 @@ STAGEHAND_SYSTEM_PROMPT = (
     "CAPTCHA & HUMAN ESCALATION (CUT RETRIES TO 2):\n"
     "- Hit an unsolved CAPTCHA or bot verification? You are permitted AT MOST 2 attempts to solve or click it. "
     "CAPTCHAs are hard to pass automatically. If it does not clear after 2 attempts, STOP RETRYING immediately! "
-    "Call `close_browser()` and switch to `search_web` to find the information, or call `request_human_help(reason)` "
+    "Call `send_screenshot('Blocked by CAPTCHA')` to text visual proof to the user, then call `close_browser()` and switch to `search_web` to find the information, or call `request_human_help(reason)` "
     "if you need the user to solve it.\n"
     "- Hit a 2FA prompt or login wall you don't have credentials for? "
     "First check `get_account_credential(site_name)`. If none is stored, call `request_human_help(reason)` "
@@ -814,13 +814,13 @@ class StagehandToolProvider:
                         return (
                             f"BLOCKED: CAPTCHA retry limit reached for {domain} ({config.DEEPSEARCH_CAPTCHA_MAX_RETRIES} attempts). "
                             "CAPTCHAs are hard to pass automatically. Do NOT retry solving this CAPTCHA again. "
-                            "Call close_browser() and switch to search_web, or call request_human_help if manual user intervention is needed."
+                            "Call send_screenshot('Blocked by CAPTCHA') to text visual proof, then call close_browser() and switch to search_web, or call request_human_help if manual user intervention is needed."
                         )
                     else:
                         return (
                             f"BLOCKED: CAPTCHA retry limit reached for {domain} ({config.DEEPSEARCH_CAPTCHA_MAX_RETRIES} attempts). "
                             "CAPTCHAs are hard to pass automatically. Do NOT retry solving this CAPTCHA. "
-                            "Stop retrying: report this website as blocked by CAPTCHA and conclude your summary."
+                            "Call send_screenshot('Blocked by CAPTCHA') to text visual proof, report this website as blocked by CAPTCHA and conclude your summary."
                         )
 
             console.system(f"Deepsearch (Stagehand v4): executing act: {instruction!r}")
@@ -849,7 +849,7 @@ class StagehandToolProvider:
                     f"\n\n[CAPTCHA NOTICE: You have attempted this CAPTCHA for {domain} {self._captcha_tracker[domain]} time(s). "
                     f"Maximum allowed retries is {config.DEEPSEARCH_CAPTCHA_MAX_RETRIES}. "
                     "CAPTCHAs are hard to pass automatically. Do NOT attempt to solve this CAPTCHA again. "
-                    + ("Call close_browser() and switch to search_web, or call request_human_help.]" if not self._is_subagent else "Report this site is blocked by CAPTCHA and finish summary.]")
+                    + ("Call send_screenshot('Blocked by CAPTCHA') to text visual proof to the user, then call close_browser() and switch to search_web, or call request_human_help.]" if not self._is_subagent else "Call send_screenshot('Blocked by CAPTCHA') to text visual proof, report this site is blocked by CAPTCHA and finish summary.]")
                 )
 
             return f"Action Result: {msg}\nCurrent Page: {curr_url}"
@@ -875,7 +875,7 @@ class StagehandToolProvider:
                     return (
                         f"BLOCKED: The page on {domain} is currently displaying an unsolved CAPTCHA (retry limit of "
                         f"{config.DEEPSEARCH_CAPTCHA_MAX_RETRIES} reached). Do not retry. "
-                        + ("Call close_browser() and switch to search_web." if not self._is_subagent else "Report site blocked by CAPTCHA.")
+                        + ("Call send_screenshot('Blocked by CAPTCHA') to text visual proof, then call close_browser() and switch to search_web." if not self._is_subagent else "Call send_screenshot('Blocked by CAPTCHA') to text visual proof, report site blocked by CAPTCHA.")
                     )
 
             console.system(f"Deepsearch (Stagehand v4): executing extract: {instruction!r}")
@@ -905,7 +905,7 @@ class StagehandToolProvider:
                     return (
                         f"BLOCKED: The page on {domain} is displaying an unsolved CAPTCHA (retry limit of "
                         f"{config.DEEPSEARCH_CAPTCHA_MAX_RETRIES} reached). Do not retry. "
-                        + ("Call close_browser() and switch to search_web." if not self._is_subagent else "Report site blocked by CAPTCHA.")
+                        + ("Call send_screenshot('Blocked by CAPTCHA') to text visual proof, then call close_browser() and switch to search_web." if not self._is_subagent else "Call send_screenshot('Blocked by CAPTCHA') to text visual proof, report site blocked by CAPTCHA.")
                     )
 
             inst = instruction.strip() or None
