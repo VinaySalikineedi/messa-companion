@@ -660,6 +660,85 @@ REACTION_CLASSIFIER_TIMEOUT_SECONDS = float(
     os.environ.get("MESSA_REACTION_CLASSIFIER_TIMEOUT_SECONDS", "6")
 )
 
+# ---- Progressive tapback updates (server.py's _run_turn_with_progress_
+# reactions) -- when a task-category reaction has been showing for a while
+# with no reply yet (a multi-minute deepsearch delegation, for example),
+# swap it to an "in progress" emoji so the thread doesn't look like Messa
+# went silent, then swap to the final checkmark once the turn actually
+# finishes, same as today. Ships OFF by default -- this restructures how
+# the real agent turn is awaited (racing a timeout against it via
+# asyncio.wait, never asyncio.wait_for, so the real turn is never
+# cancelled), so it gets verified live against a real long-running turn
+# before being flipped on.
+TAPBACK_PROGRESS_UPDATES_ENABLED = os.environ.get(
+    "MESSA_TAPBACK_PROGRESS_UPDATES_ENABLED", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+# How long a task-category reaction sits unchanged before it's swapped to
+# TAPBACK_PROGRESS_EMOJI -- the ask was specifically "if the wait gets over
+# 30 seconds," so that's the default.
+TAPBACK_PROGRESS_UPDATE_SECONDS = float(
+    os.environ.get("MESSA_TAPBACK_PROGRESS_UPDATE_SECONDS", "30")
+)
+# The "still working on it" reaction -- deliberately distinct from every
+# _TASK_REACTION_EMOJIS value and from the final checkmark, so a user can
+# tell at a glance "Messa saw this, categorized it, and is still going" vs.
+# "Messa just finished."
+TAPBACK_PROGRESS_EMOJI = os.environ.get("MESSA_TAPBACK_PROGRESS_EMOJI", "\u23f3")
+
+# ---- In-flight turn awareness (messa/turn_control.py, agents/registry.py's
+# in_flight_str prompt block) -- read-only awareness that another message
+# from the SAME user is still being processed, for a follow-up that arrives
+# well into an already-running turn (e.g. a check-in or a correction sent
+# minutes into a deepsearch delegation). Explicitly NOT a cancellation
+# mechanism -- see turn_control.py's own module docstring for why that's
+# structurally impossible today (no checkpointer/thread_id carries a turn
+# across messages), so the prompt block built from this only ever tells
+# the model a turn IS running, never that it can reach in and change it.
+# Ships OFF by default, verified live (start a deepsearch, text a
+# follow-up partway through, read the reply for sane handling) before
+# being flipped on.
+IN_FLIGHT_TURN_AWARENESS_ENABLED = os.environ.get(
+    "MESSA_IN_FLIGHT_TURN_AWARENESS_ENABLED", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+
+# ---- Pure-acknowledgment short-circuit (server.py's _pure_acknowledgment_
+# reaction / _handle_pure_acknowledgment) -- a bare "thanks"/"ok"/"👍" sent
+# after Messa's already replied costs a full orchestrator turn today for a
+# reply nobody actually needed. When this text exact-matches a small,
+# closed vocabulary (never fuzzy, never LLM-classified -- a false positive
+# here silently swallows what could be a real request, a far worse outcome
+# than the turn this saves), Messa skips the agent turn entirely and just
+# reacts with a deterministic tapback instead. iMessage-only, same
+# message_handle gate every other tapback in this file already uses --
+# plain SMS/RCS never short-circuits, since there's no tapback to answer
+# with there and silence would just look broken. Ships OFF by default,
+# verified live (a bare "thanks" gets a reaction and no text reply; "thanks,
+# also book the hotel" and a "perfect" answering a pending yes/no question
+# still get a full turn) before being flipped on.
+PURE_ACKNOWLEDGMENT_SHORTCIRCUIT_ENABLED = os.environ.get(
+    "MESSA_PURE_ACKNOWLEDGMENT_SHORTCIRCUIT_ENABLED", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+
+# ---- Double-text batching (server.py's _collect_batch_or_follow /
+# _combine_batched_messages) -- when two texts land seconds apart, the
+# second is usually a correction, clarification, or addition to the first
+# rather than a separate request. When this is on, the first message for a
+# number becomes a "leader" that briefly waits (debouncing in
+# DOUBLE_TEXT_DEBOUNCE_SECONDS-sized steps, up to the
+# DOUBLE_TEXT_MAX_COLLECTION_SECONDS ceiling so a rapid-fire burst can't
+# defer processing indefinitely) so any texts that follow can be folded
+# into ONE combined turn instead of running as their own uncoordinated
+# agent turns. This changes the hot path for every single inbound message,
+# so it ships OFF by default and gets verified live (a single message
+# still works with the debounce felt, a real typo-correction pair merges
+# into one sane reply, a rapid burst drains at the ceiling) before being
+# flipped on.
+DOUBLE_TEXT_BATCHING_ENABLED = os.environ.get(
+    "MESSA_DOUBLE_TEXT_BATCHING_ENABLED", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+DOUBLE_TEXT_DEBOUNCE_SECONDS = float(os.environ.get("MESSA_DOUBLE_TEXT_DEBOUNCE_SECONDS", "2.0"))
+DOUBLE_TEXT_MAX_COLLECTION_SECONDS = float(os.environ.get("MESSA_DOUBLE_TEXT_MAX_COLLECTION_SECONDS", "8.0"))
+
 # ---- Active Task Scratchpad + Skills Playbook (docs/autonomous_
 # integrations_and_task_memory_spec.md, migration 033) -- one on/off
 # switch for the whole feature, same shape as INBOUND_REACTIONS_ENABLED
@@ -757,7 +836,7 @@ SCRATCHPAD_CLEANUP_POLL_INTERVAL_SECONDS = int(
 # code path untouched. Ships OFF by default, same "test hard on this
 # branch, flip on without a redeploy" shape as SCRATCHPAD_AND_SKILLS_ENABLED
 # above.
-MEDIA_UNDERSTANDING_ENABLED = os.environ.get("MESSA_MEDIA_UNDERSTANDING_ENABLED", "false").strip().lower() in (
+MEDIA_UNDERSTANDING_ENABLED = os.environ.get("MESSA_MEDIA_UNDERSTANDING_ENABLED", "true").strip().lower() in (
     "1", "true", "yes", "on",
 )
 

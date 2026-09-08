@@ -498,8 +498,8 @@ def part5_asymmetric_fallback_contract():
     )
 
 
-def part5_flag_defaults_off():
-    check("MEDIA_UNDERSTANDING_ENABLED defaults to False", config.MEDIA_UNDERSTANDING_ENABLED is False)
+def part5_flag_defaults_on():
+    check("MEDIA_UNDERSTANDING_ENABLED defaults to True", config.MEDIA_UNDERSTANDING_ENABLED is True)
 
 
 async def main() -> None:
@@ -511,7 +511,7 @@ async def main() -> None:
     await part4_dispatcher_routing()
 
     part5_asymmetric_fallback_contract()
-    part5_flag_defaults_off()
+    part5_flag_defaults_on()
 
     if failures:
         print(f"\n{len(failures)} FAILURE(S): {failures}")

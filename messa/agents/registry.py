@@ -56,7 +56,7 @@ from typing import Any
 from deepagents import GeneralPurposeSubagentProfile, HarnessProfile, create_deep_agent, register_harness_profile
 from langchain_core.tools import BaseTool, tool
 
-from .. import config, console, db, deepsearch_control, live_activity, memory, timeutil
+from .. import config, console, db, deepsearch_control, live_activity, memory, timeutil, turn_control
 from langchain.agents.middleware import ModelCallLimitMiddleware
 
 from ..approval import ApprovalGate, CLIApprovalGate
@@ -792,6 +792,26 @@ def _build_system_prompt(
             "If cancel_active_search was called and closed historical sessions, tell the user that no task was actively running and the browser is closed."
         )
 
+    # Read-only awareness that ANOTHER message from this SAME user is still
+    # being processed right now (see turn_control.py's own module docstring
+    # for exactly why this can only ever be read-only, never a "go cancel
+    # it" instruction the way active_search_str above is) -- for a
+    # follow-up that arrives well into an already-running turn, e.g. a
+    # check-in or correction sent minutes into a deepsearch delegation.
+    # Gated on its own flag so this is a true no-op with it off.
+    in_flight_str = ""
+    if config.IN_FLIGHT_TURN_AWARENESS_ENABLED:
+        in_flight_description = turn_control.describe(user.user_id)
+        if in_flight_description:
+            in_flight_str = (
+                f"\n\nAnother message from this user is still being processed right now: "
+                f"{in_flight_description}. If THIS message is a short acknowledgment, a brief "
+                "reply is enough. If it reads like a correction or update to that other "
+                "message, you CANNOT reach into that other turn and change it -- say so "
+                "plainly rather than claiming you've updated or cancelled it. If it's a new, "
+                "unrelated request, just handle it normally."
+            )
+
     return (
         "You are Messa -- a task-oriented personal life manager reachable by text, email, and "
         "(soon) WhatsApp, not a chatbot. Your job is taking real things off the user's plate "
@@ -936,6 +956,7 @@ def _build_system_prompt(
         "straight to a silent tool call."
         f"{live_view_str}"
         f"{active_search_str}"
+        f"{in_flight_str}"
         "\n\n"
         "Critical: that acknowledgment and the task tool call must be in the SAME response "
         "-- there is no next turn where you get to actually make the call. If your reply "

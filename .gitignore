@@ -14,3 +14,4 @@ cloudflare/personal-email-worker/node_modules/
 Claude outputs/
 error.txt
 scratch/
+*.pptx

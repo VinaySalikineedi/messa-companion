@@ -34,6 +34,8 @@ import asyncio
 import base64
 import json
 import mimetypes
+import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -44,7 +46,7 @@ import httpx
 from fastapi import BackgroundTasks, FastAPI, Header, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
-from . import background, briefings, cli, config, console, db, live_activity, media_understanding, memory, pdf_reader, waitlist
+from . import background, briefings, cli, config, console, db, live_activity, media_understanding, memory, pdf_reader, turn_control, waitlist
 from .agents.registry import build_orchestrator
 from .approval import AutoApproveGate, DenyApprovalGate
 from .channels import browserbase, sendblue
@@ -982,12 +984,53 @@ def _sms_send_factory(from_number: str):
 
 # Sent immediately for a message that asks Messa to DO something (book,
 # send, remind, schedule, etc.) -- _react_to_inbound recognizes its own
-# reaction came back as exactly this so _process_inbound knows to swap it
+# reaction came back as one of these so _process_inbound knows to swap it
 # for a checkmark once the turn that actually does the task finishes. Not
 # user-configurable (unlike the emoji the classifier picks for everything
-# else) -- the checkmark-swap logic below depends on recognizing this exact
-# value.
-_TASK_REACTION_EMOJI = "🫡"
+# else) -- the checkmark-swap logic below depends on recognizing these
+# exact values. Five and no more: a category-specific reaction reads as
+# "Messa understood exactly what I asked," but every extra category is
+# another chance to react with something that feels subtly wrong -- worse
+# than the generic salute it would otherwise fall back to.
+_TASK_REACTION_MESSAGE = "✉️"    # send/write a text, email, or reply for them
+_TASK_REACTION_SCHEDULE = "📅"   # schedule, book time, set a reminder
+_TASK_REACTION_RESEARCH = "🔍"   # look something up, research, browse
+_TASK_REACTION_PURCHASE = "🛒"   # buy, order, pay for something
+_TASK_REACTION_GENERIC = "🫡"    # any other real task (cancel, call, renew, ...)
+_TASK_REACTION_EMOJIS = (
+    _TASK_REACTION_MESSAGE,
+    _TASK_REACTION_SCHEDULE,
+    _TASK_REACTION_RESEARCH,
+    _TASK_REACTION_PURCHASE,
+    _TASK_REACTION_GENERIC,
+)
+_TASK_REACTION_EMOJI = _TASK_REACTION_GENERIC  # back-compat alias; the catch-all category
+
+
+def _normalize_emoji(raw: str) -> str:
+    """Strip the U+FE0F "emoji presentation" variation selector before
+    comparing two emoji for equality. Two of the five task categories
+    (_TASK_REACTION_MESSAGE, _TASK_REACTION_SCHEDULE) are emoji-presentation
+    sequences that end in U+FE0F, and a model told to reply with "exactly
+    one emoji" will sometimes drop the trailing selector (returning a bare
+    "✉" instead of "✉️") -- without this, that reply would silently fail to
+    match _TASK_REACTION_EMOJIS and get treated as a non-task mood emoji
+    instead of the task reaction it was clearly meant to be."""
+    return (raw or "").replace("️", "")
+
+
+def _canonical_task_reaction(raw: str) -> str | None:
+    """Return the canonical (fully variation-selector-qualified) spelling
+    of raw if it normalizes to one of the five task categories, else None.
+    Always send this canonical spelling to Sendblue -- the later
+    "-<reaction>" removal call built in _process_inbound below matches by
+    exact string, so the swap must remove byte-for-byte what was actually
+    sent."""
+    normalized = _normalize_emoji(raw)
+    for canonical in _TASK_REACTION_EMOJIS:
+        if _normalize_emoji(canonical) == normalized:
+            return canonical
+    return None
 
 
 async def _pick_contextual_reaction(text: str) -> str | None:
@@ -997,9 +1040,10 @@ async def _pick_contextual_reaction(text: str) -> str | None:
     birthday mention, and so on) or None when nothing fits well. A message
     that asks Messa to DO something -- book, send, remind, schedule, buy,
     cancel, look up, email, text, call, order, pay, renew, or any other
-    actionable request -- always gets _TASK_REACTION_EMOJI specifically, so
-    _react_to_inbound below can recognize "this was a task" and swap the
-    reaction for a checkmark once that turn actually finishes.
+    actionable request -- always gets one of the five _TASK_REACTION_EMOJIS
+    (chosen by which category fits best, falling back to the generic
+    salute), so _react_to_inbound below can recognize "this was a task" and
+    swap the reaction for a checkmark once that turn actually finishes.
 
     Runs the cheaper SUBAGENT_MODEL_NAME (same model cli.py's own
     _apply_reply_guardrail uses for its own single-purpose rewrite call)
@@ -1022,15 +1066,28 @@ async def _pick_contextual_reaction(text: str) -> str | None:
                     "content": (
                         "You choose a single tapback emoji reaction for an incoming text "
                         "message, the way a person quickly reacting to a friend's text would. "
-                        f"If the message asks the assistant to DO something -- book, send, "
-                        "schedule, remind, buy, cancel, look up, email, text, call, order, pay, "
-                        f"renew, or any other actionable request -- reply with EXACTLY "
-                        f"'{_TASK_REACTION_EMOJI}' and nothing else. Otherwise, if a single "
-                        "emoji genuinely fits the message's topic (a bed for mattress talk, a "
-                        "birthday cake for a birthday, a plane for travel, etc.), reply with "
-                        "EXACTLY that one emoji and nothing else. If nothing fits well, reply "
-                        "with EXACTLY the word NONE. Never explain your choice. Never reply "
-                        "with more than one emoji, punctuation, or any other text."
+                        "If the message asks the assistant to DO something, pick the ONE "
+                        "category below that best fits and reply with EXACTLY that category's "
+                        "emoji and nothing else:\n"
+                        f"- {_TASK_REACTION_MESSAGE} -- send or write a text, email, or reply "
+                        "for them (e.g. \"text sarah I'm running late\", \"email the landlord "
+                        "about the leak\")\n"
+                        f"- {_TASK_REACTION_SCHEDULE} -- schedule, book time, or set a "
+                        "reminder (e.g. \"book me a haircut friday\", \"remind me to call mom\")\n"
+                        f"- {_TASK_REACTION_RESEARCH} -- look something up, research, or "
+                        "browse (e.g. \"how much is a flight to austin\", \"find a good "
+                        "italian place nearby\")\n"
+                        f"- {_TASK_REACTION_PURCHASE} -- buy, order, or pay for something "
+                        "(e.g. \"order me more coffee pods\", \"pay my electric bill\")\n"
+                        f"- {_TASK_REACTION_GENERIC} -- any other actionable request that "
+                        "doesn't fit the categories above (e.g. \"cancel my gym membership\", "
+                        "\"call the dentist and reschedule\")\n"
+                        "Otherwise, if a single emoji genuinely fits the message's topic (a "
+                        "bed for mattress talk, a birthday cake for a birthday, a plane for "
+                        "travel, etc.), reply with EXACTLY that one emoji and nothing else. "
+                        "If nothing fits well, reply with EXACTLY the word NONE. Never "
+                        "explain your choice. Never reply with more than one emoji, "
+                        "punctuation, or any other text."
                     ),
                 },
                 {"role": "user", "content": text},
@@ -1053,7 +1110,7 @@ async def _pick_contextual_reaction(text: str) -> str | None:
     return raw
 
 
-async def _react_to_inbound(number: str, message_handle: str | None, text: str) -> bool:
+async def _react_to_inbound(number: str, message_handle: str | None, text: str) -> str | None:
     """Started as its own asyncio.create_task the moment an inbound
     message's content is known (see _process_inbound below), running
     concurrently with -- never blocking -- the real agent turn: classifying
@@ -1061,26 +1118,137 @@ async def _react_to_inbound(number: str, message_handle: str | None, text: str) 
     immediately, right before this is even scheduled) or with how fast
     Messa's actual reply goes out, so it must never sit in front of either.
 
-    Returns True only when the task-salute reaction (_TASK_REACTION_EMOJI)
-    was actually sent -- _process_inbound awaits this AFTER cli.run_message
-    finishes and, only on True, swaps that reaction for a checkmark,
-    matching the ask: react with a salute the moment a task comes in, then
-    flip it to done once Messa's actually finished it. Every other outcome
-    (reactions disabled, no message_handle -- SMS/RCS/CLI have no tapback
-    support at all, the classifier found nothing worth reacting to, or the
-    Sendblue call itself failed) returns False and is handled identically
-    by the caller: nothing further to do."""
+    Returns the exact task-category emoji actually sent (one of
+    _TASK_REACTION_EMOJIS) when this was a task-like message --
+    _process_inbound awaits this AFTER cli.run_message finishes and, only
+    on a non-None result, swaps that same reaction for a checkmark,
+    matching the ask: react with a category-specific tapback the moment a
+    task comes in, then flip it to done once Messa's actually finished it.
+    Every other outcome (reactions disabled, no message_handle -- SMS/RCS/CLI
+    have no tapback support at all, the classifier found nothing worth
+    reacting to, a non-task mood emoji was sent instead, or the Sendblue
+    call itself failed) returns None and is handled identically by the
+    caller: nothing further to do."""
     if not config.INBOUND_REACTIONS_ENABLED or not message_handle:
-        return False
-    reaction = await _pick_contextual_reaction(text)
-    if not reaction:
-        return False
+        return None
+    raw_reaction = await _pick_contextual_reaction(text)
+    if not raw_reaction:
+        return None
+    task_reaction = _canonical_task_reaction(raw_reaction)
+    # Always send the canonical spelling when this is a task reaction (see
+    # _canonical_task_reaction's own docstring for why byte-for-byte
+    # matching matters for the later removal call); otherwise send the
+    # mood emoji exactly as the classifier returned it.
+    reaction_to_send = task_reaction or raw_reaction
     try:
-        await sendblue.send_reaction(number, message_handle, reaction)
+        await sendblue.send_reaction(number, message_handle, reaction_to_send)
     except SendblueError as e:
         console.system(f"[inbound reaction] send failed (non-fatal): {e}")
+        return None
+    return task_reaction
+
+
+async def _swap_reaction(number: str, message_handle: str, old: str, new: str) -> bool:
+    """Remove `old` (Sendblue's own "-<reaction>" removal convention) then
+    send `new`, swallowing any Sendblue failure -- shared by both the
+    progress-update swap in _run_turn_with_progress_reactions below and the
+    final checkmark swap in _process_inbound, since a reaction's "currently
+    displayed" value now moves through up to three states (task emoji ->
+    progress emoji -> checkmark) instead of two. Returns True only if both
+    calls succeeded; every caller here only uses this to decide whether to
+    update its own "what's currently showing" bookkeeping -- a failed swap
+    is cosmetic, same as every other reaction call in this file, never
+    worth surfacing or retrying."""
+    try:
+        await sendblue.send_reaction(number, message_handle, f"-{old}")
+        await sendblue.send_reaction(number, message_handle, new)
+        return True
+    except SendblueError as e:
+        console.system(f"[inbound reaction] swap {old!r} -> {new!r} failed (non-fatal): {e}")
         return False
-    return reaction == _TASK_REACTION_EMOJI
+
+
+def _peek_task_reaction(reaction_task: asyncio.Task) -> str | None:
+    """Non-blocking peek at the already-running reaction_task from
+    _react_to_inbound. By the time the first progress stage's timeout
+    fires (config.TAPBACK_PROGRESS_UPDATE_SECONDS, default 30s), the
+    classifier it's built on -- hard-bounded to config.REACTION_
+    CLASSIFIER_TIMEOUT_SECONDS, ~6s -- has always resolved one way or
+    another. If it somehow hasn't, this returns None and the caller simply
+    skips that progress stage rather than blocking the real turn on it."""
+    if not reaction_task.done():
+        return None
+    try:
+        return reaction_task.result()
+    except Exception:  # noqa: BLE001 - a crashed classifier is handled at its own await site; never surface here
+        return None
+
+
+def _progress_stages() -> tuple[tuple[float, str], ...]:
+    """The escalating sequence of (seconds-since-the-task-reaction-was-
+    sent, replacement-emoji) stages a long-running turn moves through.
+    Exactly one stage today, matching the explicit ask ("if the wait gets
+    over 30 seconds") -- structured as a tuple so a future multi-stage
+    escalation (for a very long deepsearch run) is a one-line addition
+    here, not a rewrite of _run_turn_with_progress_reactions below."""
+    return ((config.TAPBACK_PROGRESS_UPDATE_SECONDS, config.TAPBACK_PROGRESS_EMOJI),)
+
+
+async def _run_turn_with_progress_reactions(
+    number: str,
+    message_handle: str,
+    reaction_task: asyncio.Task,
+    turn_task: asyncio.Task,
+) -> str | None:
+    """Races each progress stage's timeout against turn_task using
+    asyncio.wait -- NEVER asyncio.wait_for, which cancels the awaited task
+    on timeout: that would kill the real agent turn, exactly what this
+    must never do. asyncio.wait leaves turn_task running untouched either
+    way, which is the entire point. Does nothing at all unless
+    _peek_task_reaction confirms a task-category reaction was actually
+    sent -- a non-task mood emoji has no "in progress" state to advance
+    toward, so it's left alone for the whole turn.
+
+    Returns whatever reaction is currently displayed once turn_task
+    finishes: the original task emoji if no progress stage ever fired
+    (a fast turn, or not a task message at all), whichever progress emoji
+    it last swapped to otherwise, or None if there was never a task
+    reaction to progress in the first place -- mirroring exactly what
+    _process_inbound's own final checkmark-swap block already checks for,
+    so that block needs no separate code path for the flag-on case."""
+    remaining = list(_progress_stages())
+    displayed: str | None = None
+    elapsed = 0.0
+
+    while remaining and not turn_task.done():
+        next_after, next_emoji = remaining.pop(0)
+        wait_for = next_after - elapsed
+        elapsed = next_after
+        if wait_for > 0:
+            done, _pending = await asyncio.wait({turn_task}, timeout=wait_for)
+            if turn_task in done:
+                break
+
+        task_reaction = _peek_task_reaction(reaction_task)
+        if not task_reaction:
+            # Never a task message (or the classifier still somehow hasn't
+            # resolved) -- nothing to progress either way, and no further
+            # stage will change that, so stop trying rather than keep
+            # polling for the rest of the turn.
+            break
+
+        current = displayed or task_reaction
+        if await _swap_reaction(number, message_handle, current, next_emoji):
+            displayed = next_emoji
+
+    await turn_task
+
+    if displayed is not None:
+        return displayed
+    # No progress stage ever fired -- fall back to whatever
+    # _react_to_inbound actually sent (or None), same value the flag-off
+    # path would use for the final checkmark swap.
+    return _peek_task_reaction(reaction_task)
 
 
 async def _share_contact_profile_safely(number: str) -> None:
@@ -1092,6 +1260,234 @@ async def _share_contact_profile_safely(number: str) -> None:
         await sendblue.share_contact_profile(number)
     except Exception as e:  # noqa: BLE001 - non-fatal cosmetic feature
         console.system(f"[contact sharing auto-share failed] {number}: {e}")
+
+
+# Closed, exact-match vocabulary for the pure-acknowledgment short-circuit
+# (see _pure_acknowledgment_reaction below) -- deliberately NOT fuzzy and
+# NOT LLM-classified. A false positive here (treating a real request as
+# filler) silently drops it with no agent turn ever running; a false
+# negative just costs the ordinary full turn this feature exists to skip
+# in the common case. That asymmetry is exactly why this list stays small,
+# lowercase, and matched only after trimming/lowercasing/stripping trailing
+# punctuation -- never a substring or keyword match.
+_ACK_GRATITUDE = frozenset({
+    "thanks", "thank you", "thanks!", "thank you!", "ty", "tysm", "thx",
+    "thanks so much", "thank you so much", "thanks a lot", "much appreciated",
+    "appreciate it", "appreciate you", "🙏", "❤️", "❤",
+})
+_ACK_NEUTRAL = frozenset({
+    "ok", "okay", "k", "kk", "cool", "great", "perfect", "got it", "gotcha",
+    "sounds good", "sounds great", "awesome", "nice", "good", "alright",
+    "sure", "will do", "noted", "👍", "👌", "✅",
+})
+_ACK_REACTION_GRATITUDE = "❤️"
+_ACK_REACTION_NEUTRAL = "👍"
+
+
+def _normalize_ack_text(text: str) -> str:
+    """Trim, lowercase, and strip a small set of trailing punctuation --
+    exactly enough to make "Thanks!" and "thanks" match the same closed-
+    vocabulary entry, never enough to turn this into a fuzzy match."""
+    return (text or "").strip().lower().rstrip(" .!?~")
+
+
+def _pure_acknowledgment_reaction(text: str) -> str | None:
+    """Returns the deterministic reaction for a bare acknowledgment
+    (_ACK_REACTION_GRATITUDE / _ACK_REACTION_NEUTRAL), or None when `text`
+    doesn't exact-match either closed vocabulary above. This function only
+    judges the TEXT itself -- see _handle_pure_acknowledgment below for the
+    contextual guards (onboarding, a pending yes/no question, etc.) that
+    decide whether it's actually safe to skip the real turn for a match."""
+    normalized = _normalize_ack_text(text)
+    if not normalized:
+        return None
+    if normalized in _ACK_GRATITUDE:
+        return _ACK_REACTION_GRATITUDE
+    if normalized in _ACK_NEUTRAL:
+        return _ACK_REACTION_NEUTRAL
+    return None
+
+
+async def _handle_pure_acknowledgment(
+    from_number: str,
+    content: str,
+    channel: str,
+    message_handle: str,
+    reaction: str,
+) -> bool:
+    """Called from _process_inbound the moment _pure_acknowledgment_reaction
+    finds a match -- returns True only when it actually short-circuited the
+    turn (mark_read fired, the raw text was logged, the deterministic
+    reaction was sent, and a short system marker was logged so a later
+    turn doesn't apologize for "ignoring" this one). False means "not
+    actually safe to skip here," and the caller falls through to the
+    ordinary full pipeline exactly as if this function didn't exist.
+
+    Four guards, in order, each one there because getting it wrong drops
+    what could be a real message -- never because any of them are
+    expensive to check:
+      - unknown phone number -> full pipeline (never skip onboarding for
+        someone who hasn't started it -- db.get_user_by_phone is the
+        read-only lookup that never creates a row, same one waitlist.py
+        uses for exactly this distinction).
+      - onboarding not complete -> full pipeline ("ok"/"perfect" can be a
+        real onboarding answer, not filler).
+      - no assistant message on record at all -> full pipeline (nothing
+        for this to plausibly be acknowledging yet).
+      - the last thing Messa said ended in "?" -> full pipeline ("perfect"
+        answering "want me to book it?" is a yes, not filler to swallow
+        silently)."""
+    user_row = await db.get_user_by_phone(from_number)
+    if user_row is None:
+        return False
+    if user_row.get("onboarding_step") != "complete":
+        return False
+
+    recent = await db.get_recent_messages(user_row["id"], limit=10)
+    last_assistant = None
+    for row in reversed(recent):
+        if row.get("role") == "assistant":
+            last_assistant = row
+            break
+    if last_assistant is None:
+        return False
+    if (last_assistant.get("content") or "").rstrip().endswith("?"):
+        return False
+
+    try:
+        await sendblue.mark_read(from_number)
+    except SendblueError:
+        pass  # cosmetic only, same as the full pipeline's own mark_read
+
+    await db.append_message(user_row["id"], "user", content, channel=channel)
+    await db.append_message(
+        user_row["id"], "system",
+        "(Pure acknowledgment -- Messa reacted with a tapback and sent no text reply.)",
+        channel=channel,
+    )
+
+    try:
+        await sendblue.send_reaction(from_number, message_handle, reaction)
+    except SendblueError as e:
+        console.system(f"[pure acknowledgment] reaction send failed (non-fatal): {e}")
+    return True
+
+
+@dataclass
+class _PendingInbound:
+    """One raw inbound message waiting to be folded into a double-text
+    batch (see _collect_batch_or_follow below) -- `content` is already
+    past media-understanding (i.e. effective_content, not the raw webhook
+    payload), so combining a batch never needs to re-derive it."""
+    content: str
+    message_handle: str | None
+    received_at: float
+
+
+# Keyed by phone number, one entry per number with a batch CURRENTLY
+# forming -- absent entirely once that batch has been drained (see
+# _collect_batch_or_follow's own docstring for the leader/follower
+# mechanics and why the check-for-existing-batch + insert below must stay
+# a single synchronous block with no `await` in between).
+_pending_batches: dict[str, list[_PendingInbound]] = {}
+
+
+def _combine_batched_messages(batch: list[_PendingInbound]) -> str:
+    """Combines a drained batch into ONE string for the model to read,
+    using this codebase's existing bracketed-note-splicing convention
+    (the same style _maybe_read_inbound_pdf/media_understanding.py already
+    use elsewhere) -- explicitly framing the timing so the model treats a
+    fast follow-up as a correction/addition to the first message rather
+    than a second, unrelated request. A batch of exactly one message (the
+    overwhelmingly common case -- no follower ever arrived) returns that
+    message's content completely unchanged, no framing at all."""
+    if len(batch) == 1:
+        return batch[0].content
+    first = batch[0]
+    window_seconds = batch[-1].received_at - first.received_at
+    lines = [
+        first.content,
+        "",
+        (
+            f"[The user sent {len(batch)} texts in quick succession (within "
+            f"{window_seconds:.0f}s), before you had a chance to reply to the first "
+            "one. Treat them as ONE message: a later text is usually a correction, "
+            "a clarification, or an addition to the earlier one rather than a "
+            "separate request. Reply once, to all of it together. Here are the "
+            "rest, in order.]"
+        ),
+    ]
+    for i, item in enumerate(batch[1:], start=2):
+        delay_seconds = item.received_at - first.received_at
+        lines.append("")
+        lines.append(f"[Text {i} of {len(batch)}, sent {delay_seconds:.0f}s after the first:]")
+        lines.append(item.content)
+    return "\n".join(lines)
+
+
+async def _collect_batch_or_follow(
+    from_number: str, effective_content: str, message_handle: str | None,
+) -> tuple[str, list[str], str | None] | None:
+    """The first message for a fresh number becomes the LEADER: it
+    registers the batch (synchronously, no `await` between the
+    _pending_batches.get check and the insert -- true today, called out
+    explicitly so a future edit doesn't accidentally introduce a race by
+    inserting one), fires the typing indicator right away so the thread
+    doesn't look dead during the wait, then loops sleeping
+    config.DOUBLE_TEXT_DEBOUNCE_SECONDS at a time, continuing only while
+    the batch keeps growing, up to config.DOUBLE_TEXT_MAX_COLLECTION_
+    SECONDS so a rapid-fire burst can't defer processing indefinitely.
+    Returns (combined_content, log_texts, last_message_handle) for the
+    caller to actually run the turn with.
+
+    Any OTHER message for the same number that arrives while a batch is
+    forming is a FOLLOWER: it appends itself to the leader's list and
+    returns None immediately -- the caller (_process_inbound) has already
+    done this message's own cheap, independent side effects (mark_read,
+    its own media-understanding pass) before calling this, so a follower
+    genuinely does nothing more; the leader's own turn will fold this
+    message in.
+
+    The collection loop is wrapped so a crash mid-loop still drains and
+    combines whatever was collected up to that point instead of losing it
+    (a batch that already has real user messages in it must never just
+    vanish), and the module-level entry is ALWAYS removed in a `finally`
+    so a crash can never leave a phantom "batch still forming" entry that
+    would swallow every future message from this number as a follower
+    with no leader left to ever process them."""
+    entry = _PendingInbound(content=effective_content, message_handle=message_handle, received_at=time.monotonic())
+    existing = _pending_batches.get(from_number)
+    if existing is not None:
+        existing.append(entry)
+        return None
+
+    batch = [entry]
+    _pending_batches[from_number] = batch
+
+    try:
+        try:
+            await sendblue.send_typing_indicator(from_number)
+        except SendblueError:
+            pass
+
+        started = time.monotonic()
+        while True:
+            size_before = len(batch)
+            remaining_ceiling = config.DOUBLE_TEXT_MAX_COLLECTION_SECONDS - (time.monotonic() - started)
+            if remaining_ceiling <= 0:
+                break
+            await asyncio.sleep(min(config.DOUBLE_TEXT_DEBOUNCE_SECONDS, remaining_ceiling))
+            if len(batch) == size_before:
+                break  # nothing new arrived during this window -- done collecting
+    except Exception as e:  # noqa: BLE001 - a crash mid-collection must still drain and process what was gathered
+        console.system(f"[double-text batching] collection loop failed for {from_number} (non-fatal): {e}")
+    finally:
+        _pending_batches.pop(from_number, None)
+
+    combined_content = _combine_batched_messages(batch)
+    log_texts = [item.content for item in batch]
+    last_handle = batch[-1].message_handle
+    return combined_content, log_texts, last_handle
 
 
 async def _process_inbound(
@@ -1136,6 +1532,35 @@ async def _process_inbound(
         # different path than a genuinely empty payload.
         return
 
+    # Pure-acknowledgment short-circuit (see _handle_pure_acknowledgment's
+    # own docstring for the four guards) -- checked BEFORE mark_read/the
+    # contextual reaction classifier/the typing indicator below, since a
+    # match skips all of that in favor of one deterministic tapback. Only
+    # ever engages on iMessage (message_handle required, same gate every
+    # other tapback in this file already uses) -- plain SMS/RCS always
+    # gets the full pipeline, since there's no tapback to answer with
+    # there and silence would just look broken.
+    if config.PURE_ACKNOWLEDGMENT_SHORTCIRCUIT_ENABLED and message_handle:
+        ack_reaction = _pure_acknowledgment_reaction(effective_content)
+        if ack_reaction and await _handle_pure_acknowledgment(
+            from_number, effective_content, channel, message_handle, ack_reaction,
+        ):
+            return
+
+    # Double-text batching (see _collect_batch_or_follow's own docstring)
+    # -- deliberately AFTER the pure-acknowledgment check above: a "thanks"
+    # must never get folded into someone else's pending batch, it should
+    # already have short-circuited by this point. `log_texts` stays None
+    # (today's exact behavior) unless batching actually ran; a FOLLOWER
+    # call returns here immediately -- its own leader (still running,
+    # elsewhere) will process the combined batch.
+    log_texts: list[str] | None = None
+    if config.DOUBLE_TEXT_BATCHING_ENABLED:
+        batch_result = await _collect_batch_or_follow(from_number, effective_content, message_handle)
+        if batch_result is None:
+            return
+        effective_content, log_texts, message_handle = batch_result
+
     # Read receipt fires HERE, before any of the actual work below -- not
     # after the full (potentially multi-minute, for a deepsearch delegation)
     # agent turn like it used to. A read receipt is about acknowledging the
@@ -1169,36 +1594,72 @@ async def _process_inbound(
 
     _send = _sms_send_factory(from_number)
 
-    try:
-        user = await cli.load_user_context(from_number, name=None, channel=channel, message_handle=message_handle)
-        agent = await build_orchestrator(user, _approval_gate())
-        await cli.run_message(user, agent, effective_content, send=_send)
-    except Exception as e:  # noqa: BLE001 - a webhook background task must never raise unseen
-        console.system(f"Sendblue: turn failed for {from_number}: {e}")
-        await _send(
-            "Sorry, something went wrong on my end handling that -- mind trying again "
-            "in a moment?"
+    async def _run_turn() -> None:
+        turn_user_id: int | None = None
+        turn_token: int | None = None
+        try:
+            user = await cli.load_user_context(from_number, name=None, channel=channel, message_handle=message_handle)
+            agent = await build_orchestrator(user, _approval_gate())
+            # Registered AFTER build_orchestrator, deliberately -- agents/
+            # registry.py's own system-prompt builder reads turn_control.
+            # describe() for THIS SAME user while constructing THIS SAME
+            # turn's prompt, so a turn must never be able to see itself as
+            # already "in flight." See turn_control.py's own module
+            # docstring for why this is read-only awareness, never a
+            # cancellation mechanism.
+            if config.IN_FLIGHT_TURN_AWARENESS_ENABLED:
+                turn_user_id = user.user_id
+                turn_token = turn_control.start_turn(turn_user_id, effective_content)
+            await cli.run_message(user, agent, effective_content, send=_send, log_texts=log_texts)
+        except Exception as e:  # noqa: BLE001 - a webhook background task must never raise unseen
+            console.system(f"Sendblue: turn failed for {from_number}: {e}")
+            await _send(
+                "Sorry, something went wrong on my end handling that -- mind trying again "
+                "in a moment?"
+            )
+        finally:
+            if turn_token is not None and turn_user_id is not None:
+                turn_control.end_turn(turn_user_id, turn_token)
+
+    # The real turn now runs as its own task specifically so a progress
+    # check can race a timeout against it (see _run_turn_with_progress_
+    # reactions below) WITHOUT ever cancelling it -- _run_turn's own
+    # try/except above is unchanged from before this turn moved into a
+    # closure, so a failure inside it is handled exactly the same way it
+    # always was.
+    turn_task = asyncio.create_task(_run_turn())
+    if config.TAPBACK_PROGRESS_UPDATES_ENABLED and message_handle:
+        displayed_reaction = await _run_turn_with_progress_reactions(
+            from_number, message_handle, reaction_task, turn_task,
         )
+    else:
+        await turn_task  # flag off: identical to before this restructure, no extra calls, no timing logic
+        displayed_reaction = None
 
     # Give the reaction classifier a little more room than its own internal
     # timeout to actually finish and send (it may still be mid-flight if the
     # agent turn above was very fast) -- but never block this webhook's
     # background task forever on it; a reaction is cosmetic, the reply
-    # above has already gone out either way.
-    try:
-        was_task = await asyncio.wait_for(
-            reaction_task, timeout=config.REACTION_CLASSIFIER_TIMEOUT_SECONDS + 3,
-        )
-    except Exception as e:  # noqa: BLE001 - see _react_to_inbound's own docstring: cosmetic, never fatal
-        console.system(f"[inbound reaction] awaiting classifier task failed (non-fatal): {e}")
-        was_task = False
-    if was_task and message_handle:
+    # above has already gone out either way. Skipped when the progress path
+    # above already resolved a reaction to swap (displayed_reaction is
+    # already the exact value to remove in that case).
+    if displayed_reaction is None:
+        try:
+            displayed_reaction = await asyncio.wait_for(
+                reaction_task, timeout=config.REACTION_CLASSIFIER_TIMEOUT_SECONDS + 3,
+            )
+        except Exception as e:  # noqa: BLE001 - see _react_to_inbound's own docstring: cosmetic, never fatal
+            console.system(f"[inbound reaction] awaiting classifier task failed (non-fatal): {e}")
+            displayed_reaction = None
+    if displayed_reaction and message_handle:
         try:
             # Sendblue's own "-" prefix removes a previously-sent reaction
             # (verified against their real API docs -- see migrations/032's
-            # sibling reaction feature notes) -- so the salute is actually
-            # replaced, not just joined by a second tapback on the same text.
-            await sendblue.send_reaction(from_number, message_handle, f"-{_TASK_REACTION_EMOJI}")
+            # sibling reaction feature notes) -- so whichever reaction is
+            # currently showing (the original task emoji, or a progress
+            # emoji it was swapped to) is actually replaced, not just
+            # joined by a second tapback on the same text.
+            await sendblue.send_reaction(from_number, message_handle, f"-{displayed_reaction}")
             await sendblue.send_reaction(from_number, message_handle, "✅")
         except SendblueError as e:
             console.system(f"[inbound reaction] checkmark swap failed (non-fatal): {e}")

@@ -13,14 +13,15 @@ Three parts:
   2. server.py's _react_to_inbound -- respects config.INBOUND_REACTIONS_
      ENABLED and the message_handle gate (iMessage-only, same as the
      existing react_to_message tool), sends the classifier's emoji, and
-     reports back True ONLY when the task-salute specifically was sent
-     (so the caller knows to swap it for a checkmark later).
+     reports back the exact task-category emoji actually sent ONLY when
+     a task reaction was sent (so the caller knows to swap it for a
+     checkmark later).
   3. server.py's _process_inbound -- mark_read now fires BEFORE the agent
      turn (not after), the reaction classifier runs concurrently (started
      right alongside mark_read, awaited only after the reply is fully
-     sent), and a True result triggers the salute -> checkmark swap; a
-     non-task reaction or no reaction at all never touches send_reaction
-     again after the first tapback.
+     sent), and a non-None task-category result triggers the
+     salute -> checkmark swap; a non-task reaction or no reaction at all
+     never touches send_reaction again after the first tapback.
 """
 import asyncio
 import os
@@ -181,21 +182,21 @@ async def part2_react_to_inbound():
         server._pick_contextual_reaction = fake_pick_should_not_run
 
         result = await server._react_to_inbound("+15551234567", "handle-1", "my mattress hurts")
-        check("disabled feature returns False and never calls the classifier",
-              result is False and pick_calls == [] and sent == [])
+        check("disabled feature returns None and never calls the classifier",
+              result is None and pick_calls == [] and sent == [])
 
         # 2b: enabled, but no message_handle (SMS/RCS/CLI) -> no reaction at all.
         config.INBOUND_REACTIONS_ENABLED = True
         result2 = await server._react_to_inbound("+15551234567", None, "my mattress hurts")
-        check("no message_handle returns False and never calls the classifier (SMS has no tapbacks)",
-              result2 is False and pick_calls == [] and sent == [])
+        check("no message_handle returns None and never calls the classifier (SMS has no tapbacks)",
+              result2 is None and pick_calls == [] and sent == [])
 
         # 2c: classifier finds nothing -> no Sendblue call, returns False.
         async def fake_pick_none(text):
             return None
         server._pick_contextual_reaction = fake_pick_none
         result3 = await server._react_to_inbound("+15551234567", "handle-1", "ok thanks")
-        check("classifier returning None sends nothing and returns False", result3 is False and sent == [])
+        check("classifier returning None sends nothing and returns None", result3 is None and sent == [])
 
         # 2d: classifier returns the task salute -> sent, returns True.
         sent.clear()
@@ -206,7 +207,8 @@ async def part2_react_to_inbound():
         result4 = await server._react_to_inbound("+15551234567", "handle-1", "book my flight please")
         check("a task reaction is actually sent via sendblue.send_reaction",
               sent == [("+15551234567", "handle-1", server._TASK_REACTION_EMOJI)])
-        check("a task reaction reports True (caller should swap it for a checkmark later)", result4 is True)
+        check("a task reaction reports the exact emoji sent (caller should swap it for a checkmark later)",
+              result4 == server._TASK_REACTION_EMOJI)
 
         # 2e: classifier returns a non-task emoji -> sent, but returns False
         # (nothing to swap to a checkmark for a non-task reaction).
@@ -217,7 +219,7 @@ async def part2_react_to_inbound():
         server._pick_contextual_reaction = fake_pick_bed
         result5 = await server._react_to_inbound("+15551234567", "handle-1", "my mattress hurts")
         check("a non-task reaction is still sent", sent == [("+15551234567", "handle-1", "🛏️")])
-        check("a non-task reaction reports False (nothing to swap to a checkmark)", result5 is False)
+        check("a non-task reaction reports None (nothing to swap to a checkmark)", result5 is None)
 
         # 2f: the Sendblue call itself fails -> swallowed, returns False.
         sent.clear()
@@ -227,7 +229,7 @@ async def part2_react_to_inbound():
         sendblue.send_reaction = failing_send_reaction
         server._pick_contextual_reaction = fake_pick_task
         result6 = await server._react_to_inbound("+15551234567", "handle-1", "book my flight please")
-        check("a failed Sendblue send is swallowed and returns False, never raises", result6 is False)
+        check("a failed Sendblue send is swallowed and returns None, never raises", result6 is None)
     finally:
         config.INBOUND_REACTIONS_ENABLED = real_enabled
         server._pick_contextual_reaction = real_pick
@@ -291,7 +293,7 @@ async def part3_process_inbound_ordering_and_swap():
         order.clear()
         reaction_calls.clear()
 
-        async def fake_run_message_task(user, agent, text, send=None):
+        async def fake_run_message_task(user, agent, text, send=None, log_texts=None):
             order.append("run_message_start")
             await asyncio.sleep(0.02)
             order.append("run_message_end")
@@ -303,7 +305,7 @@ async def part3_process_inbound_ordering_and_swap():
             order.append("reaction_task_scheduled")
             await asyncio.sleep(0.01)  # resolves WHILE run_message is still running
             order.append("reaction_task_resolved")
-            return True  # this was a task -- caller should swap to a checkmark
+            return server._TASK_REACTION_EMOJI  # this was a task -- caller should swap to a checkmark
 
         server._react_to_inbound = fake_react_task
 
@@ -316,7 +318,7 @@ async def part3_process_inbound_ordering_and_swap():
               order.index("reaction_task_resolved") < order.index("run_message_end"))
         check("run_message still fully completes normally",
               "run_message_start" in order and "run_message_end" in order)
-        check("a task reaction (True) triggers exactly the salute-removal then the checkmark, in order",
+        check("a task reaction (non-None) triggers exactly the salute-removal then the checkmark, in order",
               reaction_calls == [f"-{server._TASK_REACTION_EMOJI}", "✅"])
 
         # 3b: a non-task (or no) reaction -- no swap calls at all afterward.
@@ -324,7 +326,7 @@ async def part3_process_inbound_ordering_and_swap():
         reaction_calls.clear()
 
         async def fake_react_non_task(number, message_handle, text):
-            return False
+            return None
 
         server._react_to_inbound = fake_react_non_task
         await server._process_inbound("+15551234567", "my mattress hurts", "sms", message_handle="handle-1")
@@ -356,7 +358,7 @@ async def part3_process_inbound_ordering_and_swap():
 
         async def fake_react_records(number, message_handle, text):
             react_called_with.append(message_handle)
-            return False
+            return None
 
         server._react_to_inbound = fake_react_records
         await server._process_inbound("+15551234567", "hello", "sms", message_handle=None)

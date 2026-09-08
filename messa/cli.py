@@ -507,7 +507,9 @@ async def _send_limit_notice_once(
     return notice
 
 
-async def run_message(user: config.UserContext, agent, text: str, send=None) -> str:
+async def run_message(
+    user: config.UserContext, agent, text: str, send=None, log_texts: list[str] | None = None,
+) -> str:
     """One full, stateless turn for `user`: loads recent DB history for
     context, runs it, persists both sides, returns the final reply text.
 
@@ -576,7 +578,23 @@ async def run_message(user: config.UserContext, agent, text: str, send=None) -> 
     purpose -- an explicit ask was to keep outbound texts concise, and
     fixed strings are the only way to guarantee that stays true forever
     rather than drifting longer over time the way freely-generated model
-    text tends to."""
+    text tends to.
+
+    log_texts: optional list of raw inbound texts to log INDIVIDUALLY,
+    instead of logging `text` as a single row -- for server.py's double-
+    text batching (see plans/glowing-forging-pumpkin.md's Feature B1),
+    where several raw messages arriving in quick succession get combined
+    into one `text` string (with bracketed framing) for the model to read,
+    but the message_history transcript should still show exactly what the
+    user actually sent, as separate rows, not the combined/annotated
+    version. When given, each entry is logged via db.append_message in
+    order, those rows are excluded from the get_recent_messages read-back
+    (so the combined `text` appended below isn't duplicated against its
+    own already-logged raw pieces), and the read limit is raised by the
+    batch size so the merge doesn't push real prior context out of the
+    window. With log_texts=None (every caller today), this function's
+    logging/history-building behavior is byte-for-byte identical to
+    before this parameter existed."""
     # 12 rather than 20: measured against the real system prompt + tool
     # schemas (~2,000 tokens fixed, every turn, regardless of history), 20
     # short SMS-length messages only added another ~600-800 tokens -- not
@@ -594,7 +612,16 @@ async def run_message(user: config.UserContext, agent, text: str, send=None) -> 
     # even exist: without this line running first, a user's texts sent
     # while over their limit would just vanish instead of showing up as
     # backlog once the limit resets.
-    await db.append_message(user.user_id, "user", text, channel=user.channel)
+    # Logged INDIVIDUALLY when log_texts is given (double-text batching --
+    # see this function's own docstring above), one row per raw text the
+    # user actually sent; otherwise (every caller today) `text` alone is
+    # logged as a single row, exactly as before this parameter existed.
+    logged_ids: set[int] = set()
+    if log_texts:
+        for raw_text in log_texts:
+            logged_ids.add(await db.append_message(user.user_id, "user", raw_text, channel=user.channel))
+    else:
+        await db.append_message(user.user_id, "user", text, channel=user.channel)
 
     # Pre-agent usage gate for number_of_texts, checked BEFORE loading
     # history or building/running the agent at all -- a user already over
@@ -610,7 +637,13 @@ async def run_message(user: config.UserContext, agent, text: str, send=None) -> 
             )
             return notice or ""
 
-    recent = await db.get_recent_messages(user.user_id, limit=12)
+    # Limit raised by the batch size (0 when log_texts isn't given, so this
+    # is exactly 12 as before) so combining several raw messages into one
+    # `text` below doesn't push real prior context out of the window --
+    # then the just-logged raw rows are filtered back out, since they'd
+    # otherwise duplicate the combined `text` this turn is about to append.
+    recent = await db.get_recent_messages(user.user_id, limit=12 + len(logged_ids))
+    recent = [r for r in recent if r.get("id") not in logged_ids]
     history = [{"role": r["role"], "content": r["content"]} for r in recent]
     history.append({"role": "user", "content": text})
 

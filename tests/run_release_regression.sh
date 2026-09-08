@@ -39,6 +39,10 @@ TESTS=(
   tests/test_app_connect_queue.py
   tests/test_message_splitting.py
   tests/test_inbound_reactions.py
+  tests/test_progressive_tapbacks.py
+  tests/test_turn_control.py
+  tests/test_pure_acknowledgment.py
+  tests/test_double_texting.py
   tests/test_minimal_questions_prompt.py
   tests/test_contact_sharing.py
   tests/test_fth_upgrades.py
