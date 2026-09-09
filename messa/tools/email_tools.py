@@ -64,10 +64,11 @@ from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import BaseTool, tool
 
-from .. import config, console, db, pdf_reader, usage
+from .. import config, console, db, pdf_reader, reliability, usage
 from ..approval import ApprovalGate
 from ..channels.sendblue import SendblueError, send_message
-from .common import last_ai_text, trace_tool
+from .common import last_ai_text, run_inner_agent_with_claim_check, trace_tool
+from .integration_circuit_breaker import ToolFailureLadderMiddleware
 from .scratchpad_tools import build_scratchpad_tools, scratchpad_prompt_block
 
 LABEL = "email_agent"
@@ -782,7 +783,7 @@ def build_email_subagent(
     async def _run(state: dict[str, Any]) -> dict[str, Any]:
         messages = list(state["messages"])
         tools = build_email_tools(user, approval_gate)
-        system_prompt = _build_system_prompt(user)
+        system_prompt = _build_system_prompt(user) + reliability.RELIABILITY_GUARDRAIL_STR
         # Active Task Scratchpad + Skills Playbook -- see tools/
         # scratchpad_tools.py's own module docstring; attached here (not by
         # registry.py) since this is a CompiledSubAgent that builds its own
@@ -793,9 +794,18 @@ def build_email_subagent(
         run_config = {"recursion_limit": config.EMAIL_RECURSION_LIMIT}
         inner_agent = create_agent(
             model=model, tools=tools, system_prompt=system_prompt,
+            # "Rule of 3" self-healing (tools/integration_circuit_breaker.py)
+            # -- email_agent had zero retry protection of any kind before
+            # this, same as every subagent did before the reliability pass.
+            middleware=[
+                ToolFailureLadderMiddleware("send_email"),
+                ToolFailureLadderMiddleware("reply_to_email"),
+            ],
         )
-        result = await inner_agent.ainvoke({"messages": messages}, config=run_config)
-        return {"messages": [AIMessage(content=last_ai_text(result["messages"]))]}
+        final_messages = await run_inner_agent_with_claim_check(
+            inner_agent, messages, run_config, label="email_agent"
+        )
+        return {"messages": [AIMessage(content=last_ai_text(final_messages))]}
 
     return {
         "name": "email_agent",

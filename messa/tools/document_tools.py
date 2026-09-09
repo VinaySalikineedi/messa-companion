@@ -21,6 +21,10 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
+from langchain.agents import create_agent
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import BaseTool, tool
 from reportlab.lib.pagesizes import LETTER
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -39,8 +43,10 @@ from reportlab.platypus import (
 from reportlab.lib import colors
 from reportlab.pdfgen import canvas
 
-from .. import config
-from .common import trace_all
+from .. import config, reliability
+from .common import last_ai_text, run_inner_agent_with_claim_check, trace_all
+from .integration_circuit_breaker import ToolFailureLadderMiddleware
+from .scratchpad_tools import build_scratchpad_tools, scratchpad_prompt_block
 
 LABEL = "document_agent"
 
@@ -1171,4 +1177,48 @@ def build_document_system_prompt(user: config.UserContext | None = None) -> str:
 
 # Backward-compatible static prompt string
 DOCUMENT_SYSTEM_PROMPT = build_document_system_prompt(None)
+
+
+def build_document_subagent(user: config.UserContext, model: BaseChatModel) -> dict[str, Any]:
+    """Returns a deepagents `CompiledSubAgent` spec (feature/agentic-upgrade
+    plan) -- same shape/reasoning as email_tools.build_email_subagent.
+    document_agent used to be a plain declarative SubAgent dict (tools/
+    system_prompt frozen at build_orchestrator's start) -- see
+    tools/integration_tools.py's build_integration_subagent docstring for
+    the concrete "artifact created earlier this turn is invisible to a
+    later delegation" bug this fixes (e.g. a document referencing a
+    spreadsheet id another subagent just created this same turn)."""
+
+    async def _run(state: dict[str, Any]) -> dict[str, Any]:
+        messages = list(state["messages"])
+        tools = build_document_tools(user)
+        system_prompt = build_document_system_prompt(user) + reliability.RELIABILITY_GUARDRAIL_STR
+        if config.SCRATCHPAD_AND_SKILLS_ENABLED:
+            tools = tools + build_scratchpad_tools(user, "document_agent")
+            system_prompt = system_prompt + await scratchpad_prompt_block(user)
+        run_config = {"recursion_limit": config.RECURSION_LIMIT}
+        inner_agent = create_agent(
+            model=model,
+            tools=tools,
+            system_prompt=system_prompt,
+            middleware=[
+                ToolFailureLadderMiddleware("generate_contract_pdf"),
+                ToolFailureLadderMiddleware("generate_report_pdf"),
+                ToolFailureLadderMiddleware("generate_pdf"),
+                ToolFailureLadderMiddleware("audit_contract"),
+            ],
+        )
+        final_messages = await run_inner_agent_with_claim_check(
+            inner_agent, messages, run_config, label="document_agent"
+        )
+        return {"messages": [AIMessage(content=last_ai_text(final_messages))]}
+
+    return {
+        "name": "document_agent",
+        "description": (
+            "Generates legally structured contracts (NDAs, consulting agreements, MSAs, SOWs, "
+            "offers) and polished executive reports/briefings as PDFs from structured content."
+        ),
+        "runnable": RunnableLambda(_run),
+    }
 

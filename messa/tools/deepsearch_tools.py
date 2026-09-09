@@ -122,7 +122,7 @@ from langchain_mcp_adapters.tools import load_mcp_tools
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.errors import GraphRecursionError
 
-from .. import config, console, credentials, db, deepsearch_control, live_activity, usage
+from .. import config, console, credentials, db, deepsearch_control, live_activity, reliability, usage
 from ..approval import ApprovalGate
 from ..channels import browserbase, sendblue
 from ..channels.browserbase import BrowserbaseError
@@ -3358,7 +3358,7 @@ def build_deepsearch_subagent(
                             STAGEHAND_SYSTEM_PROMPT + user_identity_prompt
                             if _use_stagehand
                             else DEEPSEARCH_SYSTEM_PROMPT + user_identity_prompt
-                        )
+                        ) + reliability.RELIABILITY_GUARDRAIL_STR
                         # Active Task Scratchpad + Skills Playbook (see
                         # tools/scratchpad_tools.py's own module docstring)
                         # -- this is the flagship use case the feature was

@@ -17,11 +17,75 @@ from __future__ import annotations
 import inspect
 from typing import Any, Callable, Sequence
 
+from langchain_core.messages import HumanMessage
 from langchain_core.tools import BaseTool, StructuredTool, tool as tool_decorator
 
 from .. import console, usage
 from ..approval import ApprovalGate
 from ..config import UserContext
+from ..reliability import unverified_claim_reason
+
+
+async def run_inner_agent_with_claim_check(
+    inner_agent: Any,
+    messages: list[Any],
+    run_config: dict[str, Any],
+    label: str = "subagent",
+) -> list[Any]:
+    """Runs `inner_agent.ainvoke({"messages": messages}, config=run_config)`
+    once; if the NEW messages it produced end in a reply that reads like an
+    unverified completion claim (messa/reliability.py's
+    unverified_claim_reason -- "I've sent it"/"all set"/"booked it" with no
+    successful tool call behind it this delegation), replays with one nudge
+    and re-invokes exactly once. Same bounded-single-retry shape as
+    cli.py's run_turn uses for the orchestrator's own turn, and
+    executive_tools.py's own separate past-due nudge-retry already uses for
+    a different check -- never a second retry, so this can't itself become
+    a loop.
+
+    Returns the FULL final message list either way (the same shape
+    `result["messages"]` always has) -- callers do
+    `last_ai_text(await run_inner_agent_with_claim_check(...))` exactly as
+    they'd do with a plain `(await inner_agent.ainvoke(...))["messages"]`.
+
+    Deliberately passes the FULL accumulated message list (original +
+    everything the first run produced + the nudge) on the retry, not just
+    the nudge alone -- correct regardless of whether `inner_agent` has a
+    checkpointer bound (most of these subagents don't), unlike a
+    checkpointer-dependent "just send the nudge" shape that would silently
+    lose all context for one with no checkpointer."""
+    result = await inner_agent.ainvoke({"messages": messages}, config=run_config)
+    final_messages = result["messages"]
+    new_messages = final_messages[len(messages):]
+
+    any_tool_call = any(getattr(m, "tool_calls", None) for m in new_messages)
+    last_tool_content: Any = None
+    for m in new_messages:
+        if getattr(m, "type", None) == "tool":
+            last_tool_content = getattr(m, "content", None)
+    final_text = ""
+    for m in reversed(new_messages):
+        content = getattr(m, "content", "")
+        if getattr(m, "type", None) == "ai" and content:
+            final_text = content if isinstance(content, str) else str(content)
+            break
+
+    reason = unverified_claim_reason(final_text, any_tool_call, last_tool_content)
+    if not reason:
+        return final_messages
+
+    console.system(f"{label}: {reason} -- retrying once with a nudge.")
+    nudge = HumanMessage(
+        content=(
+            "(auto-check, not from the user: your previous reply claims something is "
+            "done/sent/scheduled, but the tool trace doesn't back that up -- either no "
+            "tool call actually did it, or the most recent one failed. Check the real "
+            "result: if it actually failed, say so plainly instead of claiming success; "
+            "if it should still happen, actually call the tool now.)"
+        )
+    )
+    result2 = await inner_agent.ainvoke({"messages": final_messages + [nudge]}, config=run_config)
+    return result2["messages"]
 
 
 def last_ai_text(messages: list[Any]) -> str:

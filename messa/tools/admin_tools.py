@@ -19,10 +19,18 @@ for why (a large user base can take a while to fan out to).
 """
 from __future__ import annotations
 
+from typing import Any
+
+from langchain.agents import create_agent
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import BaseTool, tool
 
-from .. import config, db
-from .common import trace_all
+from .. import config, db, reliability
+from .common import last_ai_text, run_inner_agent_with_claim_check, trace_all
+from .integration_circuit_breaker import ToolFailureLadderMiddleware
+from .scratchpad_tools import build_scratchpad_tools, scratchpad_prompt_block
 
 LABEL = "admin_agent"
 
@@ -130,3 +138,44 @@ ADMIN_SYSTEM_PROMPT = (
     "doesn't raise the cap itself (that's the MESSA_NEW_USER_CAP environment variable, not "
     "something you can change).\n"
 )
+
+
+def build_admin_subagent(user: config.UserContext, model: BaseChatModel) -> dict[str, Any]:
+    """Returns a deepagents `CompiledSubAgent` spec (feature/agentic-upgrade
+    plan) -- same shape/reasoning as email_tools.build_email_subagent.
+    admin_agent used to be a plain declarative SubAgent dict (tools/
+    system_prompt frozen at build_orchestrator's start) -- see
+    tools/integration_tools.py's build_integration_subagent docstring for
+    the concrete "artifact created earlier this turn is invisible to a
+    later delegation" bug this fixes. Only ever registered for
+    user.is_admin (see agents/registry.py's build_orchestrator) --
+    unchanged by this conversion."""
+
+    async def _run(state: dict[str, Any]) -> dict[str, Any]:
+        messages = list(state["messages"])
+        tools = build_admin_tools(user)
+        system_prompt = ADMIN_SYSTEM_PROMPT + reliability.RELIABILITY_GUARDRAIL_STR
+        if config.SCRATCHPAD_AND_SKILLS_ENABLED:
+            tools = tools + build_scratchpad_tools(user, "admin_agent")
+            system_prompt = system_prompt + await scratchpad_prompt_block(user)
+        run_config = {"recursion_limit": config.RECURSION_LIMIT}
+        inner_agent = create_agent(
+            model=model,
+            tools=tools,
+            system_prompt=system_prompt,
+            middleware=[ToolFailureLadderMiddleware("propose_broadcast_message")],
+        )
+        final_messages = await run_inner_agent_with_claim_check(
+            inner_agent, messages, run_config, label="admin_agent"
+        )
+        return {"messages": [AIMessage(content=last_ai_text(final_messages))]}
+
+    return {
+        "name": "admin_agent",
+        "description": (
+            "Admin-only: broadcast a message to every user (preview -> approval -> "
+            "execute), and manage the new-user waitlist/signup cap. Only reachable "
+            "for admin accounts."
+        ),
+        "runnable": RunnableLambda(_run),
+    }

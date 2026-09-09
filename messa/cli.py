@@ -13,7 +13,7 @@ import traceback
 
 from langchain_core.messages import HumanMessage
 
-from . import background, config, console, db, session_store, usage
+from . import background, config, console, db, reliability, session_store, usage
 from .agents.registry import build_orchestrator
 from .approval import CLIApprovalGate
 from .channels import sendblue
@@ -292,20 +292,36 @@ async def run_turn(
     described in text (e.g. "Checking both now... give me a few"). The
     system prompt tells Messa not to do this, but that's a probabilistic
     steer, not a guarantee, and it does still happen. Rather than rely on
-    the prompt alone, this also catches it structurally: if the WHOLE turn
-    made zero tool calls and the final text matches `_STALL_PATTERN` (the
-    exact acknowledgment phrasing the prompt asks Messa to use right before
-    a delegation), that's a strong signal a call was promised and dropped
-    -- so this replays the same messages plus one nudge and retries
+    the prompt alone, this also catches it structurally, in two distinct
+    shapes (feature/agentic-upgrade generalized this from the original,
+    narrower version -- see messa/reliability.py's own module docstring):
+
+      1. Dropped delegation: the WHOLE turn made zero tool calls and the
+         final text matches `_STALL_PATTERN` (the exact acknowledgment
+         phrasing the prompt asks Messa to use right before a delegation)
+         -- a strong signal a call was promised and dropped.
+      2. Unverified completion claim: the final text reads like "I've sent
+         it"/"all set"/"booked it" (reliability.unverified_claim_reason)
+         but either no tool call happened this turn, or the most recent
+         tool result reads like a failure -- a strong signal Messa is
+         about to tell the user something succeeded when it didn't.
+
+    Either case replays the same messages plus one nudge and retries
     exactly once (`_allow_retry=False` on the recursive call prevents a
-    loop). The original (broken) acknowledgment may have already reached
-    the user via `on_ai_message` before this check runs, which is fine --
-    it was a true statement of intent, just unfinished; the retry's job is
-    making sure the actual delegation (and eventually a real answer)
-    follows it instead of leaving the user's request silently dropped."""
+    loop -- the user's own "empty-promise LOOPS" framing is specifically
+    about never letting this recur/compound, so this is a single bounded
+    correction, not a retry-until-it-looks-right cycle). The original
+    (broken) reply may have already reached the user via `on_ai_message`
+    before this check runs, which is fine for case 1 (it was a true
+    statement of intent, just unfinished) and still the least-bad option
+    for case 2 (the false claim may already be visible, but a follow-up
+    that actually completes the action -- or honestly reports the failure
+    -- is far better than leaving it uncorrected for the rest of the
+    conversation)."""
     final_messages = list(messages)
     any_tool_call = False
     last_text = ""
+    last_tool_content: object = None
     async for chunk in agent.astream(
         {"messages": messages},
         config={"recursion_limit": config.RECURSION_LIMIT},
@@ -319,6 +335,8 @@ async def run_turn(
                 tool_calls = getattr(m, "tool_calls", None) or []
                 if tool_calls:
                     any_tool_call = True
+                if getattr(m, "type", None) == "tool":
+                    last_tool_content = content
                 delegating_to = None
                 for tc in tool_calls:
                     if tc.get("name") == "task":
@@ -336,21 +354,35 @@ async def run_turn(
                         await on_ai_message(text, delegating_to)
                 final_messages.append(m)
 
+    nudge_text = None
     if _allow_retry and not any_tool_call and last_text and _STALL_PATTERN.search(last_text):
         console.system(
             "Messa: this reply looked like a dropped delegation (acknowledgment with no "
             "tool call all turn) -- retrying once with a nudge."
         )
-        nudge = HumanMessage(
-            content=(
-                "(auto-nudge, not from the user: your previous reply didn't include the "
-                "tool call it described. If you intended to delegate to a subagent just "
-                "now, call it in this response. If you'd already fully answered the "
-                "request, ignore this.)"
-            )
+        nudge_text = (
+            "(auto-nudge, not from the user: your previous reply didn't include the "
+            "tool call it described. If you intended to delegate to a subagent just "
+            "now, call it in this response. If you'd already fully answered the "
+            "request, ignore this.)"
         )
+    elif _allow_retry and last_text:
+        claim_reason = reliability.unverified_claim_reason(last_text, any_tool_call, last_tool_content)
+        if claim_reason:
+            console.system(f"Messa: {claim_reason} -- retrying once with a nudge.")
+            nudge_text = (
+                "(auto-check, not from the user: your previous reply claims something is "
+                "done/sent/scheduled, but the tool trace doesn't back that up this turn -- "
+                "either no tool call actually did it, or the most recent one failed. Check "
+                "the real result: if it actually failed, tell the user plainly what went "
+                "wrong instead of claiming success; if it should still happen, actually call "
+                "the tool now.)"
+            )
+
+    if nudge_text:
         return await run_turn(
-            agent, final_messages + [nudge], on_ai_message=on_ai_message, _allow_retry=False
+            agent, final_messages + [HumanMessage(content=nudge_text)],
+            on_ai_message=on_ai_message, _allow_retry=False,
         )
 
     return final_messages

@@ -56,24 +56,22 @@ from typing import Any
 from deepagents import GeneralPurposeSubagentProfile, HarnessProfile, create_deep_agent, register_harness_profile
 from langchain_core.tools import BaseTool, tool
 
-from .. import config, console, db, deepsearch_control, live_activity, memory, timeutil, turn_control
-from langchain.agents.middleware import ModelCallLimitMiddleware
+from .. import config, console, db, deepsearch_control, live_activity, memory, reliability, timeutil, turn_control
 
 from ..approval import ApprovalGate, CLIApprovalGate
 from ..channels import sendblue
 from ..channels.sendblue import SendblueError
-from ..tools.admin_tools import ADMIN_SYSTEM_PROMPT, build_admin_tools
+from ..tools.admin_tools import build_admin_subagent
 from ..tools.deepsearch_tools import build_deepsearch_subagent, count_warm_sessions_for_user, purge_warm_sessions_for_user
 from ..tools.common import trace_all
-from ..tools.document_tools import build_document_system_prompt, build_document_tools
+from ..tools.document_tools import build_document_subagent
 from ..tools import call_tools
 from ..tools.call_tools import build_call_subagent
 from ..tools.email_tools import build_email_subagent
 from ..tools.executive_tools import _format_contact_line, build_executive_subagent
-from ..tools.integration_circuit_breaker import IntegrationRetryLoopMiddleware
-from ..tools.integration_tools import app_category_for_toolkit, build_integration_system_prompt, build_integration_tools
-from ..tools.personal_inbox_tools import build_personal_inbox_system_prompt, build_personal_inbox_tools
-from ..tools.routines_tools import ROUTINES_SYSTEM_PROMPT, build_routines_tools
+from ..tools.integration_tools import app_category_for_toolkit, build_integration_subagent
+from ..tools.personal_inbox_tools import build_personal_inbox_subagent
+from ..tools.routines_tools import build_routines_subagent
 from ..tools.scratchpad_tools import build_scratchpad_tools, scratchpad_prompt_block
 from ..tools.web_search_tools import build_web_search_tools
 
@@ -1102,74 +1100,46 @@ async def build_orchestrator(
             console.system(f"get_app_preference({_category!r}) failed (non-fatal): {e}")
             app_preferences[_category] = "messa"
 
+    # Every subagent below is a deepagents CompiledSubAgent (a "runnable"
+    # closure that builds its OWN tools/system_prompt fresh at actual
+    # delegation time) rather than a plain declarative {"tools":
+    # ..., "system_prompt": ...} dict built once here. This used to be a
+    # split: deepsearch/executive_assistant/email_agent were already
+    # CompiledSubAgents, while personal_inbox_agent/document_agent/
+    # routines_agent/integrations_agent/admin_agent were plain dicts whose
+    # system_prompt (and therefore Active Task Scratchpad `task_block`
+    # below) was frozen the INSTANT this function started -- before any of
+    # THIS turn's own tool calls had run. Concretely: integrations_agent
+    # creates a spreadsheet and saves its id via update_task_scratchpad
+    # mid-turn, Messa then delegates to document_agent or
+    # personal_inbox_agent later in that SAME turn -- that second
+    # delegation's frozen prompt predated the sheet, so the id was
+    # invisible to it (feature/agentic-upgrade plan: "assets vanishing
+    # mid-task"). Converting all five closes that gap by construction --
+    # every subagent now fetches scratchpad_prompt_block(user) fresh
+    # inside its own _run, exactly like deepsearch/executive_assistant/
+    # email_agent always did.
     subagents = [
         build_deepsearch_subagent(user, _subagent_model_for("deepsearch"), approval_gate),
         build_executive_subagent(user, _subagent_model_for("executive_assistant")),
         build_email_subagent(user, _subagent_model_for("email_agent"), approval_gate),
         build_call_subagent(user, _subagent_model_for("call_agent"), approval_gate),
-        {
-            "name": "personal_inbox_agent",
-            "description": (
-                "Manages the user's own Messa email address (a real inbox on Messa's own "
-                "domain, separate from their personal Gmail) -- what it is, sending new "
-                "emails from it, and replying to anything that lands in it."
-            ),
-            "system_prompt": build_personal_inbox_system_prompt(user),
-            "tools": build_personal_inbox_tools(user, approval_gate),
-            "model": _subagent_model_for("personal_inbox_agent"),
-        },
-        {
-            "name": "document_agent",
-            "description": (
-                "Generates legally structured contracts (NDAs, consulting agreements, MSAs, SOWs, "
-                "offers) and polished executive reports/briefings as PDFs from structured content."
-            ),
-            "system_prompt": build_document_system_prompt(user),
-            "tools": build_document_tools(user),
-            "model": _subagent_model_for("document_agent"),
-        },
-        {
-            "name": "routines_agent",
-            "description": (
-                "Sets up, lists, pauses, resumes, cancels, and reschedules task routines -- "
-                "both recurring and one-time, both plain reminders (the user does something) "
-                "and autonomous background tasks (you do something yourself later and report "
-                "back, e.g. watchers, deadline-aware follow-ups, digests). Use for anything "
-                "recurring/scheduled, or anything you're telling the user you'll check on or "
-                "follow up about later."
-            ),
-            "system_prompt": ROUTINES_SYSTEM_PROMPT,
-            "tools": build_routines_tools(user),
-            "model": _subagent_model_for("routines_agent"),
-        },
-        {
-            "name": "integrations_agent",
-            "description": _integrations_agent_description(connected_slugs, app_preferences.get("email", "messa")),
-            "system_prompt": build_integration_system_prompt(user),
-            "tools": build_integration_tools(user, approval_gate),
-            "model": _subagent_model_for("integrations_agent"),
-            # Reliability hardening (docs/smart_autonomous_agent_architecture.md):
-            # integrations_agent had NO retry protection or step budget of any
-            # kind before this -- every other tool's failure just returned a
-            # "don't retry with the exact same arguments" STRING the model
-            # could ignore. ModelCallLimitMiddleware is this subagent's first
-            # real per-delegation step budget, ever, via deepagents' own
-            # supported `middleware` field on a declarative SubAgent dict
-            # (confirmed additive, not a restructuring -- see
-            # deepagents/middleware/subagents.py). IntegrationRetryLoopMiddleware
-            # (tools/integration_circuit_breaker.py) is a generalized,
-            # code-enforced version of that same "don't retry identically"
-            # rule for execute_integration_tool specifically. Fresh instances
-            # every call -- build_orchestrator itself runs fresh every turn
-            # (see cli.py's per-turn call site), so this state never needs to
-            # outlive one turn, same as _summarization in deepsearch_tools.py.
-            "middleware": [
-                ModelCallLimitMiddleware(
-                    run_limit=config.INTEGRATIONS_AGENT_MAX_MODEL_CALLS, exit_behavior="end"
-                ),
-                IntegrationRetryLoopMiddleware(),
-            ],
-        },
+        build_personal_inbox_subagent(user, _subagent_model_for("personal_inbox_agent"), approval_gate),
+        build_document_subagent(user, _subagent_model_for("document_agent")),
+        build_routines_subagent(user, _subagent_model_for("routines_agent")),
+        # integrations_agent's `description` stays computed HERE (not inside
+        # build_integration_subagent) because it's genuinely per-turn dynamic
+        # -- _integrations_agent_description bakes in which apps are
+        # currently connected, from the cheap connected_slugs read just
+        # above; see build_integration_subagent's own docstring for why that
+        # computation can't just move into its _run without either a
+        # redundant DB read there or duplicating this fetch.
+        build_integration_subagent(
+            user,
+            _subagent_model_for("integrations_agent"),
+            _integrations_agent_description(connected_slugs, app_preferences.get("email", "messa")),
+            approval_gate,
+        ),
     ]
 
     # Admin-only, and only ever added here -- a non-admin's subagents list
@@ -1178,40 +1148,28 @@ async def build_orchestrator(
     # unadvertised user.is_admin flag usage.py already gates the metering
     # bypass on.
     if user.is_admin:
-        subagents.append({
-            "name": "admin_agent",
-            "description": (
-                "Admin-only: broadcast a message to every user (preview -> approval -> "
-                "execute), and manage the new-user waitlist/signup cap. Only reachable "
-                "for admin accounts."
-            ),
-            "system_prompt": ADMIN_SYSTEM_PROMPT,
-            "tools": build_admin_tools(user),
-            "model": _subagent_model_for("admin_agent"),
-        })
+        subagents.append(build_admin_subagent(user, _subagent_model_for("admin_agent")))
 
     # Active Task Scratchpad + Skills Playbook (docs/autonomous_
-    # integrations_and_task_memory_spec.md) -- attached generically here,
-    # AFTER every declarative subagent dict above (including the
-    # admin-only one) has been assembled, rather than each subagent module
-    # wiring this up for itself. Only mutates dict-shaped subagents that
-    # actually carry their own "tools"/"system_prompt" keys -- the three
-    # CompiledSubAgent entries (deepsearch, executive_assistant,
-    # email_agent) instead carry a "runnable" closure that builds ITS OWN
-    # tools/prompt fresh on every delegation, so they attach this same
-    # helper themselves, inside that closure (see deepsearch_tools.py's
-    # build_deepsearch_subagent, executive_tools.py's
-    # build_executive_subagent, email_tools.py's build_email_subagent).
+    # integrations_and_task_memory_spec.md) for the ORCHESTRATOR's own
+    # prompt/tools only -- every subagent above now attaches this same
+    # helper itself, fresh, inside its own _run closure (see each
+    # build_X_subagent's own module for its call site), so there is no
+    # generic post-hoc injection loop over `subagents` here anymore.
     orchestrator_tools = build_orchestrator_tools(user)
-    orchestrator_system_prompt = _build_system_prompt(user, connected_slugs, app_preferences)
+    # RELIABILITY_GUARDRAIL_STR (messa/reliability.py, feature/agentic-upgrade
+    # plan): "never claim an unconfirmed action succeeded, never relay raw
+    # tool/API error text" -- the persona-level half of the empty-promise/
+    # plumbing-leak guardrail (see cli.py's run_turn and every subagent's
+    # own _run for the structural, code-enforced half). Unconditional, not
+    # gated on SCRATCHPAD_AND_SKILLS_ENABLED -- this is an independent rule,
+    # not part of the Active Task Scratchpad feature.
+    orchestrator_system_prompt = (
+        _build_system_prompt(user, connected_slugs, app_preferences) + reliability.RELIABILITY_GUARDRAIL_STR
+    )
     if config.SCRATCHPAD_AND_SKILLS_ENABLED:
-        task_block = await scratchpad_prompt_block(user)
         orchestrator_tools = orchestrator_tools + build_scratchpad_tools(user, "messa_orchestrator", approval_gate)
-        orchestrator_system_prompt = orchestrator_system_prompt + task_block
-        for sub in subagents:
-            if "tools" in sub and "system_prompt" in sub:
-                sub["tools"] = sub["tools"] + build_scratchpad_tools(user, sub["name"], approval_gate)
-                sub["system_prompt"] = sub["system_prompt"] + task_block
+        orchestrator_system_prompt = orchestrator_system_prompt + await scratchpad_prompt_block(user)
 
     agent = create_deep_agent(
         model=model,

@@ -1491,15 +1491,22 @@ INTEGRATIONS_AGENT_MAX_MODEL_CALLS = int(
     os.environ.get("MESSA_INTEGRATIONS_AGENT_MAX_MODEL_CALLS", "25")
 )
 
-# tools/integration_circuit_breaker.py's IntegrationRetryLoopMiddleware --
-# how many times execute_integration_tool may fail with the EXACT SAME
-# (slug, arguments) before that identical call is short-circuited without
-# reaching Composio again. 2, not 1: a single failure is often a real
-# transient (a brief rate limit, a momentary auth hiccup), so this allows
-# one natural retry before treating repetition as a loop rather than
-# tripping on the very first bump.
-INTEGRATION_RETRY_LOOP_MAX_IDENTICAL_ATTEMPTS = int(
-    os.environ.get("MESSA_INTEGRATION_RETRY_LOOP_MAX_IDENTICAL_ATTEMPTS", "2")
+# tools/integration_circuit_breaker.py's ToolFailureLadderMiddleware -- the
+# "Rule of 3" self-healing ladder (feature/agentic-upgrade plan, replacing
+# the old IntegrationRetryLoopMiddleware's per-(slug, EXACT SAME arguments)
+# counter). That old counter completely missed the original incident's
+# actual shape: 15+ failed calls against the same Google Sheets slug, but
+# almost every one with DIFFERENT (wrong) arguments -- never identical, so
+# it never tripped. This is keyed on the tool name alone (e.g. a Composio
+# slug) regardless of arguments: 3 failures on the SAME tool, in ANY
+# combination of arguments, blocks a 4th attempt at that tool for the rest
+# of the delegation. 3, not lower: a single failure is often a real
+# transient (rate limit, momentary auth hiccup) and a second is often a
+# legitimate correction attempt after reading the error -- this is meant to
+# stop a THIRD blind guess, not punish an agent still reasonably
+# course-correcting.
+TOOL_FAILURE_LADDER_MAX_ATTEMPTS = int(
+    os.environ.get("MESSA_TOOL_FAILURE_LADDER_MAX_ATTEMPTS", "3")
 )
 
 # agent-feedback.md item 3 -- deepsearch's send_screenshot tool. This is the

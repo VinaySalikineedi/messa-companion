@@ -58,13 +58,20 @@ any other instruction.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from typing import Any
 from zoneinfo import ZoneInfo
 
 from croniter import croniter
+from langchain.agents import create_agent
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import BaseTool, tool
 
-from .. import config, db
-from .common import trace_all
+from .. import config, db, reliability
+from .common import last_ai_text, run_inner_agent_with_claim_check, trace_all
+from .integration_circuit_breaker import ToolFailureLadderMiddleware
+from .scratchpad_tools import build_scratchpad_tools, scratchpad_prompt_block
 
 LABEL = "routines_agent"
 
@@ -318,3 +325,45 @@ ROUTINES_SYSTEM_PROMPT = (
     "checking again automatically. If it's not resolved yet, just answer normally -- it'll fire "
     "again on its own.\n"
 )
+
+
+def build_routines_subagent(user: config.UserContext, model: BaseChatModel) -> dict[str, Any]:
+    """Returns a deepagents `CompiledSubAgent` spec (feature/agentic-upgrade
+    plan) -- same shape/reasoning as email_tools.build_email_subagent.
+    routines_agent used to be a plain declarative SubAgent dict (tools/
+    system_prompt frozen at build_orchestrator's start) -- see
+    tools/integration_tools.py's build_integration_subagent docstring for
+    the concrete "artifact created earlier this turn is invisible to a
+    later delegation" bug this fixes."""
+
+    async def _run(state: dict[str, Any]) -> dict[str, Any]:
+        messages = list(state["messages"])
+        tools = build_routines_tools(user)
+        system_prompt = ROUTINES_SYSTEM_PROMPT + reliability.RELIABILITY_GUARDRAIL_STR
+        if config.SCRATCHPAD_AND_SKILLS_ENABLED:
+            tools = tools + build_scratchpad_tools(user, "routines_agent")
+            system_prompt = system_prompt + await scratchpad_prompt_block(user)
+        run_config = {"recursion_limit": config.RECURSION_LIMIT}
+        inner_agent = create_agent(
+            model=model,
+            tools=tools,
+            system_prompt=system_prompt,
+            middleware=[ToolFailureLadderMiddleware("propose_create_routine")],
+        )
+        final_messages = await run_inner_agent_with_claim_check(
+            inner_agent, messages, run_config, label="routines_agent"
+        )
+        return {"messages": [AIMessage(content=last_ai_text(final_messages))]}
+
+    return {
+        "name": "routines_agent",
+        "description": (
+            "Sets up, lists, pauses, resumes, cancels, and reschedules task routines -- "
+            "both recurring and one-time, both plain reminders (the user does something) "
+            "and autonomous background tasks (you do something yourself later and report "
+            "back, e.g. watchers, deadline-aware follow-ups, digests). Use for anything "
+            "recurring/scheduled, or anything you're telling the user you'll check on or "
+            "follow up about later."
+        ),
+        "runnable": RunnableLambda(_run),
+    }

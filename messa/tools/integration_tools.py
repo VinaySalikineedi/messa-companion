@@ -92,12 +92,20 @@ import asyncio
 import json
 from typing import Any, Callable
 
+from langchain.agents import create_agent
+from langchain.agents.middleware import ModelCallLimitMiddleware
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import BaseTool, tool
 
-from .. import config, console, db, usage
+from .. import config, console, db, reliability, usage
 from ..approval import ApprovalGate
 from ..channels.sendblue import SendblueError, send_message
-from .common import trace_tool
+from .common import last_ai_text, run_inner_agent_with_claim_check, trace_tool
+from .integration_circuit_breaker import ToolFailureLadderMiddleware, integration_slug_identity
+from .scratchpad_tools import build_scratchpad_tools, scratchpad_prompt_block
+from .web_search_tools import build_web_search_tools
 
 LABEL = "integrations_agent"
 
@@ -809,6 +817,14 @@ def build_integration_tools(
             return _always_destructive
         return None
 
+    # search_web/read_webpage (feature/agentic-upgrade, part of the "Rule of
+    # 3" self-healing ladder -- see integration_circuit_breaker.py's module
+    # docstring): tier 2/3 of that ladder tell the model to look up the real
+    # parameter format before a third guess, which was previously an empty
+    # suggestion -- integrations_agent had no doc-lookup tool of any kind.
+    # Reuses the SAME function the orchestrator's own build_orchestrator
+    # already calls (registry.py) -- already traced/labeled internally by
+    # build_web_search_tools itself, so no double-wrapping here.
     return [
         trace_tool(
             t, LABEL,
@@ -816,7 +832,7 @@ def build_integration_tools(
             approval_gate=approval_gate,
         )
         for t in raw_tools
-    ]
+    ] + build_web_search_tools()
 
 
 def build_integration_system_prompt(user: config.UserContext) -> str:
@@ -868,6 +884,89 @@ def build_integration_system_prompt(user: config.UserContext) -> str:
         "but it can also just mean this phrasing or toolkit scope didn't hit. If you're fairly "
         "confident the app should exist, try again (a different phrasing, or without the "
         "toolkit filter) before concluding it's unsupported and reporting that back to Messa.\n"
+        "- If execute_integration_tool fails, don't just guess a different argument shape and "
+        "try again blindly: call describe_integration_tool(slug) for the real parameter schema, "
+        "search_skills(toolkit) for a lesson someone already learned, or search_web(...)/"
+        "read_webpage(...) to look up the app's real API docs -- in that order of preference. "
+        "Repeated failures on the same slug get blocked after a few attempts specifically to "
+        "force this instead of a fourth blind guess; when that happens, stop and tell the user "
+        "plainly what's blocking this rather than trying again or claiming it worked.\n"
         "Be concise in what you report back -- Messa relays your summary as a text message, not "
         "your raw tool output.\n"
     )
+
+
+def build_integration_subagent(
+    user: config.UserContext,
+    model: BaseChatModel,
+    description: str,
+    approval_gate: ApprovalGate | None = None,
+) -> dict[str, Any]:
+    """Returns a deepagents `CompiledSubAgent` spec (feature/agentic-upgrade
+    plan) -- same shape and same reasoning as executive_tools.py's
+    build_executive_subagent / email_tools.py's build_email_subagent.
+    integrations_agent used to be registered as a plain declarative
+    `SubAgent` dict straight in agents/registry.py, which meant its
+    system_prompt (and therefore its Active Task Scratchpad `task_block`,
+    see tools/scratchpad_tools.py) was built ONCE, at build_orchestrator's
+    start, before the turn's own tool calls run. Concretely: if this exact
+    subagent creates a spreadsheet and saves its id via
+    update_task_scratchpad, then Messa delegates to it (or a different
+    subagent) again LATER IN THE SAME TURN, that later delegation's frozen
+    prompt predates the write -- the id is invisible to it. Wrapping this
+    as a CompiledSubAgent (which builds its tools/prompt fresh inside its
+    own `_run`, at actual delegation time) fixes that, matching
+    deepsearch/executive_assistant/email_agent's existing behavior exactly.
+
+    Also carries this subagent's own step budget and "Rule of 3" tool-
+    failure ladder (see tools/integration_circuit_breaker.py's module
+    docstring) as middleware on its OWN inner create_agent call, moved here
+    from registry.py's old declarative "middleware": [...] key (deepagents'
+    `middleware=` kwarg on create_agent works identically either way --
+    confirmed additive, not a restructuring).
+
+    `description` is passed in (rather than hardcoded here, unlike the
+    other CompiledSubAgent builders) because it's genuinely dynamic per
+    turn: registry.py's `_integrations_agent_description(connected_slugs,
+    ...)` bakes in which apps are currently connected, computed once in
+    build_orchestrator from a cheap local DB read -- moving that
+    computation in here would mean either a DB read inside every _run
+    (redundant, and this one specifically needs to stay fast per its own
+    docstring) or duplicating build_orchestrator's connected_slugs fetch."""
+
+    async def _run(state: dict[str, Any]) -> dict[str, Any]:
+        messages = list(state["messages"])
+        tools = build_integration_tools(user, approval_gate)
+        system_prompt = build_integration_system_prompt(user) + reliability.RELIABILITY_GUARDRAIL_STR
+        if config.SCRATCHPAD_AND_SKILLS_ENABLED:
+            tools = tools + build_scratchpad_tools(user, "integrations_agent", approval_gate)
+            system_prompt = system_prompt + await scratchpad_prompt_block(user)
+        run_config = {"recursion_limit": config.RECURSION_LIMIT}
+        inner_agent = create_agent(
+            model=model,
+            tools=tools,
+            system_prompt=system_prompt,
+            middleware=[
+                ModelCallLimitMiddleware(
+                    run_limit=config.INTEGRATIONS_AGENT_MAX_MODEL_CALLS, exit_behavior="end"
+                ),
+                ToolFailureLadderMiddleware(
+                    "execute_integration_tool",
+                    identity_fn=integration_slug_identity,
+                    lookup_hint=(
+                        "call describe_integration_tool(slug), search_skills(toolkit), or "
+                        "search_web(...)/read_webpage(...) for the real parameter format"
+                    ),
+                ),
+            ],
+        )
+        final_messages = await run_inner_agent_with_claim_check(
+            inner_agent, messages, run_config, label="integrations_agent"
+        )
+        return {"messages": [AIMessage(content=last_ai_text(final_messages))]}
+
+    return {
+        "name": "integrations_agent",
+        "description": description,
+        "runnable": RunnableLambda(_run),
+    }

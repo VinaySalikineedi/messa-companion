@@ -80,13 +80,20 @@ autonomous reply costs nothing and sends nothing.
 from __future__ import annotations
 
 import re
+from typing import Any
 
+from langchain.agents import create_agent
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import BaseTool, tool
 
-from .. import config, db, timeutil
+from .. import config, db, reliability, timeutil
 from ..approval import ApprovalGate
 from ..channels.resend import ResendError, send_email as resend_send_email
-from .common import trace_tool
+from .common import last_ai_text, run_inner_agent_with_claim_check, trace_tool
+from .integration_circuit_breaker import ToolFailureLadderMiddleware
+from .scratchpad_tools import build_scratchpad_tools, scratchpad_prompt_block
 
 LABEL = "personal_inbox_agent"
 _DESTRUCTIVE = {"send_email", "reply_to_email"}
@@ -407,3 +414,53 @@ def build_personal_inbox_system_prompt(user: config.UserContext) -> str:
         "- If a tool says Resend/the domain isn't configured yet, relay that plainly instead "
         "of pretending it worked.\n"
     )
+
+
+def build_personal_inbox_subagent(
+    user: config.UserContext,
+    model: BaseChatModel,
+    approval_gate: ApprovalGate | None = None,
+) -> dict[str, Any]:
+    """Returns a deepagents `CompiledSubAgent` spec (feature/agentic-upgrade
+    plan) -- same shape and reasoning as email_tools.build_email_subagent.
+    personal_inbox_agent used to be a plain declarative SubAgent dict
+    (tools/system_prompt built once, at build_orchestrator's start, before
+    the turn's own tool calls run) -- see
+    tools/integration_tools.py's build_integration_subagent docstring for
+    the concrete "artifact created earlier this turn is invisible to a
+    later delegation" bug this fixes."""
+
+    async def _run(state: dict[str, Any]) -> dict[str, Any]:
+        messages = list(state["messages"])
+        tools = build_personal_inbox_tools(user, approval_gate)
+        system_prompt = build_personal_inbox_system_prompt(user) + reliability.RELIABILITY_GUARDRAIL_STR
+        if config.SCRATCHPAD_AND_SKILLS_ENABLED:
+            tools = tools + build_scratchpad_tools(user, "personal_inbox_agent", approval_gate)
+            system_prompt = system_prompt + await scratchpad_prompt_block(user)
+        run_config = {"recursion_limit": config.RECURSION_LIMIT}
+        inner_agent = create_agent(
+            model=model,
+            tools=tools,
+            system_prompt=system_prompt,
+            # "Rule of 3" self-healing (tools/integration_circuit_breaker.py)
+            # for this subagent's two real send actions -- it had zero retry
+            # protection of any kind before this, same as email_agent.
+            middleware=[
+                ToolFailureLadderMiddleware("send_email"),
+                ToolFailureLadderMiddleware("reply_to_email"),
+            ],
+        )
+        final_messages = await run_inner_agent_with_claim_check(
+            inner_agent, messages, run_config, label="personal_inbox_agent"
+        )
+        return {"messages": [AIMessage(content=last_ai_text(final_messages))]}
+
+    return {
+        "name": "personal_inbox_agent",
+        "description": (
+            "Manages the user's own Messa email address (a real inbox on Messa's own "
+            "domain, separate from their personal Gmail) -- what it is, sending new "
+            "emails from it, and replying to anything that lands in it."
+        ),
+        "runnable": RunnableLambda(_run),
+    }

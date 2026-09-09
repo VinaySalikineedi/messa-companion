@@ -577,20 +577,45 @@ async def part8_feature_flag_kill_switch():
 # ---------------------------------------------------------------------------
 
 def part9_wiring_present():
+    # feature/agentic-upgrade converted the five subagents that used to be
+    # plain "tools"/"system_prompt" dicts (personal_inbox_agent,
+    # document_agent, routines_agent, integrations_agent, admin_agent) into
+    # CompiledSubAgents that build their own tools/prompt fresh per
+    # delegation, same shape email_agent/executive_assistant/deepsearch
+    # already used -- see tools/integration_tools.py's
+    # build_integration_subagent docstring for exactly why (a mid-turn
+    # artifact write by an earlier delegation was invisible to a LATER
+    # delegation's frozen prompt under the old shape). registry.py's old
+    # generic post-hoc "for sub in subagents: if 'tools' in sub..."
+    # injection loop is gone as a result -- every subagent now attaches
+    # scratchpad_prompt_block itself, so there's nothing left for
+    # registry.py to inject into any subagent dict.
     registry_src = (REPO_ROOT / "messa" / "agents" / "registry.py").read_text()
     check("registry.py imports build_scratchpad_tools/scratchpad_prompt_block", "from ..tools.scratchpad_tools import build_scratchpad_tools, scratchpad_prompt_block" in registry_src)
-    check("registry.py gates the whole injection on config.SCRATCHPAD_AND_SKILLS_ENABLED", "if config.SCRATCHPAD_AND_SKILLS_ENABLED:" in registry_src)
+    check("registry.py gates the ORCHESTRATOR's own injection on config.SCRATCHPAD_AND_SKILLS_ENABLED", "if config.SCRATCHPAD_AND_SKILLS_ENABLED:" in registry_src)
     check(
-        "registry.py only mutates subagents that actually carry tools+system_prompt keys "
-        "(skipping the three CompiledSubAgent entries, which carry 'runnable' instead)",
-        '"tools" in sub and "system_prompt" in sub' in registry_src,
+        "registry.py's old generic per-subagent-dict injection loop is gone now that every "
+        "subagent is a CompiledSubAgent handling this itself",
+        '"tools" in sub and "system_prompt" in sub' not in registry_src,
     )
     check("registry.py attaches scratchpad tools to the orchestrator's OWN tools too, not just subagents", 'build_scratchpad_tools(user, "messa_orchestrator"' in registry_src)
+    check(
+        "registry.py registers all five formerly-dict subagents via their own build_X_subagent",
+        all(
+            f"build_{name}_subagent(" in registry_src
+            for name in ("personal_inbox", "document", "routines", "integration", "admin")
+        ),
+    )
 
     for path, agent_type in [
         (REPO_ROOT / "messa" / "tools" / "email_tools.py", "email_agent"),
         (REPO_ROOT / "messa" / "tools" / "executive_tools.py", "executive_assistant"),
         (REPO_ROOT / "messa" / "tools" / "deepsearch_tools.py", "deepsearch"),
+        (REPO_ROOT / "messa" / "tools" / "personal_inbox_tools.py", "personal_inbox_agent"),
+        (REPO_ROOT / "messa" / "tools" / "document_tools.py", "document_agent"),
+        (REPO_ROOT / "messa" / "tools" / "routines_tools.py", "routines_agent"),
+        (REPO_ROOT / "messa" / "tools" / "integration_tools.py", "integrations_agent"),
+        (REPO_ROOT / "messa" / "tools" / "admin_tools.py", "admin_agent"),
     ]:
         src = path.read_text()
         check(f"{path.name} imports build_scratchpad_tools", "from .scratchpad_tools import build_scratchpad_tools" in src)

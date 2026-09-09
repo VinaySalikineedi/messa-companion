@@ -37,7 +37,7 @@ from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import BaseTool, tool
 from langgraph.checkpoint.memory import MemorySaver
 
-from .. import config, db, timeutil
+from .. import config, console, db, reliability, timeutil
 from ..config import UserContext
 from .common import last_ai_text, trace_all
 from .scratchpad_tools import build_scratchpad_tools, scratchpad_prompt_block
@@ -378,7 +378,7 @@ def build_executive_subagent(user: UserContext, model: BaseChatModel) -> dict[st
         messages = list(state["messages"])
         written: list[tuple[str, datetime]] = []
         tools = build_executive_tools(user, written)
-        system_prompt = _build_system_prompt(user)
+        system_prompt = _build_system_prompt(user) + reliability.RELIABILITY_GUARDRAIL_STR
         # Active Task Scratchpad + Skills Playbook -- see tools/
         # scratchpad_tools.py's own module docstring. Attached here (built
         # fresh on every delegation, same as `tools`/`system_prompt` above)
@@ -407,6 +407,41 @@ def build_executive_subagent(user: UserContext, model: BaseChatModel) -> dict[st
             written.clear()
             nudge = HumanMessage(content=f"(auto-check, not from the user: {issue})")
             result = await inner_agent.ainvoke({"messages": [nudge]}, config=run_config)
+            final_messages = result["messages"]
+
+        # Empty-promise/unverified-claim guardrail (feature/agentic-upgrade)
+        # -- the same check every other subagent's _run now runs (see
+        # tools/common.py's run_inner_agent_with_claim_check), but done
+        # inline here rather than via that shared helper: this subagent's
+        # inner_agent is checkpointed (MemorySaver + a stable per-user
+        # thread_id), so a retry only needs to send the nudge ALONE -- the
+        # checkpoint already carries the full prior state, same convention
+        # the past-due retry just above already uses. Every OTHER
+        # subagent's inner_agent has no checkpointer, so that shared helper
+        # replays the full accumulated message list instead (see its own
+        # docstring for why passing only a nudge there would silently lose
+        # context).
+        new_messages = final_messages[len(messages):]
+        any_tool_call = any(getattr(m, "tool_calls", None) for m in new_messages)
+        last_tool_content: Any = None
+        for m in new_messages:
+            if getattr(m, "type", None) == "tool":
+                last_tool_content = getattr(m, "content", None)
+        claim_reason = reliability.unverified_claim_reason(
+            last_ai_text(final_messages), any_tool_call, last_tool_content
+        )
+        if claim_reason:
+            console.system(f"executive_assistant: {claim_reason} -- retrying once with a nudge.")
+            claim_nudge = HumanMessage(
+                content=(
+                    "(auto-check, not from the user: your previous reply claims something is "
+                    "done/sent/scheduled, but the tool trace doesn't back that up -- either no "
+                    "tool call actually did it, or the most recent one failed. Check the real "
+                    "result: if it actually failed, say so plainly instead of claiming success; "
+                    "if it should still happen, actually call the tool now.)"
+                )
+            )
+            result = await inner_agent.ainvoke({"messages": [claim_nudge]}, config=run_config)
             final_messages = result["messages"]
 
         return {"messages": [AIMessage(content=last_ai_text(final_messages))]}

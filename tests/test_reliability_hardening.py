@@ -38,7 +38,7 @@ if not (REPO_ROOT / ".env").exists():
 
 from langchain_core.messages import ToolMessage  # noqa: E402
 
-from messa import config, db  # noqa: E402
+from messa import config, db, reliability  # noqa: E402
 from messa.approval import AutoApproveGate  # noqa: E402
 from messa.tools import browser_circuit_breaker  # noqa: E402
 from messa.tools import integration_circuit_breaker  # noqa: E402
@@ -258,12 +258,22 @@ def part2_breaker_only_attached_for_stagehand_engine():
 
 
 # ---------------------------------------------------------------------------
-# Part 3: IntegrationRetryLoopMiddleware -- the equivalent breaker (plus
-# save_skill nudge) for integrations_agent.
+# Part 3: ToolFailureLadderMiddleware -- the generalized "Rule of 3"
+# self-healing ladder (feature/agentic-upgrade), replacing the old
+# IntegrationRetryLoopMiddleware's per-(slug, IDENTICAL arguments) counter.
+# The key behavior change under test here: three failures against the SAME
+# slug, in ANY combination of arguments (not just identical repeats), now
+# blocks a fourth attempt -- the actual fix for the original incident (15+
+# failed calls, almost all with DIFFERENT malformed argument shapes, which
+# the old identical-args-only counter completely missed).
 # ---------------------------------------------------------------------------
 
 async def part3_integration_retry_loop_and_nudge():
-    mw = integration_circuit_breaker.IntegrationRetryLoopMiddleware(max_identical_attempts=2)
+    mw = integration_circuit_breaker.ToolFailureLadderMiddleware(
+        "execute_integration_tool",
+        identity_fn=integration_circuit_breaker.integration_slug_identity,
+        max_attempts=3,
+    )
     handler_calls = []
 
     async def handler(request):
@@ -277,21 +287,36 @@ async def part3_integration_retry_loop_and_nudge():
     slug = "TODOIST_CREATE_TASK"
     fail_req = _FakeRequest("execute_integration_tool", {"slug": slug, "arguments": {"mode": "fail"}})
 
-    await mw.awrap_tool_call(fail_req, handler)
-    check("1st identical failure reaches the handler", len(handler_calls) == 1)
-    await mw.awrap_tool_call(fail_req, handler)
-    check("2nd identical failure (at max_identical_attempts) still reaches the handler", len(handler_calls) == 2)
-    r3 = await mw.awrap_tool_call(fail_req, handler)
-    check("3rd identical call is short-circuited before reaching the handler", len(handler_calls) == 2)
-    check("the short-circuit result tells the model not to retry identically", "BLOCKED" in r3.content)
+    r1 = await mw.awrap_tool_call(fail_req, handler)
+    check("1st failure reaches the handler", len(handler_calls) == 1)
+    check("1st failure's hint suggests checking the schema/skills before retrying", "search_skills" in r1.content)
 
     diff_args_req = _FakeRequest("execute_integration_tool", {"slug": slug, "arguments": {"mode": "fail", "extra": 1}})
-    await mw.awrap_tool_call(diff_args_req, handler)
-    check("different arguments for the same slug are never short-circuited", len(handler_calls) == 3)
+    r2 = await mw.awrap_tool_call(diff_args_req, handler)
+    check(
+        "a 2nd failure with DIFFERENT arguments on the same slug still counts toward the tally "
+        "(the actual fix -- the old identical-args-only counter never tripped on this)",
+        len(handler_calls) == 2,
+    )
+    check("2nd failure's hint is firmer and mentions looking something up before a 3rd guess", "BEFORE trying" in r2.content)
 
-    success_req = _FakeRequest("execute_integration_tool", {"slug": slug, "arguments": {"mode": "ok"}})
+    another_diff_args_req = _FakeRequest(
+        "execute_integration_tool", {"slug": slug, "arguments": {"mode": "fail", "totally": "different"}}
+    )
+    r3 = await mw.awrap_tool_call(another_diff_args_req, handler)
+    check("3rd failure (still different arguments) still reaches the handler", len(handler_calls) == 3)
+    check("3rd failure's message says this tool is now blocked for the rest of the task", "BLOCKED" in r3.content)
+
+    fourth_req = _FakeRequest("execute_integration_tool", {"slug": slug, "arguments": {"yet": "another"}})
+    r4 = await mw.awrap_tool_call(fourth_req, handler)
+    check("4th attempt at the same slug is short-circuited before reaching the handler", len(handler_calls) == 3)
+    check("the short-circuit result tells the model to stop, not to keep guessing", "BLOCKED" in r4.content)
+
+    success_slug = "TODOIST_LIST_TASKS"
+    fail_once_req = _FakeRequest("execute_integration_tool", {"slug": success_slug, "arguments": {"mode": "fail"}})
+    await mw.awrap_tool_call(fail_once_req, handler)
+    success_req = _FakeRequest("execute_integration_tool", {"slug": success_slug, "arguments": {"mode": "ok"}})
     r5 = await mw.awrap_tool_call(success_req, handler)
-    check("a success reaches the handler normally", len(handler_calls) == 4)
     check(
         "a success for a slug that failed earlier in this task gets a save_skill nudge appended",
         "save_skill" in r5.content,
@@ -303,7 +328,7 @@ async def part3_integration_retry_loop_and_nudge():
 
 
 async def part3_retry_loop_ignores_unrelated_tools():
-    mw = integration_circuit_breaker.IntegrationRetryLoopMiddleware(max_identical_attempts=1)
+    mw = integration_circuit_breaker.ToolFailureLadderMiddleware("execute_integration_tool", max_attempts=1)
 
     async def handler(request):
         return ToolMessage(content="fine", tool_call_id=request.tool_call["id"])
@@ -315,22 +340,35 @@ async def part3_retry_loop_ignores_unrelated_tools():
 
 
 def part3_registry_wiring():
-    src = (REPO_ROOT / "messa" / "agents" / "registry.py").read_text()
-    check("registry.py imports ModelCallLimitMiddleware", "from langchain.agents.middleware import ModelCallLimitMiddleware" in src)
+    # The step-budget/ladder middleware moved OFF registry.py's declarative
+    # subagent dict and onto integration_tools.py's own build_integration_
+    # subagent (feature/agentic-upgrade's CompiledSubAgent conversion --
+    # see that function's own docstring for why) -- these checks moved
+    # with it.
+    src = (REPO_ROOT / "messa" / "tools" / "integration_tools.py").read_text()
     check(
-        "registry.py imports IntegrationRetryLoopMiddleware",
-        "from ..tools.integration_circuit_breaker import IntegrationRetryLoopMiddleware" in src,
-    )
-    integrations_start = src.index('"name": "integrations_agent"')
-    integrations_block = src[integrations_start:integrations_start + 2500]
-    check(
-        "integrations_agent's dict carries a real ModelCallLimitMiddleware step budget",
-        "ModelCallLimitMiddleware(" in integrations_block
-        and "run_limit=config.INTEGRATIONS_AGENT_MAX_MODEL_CALLS" in integrations_block,
+        "integration_tools.py imports ModelCallLimitMiddleware",
+        "from langchain.agents.middleware import ModelCallLimitMiddleware" in src,
     )
     check(
-        "integrations_agent's dict carries IntegrationRetryLoopMiddleware",
-        "IntegrationRetryLoopMiddleware()" in integrations_block,
+        "integration_tools.py imports ToolFailureLadderMiddleware",
+        "from .integration_circuit_breaker import ToolFailureLadderMiddleware" in src,
+    )
+    subagent_start = src.index("def build_integration_subagent")
+    subagent_block = src[subagent_start:subagent_start + 4500]
+    check(
+        "build_integration_subagent's inner agent carries a real ModelCallLimitMiddleware step budget",
+        "ModelCallLimitMiddleware(" in subagent_block
+        and "run_limit=config.INTEGRATIONS_AGENT_MAX_MODEL_CALLS" in subagent_block,
+    )
+    check(
+        "build_integration_subagent's inner agent carries ToolFailureLadderMiddleware",
+        "ToolFailureLadderMiddleware(" in subagent_block,
+    )
+    registry_src = (REPO_ROOT / "messa" / "agents" / "registry.py").read_text()
+    check(
+        "registry.py registers integrations_agent via build_integration_subagent, not a bare dict",
+        "build_integration_subagent(" in registry_src,
     )
 
 
@@ -440,6 +478,57 @@ async def part4_execute_integration_tool_self_healing():
         config.SCRATCHPAD_AND_SKILLS_ENABLED = orig_flag
 
 
+# ---------------------------------------------------------------------------
+# Part 5: messa/reliability.py -- the shared empty-promise/unverified-claim
+# detector used by cli.py's run_turn and every subagent's own _run
+# (feature/agentic-upgrade). False-positive safety matters as much as
+# detection here (same tradeoff cli.py's own pre-existing _STALL_PATTERN
+# already accepts) -- an ordinary reply must never get flagged.
+# ---------------------------------------------------------------------------
+
+def part5_looks_like_tool_failure():
+    check("an ERROR running string is a failure", reliability.looks_like_tool_failure("ERROR running 'x': boom"))
+    check("a BLOCKED string is a failure", reliability.looks_like_tool_failure("BLOCKED: already failed twice"))
+    check("a '<slug>' failed: string is a failure", reliability.looks_like_tool_failure("'TODOIST_X' failed: 400"))
+    check("a not-connected string is a failure", reliability.looks_like_tool_failure("Gmail isn't connected yet"))
+    check("a plain success string is not a failure", not reliability.looks_like_tool_failure("Sent email to sam@x.com"))
+    check("a non-string content is never a failure", not reliability.looks_like_tool_failure(None))
+    check("an empty string is never a failure", not reliability.looks_like_tool_failure(""))
+
+
+def part5_unverified_claim_reason():
+    check(
+        "a done-claim with zero tool calls is flagged",
+        reliability.unverified_claim_reason("I've sent the email to Sam.", any_tool_call=False, last_tool_content=None)
+        is not None,
+    )
+    check(
+        "a done-claim after a failed tool call is flagged",
+        reliability.unverified_claim_reason(
+            "All set, it's booked!", any_tool_call=True, last_tool_content="'BOOK_X' failed: no availability"
+        )
+        is not None,
+    )
+    check(
+        "a done-claim backed by a real successful tool call is NEVER flagged",
+        reliability.unverified_claim_reason(
+            "I've sent that over to Sam.", any_tool_call=True, last_tool_content="Sent email to sam@x.com"
+        )
+        is None,
+    )
+    check(
+        "an ordinary non-claim reply is never flagged, even with zero tool calls",
+        reliability.unverified_claim_reason(
+            "Sure -- what time works best for you?", any_tool_call=False, last_tool_content=None
+        )
+        is None,
+    )
+    check(
+        "an empty reply is never flagged",
+        reliability.unverified_claim_reason("", any_tool_call=False, last_tool_content=None) is None,
+    )
+
+
 async def main() -> None:
     await part1_close_browser_blocked_during_otp_wait()
     part1_request_human_help_shares_the_same_gate()
@@ -452,6 +541,8 @@ async def main() -> None:
     part3_registry_wiring()
     await part4_describe_integration_tool()
     await part4_execute_integration_tool_self_healing()
+    part5_looks_like_tool_failure()
+    part5_unverified_claim_reason()
 
     if failures:
         print(f"\n{len(failures)} FAILURE(S): {failures}")
