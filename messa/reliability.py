@@ -58,7 +58,7 @@ _COMPLETION_CLAIM_PATTERN = re.compile(
 # result actually work."
 _FAILURE_PREFIXES = ("ERROR running", "BLOCKED:", "Could not", "Can't", "Couldn't")
 _FAILED_CALL_RE = re.compile(r"^'[^']+' failed:")
-_NOT_SET_UP_RE = re.compile(r"isn'?t (?:set up|connected|enabled)\b", re.IGNORECASE)
+_NOT_SET_UP_RE = re.compile(r"(?:isn'?t|is not)\s+(?:set up|connected|enabled)\b", re.IGNORECASE)
 
 
 def looks_like_tool_failure(content: Any) -> bool:
