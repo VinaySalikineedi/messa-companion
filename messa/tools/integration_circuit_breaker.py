@@ -92,6 +92,11 @@ class ToolFailureLadderMiddleware(AgentMiddleware):
         # save_skill nudge on a later success, same as before.
         self._ever_failed: set[str] = set()
 
+    @property
+    def name(self) -> str:
+        """Unique name per watched tool to satisfy langchain's uniqueness requirement."""
+        return f"ToolFailureLadderMiddleware_{self._watched_tool_name}"
+
     async def awrap_tool_call(
         self,
         request: ToolCallRequest,

@@ -529,6 +529,32 @@ def part5_unverified_claim_reason():
     )
 
 
+def part6_multiple_failure_ladder_middleware_instances_have_unique_names() -> None:
+    from messa.tools.integration_circuit_breaker import ToolFailureLadderMiddleware
+    from langchain.agents import create_agent
+    from langchain_core.language_models.fake import FakeListLLM
+
+    m1 = ToolFailureLadderMiddleware("send_email")
+    m2 = ToolFailureLadderMiddleware("reply_to_email")
+    check("distinct middleware have distinct names", m1.name != m2.name)
+    check("middleware name reflects watched tool", "send_email" in m1.name and "reply_to_email" in m2.name)
+
+    try:
+        create_agent(
+            model=FakeListLLM(responses=["ok"]),
+            tools=[],
+            middleware=[m1, m2],
+        )
+        check("create_agent accepts multiple ToolFailureLadderMiddleware instances without duplicate error", True)
+    except AssertionError as e:
+        if "duplicate middleware" in str(e):
+            check("create_agent rejected duplicate middleware", False)
+        else:
+            raise
+    except Exception:
+        check("create_agent did not raise duplicate middleware AssertionError", True)
+
+
 async def main() -> None:
     await part1_close_browser_blocked_during_otp_wait()
     part1_request_human_help_shares_the_same_gate()
@@ -543,6 +569,7 @@ async def main() -> None:
     await part4_execute_integration_tool_self_healing()
     part5_looks_like_tool_failure()
     part5_unverified_claim_reason()
+    part6_multiple_failure_ladder_middleware_instances_have_unique_names()
 
     if failures:
         print(f"\n{len(failures)} FAILURE(S): {failures}")
