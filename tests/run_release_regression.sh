@@ -43,6 +43,7 @@ TESTS=(
   tests/test_turn_control.py
   tests/test_pure_acknowledgment.py
   tests/test_double_texting.py
+  tests/test_region_gate.py
   tests/test_minimal_questions_prompt.py
   tests/test_contact_sharing.py
   tests/test_fth_upgrades.py

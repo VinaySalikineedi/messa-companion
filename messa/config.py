@@ -1608,6 +1608,17 @@ ROUTINE_ESCALATION_BASE_MINUTES = int(os.environ.get("MESSA_ROUTINE_ESCALATION_B
 ROUTINE_ESCALATION_SHRINK_FACTOR = float(os.environ.get("MESSA_ROUTINE_ESCALATION_SHRINK_FACTOR", "0.5"))
 ROUTINE_ESCALATION_MIN_MINUTES = int(os.environ.get("MESSA_ROUTINE_ESCALATION_MIN_MINUTES", "15"))
 
+# ---- US-only launch gate (messa/region_gate.py) ----
+# This is a US-market-only launch: a brand-new phone number that isn't a
+# clean US E.164 number ("+1" then exactly 10 digits) gets a polite
+# "USA only for now" reply. Applies to all incoming numbers (new and
+# existing alike). True by default since that's the actual launch state
+# being asked for; flip to false (MESSA_US_ONLY_ENABLED=false) for the
+# "world release", no code change or redeploy of logic needed.
+US_ONLY_ENABLED = os.environ.get(
+    "MESSA_US_ONLY_ENABLED", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+
 # ---- New-user cap + waitlist (migrations/025_new_user_cap_waitlist.sql,
 # messa/waitlist.py) ----
 # How many NEW users (signed up after this cap was first turned on -- see

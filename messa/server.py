@@ -46,7 +46,7 @@ import httpx
 from fastapi import BackgroundTasks, FastAPI, Header, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
-from . import background, briefings, cli, config, console, db, live_activity, media_understanding, memory, pdf_reader, turn_control, waitlist
+from . import background, briefings, cli, config, console, db, live_activity, media_understanding, memory, pdf_reader, region_gate, turn_control, waitlist
 from .agents.registry import build_orchestrator
 from .approval import AutoApproveGate, DenyApprovalGate
 from .channels import browserbase, sendblue
@@ -1497,6 +1497,21 @@ async def _process_inbound(
     media_url: str | None = None,
     message_handle: str | None = None,
 ) -> None:
+    # US-only launch gate (messa/region_gate.py) -- checked FIRST, even
+    # before the waitlist cap right below: there's no reason to spend a
+    # waitlist slot (or even a DB read, for a number that's already a
+    # clean US number) on a phone number that can never be admitted in
+    # the first place. On by default (US_ONLY_ENABLED) -- applies
+    # across the board to all incoming numbers (both new and existing users).
+    region_decision = await region_gate.check_region_admission(from_number)
+    if not region_decision.allowed:
+        if region_decision.reply_text:
+            try:
+                await sendblue.send_message(from_number, region_decision.reply_text)
+            except SendblueError as e:
+                console.system(f"[region gate notify failed] {from_number}: {e}")
+        return
+
     # New-user cap gate (messa/waitlist.py) -- checked before ANY other work
     # on a message that might be from a brand-new phone number, so a
     # waitlisted text costs no PDF download, no typing indicator, no agent
