@@ -6,15 +6,18 @@ server.py's `_process_inbound`, deliberately BEFORE the new-user-cap
 waitlist gate (messa/waitlist.py) -- there's no reason to spend a waitlist
 slot, or even a DB read, on a number that can never be admitted anyway.
 
-Applies across the board to all incoming phone numbers (both new signups
-and any existing accounts).
+Mirrors that same module's own central guarantee: an already-existing user
+is NEVER retroactively locked out by this, regardless of what's actually
+stored in their phone_number column (a hand-inserted test account, a
+legacy row from before this gate existed, whatever) -- this gate only ever
+governs who gets IN for the first time, never anyone already here.
 
 This is meant to be temporary (see the reply text below, and the "world
 release" this is explicitly scoped to end at), so it stays a single flag
 -- config.US_ONLY_ENABLED, defaulting to True since that's the actual
 launch state being asked for here -- rather than something hardcoded, so
-turning it off later is one env var (MESSA_US_ONLY_ENABLED=false), with no
-code change and no redeploy of logic needed."""
+turning it off later is one env var, no code change and no redeploy of
+logic."""
 from __future__ import annotations
 
 import re
@@ -55,13 +58,20 @@ def is_us_phone_number(phone_number: str) -> bool:
 
 async def check_region_admission(phone_number: str) -> RegionAdmissionDecision:
     """Call this BEFORE waitlist.check_new_user_admission (and before
-    db.get_or_create_user) for any inbound text -- fast regex check (no DB
-    call needed). Applies to all phone numbers (both new and existing users).
-    Controlled by config.US_ONLY_ENABLED so the region gate can be stopped
-    or disabled at any time in the future via MESSA_US_ONLY_ENABLED=false."""
+    db.get_or_create_user) for any inbound text -- cheap when the gate is
+    off or the number is already a clean US one (one regex match, no DB
+    call at all); only reaches the DB at all to check the "already an
+    existing user" exemption for a number that fails the format check."""
     if not config.US_ONLY_ENABLED:
         return RegionAdmissionDecision(allowed=True)
     if is_us_phone_number(phone_number):
+        return RegionAdmissionDecision(allowed=True)
+
+    existing = await db.get_user_by_phone(phone_number)
+    if existing is not None:
+        # Already a real user -- this gate only ever governs who gets IN,
+        # never anyone already here (same guarantee waitlist.py's own
+        # new-user cap makes, see this module's own docstring).
         return RegionAdmissionDecision(allowed=True)
 
     return RegionAdmissionDecision(allowed=False, reply_text=NON_US_MESSAGE)

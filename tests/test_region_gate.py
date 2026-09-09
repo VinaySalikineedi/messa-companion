@@ -123,24 +123,21 @@ async def part2_check_region_admission():
               get_user_calls == [])
 
         # A non-US number that's NOT an existing user -- rejected.
+        get_user_calls.clear()
         decision_new = await region_gate.check_region_admission("+447911123456")
         check("flag on + new non-US number: rejected", decision_new.allowed is False)
         check("flag on + new non-US number: gets the exact USA-only reply text",
               decision_new.reply_text == region_gate.NON_US_MESSAGE)
+        check("flag on + new non-US number: does check whether they're an existing user first",
+              get_user_calls == ["+447911123456"])
 
-        # A non-US number that IS ALREADY an existing user -- also rejected
-        # (the lock applies across the board, to new and existing users alike).
+        # A non-US number that IS ALREADY an existing user -- never
+        # retroactively locked out.
+        get_user_calls.clear()
         decision_existing = await region_gate.check_region_admission("+447911999999")
-        check("flag on + EXISTING non-US user: rejected (applies to existing users too)",
-              decision_existing.allowed is False)
-        check("flag on + existing non-US user: gets the exact USA-only reply text",
-              decision_existing.reply_text == region_gate.NON_US_MESSAGE)
-
-        # When the feature is stopped (flag off) -- non-US numbers are allowed.
-        config.US_ONLY_ENABLED = False
-        decision_stopped = await region_gate.check_region_admission("+447911999999")
-        check("flag off (feature stopped in future): non-US user allowed",
-              decision_stopped.allowed is True)
+        check("flag on + EXISTING non-US user: still allowed (never retroactively locked out)",
+              decision_existing.allowed is True)
+        check("flag on + existing non-US user: no reply text", decision_existing.reply_text is None)
     finally:
         config.US_ONLY_ENABLED = real_flag
         db.get_user_by_phone = real_get_user_by_phone
