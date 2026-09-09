@@ -19,6 +19,24 @@ from .approval import CLIApprovalGate
 from .channels import sendblue
 from .channels.sendblue import SendblueError
 
+# Keep-alive set for run_message's optional on_turn_complete fire-and-
+# forget task (see run_message's own docstring) -- same "asyncio.create_task
+# alone can silently get garbage-collected mid-run" bug server.py's own
+# _spawn_background/_fire_and_forget_tasks pair already guards against.
+# Not reusing that exact helper (server.py is the production webhook path
+# and imports cli.py already; the reverse import would be circular) -- a
+# second, tiny copy of the same three lines here, scoped to this module's
+# own one use of the pattern.
+_fire_and_forget_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _fire_and_forget_tasks.add(task)
+    task.add_done_callback(_fire_and_forget_tasks.discard)
+    return task
+
+
 # Heuristic backstop for the "empty promise" failure mode (see run_turn's
 # docstring): the system prompt explicitly tells Messa to open with a short
 # acknowledgment like "Checking flights now..." or "Give me a few" right
@@ -541,10 +559,25 @@ async def _send_limit_notice_once(
 
 
 async def run_message(
-    user: config.UserContext, agent, text: str, send=None, log_texts: list[str] | None = None,
+    user: config.UserContext,
+    agent,
+    text: str,
+    send=None,
+    log_texts: list[str] | None = None,
+    on_turn_complete=None,
 ) -> str:
     """One full, stateless turn for `user`: loads recent DB history for
     context, runs it, persists both sides, returns the final reply text.
+
+    on_turn_complete: optional async callable(user, final_messages) -- see
+    asset_consolidation.consolidate_after_turn, the one real caller today
+    (server.py's _run_turn passes it in). Fired as its own background task
+    (via this module's own _spawn_background) the moment this turn's
+    messages are known, WITHOUT being awaited -- so it adds ZERO latency
+    to this function's own return, and a slow or failing consolidation
+    pass can never delay or break the reply the user is actually waiting
+    on. Exceptions inside it are the callable's own responsibility to
+    swallow (consolidate_after_turn does); nothing here catches them.
 
     This is what the Sendblue webhook server uses -- each inbound webhook
     is its own HTTP request with no long-lived process holding conversation
@@ -788,6 +821,15 @@ async def run_message(
                 await send(chunk)
 
     final = await run_turn(agent, history, on_ai_message=_on_ai_message)
+
+    # "Sleep & dream" post-turn consolidation (docs/executive_agent_
+    # architecture_proposal.md 3.C) -- fired here, the earliest point
+    # `final` (this turn's full message list, tool calls included) is
+    # known, and spawned rather than awaited so it truly adds zero latency
+    # to everything below (the onboarding reveal, sent_texts, this
+    # function's own return) that the user is actually waiting on.
+    if on_turn_complete is not None:
+        _spawn_background(on_turn_complete(user, final))
 
     # Deterministic, one-time onboarding-complete reveal -- see
     # _onboarding_complete_messages' own docstring for why this isn't left

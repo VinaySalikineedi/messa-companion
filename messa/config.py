@@ -818,6 +818,36 @@ SCRATCHPAD_CLEANUP_POLL_INTERVAL_SECONDS = int(
     os.environ.get("MESSA_SCRATCHPAD_CLEANUP_POLL_INTERVAL_SECONDS", str(6 * 3600))
 )
 
+# ---- Persistent Workspace Asset Registry + Entity auto-discovery +
+# Autonomous Fallback Waterfall (docs/executive_agent_architecture_
+# proposal.md sections 3.A/3.B/4.A, migration 037) -- one kill switch for
+# all three: they share the same two tables and the same code paths
+# (tools/workspace_asset_tools.py, db.py's user_assets/user_app_entities
+# functions), so one flag turns all of it off at once, same "instantly
+# flippable, no redeploy" reasoning as SCRATCHPAD_AND_SKILLS_ENABLED
+# above. When false, execute_integration_tool/document_tools' PDF tools
+# skip persisting assets entirely, create_workspace_asset isn't attached
+# to integrations_agent, registry.py doesn't inject the recent-assets
+# block, and asset_consolidation's post-turn sweep no-ops immediately.
+WORKSPACE_ASSETS_ENABLED = os.environ.get("MESSA_WORKSPACE_ASSETS_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+# How many of the user's most-recently-referenced assets get injected into
+# the orchestrator's own system prompt every turn (registry._build_system_
+# prompt) -- small and fixed on purpose: this is a "don't have amnesia
+# about what you already made them" memory aid, not a full asset browser
+# (search_web/execute_integration_tool's own list actions are for that).
+USER_ASSETS_MAX_INJECTED = int(os.environ.get("MESSA_USER_ASSETS_MAX_INJECTED", "5"))
+
+# Retention for user_assets -- deliberately much longer than
+# ACTIVE_TASK_ROW_RETENTION_DAYS above: the whole point of this table is
+# that it survives past any one task's own lifetime, so a short window
+# here would defeat the feature. Purged by db.purge_stale_user_assets,
+# swept from the same server.py _production_scratchpad_cleanup_loop that
+# already handles active_tasks retention (see that loop's own docstring).
+USER_ASSETS_ROW_RETENTION_DAYS = int(os.environ.get("MESSA_USER_ASSETS_ROW_RETENTION_DAYS", "180"))
+
 # ---- Voice and image input (messa/media_understanding.py) -- lets a user
 # text Messa a voice memo or a photo and have it actually understood,
 # instead of the SMS/iMessage path silently ignoring anything that isn't a

@@ -323,7 +323,7 @@ async def part5_process_inbound_wiring():
     async def fake_build_orchestrator(user, gate):
         return object()
 
-    async def fake_run_message(user, agent, text, send=None, log_texts=None):
+    async def fake_run_message(user, agent, text, send=None, log_texts=None, on_turn_complete=None):
         run_message_calls.append({"text": text, "log_texts": log_texts})
         return "done"
 

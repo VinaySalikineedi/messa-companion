@@ -47,7 +47,7 @@ import websockets
 from fastapi import BackgroundTasks, FastAPI, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
-from . import background, briefings, call_activity, call_control, cli, config, console, db, live_activity, media_understanding, memory, pdf_reader, region_gate, turn_control, waitlist
+from . import asset_consolidation, background, briefings, call_activity, call_control, cli, config, console, db, live_activity, media_understanding, memory, pdf_reader, region_gate, turn_control, waitlist
 from .agents.registry import build_orchestrator
 from .approval import AutoApproveGate, DenyApprovalGate
 from .call_live_view_page import render_call_live_view_page
@@ -1747,7 +1747,10 @@ async def _process_inbound(
             if config.IN_FLIGHT_TURN_AWARENESS_ENABLED:
                 turn_user_id = user.user_id
                 turn_token = turn_control.start_turn(turn_user_id, effective_content)
-            await cli.run_message(user, agent, effective_content, send=_send, log_texts=log_texts)
+            await cli.run_message(
+                user, agent, effective_content, send=_send, log_texts=log_texts,
+                on_turn_complete=asset_consolidation.consolidate_after_turn,
+            )
         except Exception as e:  # noqa: BLE001 - a webhook background task must never raise unseen
             console.system(f"Sendblue: turn failed for {from_number}: {e}")
             await _send(
@@ -2694,6 +2697,20 @@ async def _production_app_connection_poll_loop() -> None:
                 toolkit_slug = req["toolkit_slug"]
                 if status == "ACTIVE":
                     await db.mark_app_connected(req["id"])
+                    # Entity & Workspace Auto-Discovery (docs/executive_
+                    # agent_architecture_proposal.md 3.B) -- the faithful
+                    # "when an app connects, auto-probe and cache" trigger,
+                    # right at the moment the connection actually goes
+                    # ACTIVE. Its own try/except, isolated from the
+                    # confirmation-message/notify logic below -- a probe
+                    # failure must never look like the connection itself
+                    # failed (see integration_tools.discover_and_cache_
+                    # app_entities' own docstring: this is convenience
+                    # only, never load-bearing).
+                    try:
+                        await integration_tools.discover_and_cache_app_entities(req["user_id"], toolkit_slug)
+                    except Exception as e:  # noqa: BLE001 - the connection itself succeeded either way
+                        console.system(f"[app entity discovery failed] request=#{req['id']}: {e}")
                     try:
                         text = await _connection_confirmation_message(req["user_id"], toolkit_slug, toolkit_slug)
                     except Exception as e:  # noqa: BLE001 - the connection itself succeeded either way; fall back to the plain confirmation rather than lose the notification entirely
@@ -2810,6 +2827,20 @@ async def _production_scratchpad_cleanup_loop() -> None:
                     console.system(f"[scratchpad cleanup] {result}")
         except Exception as e:  # noqa: BLE001 - a background loop must never die silently mid-process
             console.system(f"[scratchpad cleanup poller error] {e}")
+        # Persistent Workspace Asset Registry retention (docs/executive_
+        # agent_architecture_proposal.md 3.A, migration 037) -- its own
+        # try/except, isolated from the scratchpad sweep above, same
+        # per-effect-isolation reasoning as every other loop in this file
+        # that does more than one independent thing per iteration (see
+        # _production_app_connection_poll_loop): a failure purging one
+        # table must never skip the other.
+        try:
+            if config.WORKSPACE_ASSETS_ENABLED:
+                asset_result = await db.purge_stale_user_assets()
+                if asset_result["rows_deleted"]:
+                    console.system(f"[user assets cleanup] {asset_result}")
+        except Exception as e:  # noqa: BLE001 - a background loop must never die silently mid-process
+            console.system(f"[user assets cleanup poller error] {e}")
         await asyncio.sleep(config.SCRATCHPAD_CLEANUP_POLL_INTERVAL_SECONDS)
 
 

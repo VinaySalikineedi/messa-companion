@@ -663,6 +663,7 @@ def _build_system_prompt(
     user: config.UserContext,
     connected_slugs: list[str] | None = None,
     app_preferences: dict[str, str] | None = None,
+    recent_assets: list[dict[str, Any]] | None = None,
 ) -> str:
     connected_slugs = connected_slugs or []
     app_preferences = app_preferences or {}
@@ -704,6 +705,33 @@ def _build_system_prompt(
         primary = app_preferences.get(category) or default
         known.append(_category_known_line(category, primary, connected_slugs, user))
     known_str = ("Known about this user so far -- " + ", ".join(known) + ".\n\n") if known else ""
+
+    # Persistent Workspace Asset Registry (docs/executive_agent_
+    # architecture_proposal.md 3.A, migration 037) -- the user's most
+    # recently touched workspace assets (a Google Sheet, an Airtable
+    # base, a generated PDF, ...), so Messa never has amnesia about
+    # something she already made them and doesn't send them off to dig
+    # through their own Google Drive to find it. Small and fixed
+    # (config.USER_ASSETS_MAX_INJECTED, default 5) -- a memory aid, not a
+    # full asset browser; execute_integration_tool's own list actions
+    # cover genuine browsing. Omitted entirely when there's nothing to
+    # show, same "omit rather than placeholder" convention as every other
+    # optional fragment in this function.
+    recent_assets = recent_assets or []
+    if recent_assets:
+        asset_lines = []
+        for a in recent_assets:
+            line = f"- {a.get('title')} ({a.get('asset_type')})"
+            if a.get("url"):
+                line += f": {a['url']}"
+            asset_lines.append(line)
+        assets_str = (
+            "The user's most recently touched workspace assets (reference these instead of "
+            "asking the user to find something you already made them, or re-creating it from "
+            "scratch):\n" + "\n".join(asset_lines) + "\n\n"
+        )
+    else:
+        assets_str = ""
 
     # Neither Messa's nor any subagent's system prompt used to state the
     # actual current date/time or the user's timezone at all -- meaning the
@@ -956,6 +984,7 @@ def _build_system_prompt(
         "immediately, the same as a request to USE one. Let its own search tell you whether "
         "Composio supports it; only fall back to deepsearch if it reports nothing matches.\n\n"
         f"{known_str}"
+        f"{assets_str}"
         f"{time_str}"
         f"{onboarding_str}"
         f"{profile_str}"
@@ -1100,6 +1129,21 @@ async def build_orchestrator(
             console.system(f"get_app_preference({_category!r}) failed (non-fatal): {e}")
             app_preferences[_category] = "messa"
 
+    # Persistent Workspace Asset Registry (docs/executive_agent_
+    # architecture_proposal.md 3.A) -- same "cheap local read, never
+    # fatal to a turn" shape as connected_slugs/app_preferences just
+    # above. Gated on WORKSPACE_ASSETS_ENABLED (not just the table-exists
+    # check inside db.get_recent_user_assets itself) so this is a true
+    # kill switch, consistent with how every other flag in this function
+    # behaves.
+    recent_assets: list[dict[str, Any]] = []
+    if config.WORKSPACE_ASSETS_ENABLED:
+        try:
+            recent_assets = await db.get_recent_user_assets(user.user_id)
+        except Exception as e:  # noqa: BLE001 - a hint, not load-bearing
+            console.system(f"get_recent_user_assets failed (non-fatal): {e}")
+            recent_assets = []
+
     # Every subagent below is a deepagents CompiledSubAgent (a "runnable"
     # closure that builds its OWN tools/system_prompt fresh at actual
     # delegation time) rather than a plain declarative {"tools":
@@ -1165,7 +1209,8 @@ async def build_orchestrator(
     # gated on SCRATCHPAD_AND_SKILLS_ENABLED -- this is an independent rule,
     # not part of the Active Task Scratchpad feature.
     orchestrator_system_prompt = (
-        _build_system_prompt(user, connected_slugs, app_preferences) + reliability.RELIABILITY_GUARDRAIL_STR
+        _build_system_prompt(user, connected_slugs, app_preferences, recent_assets)
+        + reliability.RELIABILITY_GUARDRAIL_STR
     )
     if config.SCRATCHPAD_AND_SKILLS_ENABLED:
         orchestrator_tools = orchestrator_tools + build_scratchpad_tools(user, "messa_orchestrator", approval_gate)

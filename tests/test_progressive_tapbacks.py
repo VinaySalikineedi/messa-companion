@@ -313,7 +313,7 @@ async def part5_process_inbound_progress_wiring():
         config.TAPBACK_PROGRESS_UPDATES_ENABLED = False
         reaction_calls.clear()
 
-        async def fake_run_message_slow(user, agent, text, send=None, log_texts=None):
+        async def fake_run_message_slow(user, agent, text, send=None, log_texts=None, on_turn_complete=None):
             await asyncio.sleep(0.08)
             return "done"
 
@@ -331,7 +331,7 @@ async def part5_process_inbound_progress_wiring():
         config.TAPBACK_PROGRESS_UPDATES_ENABLED = True
         reaction_calls.clear()
 
-        async def fake_run_message_fast(user, agent, text, send=None, log_texts=None):
+        async def fake_run_message_fast(user, agent, text, send=None, log_texts=None, on_turn_complete=None):
             await asyncio.sleep(0.005)
             return "done"
 
@@ -345,7 +345,7 @@ async def part5_process_inbound_progress_wiring():
         reaction_calls.clear()
         run_message_completed = {"v": False}
 
-        async def fake_run_message_slow2(user, agent, text, send=None, log_texts=None):
+        async def fake_run_message_slow2(user, agent, text, send=None, log_texts=None, on_turn_complete=None):
             await asyncio.sleep(0.08)
             run_message_completed["v"] = True
             return "done"

@@ -4383,3 +4383,167 @@ async def search_skills(agent_type: str, domain: str, limit: int | None = None) 
             limit or config.SKILLS_MAX_PER_QUERY,
         )
         return _rows(rows)
+
+
+# ---------------------------------------------------------------------------
+# Persistent Workspace Asset Registry + per-toolkit Entity cache
+# (docs/executive_agent_architecture_proposal.md sections 3.A/3.B,
+# migration 037/workspace_asset_registry.sql). See that migration's own
+# header comment for the full dedup reasoning. SERIAL-id, upsert-per-user
+# shape -- same convention as user_app_preferences above, NOT the UUID
+# convention active_tasks/agent_skills use just above this.
+# ---------------------------------------------------------------------------
+
+async def record_user_asset(
+    user_id: int,
+    asset_type: str,
+    title: str,
+    external_id: str | None,
+    url: str | None,
+    summary: str | None = None,
+) -> dict[str, Any] | None:
+    """Upsert when external_id is known: re-touching an already-known
+    (user_id, asset_type, external_id) asset refreshes title/url/summary
+    and bumps last_referenced_at on the SAME row rather than creating a
+    duplicate. When external_id is None (a URL-only discovery -- see
+    asset_consolidation.py's background sweep), this always INSERTs a new
+    row instead -- Postgres's own UNIQUE-constraint semantics mean NULL
+    never collides against NULL, which is also the right real-world
+    behavior here: two different unknown-id discoveries of the same type/
+    title aren't necessarily the same asset touched twice."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_assets"):
+            return None
+        if external_id:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO user_assets (user_id, asset_type, title, external_id, url, summary)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (user_id, asset_type, external_id) DO UPDATE SET
+                    title = EXCLUDED.title,
+                    url = COALESCE(EXCLUDED.url, user_assets.url),
+                    summary = COALESCE(EXCLUDED.summary, user_assets.summary),
+                    last_referenced_at = NOW()
+                RETURNING *
+                """,
+                user_id, asset_type, title, external_id, url, summary,
+            )
+        else:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO user_assets (user_id, asset_type, title, external_id, url, summary)
+                VALUES ($1, $2, $3, NULL, $4, $5)
+                RETURNING *
+                """,
+                user_id, asset_type, title, url, summary,
+            )
+        return dict(row) if row else None
+
+
+async def get_recent_user_assets(user_id: int, limit: int | None = None) -> list[dict[str, Any]]:
+    """The read-time half of "never have amnesia about past assets" --
+    registry._build_system_prompt injects this list (capped at
+    config.USER_ASSETS_MAX_INJECTED) into every turn's system prompt, the
+    same "small, fixed, always-there" shape as the known-about-user block
+    right next to it."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_assets"):
+            return []
+        rows = await conn.fetch(
+            """
+            SELECT * FROM user_assets WHERE user_id = $1
+            ORDER BY last_referenced_at DESC LIMIT $2
+            """,
+            user_id, limit or config.USER_ASSETS_MAX_INJECTED,
+        )
+        return _rows(rows)
+
+
+async def touch_user_asset_by_url(user_id: int, url: str) -> bool:
+    """Bumps last_referenced_at on an already-known asset matching this
+    exact URL, WITHOUT creating a new row. Used by asset_consolidation.py's
+    background sweep to avoid double-recording a link a synchronous hook
+    (execute_integration_tool/document_tools' PDF tools) already persisted
+    earlier in the very same turn. Returns whether a row actually existed
+    to touch, so the caller knows whether it still needs to record a
+    brand-new row for this URL."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_assets"):
+            return False
+        result = await conn.execute(
+            "UPDATE user_assets SET last_referenced_at = NOW() WHERE user_id = $1 AND url = $2",
+            user_id, url,
+        )
+        try:
+            return int(result.split(" ")[-1]) > 0
+        except Exception:
+            return False
+
+
+async def purge_stale_user_assets() -> dict[str, int]:
+    """Retention sweep: drops rows not referenced in
+    config.USER_ASSETS_ROW_RETENTION_DAYS -- same time-window pattern as
+    purge_stale_active_tasks above, run from server.py's
+    _production_scratchpad_cleanup_loop (extended to cover this table
+    too)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_assets"):
+            return {"rows_deleted": 0}
+        result = await conn.execute(
+            """
+            DELETE FROM user_assets
+            WHERE last_referenced_at < NOW() - ($1 || ' days')::interval
+            """,
+            str(config.USER_ASSETS_ROW_RETENTION_DAYS),
+        )
+        try:
+            deleted = int(result.split(" ")[-1])
+        except Exception:
+            deleted = 0
+        return {"rows_deleted": deleted}
+
+
+async def get_cached_app_entity(user_id: int, toolkit_slug: str, entity_type: str) -> str | None:
+    """The one cached id (a default Airtable workspace, a default Drive
+    folder, ...) execute_integration_tool auto-injects instead of either
+    asking the user for it or letting the model guess/fabricate one. None
+    if never discovered (or discovery failed) -- callers must degrade
+    gracefully to today's ask-or-guess-free behavior in that case, never
+    treat a cache miss as an error."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_app_entities"):
+            return None
+        row = await conn.fetchrow(
+            "SELECT entity_id FROM user_app_entities WHERE user_id = $1 AND toolkit_slug = $2 AND entity_type = $3",
+            user_id, toolkit_slug.lower().strip(), entity_type,
+        )
+        return row["entity_id"] if row else None
+
+
+async def set_cached_app_entity(
+    user_id: int, toolkit_slug: str, entity_type: str, entity_id: str, label: str | None = None,
+) -> dict[str, Any] | None:
+    """Upsert -- a second discovery for the same (user, toolkit, type)
+    (e.g. the user reconnected the app) overwrites the stale id rather
+    than creating a duplicate row, same ON CONFLICT DO UPDATE shape as
+    set_app_preference above."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_app_entities"):
+            return None
+        row = await conn.fetchrow(
+            """
+            INSERT INTO user_app_entities (user_id, toolkit_slug, entity_type, entity_id, label)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (user_id, toolkit_slug, entity_type) DO UPDATE SET
+                entity_id = EXCLUDED.entity_id, label = EXCLUDED.label, discovered_at = NOW()
+            RETURNING *
+            """,
+            user_id, toolkit_slug.lower().strip(), entity_type, entity_id, label,
+        )
+        return dict(row) if row else None

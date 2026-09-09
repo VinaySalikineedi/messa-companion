@@ -57,6 +57,7 @@ TESTS=(
   tests/test_call_webhook.py
   tests/test_reliability_hardening.py
   tests/test_subagent_freshness.py
+  tests/test_workspace_asset_registry.py
 )
 
 PASSED=()

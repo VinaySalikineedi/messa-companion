@@ -224,7 +224,7 @@ async def part3_process_inbound_wiring():
     try:
         turn_control._in_flight.pop(uid, None)
 
-        async def fake_run_message_records(user, agent, text, send=None, log_texts=None):
+        async def fake_run_message_records(user, agent, text, send=None, log_texts=None, on_turn_complete=None):
             observed["described_during_run"] = turn_control.describe(user.user_id)
             return "done"
 
@@ -238,7 +238,7 @@ async def part3_process_inbound_wiring():
         check("the turn is cleaned up afterward (no leaked entry)", turn_control.is_active(uid) is False)
 
         # end_turn must fire even when the turn itself raises.
-        async def fake_run_message_raises(user, agent, text, send=None, log_texts=None):
+        async def fake_run_message_raises(user, agent, text, send=None, log_texts=None, on_turn_complete=None):
             raise RuntimeError("boom")
 
         server.cli.run_message = fake_run_message_raises
@@ -250,7 +250,7 @@ async def part3_process_inbound_wiring():
         config.IN_FLIGHT_TURN_AWARENESS_ENABLED = False
         observed["described_during_run"] = "unset"
 
-        async def fake_run_message_flag_off(user, agent, text, send=None, log_texts=None):
+        async def fake_run_message_flag_off(user, agent, text, send=None, log_texts=None, on_turn_complete=None):
             observed["described_during_run"] = turn_control.active_count(user.user_id)
             return "done"
 

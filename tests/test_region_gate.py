@@ -193,7 +193,7 @@ async def part3_process_inbound_wiring():
         calls_touched.append("build_orchestrator")
         return object()
 
-    async def fake_run_message(user, agent, text, send=None, log_texts=None):
+    async def fake_run_message(user, agent, text, send=None, log_texts=None, on_turn_complete=None):
         calls_touched.append("run_message")
         return "done"
 

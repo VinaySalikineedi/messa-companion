@@ -43,7 +43,7 @@ from reportlab.platypus import (
 from reportlab.lib import colors
 from reportlab.pdfgen import canvas
 
-from .. import config, reliability
+from .. import config, console, db, reliability
 from .common import last_ai_text, run_inner_agent_with_claim_check, trace_all
 from .integration_circuit_breaker import ToolFailureLadderMiddleware
 from .scratchpad_tools import build_scratchpad_tools, scratchpad_prompt_block
@@ -876,6 +876,32 @@ def build_document_tools(user: config.UserContext | None = None) -> list[BaseToo
     out_dir = Path(config.OUTPUTS_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    async def _record_pdf_asset(asset_type: str, title: str, out_path: Path) -> None:
+        """Persistent Workspace Asset Registry (docs/executive_agent_
+        architecture_proposal.md 3.A): a generated PDF is exactly the kind
+        of thing this feature exists to stop Messa forgetting -- see
+        tools/workspace_asset_tools.py's module docstring for the twin
+        hook on the Composio side (record_asset_from_execution). Best-
+        effort and non-fatal: a failure here must never turn an
+        already-successful PDF generation into an error. `user` can be
+        None (this function's own default parameter) for a caller with no
+        real user context (e.g. a bare CLI smoke test) -- silently skipped
+        in that case, same as every other user-scoped feature here."""
+        if user is None or not config.WORKSPACE_ASSETS_ENABLED:
+            return
+        try:
+            # external_id = the resolved file path, not None -- regenerating
+            # the same title (a common pattern: "redo that report with the
+            # updated numbers") should UPDATE this user's existing row via
+            # record_user_asset's own ON CONFLICT upsert, not pile up a
+            # fresh duplicate row every time.
+            await db.record_user_asset(
+                user.user_id, asset_type, title, external_id=str(out_path.resolve()), url=None,
+                summary=f"Generated locally: {out_path.name}",
+            )
+        except Exception as e:  # noqa: BLE001 - a memory aid, never load-bearing
+            console.system(f"_record_pdf_asset: failed to persist {asset_type!r} (non-fatal): {e}")
+
     @tool
     async def generate_contract_pdf(
         title: str,
@@ -926,6 +952,7 @@ def build_document_tools(user: config.UserContext | None = None) -> list[BaseToo
             )
         except Exception as e:
             return f"Error generating contract PDF: {e}"
+        await _record_pdf_asset("contract_pdf", title, out_path)
         return f"Generated Contract PDF at {out_path.resolve()}"
 
     @tool
@@ -971,6 +998,7 @@ def build_document_tools(user: config.UserContext | None = None) -> list[BaseToo
             )
         except Exception as e:
             return f"Error generating report PDF: {e}"
+        await _record_pdf_asset("report_pdf", title, out_path)
         return f"Generated Report PDF at {out_path.resolve()}"
 
     @tool
@@ -993,6 +1021,7 @@ def build_document_tools(user: config.UserContext | None = None) -> list[BaseToo
             _build_generic_pdf(title, sections, out_path)
         except Exception as e:
             return f"Error generating PDF: {e}"
+        await _record_pdf_asset("pdf", title, out_path)
         return f"Generated PDF at {out_path.resolve()}"
 
     @tool

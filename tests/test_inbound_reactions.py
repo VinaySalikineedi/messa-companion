@@ -293,7 +293,7 @@ async def part3_process_inbound_ordering_and_swap():
         order.clear()
         reaction_calls.clear()
 
-        async def fake_run_message_task(user, agent, text, send=None, log_texts=None):
+        async def fake_run_message_task(user, agent, text, send=None, log_texts=None, on_turn_complete=None):
             order.append("run_message_start")
             await asyncio.sleep(0.02)
             order.append("run_message_end")

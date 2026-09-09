@@ -106,6 +106,13 @@ from .common import last_ai_text, run_inner_agent_with_claim_check, trace_tool
 from .integration_circuit_breaker import ToolFailureLadderMiddleware, integration_slug_identity
 from .scratchpad_tools import build_scratchpad_tools, scratchpad_prompt_block
 from .web_search_tools import build_web_search_tools
+from .workspace_asset_tools import (
+    apply_cached_entity_defaults,
+    build_workspace_asset_tool,
+    discover_and_cache_app_entities,
+    record_asset_from_execution,
+    toolkit_for_injection_target,
+)
 
 LABEL = "integrations_agent"
 
@@ -755,6 +762,20 @@ def build_integration_tools(
             if not limit_result.allowed:
                 return limit_result.upgrade_message
 
+        # Entity & Workspace Auto-Discovery (docs/executive_agent_
+        # architecture_proposal.md 3.B, tools/workspace_asset_tools.py):
+        # if this slug needs a default id (e.g. AIRTABLE_CREATE_BASE's
+        # workspace_id) and this connection predates the feature (or was
+        # never seen by server.py's connection-poll loop, e.g. CLI/dev
+        # use), probe for it now, once -- idempotent and non-fatal either
+        # way, see discover_and_cache_app_entities' own docstring. Then
+        # silently fill in whatever's cached and still missing from
+        # `arguments`, never overriding a value already supplied.
+        toolkit_needing_entity = toolkit_for_injection_target(slug)
+        if toolkit_needing_entity and config.WORKSPACE_ASSETS_ENABLED:
+            await discover_and_cache_app_entities(user.user_id, toolkit_needing_entity, client=client)
+        arguments = await apply_cached_entity_defaults(user, slug, arguments)
+
         def _execute_sync() -> Any:
             kwargs: dict = {"slug": slug, "arguments": arguments, "user_id": composio_user_id}
             if config.COMPOSIO_TOOLKIT_VERSION:
@@ -792,11 +813,19 @@ def build_integration_tools(
                 f"call describe_integration_tool({slug!r}) to check the real parameter schema, "
                 "or adjust your arguments."
             )
+        # Persistent Workspace Asset Registry (3.A): a no-op for the vast
+        # majority of slugs (classify_asset_creation returns None for
+        # anything that isn't a recognizable "made a workspace asset"
+        # call) -- see record_asset_from_execution's own docstring for why
+        # this is safe to call unconditionally and unawaited-for-failure
+        # right here rather than gating it on a hand-maintained slug list.
+        await record_asset_from_execution(user, slug, arguments, result)
         return str(result)
 
     raw_tools: list[BaseTool] = [
         search_integration_tools, describe_integration_tool, connect_integration_app,
         queue_app_connections, disconnect_integration_app, execute_integration_tool,
+        build_workspace_asset_tool(user, _get_client, composio_user_id),
     ]
 
     def _destructive_check_for(name: str) -> Callable[..., bool] | None:
@@ -811,6 +840,14 @@ def build_integration_tools(
         # decided dynamically per slug.
         if name == "execute_integration_tool":
             return _is_write_action
+        if name == "create_workspace_asset":
+            # Always destructive -- it calls the underlying Composio client
+            # directly (bypassing execute_integration_tool's own dynamic
+            # _is_write_action gating), and every one of its tiers creates
+            # a brand-new real resource (an Airtable base, a Google Sheet,
+            # or a PDF), so it needs the exact same confirm-before-create
+            # rule execute_integration_tool's write actions already get.
+            return _always_destructive
         if name == "connect_integration_app":
             return _is_switch_account_call
         if name == "disconnect_integration_app":
@@ -891,6 +928,15 @@ def build_integration_system_prompt(user: config.UserContext) -> str:
         "Repeated failures on the same slug get blocked after a few attempts specifically to "
         "force this instead of a fourth blind guess; when that happens, stop and tell the user "
         "plainly what's blocking this rather than trying again or claiming it worked.\n"
+        "- create_workspace_asset(title, headers=None, rows=None): when the user just wants 'a "
+        "list/sheet/table of X' and doesn't care which specific app it lives in, prefer this over "
+        "manually chaining search_integration_tools/execute_integration_tool calls yourself -- it "
+        "already tries Airtable, then Google Sheets, then falls back to a PDF table on its own, so "
+        "the user always gets a real deliverable. Use execute_integration_tool directly instead "
+        "when they named a specific app, or asked for something more specific than a simple table "
+        "(formulas, formatting, sharing permissions, appending to an existing sheet, ...). Whatever "
+        "it made, tell the user plainly what and where -- never mention which tier(s) it tried or "
+        "failed first; that's plumbing, not something they asked about.\n"
         "Be concise in what you report back -- Messa relays your summary as a text message, not "
         "your raw tool output.\n"
     )
@@ -958,6 +1004,14 @@ def build_integration_subagent(
                         "search_web(...)/read_webpage(...) for the real parameter format"
                     ),
                 ),
+                # create_workspace_asset already runs its own internal
+                # Airtable -> Google Sheets -> PDF waterfall and never
+                # raises/claims false success -- this just stops the MODEL
+                # from repeatedly re-calling it with cosmetic title changes
+                # believing a retry might reach a different app, once it's
+                # already told plainly (via its own return string) that the
+                # PDF fallback is what it got.
+                ToolFailureLadderMiddleware("create_workspace_asset"),
             ],
         )
         final_messages = await run_inner_agent_with_claim_check(
