@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from . import config, db, plans, timeutil
+from . import config, console, db, plans, timeutil
 
 # Feature keys -- must match messa.plans.PlanLimits field names exactly for
 # the three day-rate features (checked with getattr below). Defined here so
@@ -26,6 +26,10 @@ FEATURE_OUTBOUND_EMAILS = "outbound_emails"
 FEATURE_BROWSE_ACTIONS = "browse_actions"
 FEATURE_NUMBER_OF_TEXTS = "number_of_texts"
 FEATURE_MAX_CONNECTED_APPS = "max_connected_apps"
+# MONTHLY, not a day-rate -- see check_and_consume_monthly below. Still
+# matches a PlanLimits field name exactly, same convention as the four
+# day-rate/standing-ceiling features above.
+FEATURE_CALL_MINUTES = "call_minutes"
 
 # Composio action slugs across email-capable toolkits that represent a real
 # outbound send -- used by tools/integration_tools.py's
@@ -95,6 +99,13 @@ def _local_day(user: "config.UserContext"):
     return timeutil.local_today(user.timezone if user.timezone_confirmed else None)
 
 
+def _local_month(user: "config.UserContext"):
+    # Same fallback reasoning as _local_day, just month-truncated -- see
+    # timeutil.local_month_start's own docstring for why reusing the
+    # day-rate storage for a monthly bucket is safe.
+    return timeutil.local_month_start(user.timezone if user.timezone_confirmed else None)
+
+
 async def check_and_consume(
     user: "config.UserContext", feature: str, amount: int = 1
 ) -> LimitResult:
@@ -116,6 +127,70 @@ async def check_and_consume(
     if user.is_admin:
         allowed = True
     return LimitResult(allowed=allowed, feature=feature, count=count_after, limit=limit, plan_name=plan.name)
+
+
+async def check_and_consume_monthly(
+    user: "config.UserContext", feature: str, amount: int = 1
+) -> LimitResult:
+    """The MONTHLY counterpart to check_and_consume, for FEATURE_CALL_MINUTES
+    only today -- everything else about it is identical (same atomic
+    upsert, same admin-always-allowed override, same "always records even
+    when unlimited/admin" behavior for cost visibility), just bucketed by
+    calendar month (_local_month) instead of by day. `amount` here is
+    real, variable minutes (the actual billed duration of one call), not
+    always 1 -- db.check_and_increment_usage already supports that via its
+    own `amount` parameter, untouched.
+
+    This is the pre-dial/pre-check path and inherits check_and_increment_
+    usage's normal fail-OPEN behavior on DB unreachability. For the
+    specific pre-dial gate in call_tools.py, wrap this with a fail-CLOSED
+    check instead (see that module's own comment) -- a DB outage must
+    never silently grant free phone-call minutes, unlike every other
+    feature this system meters, which trades correctness for availability
+    on purpose."""
+    plan = plans.get_plan(user.plan_id)
+    limit = getattr(plan.limits, feature)
+    month = _local_month(user)
+    allowed, count_after = await db.check_and_increment_usage(user.user_id, feature, month, limit, amount)
+    if user.is_admin:
+        allowed = True
+    return LimitResult(allowed=allowed, feature=feature, count=count_after, limit=limit, plan_name=plan.name)
+
+
+async def peek_usage_monthly(user: "config.UserContext", feature: str) -> LimitResult:
+    """Read-only version of check_and_consume_monthly -- does not increment.
+    Used for a fail-closed pre-dial remaining-minutes check (call_tools.py)
+    that needs to know how many minutes are left THIS call, without that
+    check itself consuming any."""
+    plan = plans.get_plan(user.plan_id)
+    limit = getattr(plan.limits, feature)
+    month = _local_month(user)
+    count = await db.get_usage_count(user.user_id, feature, month)
+    allowed = user.is_admin or limit is None or count <= limit
+    return LimitResult(allowed=allowed, feature=feature, count=count, limit=limit, plan_name=plan.name)
+
+
+async def peek_usage_monthly_fail_closed(user: "config.UserContext", feature: str) -> LimitResult:
+    """The fail-CLOSED counterpart to peek_usage_monthly -- the plan's
+    explicitly called-out deviation from this system's normal fail-open
+    philosophy (see plans/glowing-forging-pumpkin.md's usage.py section):
+    a DB outage must never silently grant free phone-call minutes, unlike
+    every other feature this system meters. Used ONLY for the pre-dial
+    remaining-minutes check in call_tools.py -- post-call metering
+    (check_and_consume_monthly, run once the call has already happened)
+    stays fail-open like everything else, matching the plan's own
+    reasoning that a call that already happened has nothing left to
+    protect by blocking after the fact."""
+    plan = plans.get_plan(user.plan_id)
+    limit = getattr(plan.limits, feature)
+    month = _local_month(user)
+    try:
+        count = await db.get_usage_count_strict(user.user_id, feature, month)
+    except Exception as e:  # noqa: BLE001 - deliberately fails CLOSED here, unlike every other usage check
+        console.system(f"peek_usage_monthly_fail_closed: DB unavailable, failing CLOSED ({feature}): {e}")
+        return LimitResult(allowed=False, feature=feature, count=0, limit=limit, plan_name=plan.name)
+    allowed = user.is_admin or limit is None or count <= limit
+    return LimitResult(allowed=allowed, feature=feature, count=count, limit=limit, plan_name=plan.name)
 
 
 async def peek_usage(user: "config.UserContext", feature: str) -> LimitResult:

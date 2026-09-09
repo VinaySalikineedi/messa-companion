@@ -1,0 +1,28 @@
+-- Additive migration for the voice-calling feature's v1 launch access gate
+-- (plans/glowing-forging-pumpkin.md), same shape and same reasoning as
+-- migrations/029_deepsearch_beta_access.sql:
+--
+-- users.call_beta_access -- a quiet, manually-flipped bypass exactly like
+-- users.is_admin / users.deepsearch_beta_access: a plain boolean, nothing
+-- discoverable, nothing on a pricing page, granted per account with a
+-- manual
+--     UPDATE users SET call_beta_access = true WHERE phone_number = '+1...';
+--
+-- Why this exists: a real outbound phone call is a genuinely new, higher-
+-- stakes action than anything this product has done before (real money,
+-- a real stranger talking to something acting on the user's behalf) -- it
+-- should launch gated to hand-picked accounts regardless of plan tier,
+-- exactly how deepsearch itself launched, before ever going fully public.
+-- See messa/config.py's CALL_PUBLIC_ACCESS and UserContext.has_call_access
+-- for the actual combined gate every call site reads (messa/tools/
+-- call_tools.py's build_call_subagent checks it before even the usage-
+-- limit check, so a gated user's request never proposes a call or spends
+-- anything at all).
+--
+-- Going public later needs NONE of this touched again: it's a single
+-- config flip (MESSA_CALL_PUBLIC_ACCESS=true), not a fresh migration or a
+-- per-user backfill. This column stays around afterward too -- harmless
+-- once the public switch is on, and useful again if access ever needs to
+-- be narrowed back down.
+
+ALTER TABLE users ADD COLUMN IF NOT EXISTS call_beta_access BOOLEAN NOT NULL DEFAULT false;

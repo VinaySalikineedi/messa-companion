@@ -1596,6 +1596,47 @@ async def _insert_broadcast(conn: asyncpg.Connection, user_id: int, payload: dic
     return dict(row)
 
 
+async def _insert_call_session_confirmed(
+    conn: asyncpg.Connection, user_id: int, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Applier for the 'place_call' gated action (messa/tools/call_tools.py's
+    propose_call) -- only ever stages a call_sessions row with
+    status='confirmed'. The actual dial (a real, slow, failable HTTP call
+    to messa/channels/vapi.py's create_call) happens as a SEPARATE step
+    immediately after, outside this transaction, triggered by registry.py's
+    confirm_pending_action tool -- same reasoning _insert_broadcast's own
+    docstring gives for why broadcasts' fan-out send isn't done in here
+    either: a slow/failable external call has no business holding this
+    transaction open, or risking "call placed, DB rolled back, no record
+    of it ever existing."
+
+    call_id (our own app-generated correlation id -- distinct from Vapi's
+    own provider_call_id, which doesn't exist until AFTER the dial
+    succeeds) is generated HERE, at confirm time, not earlier when
+    propose_call first built the payload -- nothing needs it before this
+    row exists.
+
+    pending_action_id is deliberately left unset (NULL) -- this applier's
+    signature, like every other one in _APPLIERS, only ever receives
+    (conn, user_id, payload), not the pending_action's own id, matching
+    _insert_broadcast's identical omission just above."""
+    call_id = str(uuid.uuid4())
+    row = await conn.fetchrow(
+        """
+        INSERT INTO call_sessions
+            (call_id, user_id, provider, destination_number, business_name,
+             task_description, scratchpad_snapshot, allowed_info_fields,
+             status, max_duration_seconds)
+        VALUES ($1, $2, 'vapi', $3, $4, $5, $6, $7, 'confirmed', $8)
+        RETURNING *
+        """,
+        call_id, user_id, payload["destination_number"], payload.get("business_name"),
+        payload["task_description"], payload.get("scratchpad_snapshot", "{}"),
+        payload.get("allowed_info_fields", "[]"), payload["max_duration_seconds"],
+    )
+    return dict(row)
+
+
 async def get_pending_broadcasts() -> list[dict[str, Any]]:
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -1653,6 +1694,16 @@ async def list_broadcasts(limit: int = 10) -> list[dict[str, Any]]:
 # a lot of people at once and can't be walked back) -- admin_tools.py's own
 # "preview -> approval -> execute" requirement is exactly this gate, reused
 # rather than building a second confirm mechanism.
+#
+# A third category (plans/glowing-forging-pumpkin.md): place_call. A real
+# outbound phone call is the highest-stakes single action this system can
+# take on a user's behalf -- money can be spent, a real stranger picks up
+# and starts talking to something acting for the user -- so it gets the
+# exact same "confirm before it's real" treatment as scheduling and
+# broadcasts, reusing this mechanism rather than inventing a new one (the
+# synchronous ApprovalGate/trace_tool(destructive=True) path is hard-
+# blocked in production via DenyApprovalGate anyway, and was never meant
+# for this -- see call_tools.py's own notes on why this gate was chosen).
 # ---------------------------------------------------------------------------
 
 _APPLIERS = {
@@ -1661,6 +1712,7 @@ _APPLIERS = {
     "delete_calendar_event": _delete_calendar_event,
     "create_routine": _insert_cron_job,
     "broadcast_message": _insert_broadcast,
+    "place_call": _insert_call_session_confirmed,
 }
 
 GATED_ACTION_TYPES = set(_APPLIERS)
@@ -1739,6 +1791,30 @@ async def confirm_pending_action(user_id: int, pending_action_id: int) -> dict[s
                 user_id, action["action_type"], action["payload"], pending_action_id,
             )
     return {"ok": True, "action_type": action["action_type"], "result": result}
+
+
+async def log_audit_event(user_id: int, action_type: str, payload: dict[str, Any]) -> None:
+    """Standalone audit_logs write for an event that happens OUTSIDE any
+    pending_actions confirm flow -- confirm_pending_action above writes its
+    own audit_logs row inline (inside that same transaction, since it's
+    already there); this is for the one caller today that has no
+    pending_actions row to hang off of at all: messa/tools/call_tools.py's
+    mid-call info-tool dispatch, triggered by a webhook long after the
+    original 'place_call' confirmation already happened and was logged
+    separately. source_pending_action_id is left NULL here on purpose --
+    there's no single pending action this specific event confirms.
+    Best-effort: swallows its own failures (logged, not raised) so a
+    logging hiccup can never be the reason a real mid-call response fails
+    to go out."""
+    try:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO audit_logs (user_id, action_type, payload) VALUES ($1, $2, $3)",
+                user_id, action_type, json.dumps(payload, default=_json_default),
+            )
+    except Exception as e:  # noqa: BLE001 - audit logging must never break the caller
+        console.system(f"log_audit_event: failed to write audit log ({action_type}): {e}")
 
 
 async def set_pending_action_state(pending_action_id: int, state: str) -> None:
@@ -3825,6 +3901,179 @@ async def get_usage_count(user_id: int, feature: str, day: Any) -> int:
     except Exception as e:  # noqa: BLE001 - usage metering must never break a real tool call
         console.system(f"get_usage_count: DB unavailable, failing open ({feature}): {e}")
         return 0
+
+
+# ---------------------------------------------------------------------------
+# Call sessions -- outbound voice-calling feature (migrations/
+# 035_call_sessions.sql, messa/plans.py's call_minutes, messa/channels/
+# vapi.py). One row per outbound call Messa places on a user's behalf.
+# Plain CRUD, same _has_table graceful-degrade shape as active_tasks/
+# deepsearch_sessions above: a process running before migration 035 has
+# landed just gets no call history (every function below returns
+# None/[]/False rather than crashing).
+#
+# NOTE for a future reader: the 'place_call' pending-actions applier (the
+# function that actually INSERTs the very first row for a call, at
+# confirm-before-dial time) lives with the rest of _APPLIERS further up
+# this file, not here -- this section is read/update-focused CRUD for a
+# row that already exists.
+# ---------------------------------------------------------------------------
+
+async def create_call_session(
+    user_id: int,
+    *,
+    call_id: str,
+    destination_number: str,
+    task_description: str,
+    max_duration_seconds: int,
+    pending_action_id: int | None = None,
+    business_name: str | None = None,
+    scratchpad_snapshot: str = "{}",
+    allowed_info_fields: str = "[]",
+    provider: str = "vapi",
+    status: str = "confirmed",
+) -> dict[str, Any] | None:
+    """Creates the first row for a call. Called by the 'place_call' applier
+    (confirm-before-dial time, status stays 'confirmed' -- no external HTTP
+    call happens inside that transaction, see _APPLIERS' own docstring
+    above) -- kept here rather than inlined there so every other caller
+    that ever needs to create a call_sessions row (a future admin tool,
+    a test fixture) gets the same defaults and the same _has_table guard
+    without duplicating the INSERT."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "call_sessions"):
+            return None
+        row = await conn.fetchrow(
+            """
+            INSERT INTO call_sessions
+                (call_id, user_id, pending_action_id, provider, destination_number,
+                 business_name, task_description, scratchpad_snapshot, allowed_info_fields,
+                 status, max_duration_seconds)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            RETURNING *
+            """,
+            call_id, user_id, pending_action_id, provider, destination_number,
+            business_name, task_description, scratchpad_snapshot, allowed_info_fields,
+            status, max_duration_seconds,
+        )
+        return dict(row) if row else None
+
+
+async def get_call_session(call_id: str) -> dict[str, Any] | None:
+    """Looked up by our own app-generated call_id -- e.g. right after
+    dial_confirmed_call creates the row, before Vapi's create-call response
+    (and therefore provider_call_id) exists yet."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "call_sessions"):
+            return None
+        row = await conn.fetchrow("SELECT * FROM call_sessions WHERE call_id = $1", call_id)
+        return dict(row) if row else None
+
+
+async def get_call_session_by_provider_id(provider_call_id: str) -> dict[str, Any] | None:
+    """The webhook-side lookup: every inbound Vapi webhook event (mid-call
+    tool-call, end-of-call report) carries Vapi's OWN call id, never our
+    call_id. Returns None for an id that isn't in our table at all --
+    callers MUST treat that as a hard rejection (a forged/replayed webhook,
+    or an event for a call this deployment never placed), not as "not
+    found yet, retry" -- see call_tools.py's webhook-handling security
+    notes."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "call_sessions"):
+            return None
+        row = await conn.fetchrow(
+            "SELECT * FROM call_sessions WHERE provider_call_id = $1", provider_call_id,
+        )
+        return dict(row) if row else None
+
+
+async def get_active_call_session_for_user(user_id: int) -> dict[str, Any] | None:
+    """The row (if any) currently occupying this user's concurrency slot --
+    used by call_control's active_count/is_active. "Active" here means
+    anywhere between confirmed-but-not-yet-dialed and actually in progress
+    -- everything except the two terminal states."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "call_sessions"):
+            return None
+        row = await conn.fetchrow(
+            """
+            SELECT * FROM call_sessions
+            WHERE user_id = $1 AND status NOT IN ('ended', 'failed')
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            user_id,
+        )
+        return dict(row) if row else None
+
+
+async def update_call_session(call_id: str, fields: dict[str, Any]) -> dict[str, Any] | None:
+    """Generic partial-update by our own call_id -- every state transition
+    (dialing -> ringing -> in_progress -> ended/failed, plus
+    provider_call_id arriving, plus the end-of-call metering fields) goes
+    through this one function rather than a bespoke UPDATE per transition,
+    so there's exactly one place that stamps updated_at and one place a
+    future caller needs to check for the allowed column list. `fields`
+    keys must be real column names -- this is an internal helper, not
+    exposed to any model-facing tool, so that trust boundary is fine."""
+    if not fields:
+        return await get_call_session(call_id)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "call_sessions"):
+            return None
+        set_clauses = []
+        values: list[Any] = []
+        for i, (key, value) in enumerate(fields.items(), start=2):
+            set_clauses.append(f"{key} = ${i}")
+            values.append(value)
+        query = (
+            f"UPDATE call_sessions SET {', '.join(set_clauses)}, updated_at = NOW() "
+            "WHERE call_id = $1 RETURNING *"
+        )
+        row = await conn.fetchrow(query, call_id, *values)
+        return dict(row) if row else None
+
+
+async def list_recent_call_sessions(user_id: int, limit: int = 10) -> list[dict[str, Any]]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "call_sessions"):
+            return []
+        rows = await conn.fetch(
+            "SELECT * FROM call_sessions WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2",
+            user_id, limit,
+        )
+        return _rows(rows)
+
+
+async def get_usage_count_strict(user_id: int, feature: str, day: Any) -> int:
+    """Same as get_usage_count, but RAISES on any real DB-reachability
+    failure instead of failing open -- for the one caller in this system
+    that needs fail-CLOSED semantics: messa/usage.py's
+    peek_usage_monthly_fail_closed, used by call_tools.py's pre-dial
+    monthly-minutes check. A DB outage must never silently grant free
+    phone-call minutes, unlike every other feature this system meters
+    (see get_usage_count's own docstring for why fail-open is the
+    deliberately correct default everywhere else -- this function exists
+    ONLY because voice calling is the one exception to that).
+
+    Still returns 0 (not a raise) for a pre-migration deployment where the
+    table genuinely doesn't exist yet -- that's a real "not set up", not
+    an outage, and callers should treat it the same as "no usage yet",
+    not block a whole feature over a migration that simply hasn't run."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "usage_daily_counts"):
+            return 0
+        row = await conn.fetchrow(
+            "SELECT count FROM usage_daily_counts WHERE user_id = $1 AND feature = $2 AND day = $3",
+            user_id, feature, day,
+        )
+        return row["count"] if row else 0
 
 
 # ---------------------------------------------------------------------------

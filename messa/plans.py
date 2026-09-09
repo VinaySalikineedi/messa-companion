@@ -57,6 +57,17 @@ class PlanLimits:
     # against Composio's own live connected-accounts count at connect time,
     # not a locally cached number, so it can't drift stale.
     max_connected_apps: int | None
+    # NOT a daily rate either -- a MONTHLY cap (calendar-month, the user's
+    # own timezone -- see messa/usage.py's check_and_consume_monthly) on
+    # total outbound-voice-call minutes, in the whole-number-of-minutes
+    # sense a phone bill uses (a 90-second call bills as 2). 0 means "no
+    # voice calling on this plan," not "unlimited" -- unlike every other
+    # field on this dataclass, None still means unlimited here too, but 0
+    # is the real value basic/pro actually carry today. Defaults to 0 when
+    # absent from an older MESSA_PLANS_OVERRIDE_JSON -- see _parse_limits
+    # below for why this is handled there instead of the required-fields
+    # tuple.
+    call_minutes: int | None = 0
 
 
 @dataclass(frozen=True)
@@ -86,24 +97,28 @@ PLANS: dict[str, Plan] = {
         id="basic", name="Basic", price_cents=0,
         limits=PlanLimits(
             outbound_emails=10, browse_actions=5, number_of_texts=25, max_connected_apps=2,
+            call_minutes=0,
         ),
     ),
     "pro": Plan(
         id="pro", name="Pro", price_cents=1200,
         limits=PlanLimits(
             outbound_emails=50, browse_actions=25, number_of_texts=150, max_connected_apps=6,
+            call_minutes=0,
         ),
     ),
     "plus": Plan(
         id="plus", name="Plus", price_cents=2900,
         limits=PlanLimits(
             outbound_emails=200, browse_actions=75, number_of_texts=500, max_connected_apps=15,
+            call_minutes=20,
         ),
     ),
     "business": Plan(
         id="business", name="Business", price_cents=7900,
         limits=PlanLimits(
             outbound_emails=1000, browse_actions=300, number_of_texts=2000, max_connected_apps=None,
+            call_minutes=40,
         ),
     ),
 }
@@ -126,7 +141,15 @@ def _parse_limits(raw: dict) -> PlanLimits:
     missing = [k for k in required if k not in raw]
     if missing:
         raise ValueError(f"plan limits missing required field(s): {missing}")
-    return PlanLimits(**{k: raw[k] for k in required})
+    limits_dict = {k: raw[k] for k in required}
+    # call_minutes is deliberately NOT in `required` above: an existing
+    # MESSA_PLANS_OVERRIDE_JSON set in production before this field existed
+    # must not suddenly raise (and brick the app on boot) the instant this
+    # feature deploys. Missing means "no voice calling configured for this
+    # plan yet," i.e. 0 -- the same value basic/pro carry in PLANS itself
+    # -- not "unlimited."
+    limits_dict["call_minutes"] = raw.get("call_minutes", 0)
+    return PlanLimits(**limits_dict)
 
 
 def _parse_override(raw_json: str) -> dict[str, Plan]:

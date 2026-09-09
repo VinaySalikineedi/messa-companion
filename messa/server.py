@@ -43,18 +43,21 @@ from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, Header, Request
+import websockets
+from fastapi import BackgroundTasks, FastAPI, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
-from . import background, briefings, cli, config, console, db, live_activity, media_understanding, memory, pdf_reader, region_gate, turn_control, waitlist
+from . import background, briefings, call_activity, call_control, cli, config, console, db, live_activity, media_understanding, memory, pdf_reader, region_gate, turn_control, waitlist
 from .agents.registry import build_orchestrator
 from .approval import AutoApproveGate, DenyApprovalGate
-from .channels import browserbase, sendblue
+from .call_live_view_page import render_call_live_view_page
+from .channels import browserbase, sendblue, vapi
 from .channels.sendblue import SendblueError
+from .channels.vapi import VapiError
 from .landing_page import render_landing_page
 from .live_view_page import render_live_view_page
 from .privacy_page import render_privacy_page
-from .tools import email_tools, integration_tools
+from .tools import call_tools, email_tools, integration_tools
 from .tools.routines_tools import ONE_SHOT_SENTINEL, compute_next_run
 
 app = FastAPI(title="Messa Sendblue webhook")
@@ -747,6 +750,125 @@ async def live_view_email_thread(token: str, thread_id: str) -> JSONResponse:
         "thread_id": thread_id,
         "messages": [_serialize_email_row(r, tz) for r in rows],
     })
+
+
+@app.get("/live/{token}/call")
+async def call_live_view_page(token: str) -> HTMLResponse:
+    """The public page a call's live-listen link points at (see
+    messa/tools/call_tools.py's dial_confirmed_call). Always returns 200
+    with the page shell regardless of whether the token is valid -- same
+    reasoning as live_view_page above -- the page's own JS calls the
+    status route below to find out."""
+    return HTMLResponse(render_call_live_view_page(token))
+
+
+@app.get("/live/{token}/call/status")
+async def call_live_view_status(token: str) -> JSONResponse:
+    """Polled by the page above every few seconds. 404 means "no such
+    link"; 200 with active=false means "valid link, no call running right
+    now". `active` is driven by call_control.is_active, which already
+    applies its own staleness pruning (a call-specific cutoff, much
+    tighter than browsing's 15-minute one, given real call audio is more
+    sensitive) -- so a stale/ended call can never keep looking "live"
+    just because call_activity's in-memory log hasn't been cleared yet."""
+    user = await db.get_user_by_live_token(token)
+    if user is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    user_id = user["id"]
+    if not call_control.is_active(user_id):
+        return JSONResponse({"active": False})
+    activity = call_activity.get(user_id)
+    return JSONResponse({
+        "active": True,
+        "call_id": activity["call_id"],
+        "business_name": activity["business_name"],
+        "task_description": activity["task_description"],
+        "status": activity["status"],
+        "transcript_lines": activity["transcript_lines"],
+    })
+
+
+@app.websocket("/live/{token}/call/audio")
+async def call_live_view_audio(websocket: WebSocket) -> None:
+    """The one-directional audio relay (plan Section 4): the browser NEVER
+    sees Vapi's raw listenUrl -- this server privately holds it (in
+    call_activity, in-memory only, never persisted -- see migrations/
+    035_call_sessions.sql's own "deliberate omissions" comment) and opens
+    its OWN outbound connection to it, relaying frames to the browser.
+    Structurally one-directional in code: this loop only ever reads from
+    the upstream Vapi connection and writes to the browser -- it never
+    reads anything the browser sends and never forwards it anywhere,
+    which is what keeps "listen-only" true even against a deliberate
+    attempt to push audio up the same socket, not just a documented
+    intention.
+
+    FLAGGED for go-live verification (see channels/vapi.py's own
+    FLAG_FOR_GO_LIVE_VERIFICATION): whether relaying listenUrl server-side
+    needs any auth beyond possessing the URL, and the exact audio frame
+    format Vapi actually streams."""
+    token = websocket.path_params.get("token")
+    user = await db.get_user_by_live_token(token) if token else None
+    if user is None or not call_control.is_active(user["id"]):
+        await websocket.close(code=4404)
+        return
+
+    listen_url = call_activity.get(user["id"]).get("listen_url")
+    if not listen_url:
+        await websocket.close(code=4404)
+        return
+
+    await websocket.accept()
+    try:
+        async with websockets.connect(listen_url) as upstream:
+            async for frame in upstream:
+                await websocket.send_bytes(frame if isinstance(frame, (bytes, bytearray)) else frame.encode())
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:  # noqa: BLE001 - a relay hiccup must not crash the server
+        console.system(f"call_live_view_audio: relay error for user {user['id']}: {e}")
+    finally:
+        try:
+            await websocket.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@app.post("/webhook/vapi")
+async def vapi_webhook(request: Request) -> JSONResponse:
+    """Every Vapi event this feature cares about arrives here: the mid-call
+    info-tool request (dispatched to call_tools.handle_mid_call_tool_call,
+    whose return value IS the tool-response envelope Vapi expects) and the
+    end-of-call report (call_tools.handle_end_of_call_report, which
+    finalizes the call_sessions row and meters real billed minutes).
+    Verifies Vapi's shared secret first (vapi.verify_webhook_request) --
+    an unset config.VAPI_WEBHOOK_SECRET is accepted unverified, matching
+    Sendblue's own webhook posture for local dev, per that config var's
+    own comment about the tradeoff in a real deployment."""
+    body = await request.body()
+    if not vapi.verify_webhook_request(dict(request.headers), body):
+        console.system("Vapi webhook: rejected request with bad/missing signing secret.")
+        return JSONResponse({"error": "invalid signing secret"}, status_code=401)
+
+    try:
+        payload: dict[str, Any] = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+
+    message = payload.get("message") or {}
+    message_type = message.get("type") or payload.get("type")
+
+    if message_type in ("tool-calls", "function-call"):
+        result = await call_tools.handle_mid_call_tool_call(payload)
+        return JSONResponse(result)
+
+    if message_type == "end-of-call-report":
+        await call_tools.handle_end_of_call_report(payload)
+        return JSONResponse({"status": "ok"})
+
+    # Any other Vapi event type (status updates, transcript partials, ...)
+    # -- acknowledged, not acted on. Never a hard error: an unrecognized
+    # event type must not make Vapi think the webhook itself is broken.
+    return JSONResponse({"status": "ignored"})
 
 
 @app.get("/files/{token}")

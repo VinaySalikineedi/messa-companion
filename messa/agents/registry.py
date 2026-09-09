@@ -66,6 +66,8 @@ from ..tools.admin_tools import ADMIN_SYSTEM_PROMPT, build_admin_tools
 from ..tools.deepsearch_tools import build_deepsearch_subagent, count_warm_sessions_for_user, purge_warm_sessions_for_user
 from ..tools.common import trace_all
 from ..tools.document_tools import build_document_system_prompt, build_document_tools
+from ..tools import call_tools
+from ..tools.call_tools import build_call_subagent
 from ..tools.email_tools import build_email_subagent
 from ..tools.executive_tools import _format_contact_line, build_executive_subagent
 from ..tools.integration_circuit_breaker import IntegrationRetryLoopMiddleware
@@ -101,7 +103,18 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
         result = await db.confirm_pending_action(uid, pending_action_id)
         if not result.get("ok"):
             return f"Could not confirm #{pending_action_id}: {result.get('error')}"
-        return f"Confirmed and applied action #{pending_action_id} ({result['action_type']})."
+        base = f"Confirmed and applied action #{pending_action_id} ({result['action_type']})."
+        if result["action_type"] == "place_call":
+            # The 'place_call' applier (db._insert_call_session_confirmed)
+            # only ever staged a call_sessions row with status='confirmed'
+            # -- the actual dial (a real, slow, failable HTTP call to
+            # Vapi) happens HERE, as a separate step outside that
+            # transaction, same reasoning broadcast_message's own fan-out
+            # send being a separate background loop gives. See
+            # call_tools.dial_confirmed_call's own docstring.
+            outcome = await call_tools.dial_confirmed_call(result["result"])
+            return f"{base} {outcome}"
+        return base
 
     @tool
     async def reject_pending_action(pending_action_id: int) -> str:
@@ -1093,6 +1106,7 @@ async def build_orchestrator(
         build_deepsearch_subagent(user, _subagent_model_for("deepsearch"), approval_gate),
         build_executive_subagent(user, _subagent_model_for("executive_assistant")),
         build_email_subagent(user, _subagent_model_for("email_agent"), approval_gate),
+        build_call_subagent(user, _subagent_model_for("call_agent"), approval_gate),
         {
             "name": "personal_inbox_agent",
             "description": (

@@ -49,6 +49,12 @@ TESTS=(
   tests/test_fth_upgrades.py
   tests/test_fth_consent_and_form_js_live.py
   tests/test_scratchpad_and_skills.py
+  tests/test_call_plans_usage.py
+  tests/test_vapi_channel.py
+  tests/test_call_control_and_activity.py
+  tests/test_call_tools_security.py
+  tests/test_call_tools_flow.py
+  tests/test_call_webhook.py
 )
 
 PASSED=()

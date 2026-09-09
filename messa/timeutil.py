@@ -247,6 +247,24 @@ def local_today(user_tz: str | None) -> date:
     return datetime.now(tz).date()
 
 
+def local_month_start(user_tz: str | None) -> date:
+    """The first day of THIS calendar month in the user's own timezone --
+    mirrors local_today exactly (same fallback-to-UTC-when-unset
+    behavior), just truncated to month granularity. Exists for one
+    reason: messa/usage.py's check_and_consume_monthly/peek_usage_monthly
+    pass this as the `day` argument to db.check_and_increment_usage/
+    get_usage_count -- those functions store "whatever date they're
+    given" per their own docstrings, so a month-start date here (instead
+    of local_today's actual day) turns the exact same atomic, race-safe
+    day-bucketed upsert into a monthly bucket, with zero new migration or
+    duplicated locking logic. Safe only because the `feature` string
+    passed alongside it (e.g. "call_minutes") never overlaps with a real
+    per-day feature sharing that same table -- see usage.py's own comment
+    at the call site."""
+    tz = ZoneInfo(user_tz) if user_tz else dt_timezone.utc
+    return datetime.now(tz).date().replace(day=1)
+
+
 def current_context_str(user_tz: str, confirmed: bool) -> str:
     """One line every time-sensitive system prompt should include: the
     actual current date/time in the user's own timezone, made explicit

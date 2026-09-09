@@ -1029,6 +1029,49 @@ SMS_AUTO_APPROVE_DESTRUCTIVE = os.environ.get("MESSA_SMS_AUTO_APPROVE_DESTRUCTIV
     "1", "true", "yes",
 )
 
+# ---- Vapi (outbound voice-calling provider, messa/channels/vapi.py) ----
+# Same "left optional, graceful absence" pattern as Sendblue above: no
+# account/API key exists yet as of this writing (plans/glowing-forging-
+# pumpkin.md), so every one of these defaults to unset/off, and
+# messa/tools/call_tools.py's build_call_subagent checks VAPI_API_KEY/
+# VAPI_PHONE_NUMBER_ID itself and calmly declines ("voice calling isn't
+# set up on this account yet") rather than assuming they're present. This
+# is deliberately a THIRD-PARTY-SWAPPABLE client shape (see vapi.py's own
+# module docstring) -- nothing outside vapi.py should ever read these
+# directly.
+VAPI_API_KEY = os.environ.get("VAPI_API_KEY")
+# The Vapi phone number Messa calls FROM (a Vapi-side resource id, not a
+# raw phone number string) -- required alongside VAPI_API_KEY to place any
+# call at all.
+VAPI_PHONE_NUMBER_ID = os.environ.get("VAPI_PHONE_NUMBER_ID")
+# Verified against Vapi's live webhook payloads at go-live time (see the
+# plan's own "flag explicitly for implementation time" list) -- most
+# likely a static shared-secret header, mirroring how Sendblue's
+# SENDBLUE_WEBHOOK_SECRET already works in this codebase, not an HMAC
+# scheme. Unset = no verification, same "fine for local dev, set it once
+# the URL is public" posture SENDBLUE_WEBHOOK_SECRET already documents --
+# but unlike Sendblue, call_tools.py's webhook handler should refuse to
+# process ANY mid-call/end-of-call event while VAPI_API_KEY is set but
+# this is unset in a real deployment, since a call actually placing money
+# and possibly disclosing user info is a meaningfully higher-stakes
+# webhook surface than an inbound text.
+VAPI_WEBHOOK_SECRET = os.environ.get("VAPI_WEBHOOK_SECRET")
+# Hard ceiling on any single call's length, enforced via Vapi's own
+# maxDurationSeconds (never left to the model's judgment to hang up) --
+# see call_tools.py's dial_confirmed_call, which takes the SMALLER of
+# this and the user's actual remaining monthly call_minutes for that
+# specific call. 600s = 10 minutes; generous for "order my usual" or
+# "resolve my ticket" style tasks without leaving a runaway call able to
+# burn a large chunk of someone's monthly allowance in one shot.
+CALL_MAX_DURATION_SECONDS = int(os.environ.get("MESSA_CALL_MAX_DURATION_SECONDS", "600"))
+# Per-user concurrency cap -- deliberately LOWER than
+# DEEPSEARCH_MAX_CONCURRENT_SESSIONS_PER_USER's default of 2: a real
+# outbound phone call is a heavier, costlier, more real-world-consequential
+# action than one more browser tab, and there's no realistic "look this
+# up, then also check that" case for two simultaneous phone calls the way
+# there is for two simultaneous searches.
+CALL_MAX_CONCURRENT_PER_USER = int(os.environ.get("MESSA_CALL_MAX_CONCURRENT_PER_USER", "1"))
+
 # ---- Identity of the local CLI user ----
 # Phase 1 runs single-user over the CLI (no phone/email channel yet), so we
 # pin a fixed dev identity. Phase 2 will resolve this per-channel instead
@@ -1318,6 +1361,16 @@ DEEPSEARCH_MAX_SESSION_SECONDS = int(os.environ.get("MESSA_DEEPSEARCH_MAX_SESSIO
 # combined check every call site uses.
 DEEPSEARCH_PUBLIC_ACCESS = os.environ.get("MESSA_DEEPSEARCH_PUBLIC_ACCESS", "false").strip().lower() in ("1", "true", "yes")
 
+# Same v1-launch access-gate pattern as DEEPSEARCH_PUBLIC_ACCESS just
+# above, for voice calling (plans/glowing-forging-pumpkin.md,
+# migrations/036_call_beta_access.sql): OFF by default regardless of plan
+# tier -- a real outbound phone call is a genuinely new, higher-stakes
+# action (real money, a real stranger talking to something acting on the
+# user's behalf) that should launch to hand-picked accounts only, exactly
+# how deepsearch itself launched. See UserContext.has_call_access for the
+# actual combined gate every call site reads.
+CALL_PUBLIC_ACCESS = os.environ.get("MESSA_CALL_PUBLIC_ACCESS", "false").strip().lower() in ("1", "true", "yes")
+
 # Scalability fix (pre-1000-user launch): a hard, process-wide cap on how
 # many TOP-LEVEL deepsearch sessions can be running at once, across every
 # user sharing this one container. Before this, there was no such
@@ -1482,6 +1535,12 @@ EXECUTIVE_RECURSION_LIMIT = int(os.environ.get("MESSA_EXECUTIVE_RECURSION_LIMIT"
 # of failing fast and telling Messa what actually went wrong. See
 # tools/email_tools.py's build_email_subagent.
 EMAIL_RECURSION_LIMIT = int(os.environ.get("MESSA_EMAIL_RECURSION_LIMIT", "12"))
+# Same reasoning as EMAIL_RECURSION_LIMIT: messa/tools/call_tools.py's
+# build_call_subagent is a CompiledSubAgent with its own small step
+# budget, independent of whatever recursion_limit is ambient on the
+# orchestrator's own call -- propose_call is normally a single tool call,
+# not a multi-step research-sized loop.
+CALL_RECURSION_LIMIT = int(os.environ.get("MESSA_CALL_RECURSION_LIMIT", "8"))
 
 # All server-side "now" comparisons (due reminders/cron) use tz-aware UTC
 # datetimes explicitly (datetime.now(timezone.utc)) rather than naive
@@ -1740,6 +1799,10 @@ class UserContext:
     # column feeds -- going public later never touches this column at all,
     # it's a single config flip.
     deepsearch_beta_access: bool = False
+    # From users.call_beta_access (migrations/036_call_beta_access.sql) --
+    # same manually-flipped-bypass convention as deepsearch_beta_access
+    # just above, for the voice-calling feature. See has_call_access.
+    call_beta_access: bool = False
     # From users.memory_profile (migrations/027_memory.sql) -- the cheap,
     # always-on profile digest, read once per turn via db.get_memory_profile
     # exactly like the fields above, NOT a live Mem0 call (see
@@ -1775,6 +1838,19 @@ class UserContext:
         prompt hint in _build_system_prompt -- reads the exact same
         decision, and there's only one place this logic could ever drift."""
         return DEEPSEARCH_PUBLIC_ACCESS or self.is_admin or self.deepsearch_beta_access
+
+    @property
+    def has_call_access(self) -> bool:
+        """The voice-calling counterpart to has_deepsearch_access above --
+        same combined-gate shape, same reasoning: CALL_PUBLIC_ACCESS (the
+        v1 -> public-release switch), or an admin account, or a hand-
+        picked beta account (call_beta_access, migrations/
+        036_call_beta_access.sql). Checked by messa/tools/call_tools.py's
+        build_call_subagent BEFORE even the plan/usage-limit check -- an
+        ungated user's request never touches the monthly-minutes counter,
+        never proposes a pending_actions row, never gets anywhere near
+        actually dialing."""
+        return CALL_PUBLIC_ACCESS or self.is_admin or self.call_beta_access
 
     @property
     def messa_email(self) -> str | None:
