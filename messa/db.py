@@ -13,6 +13,7 @@ import json
 import mimetypes
 import re
 import secrets
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from email.utils import parseaddr
@@ -4159,6 +4160,16 @@ async def get_usage_count_strict(user_id: int, feature: str, day: Any) -> int:
 # called, it's trusted to already be screened.
 # ---------------------------------------------------------------------------
 
+# V3-autonomous.md Phase 4 ("skills-index short-circuit"): process-local
+# cache backing agent_type_has_any_skills (defined after search_skills,
+# further down), keyed by agent_type -> (has_any_skills, cached_at_
+# monotonic). See that function's own docstring for the full reasoning;
+# declared here, at the top of this section, so upsert_skill below can
+# flip an entry to True immediately on a successful save, without waiting
+# for the TTL.
+_SKILLS_EXISTENCE_CACHE: dict[str, tuple[bool, float]] = {}
+
+
 async def get_active_task(user_id: int) -> dict[str, Any] | None:
     """The user's current in_progress/waiting_user_input task, if any -- at
     most one is expected open per user at a time (see start_active_task).
@@ -4423,6 +4434,13 @@ async def upsert_skill(
         )
         if row is None:
             return None
+        # V3-autonomous.md Phase 4: flip the existence cache to True
+        # immediately, not on the next TTL refresh -- the whole point of
+        # save_skill just succeeding is that a future delegation's
+        # search_skills nudge (see agent_type_has_any_skills' own
+        # docstring) should reflect that right away, not up to
+        # config.SKILLS_EXISTENCE_CACHE_TTL_SECONDS later.
+        _SKILLS_EXISTENCE_CACHE[agent_type] = (True, time.monotonic())
         result = dict(row)
         await _evict_excess_skills(conn, agent_type, domain)
         return result
@@ -4449,6 +4467,51 @@ async def search_skills(agent_type: str, domain: str, limit: int | None = None) 
             limit or config.SKILLS_MAX_PER_QUERY,
         )
         return _rows(rows)
+
+
+async def agent_type_has_any_skills(agent_type: str) -> bool:
+    """V3-autonomous.md Phase 4 ("skills-index short-circuit"): a cheap,
+    process-local, TTL'd (config.SKILLS_EXISTENCE_CACHE_TTL_SECONDS) cache
+    of whether ANY skill has ever been recorded for this agent_type, across
+    every domain. Lets scratchpad_tools.py's system-prompt nudge decide
+    whether it's worth telling the model to call search_skills at all right
+    now, instead of spending a full extra tool-call round trip on every
+    single delegation just to be told "nothing yet" -- the actual cost this
+    phase's "cache skills index" deliverable exists to cut.
+
+    Deliberately coarser than search_skills' own (agent_type, domain)
+    scoping: domain isn't known until the model picks a tool/site mid-turn,
+    so this can only answer "has this agent_type learned ANYTHING yet", not
+    "...about this specific domain". A false positive here (cache says
+    True, this particular domain still has nothing) just means an ordinary
+    search_skills call that comes back empty -- exactly today's behavior. A
+    false negative is impossible by construction: upsert_skill flips this
+    cache to True immediately on every successful save, never waiting on
+    the TTL, so a domain's first-ever skill is never hidden from the very
+    next delegation because of a stale cache entry.
+
+    In-process only -- a multi-worker deployment keeps one cache per
+    worker, so a worker that hasn't seen a just-saved first skill for some
+    agent_type may keep showing the nudge-suppressed prompt for up to the
+    TTL. Acceptable: the cost of being briefly wrong here is one extra,
+    harmless search_skills call -- never a correctness issue, and never
+    worse than every single call before this cache existed."""
+    agent_type = agent_type.lower().strip()
+    now = time.monotonic()
+    cached = _SKILLS_EXISTENCE_CACHE.get(agent_type)
+    if cached is not None and (now - cached[1]) < config.SKILLS_EXISTENCE_CACHE_TTL_SECONDS:
+        return cached[0]
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "agent_skills"):
+            result = False
+        else:
+            result = bool(await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM agent_skills WHERE agent_type = $1)",
+                agent_type,
+            ))
+    _SKILLS_EXISTENCE_CACHE[agent_type] = (result, now)
+    return result
 
 
 # ---------------------------------------------------------------------------

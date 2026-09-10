@@ -436,7 +436,7 @@ def build_personal_inbox_subagent(
         system_prompt = build_personal_inbox_system_prompt(user) + reliability.RELIABILITY_GUARDRAIL_STR
         if config.SCRATCHPAD_AND_SKILLS_ENABLED:
             tools = tools + build_scratchpad_tools(user, "personal_inbox_agent", approval_gate)
-            system_prompt = system_prompt + await scratchpad_prompt_block(user)
+            system_prompt = system_prompt + await scratchpad_prompt_block(user, "personal_inbox_agent")
         run_config = {"recursion_limit": config.RECURSION_LIMIT}
         inner_agent = create_agent(
             model=model,

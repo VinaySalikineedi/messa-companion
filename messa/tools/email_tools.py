@@ -790,7 +790,7 @@ def build_email_subagent(
         # inner agent fresh on every delegation.
         if config.SCRATCHPAD_AND_SKILLS_ENABLED:
             tools = tools + build_scratchpad_tools(user, "email_agent", approval_gate)
-            system_prompt = system_prompt + await scratchpad_prompt_block(user)
+            system_prompt = system_prompt + await scratchpad_prompt_block(user, "email_agent")
         run_config = {"recursion_limit": config.EMAIL_RECURSION_LIMIT}
         inner_agent = create_agent(
             model=model, tools=tools, system_prompt=system_prompt,

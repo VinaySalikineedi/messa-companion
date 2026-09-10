@@ -1224,7 +1224,7 @@ def build_document_subagent(user: config.UserContext, model: BaseChatModel) -> d
         system_prompt = build_document_system_prompt(user) + reliability.RELIABILITY_GUARDRAIL_STR
         if config.SCRATCHPAD_AND_SKILLS_ENABLED:
             tools = tools + build_scratchpad_tools(user, "document_agent")
-            system_prompt = system_prompt + await scratchpad_prompt_block(user)
+            system_prompt = system_prompt + await scratchpad_prompt_block(user, "document_agent")
         run_config = {"recursion_limit": config.RECURSION_LIMIT}
         inner_agent = create_agent(
             model=model,

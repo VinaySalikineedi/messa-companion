@@ -914,6 +914,42 @@ EMAIL_TRIAGE_ENABLED = os.environ.get("MESSA_EMAIL_TRIAGE_ENABLED", "true").stri
     "1", "true", "yes", "on",
 )
 
+# ---- V3-autonomous.md Phase 4: Subagent Concurrency & Latency Drop.
+# Three related latency optimizations under one flag, deliberately NOT new
+# tools, subagents, or middleware -- the actual concurrent-tool-call
+# EXECUTION path (langgraph's prebuilt ToolNode) already runs every tool
+# call in one AI message concurrently via asyncio.gather, confirmed by
+# reading its own source (_afunc); Messa's own model was simply never told
+# she's allowed to ask for more than one delegation per turn. So this is
+# prompt-level guidance plus one small cache, not new execution machinery:
+#   1. registry.py's system prompt tells Messa to batch independent task()
+#      delegations into the SAME turn instead of one-at-a-time round
+#      trips, when they don't depend on each other's results.
+#   2. registry.py's system prompt tells Messa to write an email draft/
+#      preview herself (same third-person voice already required at send
+#      time) rather than delegating purely to preview it -- delegation is
+#      for the actual send, or for something only that subagent's own
+#      tools can do (thread/contact lookup, attachments).
+#   3. db.agent_type_has_any_skills (a process-local, TTL'd cache -- see
+#      its own docstring) lets scratchpad_tools.py drop the "call
+#      search_skills before working with it" nudge for an agent_type with
+#      zero learned skills recorded anywhere, instead of spending a full
+#      extra tool-call round trip on every delegation just to hear
+#      "nothing yet" every single time.
+# When false, every one of the above reverts to exactly its pre-Phase-4
+# wording/behavior -- same "instantly flippable, no redeploy" kill switch
+# as every other phase's flag.
+LATENCY_OPTIMIZATIONS_ENABLED = os.environ.get("MESSA_LATENCY_OPTIMIZATIONS_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+# How long db.agent_type_has_any_skills trusts its cached answer before
+# re-checking the database -- see that function's own docstring for why a
+# stale "no skills yet" is harmless (one extra ordinary search_skills call)
+# while a stale "has skills" never happens at all (upsert_skill invalidates
+# immediately on every successful save, regardless of this TTL).
+SKILLS_EXISTENCE_CACHE_TTL_SECONDS = int(os.environ.get("MESSA_SKILLS_EXISTENCE_CACHE_TTL_SECONDS", "300"))
+
 # ---- Voice and image input (messa/media_understanding.py) -- lets a user
 # text Messa a voice memo or a photo and have it actually understood,
 # instead of the SMS/iMessage path silently ignoring anything that isn't a

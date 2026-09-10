@@ -388,7 +388,7 @@ def build_executive_subagent(user: UserContext, model: BaseChatModel) -> dict[st
         # subagents that carry a plain "tools"/"system_prompt" dict.
         if config.SCRATCHPAD_AND_SKILLS_ENABLED:
             tools = tools + build_scratchpad_tools(user, "executive_assistant")
-            system_prompt = system_prompt + await scratchpad_prompt_block(user)
+            system_prompt = system_prompt + await scratchpad_prompt_block(user, "executive_assistant")
 
         checkpointer = MemorySaver()
         run_config = {

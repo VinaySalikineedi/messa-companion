@@ -561,7 +561,7 @@ async def part8_feature_flag_kill_switch():
         check("save_skill reports disabled and touches no DB fn", "disabled" in r2.lower())
         check("search_skills reports disabled and touches no DB fn", "disabled" in r3.lower())
         check("no DB function was ever called while the flag was off", len(touched) == 0)
-        block = await scratchpad_tools.scratchpad_prompt_block(user)
+        block = await scratchpad_tools.scratchpad_prompt_block(user, "integrations_agent")
         check("scratchpad_prompt_block returns empty string when disabled", block == "")
     finally:
         config.SCRATCHPAD_AND_SKILLS_ENABLED = orig

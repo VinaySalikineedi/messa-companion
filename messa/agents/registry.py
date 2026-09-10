@@ -934,6 +934,43 @@ def _build_system_prompt(
         "new-user waitlist)"
     ) if user.is_admin else ""
 
+    # V3-autonomous.md Phase 4 ("Subagent Concurrency & Latency Drop"):
+    # langgraph's own ToolNode already runs every tool call in one AI
+    # message concurrently (asyncio.gather, confirmed by reading its
+    # source) -- nothing in this codebase ever serializes multiple task()
+    # calls. The doc's own field incident (a routines_agent -> orchestrator
+    # -> email_agent chain taking 6m43s) was independent delegations being
+    # requested one at a time, waited on, THEN the next one decided --
+    # never actually forced to be sequential, just never told otherwise.
+    # This paragraph is that permission, not new execution machinery.
+    parallel_delegation_note = (
+        "\n\nSpeed: when a request needs more than one delegation and they don't "
+        "depend on each other's results (e.g. checking two unrelated inboxes, or "
+        "creating a routine while also looking something up), call task for BOTH in "
+        "the SAME response instead of delegating one, waiting, then delegating the "
+        "next -- they run concurrently and you'll have both results together. Only "
+        "delegate one at a time when the second delegation genuinely needs the "
+        "first one's result to know what to ask for."
+    ) if config.LATENCY_OPTIMIZATIONS_ENABLED else ""
+
+    # V3-autonomous.md Phase 4 ("Fast-Path Draft Preview"): drafting text
+    # is plain generation, not a tool call -- delegating purely to preview
+    # wording spends a whole extra subagent round trip (its own model call,
+    # its own tool-schema tokens) producing something Messa can write
+    # herself in the same voice, just as fast, in the SAME response the
+    # user is already waiting on. Delegation is for the parts only the
+    # subagent can actually do: the real send, or looking something up
+    # first (a thread, a contact, an attachment).
+    fast_path_draft_note = (
+        " When the user asks you to draft, write, or preview an email WITHOUT also "
+        "asking you to send/reply right now, write the draft text yourself, right "
+        "here, in the same third-person Messa-voice required at send time -- don't "
+        "delegate just to preview it. Delegate to personal_inbox_agent/email_agent "
+        "once they confirm they want it sent (or if you need something only that "
+        "subagent's own tools provide first, like a thread lookup, a contact's "
+        "address, or an attachment)."
+    ) if config.LATENCY_OPTIMIZATIONS_ENABLED else ""
+
     # Only ever non-empty for a user WITHOUT deepsearch access (the common
     # case at v1 launch -- see UserContext.has_deepsearch_access's own
     # docstring). Told up front, before the delegation-routing paragraphs
@@ -1046,7 +1083,8 @@ def _build_system_prompt(
         "something, and background tasks where YOU do something yourself and report back, "
         "e.g. watchers, deadline-aware follow-ups), integrations_agent (any other app -- "
         f"Reddit, Todoist, Slack, Notion, GitHub, Google Calendar, and 1,400+ more)"
-        f"{admin_agent_mention}.\n\n"
+        f"{admin_agent_mention}."
+        f"{parallel_delegation_note}\n\n"
         "Routing -- email, calendar, and tasks each have a NATIVE Messa tool and, once "
         "connected, a REAL app that can compete with it. Same pattern all three: a GENERIC "
         "request naming neither ('check my email', 'what's on my schedule', 'add a task') "
@@ -1061,7 +1099,8 @@ def _build_system_prompt(
         "Gmail). 'my gmail'/'my real email' -> email_agent; 'my messa email'/'the address you "
         "gave me' -> personal_inbox_agent. Whenever you draft or send from their Messa "
         "address, always write third-person on their behalf ('<Name> asked me to confirm...') "
-        "-- never first-person as the user, never sign off with their name.\n"
+        "-- never first-person as the user, never sign off with their name."
+        f"{fast_path_draft_note}\n"
         "  - calendar: executive_assistant (Messa's own internal calendar) vs "
         "integrations_agent (a real connected calendar, e.g. Google Calendar, Composio "
         "toolkit slug 'googlecalendar'). CONNECT/sync/manage a real calendar always goes to "
@@ -1376,7 +1415,7 @@ async def build_orchestrator(
     )
     if config.SCRATCHPAD_AND_SKILLS_ENABLED:
         orchestrator_tools = orchestrator_tools + build_scratchpad_tools(user, "messa_orchestrator", approval_gate)
-        orchestrator_system_prompt = orchestrator_system_prompt + await scratchpad_prompt_block(user)
+        orchestrator_system_prompt = orchestrator_system_prompt + await scratchpad_prompt_block(user, "messa_orchestrator")
 
     agent = create_deep_agent(
         model=model,

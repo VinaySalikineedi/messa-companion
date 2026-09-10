@@ -3375,7 +3375,7 @@ def build_deepsearch_subagent(
                             _deepsearch_tools = _deepsearch_tools + build_scratchpad_tools(
                                 user, "deepsearch", approval_gate
                             )
-                            _active_system_prompt = _active_system_prompt + await scratchpad_prompt_block(user)
+                            _active_system_prompt = _active_system_prompt + await scratchpad_prompt_block(user, "deepsearch")
                         # Zero-delta circuit breaker (docs/smart_autonomous_
                         # agent_architecture.md, System 6) -- only for the
                         # Stagehand engine, which had no general breaker of

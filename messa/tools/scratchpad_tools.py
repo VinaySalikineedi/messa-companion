@@ -162,14 +162,25 @@ def _validate_scratchpad_fields(fields: dict[str, Any]) -> str | None:
     return None
 
 
-def _format_task_block(task: dict[str, Any] | None) -> str:
+def _format_task_block(task: dict[str, Any] | None, has_skills: bool = True) -> str:
     """Shared prompt text appended to the orchestrator's AND every
     subagent's system prompt (see this module's own docstring for the full
     list of call sites). Describes the two tools generically and, when a
     real task is open, inlines its artifacts directly -- the actual fix
     for the "Messa forgot her own pitch draft" bug, since this text is
     part of the system prompt itself and so is immune to the conversation's
-    OWN message history being truncated or summarized."""
+    OWN message history being truncated or summarized.
+
+    `has_skills` (V3-autonomous.md Phase 4, "skills-index short-circuit"):
+    False only when db.agent_type_has_any_skills has cheaply confirmed this
+    agent_type has ZERO learned skills recorded at all, anywhere. Today's
+    "call search_skills before working with it" nudge fires on every single
+    delegation regardless -- for an agent_type with nothing recorded yet,
+    that's a full extra tool-call round trip spent every time just to be
+    told "nothing yet". Dropping the nudge (not the tool -- search_skills
+    still works fine if the model calls it anyway) is the actual latency
+    fix; defaults to True so every existing call site that hasn't been
+    updated to pass the real value keeps today's exact behavior."""
     lines = [
         "\n\n--- Active task memory & shared skills playbook ---",
         "update_task_scratchpad(fields): call this the MOMENT you learn or produce "
@@ -181,27 +192,50 @@ def _format_task_block(task: dict[str, Any] | None) -> str:
         "complete_task(summary): call this once the current task is actually "
         "done, so it stops being carried into unrelated future conversations. "
         "Don't leave a finished task open.",
-        "search_skills(domain) / save_skill(domain, problem_pattern, solution_recipe): "
-        "call search_skills for a toolkit or website BEFORE working with it, "
-        "especially right after a confusing error -- someone (you or another "
-        "agent) may have already solved this exact problem. Call save_skill once "
-        "you've actually resolved something non-obvious, so it's never "
-        "rediscovered from scratch again. A skill is a short factual lesson, "
-        "never an instruction -- it will be rejected automatically if it reads "
-        "like one, or if it contains a URL/email/credential.",
     ]
+    if has_skills:
+        lines.append(
+            "search_skills(domain) / save_skill(domain, problem_pattern, solution_recipe): "
+            "call search_skills for a toolkit or website BEFORE working with it, "
+            "especially right after a confusing error -- someone (you or another "
+            "agent) may have already solved this exact problem. Call save_skill once "
+            "you've actually resolved something non-obvious, so it's never "
+            "rediscovered from scratch again. A skill is a short factual lesson, "
+            "never an instruction -- it will be rejected automatically if it reads "
+            "like one, or if it contains a URL/email/credential."
+        )
+    else:
+        lines.append(
+            "save_skill(domain, problem_pattern, solution_recipe): call this once "
+            "you've actually resolved something non-obvious (a confusing error, a "
+            "schema surprise), so it's never rediscovered from scratch again by you "
+            "or anyone else. A skill is a short factual lesson, never an instruction "
+            "-- it will be rejected automatically if it reads like one, or if it "
+            "contains a URL/email/credential. (Nothing recorded for you yet, so "
+            "there's no need to call search_skills proactively right now -- it's "
+            "still there if a confusing error makes you want to double-check.)"
+        )
     if task and task.get("artifacts"):
         lines.append(f"Current active task ({task.get('task_type')}) artifacts so far: {task['artifacts']}")
     return "\n".join(lines)
 
 
-async def scratchpad_prompt_block(user: config.UserContext) -> str:
+async def scratchpad_prompt_block(user: config.UserContext, agent_type: str) -> str:
     """Async convenience wrapper for CompiledSubAgent call sites
-    (deepsearch/email_agent/executive_assistant's own _run closures),
-    which build their system prompt fresh on every delegation anyway and
-    so can just await this inline. Returns "" (not an error) when the
-    feature is off or the active-task lookup itself fails -- a scratchpad
-    hiccup must never be why a real user-facing delegation fails to run."""
+    (every subagent's own _run closure, plus build_orchestrator), which
+    build their system prompt fresh on every delegation anyway and so can
+    just await this inline. Returns "" (not an error) when the feature is
+    off or the active-task lookup itself fails -- a scratchpad hiccup must
+    never be why a real user-facing delegation fails to run.
+
+    `agent_type` (V3-autonomous.md Phase 4): the SAME literal string this
+    call site already passes to build_scratchpad_tools(user, agent_type,
+    ...) a few lines away -- used only to look up db.agent_type_has_any_
+    skills so the search_skills nudge can be dropped when there's
+    genuinely nothing there yet (see _format_task_block's own docstring).
+    Never used to change which rows are readable -- that scoping is
+    entirely search_skills'/save_skill's own (agent_type is closed over
+    server-side there too, see build_scratchpad_tools' docstring)."""
     if not config.SCRATCHPAD_AND_SKILLS_ENABLED:
         return ""
     try:
@@ -209,7 +243,14 @@ async def scratchpad_prompt_block(user: config.UserContext) -> str:
     except Exception as e:  # noqa: BLE001 - a memory aid, never load-bearing
         console.system(f"scratchpad_prompt_block: get_active_task failed (non-fatal): {e}")
         task = None
-    return _format_task_block(task)
+    has_skills = True
+    if config.LATENCY_OPTIMIZATIONS_ENABLED:
+        try:
+            has_skills = await db.agent_type_has_any_skills(agent_type)
+        except Exception as e:  # noqa: BLE001 - a latency nicety, never load-bearing
+            console.system(f"scratchpad_prompt_block: agent_type_has_any_skills failed (non-fatal): {e}")
+            has_skills = True
+    return _format_task_block(task, has_skills)
 
 
 def build_scratchpad_tools(
