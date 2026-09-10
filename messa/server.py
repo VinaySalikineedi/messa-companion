@@ -47,7 +47,7 @@ import websockets
 from fastapi import BackgroundTasks, FastAPI, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
-from . import asset_consolidation, background, briefings, call_activity, call_control, cli, config, console, db, live_activity, media_understanding, memory, pdf_reader, region_gate, turn_control, waitlist
+from . import asset_consolidation, background, briefings, call_activity, call_control, cli, config, console, db, email_triage, live_activity, media_understanding, memory, pdf_reader, region_gate, turn_control, waitlist
 from .agents.registry import build_orchestrator
 from .approval import AutoApproveGate, DenyApprovalGate
 from .call_live_view_page import render_call_live_view_page
@@ -1997,6 +1997,29 @@ async def personal_email_inbound_webhook(
         )
         return JSONResponse({"status": "accepted (muted sender, notification suppressed)"})
 
+    # V3-autonomous.md Phase 3: deterministic (zero-token) three-tier
+    # triage (messa/email_triage.py) -- runs LAST, right before the one
+    # line that actually spends anything (an agent turn + an SMS), same
+    # placement reasoning as the mute check right above it. A 'vip'
+    # classification changes nothing (today's exact behavior, below).
+    # 'daily'/'weekly' are logged and queued for the next matching
+    # briefing instead of spawning a full Messa turn right now -- the
+    # actual fix for the "5:51 AM notification fatigue" field incident
+    # this phase exists for.
+    if config.EMAIL_TRIAGE_ENABLED:
+        tier = await email_triage.classify_inbound_email(
+            user["id"], from_address, payload.get("subject") or "", body_text,
+        )
+        if tier != email_triage.TIER_VIP:
+            summary = email_triage.summarize_for_digest(from_address, payload.get("subject") or "")
+            await db.enqueue_email_digest_item(user["id"], tier, summary)
+            when = "the next morning briefing" if tier == email_triage.TIER_DAILY else "this Sunday's evening briefing"
+            console.system(
+                f"Personal-email: classified {from_address!r} as {tier!r} for user #{user['id']} -- "
+                f"queued for {when}, notification turn suppressed."
+            )
+            return JSONResponse({"status": f"accepted (queued for {tier} digest)"})
+
     background_tasks.add_task(_process_inbound_personal_email, user["id"], logged, pdf_note)
     return JSONResponse({"status": "accepted"})
 
@@ -2445,6 +2468,12 @@ async def _send_one_briefing(job: dict[str, Any]) -> None:
         text = await briefings.render_briefing(job)
         if text:
             await sendblue.send_message(job["phone_number"], text)
+            if config.EMAIL_TRIAGE_ENABLED:
+                # Only clears what actually just got sent (see
+                # email_triage.tiers_for_briefing_kind) -- never on a
+                # failed send, so a Sendblue outage leaves queued items in
+                # place for the next due briefing instead of losing them.
+                await email_triage.clear_flushed_digest_tiers(job)
     except Exception as e:  # noqa: BLE001
         console.system(f"[briefing delivery failed] job=#{job['id']} kind={job.get('kind')}: {e}")
     next_run = compute_next_run(job["cron_expression"], job["user_timezone"])

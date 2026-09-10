@@ -368,6 +368,74 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
         return "Muted senders/domains: " + ", ".join(r["item_value"] for r in rows)
 
     @tool
+    async def mark_email_vip(sender_or_domain: str) -> str:
+        """Force a specific email sender or entire domain to ALWAYS be
+        treated as VIP (instant SMS notification, exactly like today's
+        behavior) by V3-autonomous.md Phase 3's deterministic email triage
+        -- even if that sender's emails would otherwise read as an
+        automated receipt/update or marketing message and get rolled into
+        a briefing instead. Use this when the user corrects a
+        misclassification ('actually always text me right away for emails
+        from my accountant', 'don't ever delay emails from X'). Pass
+        either a full address ('jane@accountingfirm.com') or a bare domain
+        ('accountingfirm.com') to cover every sender there.
+
+        Low-risk, trivially reversible (unmark_email_vip undoes it) -- no
+        confirmation needed, same as mute_email_sender above."""
+        if not config.EMAIL_TRIAGE_ENABLED:
+            return "Email triage isn't enabled on this deployment right now."
+        cleaned = (sender_or_domain or "").strip().lower()
+        if not cleaned:
+            return "Give me a sender's email address or a domain to mark as VIP."
+        if cleaned.startswith("@") and "." in cleaned and "@" not in cleaned[1:]:
+            cleaned = cleaned[1:]
+        if "@" in cleaned:
+            local, _, domain_part = cleaned.partition("@")
+            if not local or not domain_part or "@" in domain_part:
+                return f"{sender_or_domain!r} doesn't look like a valid email address."
+        elif not _BARE_DOMAIN_RE.match(cleaned):
+            return f"{sender_or_domain!r} doesn't look like a valid email address or domain."
+        row = await db.add_user_list_item(uid, "vip_email_senders", cleaned)
+        if row is None:
+            return "VIP senders isn't set up on this deployment yet (run migrations/038_user_lists.sql)."
+        kind = "sender" if "@" in cleaned else "entire domain"
+        return (
+            f"Marked the {kind} '{row['item_value']}' as VIP -- you'll always get an instant "
+            "text for emails from it, regardless of what they look like. Say 'unmark VIP' any "
+            "time to undo this."
+        )
+
+    @tool
+    async def unmark_email_vip(sender_or_domain: str) -> str:
+        """Undo mark_email_vip for a specific address or domain -- it goes
+        back to being classified normally by the email triage heuristic.
+        Safe to call even if it was never actually marked VIP (just says
+        so, changes nothing)."""
+        if not config.EMAIL_TRIAGE_ENABLED:
+            return "Email triage isn't enabled on this deployment right now."
+        cleaned = (sender_or_domain or "").strip().lower()
+        if not cleaned:
+            return "Give me a sender's email address or a domain to unmark."
+        if cleaned.startswith("@") and "." in cleaned and "@" not in cleaned[1:]:
+            cleaned = cleaned[1:]
+        removed = await db.remove_user_list_item(uid, "vip_email_senders", cleaned)
+        if removed:
+            return f"Unmarked '{cleaned}' as VIP -- it'll be classified normally again."
+        return f"'{cleaned}' wasn't marked VIP -- nothing to change."
+
+    @tool
+    async def list_vip_email_senders() -> str:
+        """List every sender/domain you've marked as always-VIP. Call this
+        when the user asks what's marked VIP, or before marking/unmarking
+        something if you want to check the current state first."""
+        if not config.EMAIL_TRIAGE_ENABLED:
+            return "Email triage isn't enabled on this deployment right now."
+        rows = await db.get_user_list_items(uid, "vip_email_senders")
+        if not rows:
+            return "Nothing marked VIP right now."
+        return "VIP senders/domains: " + ", ".join(r["item_value"] for r in rows)
+
+    @tool
     async def list_deepsearch_sessions(status: str | None = None) -> str:
         """List the user's deepsearch (browsing/research) sessions, most recent first.
         status: 'active' (unfinished/resumable), 'completed', or omit for all. Use this
@@ -619,6 +687,7 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
         track_project, list_active_projects, save_profile_info,
         set_app_preference, list_my_connected_apps,
         mute_email_sender, unmute_email_sender, list_muted_email_senders,
+        mark_email_vip, unmark_email_vip, list_vip_email_senders,
         get_system_status, get_session_details, get_recent_message_activity,
         react_to_message, send_styled_message,
         list_deepsearch_sessions, find_contact, send_pdf_over_text,

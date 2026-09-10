@@ -4742,3 +4742,93 @@ async def is_muted_sender(user_id: int, from_address: str) -> bool:
             user_id, candidates,
         )
         return row is not None
+
+
+async def is_vip_sender(user_id: int, from_address: str) -> bool:
+    """User-controlled override for V3-autonomous.md Phase 3's email triage
+    classifier (messa/email_triage.py): True if `from_address` -- or its
+    domain -- is on this user's 'vip_email_senders' list (registry.py's
+    mark_email_vip tool). Lets a sender who'd otherwise land in the
+    'daily'/'weekly' tier by subject/address heuristics (e.g. an
+    accountant whose emails happen to read as receipt-shaped) get forced
+    back to the 'vip' tier -- today's exact instant-SMS behavior -- rather
+    than the deterministic classifier having the last word. Checked FIRST,
+    before any heuristic, by email_triage.classify_inbound_email.
+
+    Same exact-address/domain/parent-domain matching as is_muted_sender
+    above (see its own docstring for the matching rules) -- duplicated
+    rather than shared since the two lists are looked up independently for
+    two different, unrelated decisions, and each reads more simply on its
+    own than behind one extra layer of indirection."""
+    address = parseaddr(from_address or "")[1].strip().lower()
+    if not address or "@" not in address:
+        return False
+    domain = address.rsplit("@", 1)[1]
+    candidates = [address, domain]
+    parts = domain.split(".")
+    for i in range(1, len(parts) - 1):
+        parent = ".".join(parts[i:])
+        if "." in parent and parent not in candidates:
+            candidates.append(parent)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_lists"):
+            return False
+        row = await conn.fetchval(
+            """
+            SELECT 1 FROM user_lists
+            WHERE user_id = $1 AND list_name = 'vip_email_senders'
+              AND item_value = ANY($2)
+            LIMIT 1
+            """,
+            user_id, candidates,
+        )
+        return row is not None
+
+
+# ---------------------------------------------------------------------------
+# Email digest queue (V3-autonomous.md Phase 3, migrations/039_email_
+# digest_queue.sql) -- deterministic tiers written by messa/email_triage.py
+# for an inbound personal email server.py's webhook decided NOT to spend a
+# full Messa turn/instant SMS on. Deliberately a SEPARATE table from
+# digest_queue above (routine notify/autonomous "while you were away"
+# results): the two features are flushed by entirely different code on
+# entirely different cadences (this one by briefings.py's morning/Sunday-
+# evening renders, that one by _production_digest_loop's own local-hour/
+# backstop-count check) -- sharing one table would risk an email item
+# getting swept up and sent early as a "while you were away" text instead
+# of appearing inside the briefing it was actually meant for.
+# ---------------------------------------------------------------------------
+
+async def enqueue_email_digest_item(user_id: int, tier: str, summary: str) -> None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "email_digest_queue"):
+            return
+        await conn.execute(
+            "INSERT INTO email_digest_queue (user_id, tier, summary) VALUES ($1, $2, $3)",
+            user_id, tier, summary,
+        )
+
+
+async def get_pending_email_digest_items(user_id: int, tier: str) -> list[dict[str, Any]]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "email_digest_queue"):
+            return []
+        rows = await conn.fetch(
+            "SELECT * FROM email_digest_queue WHERE user_id = $1 AND tier = $2 ORDER BY created_at",
+            user_id, tier,
+        )
+        return _rows(rows)
+
+
+async def clear_email_digest_items(user_id: int, tier: str) -> None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "email_digest_queue"):
+            return
+        await conn.execute(
+            "DELETE FROM email_digest_queue WHERE user_id = $1 AND tier = $2",
+            user_id, tier,
+        )

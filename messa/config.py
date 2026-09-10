@@ -892,6 +892,28 @@ USER_LISTS_ENABLED = os.environ.get("MESSA_USER_LISTS_ENABLED", "true").strip().
     "1", "true", "yes", "on",
 )
 
+# ---- V3-autonomous.md Phase 3: deterministic (zero-LLM) inbound-email
+# triage (messa/email_triage.py, migrations/039_email_digest_queue.sql,
+# db.py's enqueue/get_pending/clear_email_digest_item + is_vip_sender,
+# briefings.py's digest section, server.py's personal-email webhook +
+# _send_one_briefing). Every inbound personal email that isn't muted gets
+# sorted into exactly one tier using only regex/keyword matching on the
+# sender address and subject/body -- no model call anywhere in this path,
+# so it can never add a token or an instruction to Messa's own system
+# prompt: 'vip' (today's exact behavior -- a full Messa turn + instant SMS,
+# the safe default for anything that doesn't clearly look automated),
+# 'daily' (receipts/updates/notifications -- rolled into the next 7am
+# morning_briefing instead of an interrupting text), or 'weekly'
+# (marketing/promotional -- rolled into the next Sunday evening_briefing).
+# This is the fix for the "5:51 AM notification fatigue" field incident:
+# an automated sender no longer spends a full agent turn + SMS the moment
+# it lands. When false, every inbound email is treated as 'vip' (today's
+# exact pre-Phase-3 behavior) -- same "instantly flippable, no redeploy"
+# kill switch as USER_LISTS_ENABLED above.
+EMAIL_TRIAGE_ENABLED = os.environ.get("MESSA_EMAIL_TRIAGE_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
 # ---- Voice and image input (messa/media_understanding.py) -- lets a user
 # text Messa a voice memo or a photo and have it actually understood,
 # instead of the SMS/iMessage path silently ignoring anything that isn't a

@@ -42,7 +42,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from . import config, db, weather
+from . import config, db, email_triage, weather
 
 
 def _local_day_bounds_utc(tz_name: str, day_offset: int = 0) -> tuple[datetime, datetime]:
@@ -178,6 +178,16 @@ async def render_morning_briefing(job: dict[str, Any]) -> str:
     if not events and not due_today_or_overdue and not reminders:
         lines.append("Nothing on deck today -- let me know if you want to add anything or want me to look into something for you.")
 
+    # V3-autonomous.md Phase 3: updates/receipts triaged out of an instant
+    # per-email SMS during the day (messa/email_triage.py) roll in here
+    # instead -- this is the actual fix for the "5:51 AM notification
+    # fatigue" incident, not a separate text.
+    digest_line = await email_triage.render_digest_section(
+        user_id, email_triage.tiers_for_briefing_kind("morning_briefing", datetime.now(tz))
+    )
+    if digest_line:
+        lines.append(digest_line)
+
     return "\n".join(lines)
 
 
@@ -251,6 +261,18 @@ async def render_evening_briefing(job: dict[str, Any]) -> str:
 
     if not today_bits and not tomorrow_schedule_bits and not tomorrow_reminders:
         lines.append("Quiet day -- nothing done, nothing on the calendar. Let me know if you want help planning tomorrow.")
+
+    # V3-autonomous.md Phase 3: on a local Sunday only, this same daily 8pm
+    # evening_briefing also carries the week's accumulated marketing/promo
+    # digest (messa/email_triage.py) -- reusing this existing cron/kind as
+    # the weekly digest's delivery slot rather than a new one. Any other
+    # day of the week, tiers_for_briefing_kind returns [] here and this is
+    # a no-op.
+    digest_line = await email_triage.render_digest_section(
+        user_id, email_triage.tiers_for_briefing_kind("evening_briefing", datetime.now(tz))
+    )
+    if digest_line:
+        lines.append(digest_line)
 
     return "\n".join(lines)
 

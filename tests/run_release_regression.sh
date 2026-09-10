@@ -60,6 +60,7 @@ TESTS=(
   tests/test_workspace_asset_registry.py
   tests/test_v3_phase1_approvals_and_supersede.py
   tests/test_v3_phase2_user_lists.py
+  tests/test_v3_phase3_email_triage.py
 )
 
 PASSED=()
