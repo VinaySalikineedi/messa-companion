@@ -8,10 +8,9 @@
 
 - **Current Repository Directory**: `/Users/robocafedesktop/Documents/textMessa`
 - **Active Git Branch**: `main`
-- **Latest Commit**: `63b11a0` (`test(regression): harden regression harness, skip missing playwright, isolate usage limit`)
-- **Python Virtualenv**: `./venv/bin/python` (Python 3.12)
+- **Latest Commit**: `feat(v3-phase6): deploy autonomous project capsules & multi-modal vault`
 - **Live Production Service**: `https://live.textmessa.com/health` (Healthy, 200 OK)
-- **Immediate Task on Resume**: **Architect and implement Phase 6: Project Capsule System (Multi-Week Autonomous Missions).**
+- **Status**: **Phase 6 Complete & Verified.**
 
 ---
 
@@ -23,12 +22,32 @@
 | **Phase 2** | Deterministic User Lists & Mute Engine | **DONE** | `1d1a7d4` | Deployed to `main`. Migration `038_user_lists.sql` applied to Neon DB. |
 | **Phase 3** | Three-Tier Inbound Email Triage (VIP / Daily / Weekly) | **DONE** | `cfb1ac1` | Deployed to `main`. Migration `039_email_digest_queue.sql` applied to Neon DB. |
 | **Phase 4** | Subagent Concurrency & Latency Drop | **DONE** | `9b58ae3` | Deployed to `main`, pushed to GitHub & Hugging Face. Zero tool regressions. |
-| **Phase 5** | **Meeting Dossiers & Implicit Commitment Ledger** | **DONE** | `63b11a0` | Deployed to `main`, pushed to GitHub & Hugging Face. Migration `040_meeting_dossiers_and_commitments.sql` applied to Neon DB. |
-| **Phase 6** | **Project Capsule System (Multi-Week Autonomous Missions)** | **NEXT UP** | — | Ready to plan and architect Phase 6. |
+| **Phase 5** | Meeting Dossiers & Implicit Commitment Ledger | **DONE** | `63b11a0` | Deployed to `main`, pushed to GitHub & Hugging Face. Migration `040_meeting_dossiers_and_commitments.sql` applied to Neon DB. |
+| **Phase 6** | **Autonomous Project Capsules & Multi-Modal Vault** | **DONE** | Merged to `main` | Deployed to `main`. Migration `041_project_capsules.sql` applied to live Neon DB. All 40 regression suites passing (100%). |
 
 ---
 
-## 3. Phase 5 Details (What Was Built)
+## 3. Phase 6 Details (What Was Built & Hardened)
+
+- **Autonomous Project Capsules** (`messa/tools/routines_tools.py`, `messa/db.py`, `messa/server.py`):
+  - Thin wrapper over existing autonomous routine engine (`cron_jobs` / `routines_agent`).
+  - Tools: `propose_create_project_capsule`, `list_my_project_capsules`, `get_project_capsule_details`, `pause_project_capsule`, `resume_project_capsule`, `cancel_project_capsule`, `finish_project_capsule`, `add_project_capsule_asset`, `log_project_capsule_event`.
+  - Background cadence loop in `_fire_autonomous_routine` detects linked capsules and injects project ID, title, and goal into agent context.
+- **Centralized Status Sync (`_sync_linked_project_capsule_status`)**:
+  - Automatically mirrors routine status changes (pause, resume, cancel, auto-supersede, generic finish) onto linked capsules with timeline events and outcome preservation.
+- **Multi-Modal Vault**:
+  - Files attachments (receipts, contracts, PDFs, photos) via model judgment into `project_vault_assets`.
+  - Unconditionally preserves Sendblue `[attachment_url: ...]` on inbound messages even when vision or audio transcription is unavailable.
+- **Database Migration**:
+  - `migrations/041_project_capsules.sql` creates:
+    1. `project_capsules` (user_id, cron_job_id, title, goal, status, outcome_summary)
+    2. `project_vault_assets` (project_id, source_url, description)
+    3. `project_timeline_events` (project_id, event_text)
+- **Tests & Production Readiness**:
+  - Dedicated suite: `tests/test_v3_phase6_project_capsules.py` (88 checks passing).
+  - Full Release Regression Suite: **40 test suites passed, 0 failed** (`bash tests/run_release_regression.sh`).
+  - QA verification report saved to `docs/p6-report.md`.
+
 
 - **Commitment Ledger** (`messa/commitments.py`):
   - Async fire-and-forget LLM extraction on outbound email send (`tools/email_tools.py` & `tools/personal_inbox_tools.py`).
