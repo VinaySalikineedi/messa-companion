@@ -1463,7 +1463,7 @@ async def _auto_supersede_conflicting_routine(
     touch anything. Guessing wrong here means silently cancelling a real
     user's real automation, which is a far worse failure than occasionally
     leaving a genuine duplicate for the user to clean up themselves."""
-    emails = set(_ROUTINE_EMAIL_RE.findall(prompt_or_task or ""))
+    emails = {e.lower() for e in _ROUTINE_EMAIL_RE.findall(prompt_or_task or "")}
     if not emails:
         return None
     candidates = await conn.fetch(
@@ -1473,7 +1473,7 @@ async def _auto_supersede_conflicting_routine(
     )
     matches = [
         c for c in candidates
-        if emails & set(_ROUTINE_EMAIL_RE.findall(c["prompt_or_task"] or ""))
+        if emails & {e.lower() for e in _ROUTINE_EMAIL_RE.findall(c["prompt_or_task"] or "")}
     ]
     if len(matches) != 1:
         return None

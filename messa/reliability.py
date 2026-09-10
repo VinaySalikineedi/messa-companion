@@ -154,8 +154,11 @@ RELIABILITY_GUARDRAIL_STR = (
 # suggests it missed an obvious yes.
 _AFFIRMATION_PATTERN = re.compile(
     r"^(?:ok(?:ay)?|yes|yep|yeah|yup|sure|approved?|confirmed?|correct|affirmative|"
-    r"do it|send it|go ahead|go for it|go|lock it in|ship it|sounds? good|looks? good|"
-    r"perfect|great|lgtm|all good|good to go|makes sense|that works|works for me)$",
+    r"do it|send it|go ahead|go for it|go|lock it in|ship it|"
+    r"sounds? (?:good|great|awesome|fine)|looks? (?:good|great|awesome|fine)|"
+    r"yes please|please do|sure thing|"
+    r"perfect|great|awesome|lgtm|all good|good to go|makes sense|that works|works for me)"
+    r"(?:,?\s*(?:thanks|thank you|pls|please))?$",
     re.IGNORECASE,
 )
 

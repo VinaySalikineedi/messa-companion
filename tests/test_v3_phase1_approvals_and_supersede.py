@@ -143,6 +143,10 @@ def part1_is_bare_affirmation():
         ("I like this version! Approved", True,
          "the actual field-incident shape: real content, then a short, clear affirmation"),
         ("sounds good", True, "two-word affirmation phrase"),
+        ("looks great", True, "synonym: looks great"),
+        ("sounds great", True, "synonym: sounds great"),
+        ("Yes please", True, "polite affirmation: yes please"),
+        ("Approved, thanks", True, "affirmation with polite suffix: thanks"),
         ("send it", True), ("go ahead", True), ("lock it in", True), ("lgtm", True),
         ("yes but move it to 3pm", False, "an affirmation word followed by a real correction"),
         ("yesterday I approved this contract", False, "the word 'yes'/'approved' inside unrelated prose"),
@@ -191,6 +195,15 @@ async def part2_auto_supersede_conflicting_routine():
         check("exactly one match: issues exactly one UPDATE...cancelled call", len(update_calls) == 1)
         check("exactly one match: cancels the OLD routine's id, not the new one",
               update_calls[0][2] == (42,))
+
+        # 2c-bis: email casing differences match cleanly (e.g. KJ@ vs kj@)
+        old_row_upper = FakeRow(id=45, prompt_or_task="email KJ@MANGUSTACAP.COM every day", status="active")
+        cancelled_row_upper = FakeRow(id=45, prompt_or_task=old_row_upper["prompt_or_task"], status="cancelled")
+        conn = FakeConn(fetch_queue=[[old_row_upper]], fetchrow_queue=[cancelled_row_upper])
+        result_case = await db._auto_supersede_conflicting_routine(
+            conn, 1, 99, "follow up with kj@mangustacap.com about the term sheet",
+        )
+        check("casing differences match: KJ@ matches kj@", result_case == cancelled_row_upper)
 
         # 2d: TWO other routines mention the same email -- genuinely
         # ambiguous, so nothing is touched (same safety rule as
