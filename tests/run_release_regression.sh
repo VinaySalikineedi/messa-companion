@@ -63,6 +63,7 @@ TESTS=(
   tests/test_v3_phase3_email_triage.py
   tests/test_v3_phase4_latency.py
   tests/test_v3_phase5_meeting_dossiers.py
+  tests/test_v3_phase6_project_capsules.py
 )
 
 PASSED=()
@@ -83,12 +84,8 @@ done
 echo ""
 echo "=================================================================="
 echo "SUMMARY: ${#PASSED[@]} passed, ${#FAILED[@]} failed"
-if [ "${#PASSED[@]}" -gt 0 ]; then
-  for t in "${PASSED[@]}"; do echo "  [PASS] $t"; done
-fi
-if [ "${#FAILED[@]}" -gt 0 ]; then
-  for t in "${FAILED[@]}"; do echo "  [FAIL] $t"; done
-fi
+for t in "${PASSED[@]}"; do echo "  [PASS] $t"; done
+for t in "${FAILED[@]}"; do echo "  [FAIL] $t"; done
 echo "=================================================================="
 
 if [ "${#FAILED[@]}" -gt 0 ]; then

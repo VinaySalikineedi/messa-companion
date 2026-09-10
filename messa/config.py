@@ -1895,6 +1895,28 @@ ROUTINE_ESCALATION_BASE_MINUTES = int(os.environ.get("MESSA_ROUTINE_ESCALATION_B
 ROUTINE_ESCALATION_SHRINK_FACTOR = float(os.environ.get("MESSA_ROUTINE_ESCALATION_SHRINK_FACTOR", "0.5"))
 ROUTINE_ESCALATION_MIN_MINUTES = int(os.environ.get("MESSA_ROUTINE_ESCALATION_MIN_MINUTES", "15"))
 
+# ---- Project Capsules (migrations/041_project_capsules.sql, V3-autonomous.md
+# Phase 6) ----
+# A project capsule is a THIN WRAPPER around the same task-routines engine
+# above (cron_jobs / routines_agent) -- see db._insert_project_capsule's own
+# docstring. These bounds are deliberately their OWN, separate ceiling from
+# ROUTINE_MAX_EXPIRE_HOURS just above: a genuine multi-week objective (an
+# airline refund dispute, an apartment search) legitimately needs far
+# longer than an ordinary routine's 7-day ceiling, but "always eventually
+# terminates" stays non-negotiable -- so this gets its own, still-hard
+# ceiling rather than raising the ordinary routine's ceiling for everyone
+# (which would weaken that safety property for every OTHER autonomous
+# routine that has nothing to do with project capsules). Unlike an
+# ordinary routine, a project capsule has NO expire_in_hours=0 ("run
+# forever") escape hatch at all -- see routines_tools.py's
+# propose_create_project_capsule -- a delegated multi-week project is
+# exactly the kind of thing that must always have a real, bounded end.
+PROJECT_CAPSULES_ENABLED = os.environ.get("MESSA_PROJECT_CAPSULES_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+PROJECT_DEFAULT_EXPIRE_HOURS = float(os.environ.get("MESSA_PROJECT_DEFAULT_EXPIRE_HOURS", "720"))  # 30 days
+PROJECT_MAX_EXPIRE_HOURS = float(os.environ.get("MESSA_PROJECT_MAX_EXPIRE_HOURS", "2160"))  # 90 days
+
 # ---- US-only launch gate (messa/region_gate.py) ----
 # This is a US-market-only launch: a brand-new phone number that isn't a
 # clean US E.164 number ("+1" then exactly 10 digits) gets a polite

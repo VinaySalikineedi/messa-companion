@@ -112,6 +112,76 @@ def _format_job_line(r: dict) -> str:
     return " ".join(bits)
 
 
+def _build_schedule_and_meta(
+    user: config.UserContext,
+    *,
+    cron_expression: str | None,
+    run_once_in_minutes: int | None,
+    deadline_in_minutes: int | None,
+    expire_in_hours: float | None,
+    digest: bool,
+    escalate_on_no_response: bool,
+    apply_expiry: bool,
+    default_expire_hours: float,
+    max_expire_hours: float,
+    allow_no_expiry: bool,
+) -> tuple[datetime, str, str, dict] | str:
+    """Shared by propose_create_routine and propose_create_project_capsule
+    (V3-autonomous.md Phase 6) -- both are "pick a schedule, build a meta
+    dict" operations that differ only in WHICH expiry bounds apply (a
+    project capsule gets its own, longer-but-still-bounded ceiling --
+    config.PROJECT_DEFAULT_EXPIRE_HOURS/PROJECT_MAX_EXPIRE_HOURS -- instead
+    of an ordinary routine's) and in whether the 0-hours "run forever"
+    escape hatch exists at all (a project capsule never gets it). Pulled
+    out rather than duplicated so the two proposal tools can't quietly
+    drift out of sync with each other over time.
+
+    Returns (next_run, stored_cron_expression, schedule_desc, meta) on
+    success, or an "ERROR: ..." string a caller should return verbatim."""
+    if bool(cron_expression) == bool(run_once_in_minutes):
+        return "ERROR: give exactly one of cron_expression or run_once_in_minutes, not both/neither."
+
+    now_local = datetime.now(ZoneInfo(user.timezone))
+    if cron_expression:
+        try:
+            next_run = compute_next_run(cron_expression, user.timezone, base=now_local)
+        except Exception as e:
+            return f"ERROR: '{cron_expression}' isn't a valid cron expression ({e})."
+        stored_cron_expression = cron_expression
+        schedule_desc = f"on schedule '{cron_expression}'"
+    else:
+        if run_once_in_minutes <= 0:
+            return "ERROR: run_once_in_minutes must be positive."
+        next_run = now_local + timedelta(minutes=run_once_in_minutes)
+        stored_cron_expression = ONE_SHOT_SENTINEL
+        schedule_desc = f"once, in {run_once_in_minutes} minutes ({next_run.isoformat()})"
+
+    meta: dict = {}
+    if deadline_in_minutes is not None:
+        if deadline_in_minutes <= 0:
+            return "ERROR: deadline_in_minutes must be positive."
+        meta["deadline_at"] = (now_local + timedelta(minutes=deadline_in_minutes)).isoformat()
+    if apply_expiry:
+        if not allow_no_expiry and expire_in_hours == 0:
+            return "ERROR: expire_in_hours must be positive for this kind of task (there's no 'run forever' option)."
+        if not (allow_no_expiry and expire_in_hours == 0):
+            # 0 (only reachable when allow_no_expiry) is the explicit,
+            # documented "no expiry -- genuinely ongoing" opt-out; None
+            # (the common case, nothing specified) gets the safe bounded
+            # default rather than silently running forever.
+            hours = expire_in_hours if expire_in_hours is not None else default_expire_hours
+            hours = min(hours, max_expire_hours)
+            if hours < 0:
+                suffix = " (or 0 for no expiry)." if allow_no_expiry else "."
+                return f"ERROR: expire_in_hours must be positive{suffix}"
+            meta["expire_at"] = (now_local + timedelta(hours=hours)).isoformat()
+    if digest:
+        meta["digest"] = True
+    if escalate_on_no_response:
+        meta["escalate_on_no_response"] = True
+    return next_run, stored_cron_expression, schedule_desc, meta
+
+
 def build_routines_tools(user: config.UserContext) -> list[BaseTool]:
     uid = user.user_id
 
@@ -183,42 +253,20 @@ def build_routines_tools(user: config.UserContext) -> list[BaseTool]:
         """
         if execution_mode not in VALID_EXECUTION_MODES:
             return f"ERROR: execution_mode must be one of {VALID_EXECUTION_MODES}, got {execution_mode!r}."
-        if bool(cron_expression) == bool(run_once_in_minutes):
-            return "ERROR: give exactly one of cron_expression or run_once_in_minutes, not both/neither."
 
-        now_local = datetime.now(ZoneInfo(user.timezone))
-        if cron_expression:
-            try:
-                next_run = compute_next_run(cron_expression, user.timezone, base=now_local)
-            except Exception as e:
-                return f"ERROR: '{cron_expression}' isn't a valid cron expression ({e})."
-            stored_cron_expression = cron_expression
-            schedule_desc = f"on schedule '{cron_expression}'"
-        else:
-            if run_once_in_minutes <= 0:
-                return "ERROR: run_once_in_minutes must be positive."
-            next_run = now_local + timedelta(minutes=run_once_in_minutes)
-            stored_cron_expression = ONE_SHOT_SENTINEL
-            schedule_desc = f"once, in {run_once_in_minutes} minutes ({next_run.isoformat()})"
-
-        meta: dict = {}
-        if deadline_in_minutes is not None:
-            if deadline_in_minutes <= 0:
-                return "ERROR: deadline_in_minutes must be positive."
-            meta["deadline_at"] = (now_local + timedelta(minutes=deadline_in_minutes)).isoformat()
-        if execution_mode == "autonomous" and expire_in_hours != 0:
-            # 0 is the explicit, documented "no expiry -- genuinely ongoing"
-            # opt-out; None (the common case, nothing specified) gets the
-            # safe bounded default rather than silently running forever.
-            hours = expire_in_hours if expire_in_hours is not None else config.ROUTINE_DEFAULT_EXPIRE_HOURS
-            hours = min(hours, config.ROUTINE_MAX_EXPIRE_HOURS)
-            if hours < 0:
-                return "ERROR: expire_in_hours must be positive (or 0 for no expiry)."
-            meta["expire_at"] = (now_local + timedelta(hours=hours)).isoformat()
-        if digest:
-            meta["digest"] = True
-        if escalate_on_no_response:
-            meta["escalate_on_no_response"] = True
+        result = _build_schedule_and_meta(
+            user,
+            cron_expression=cron_expression, run_once_in_minutes=run_once_in_minutes,
+            deadline_in_minutes=deadline_in_minutes, expire_in_hours=expire_in_hours,
+            digest=digest, escalate_on_no_response=escalate_on_no_response,
+            apply_expiry=(execution_mode == "autonomous"),
+            default_expire_hours=config.ROUTINE_DEFAULT_EXPIRE_HOURS,
+            max_expire_hours=config.ROUTINE_MAX_EXPIRE_HOURS,
+            allow_no_expiry=True,
+        )
+        if isinstance(result, str):
+            return result
+        next_run, stored_cron_expression, schedule_desc, meta = result
 
         row = await db.propose_action(
             uid, "create_routine",
@@ -293,10 +341,210 @@ def build_routines_tools(user: config.UserContext) -> list[BaseTool]:
         )
         return f"Finished and stopped job #{cron_id}: {outcome_summary}"
 
+    @tool
+    async def propose_create_project_capsule(
+        title: str,
+        goal: str,
+        cadence_cron_expression: str,
+        expire_in_hours: float | None = None,
+        deadline_in_minutes: int | None = None,
+        digest: bool = False,
+        escalate_on_no_response: bool = False,
+    ) -> str:
+        """Propose a new PROJECT CAPSULE: a delegated, multi-day/multi-week
+        OBJECTIVE that you manage autonomously on your own cadence until
+        it's resolved -- an airline refund dispute, an apartment search, an
+        investor outreach campaign, a holiday gift hunt. Use this instead
+        of a plain propose_create_routine when the user is handing off a
+        whole GOAL with many possible steps and an uncertain path to done,
+        not a single recurring check. This only stages it for confirmation,
+        same as propose_create_routine.
+
+        title: short label for the project (e.g. "Delta $850 refund dispute").
+        goal: the actual objective in plain language -- exactly what you'll
+        act on every time the cadence check fires.
+        cadence_cron_expression: standard 5-field cron for how often you
+        check in on this in the background (e.g. '0 9 * * *' = daily at
+        9am). Pick a cadence that matches how fast this kind of thing
+        actually moves -- daily for something time-sensitive, every few
+        days for a slower search.
+        expire_in_hours (optional): hard stop for the whole project --
+        after this long with no resolution, you give up and tell the user
+        instead of continuing indefinitely. Defaults to a generous bound
+        for a genuine multi-week project (and can't exceed the platform
+        max regardless of what's asked for). Unlike an ordinary routine, a
+        project has no "run forever" option -- always give it a real,
+        if generous, end.
+        deadline_in_minutes, digest, escalate_on_no_response: same meaning
+        as propose_create_routine's own version of each.
+        """
+        if not title.strip() or not goal.strip():
+            return "ERROR: title and goal can't be empty."
+        result = _build_schedule_and_meta(
+            user,
+            cron_expression=cadence_cron_expression, run_once_in_minutes=None,
+            deadline_in_minutes=deadline_in_minutes, expire_in_hours=expire_in_hours,
+            digest=digest, escalate_on_no_response=escalate_on_no_response,
+            apply_expiry=True,
+            default_expire_hours=config.PROJECT_DEFAULT_EXPIRE_HOURS,
+            max_expire_hours=config.PROJECT_MAX_EXPIRE_HOURS,
+            allow_no_expiry=False,
+        )
+        if isinstance(result, str):
+            return result
+        next_run, stored_cron_expression, schedule_desc, meta = result
+        row = await db.propose_action(
+            uid, "create_project",
+            {
+                "title": title,
+                "prompt_or_task": goal,
+                "cron_expression": stored_cron_expression,
+                "user_timezone": user.timezone,
+                "next_run_at": next_run,
+                "execution_mode": "autonomous",
+                "meta": meta,
+            },
+        )
+        return (
+            f"Proposed (pending confirmation, id #{row['id']}): I'll manage the project "
+            f"'{title}' -- checking in {schedule_desc}, on: {goal}"
+        )
+
+    @tool
+    async def list_my_project_capsules() -> str:
+        """List the user's project capsules (delegated multi-step objectives
+        you're managing autonomously) -- active, paused, completed, and
+        cancelled -- with each one's status and next check-in. Use this
+        before filing a vault asset or pulling up a project's details, to
+        find its id."""
+        rows = await db.list_project_capsules(uid)
+        if not rows:
+            return "No project capsules set up."
+        lines = []
+        for r in rows:
+            bits = [f"#{r['id']} [{r['status']}]", f"'{r['title']}'"]
+            if r.get("next_run_at"):
+                bits.append(f"(next check-in: {r['next_run_at']})")
+            lines.append(" ".join(bits))
+        return "\n".join(lines)
+
+    @tool
+    async def get_project_capsule_details(project_id: int) -> str:
+        """Full detail on one project capsule: its goal, status, vault
+        assets on file, and recent timeline events. Call this before an
+        autonomous cadence check-in on a project so you know what's
+        already been done and what's already in the vault -- and before
+        deciding whether an incoming photo/PDF plausibly belongs in it."""
+        project = await db.get_project_capsule(uid, project_id)
+        if project is None:
+            return f"No project capsule #{project_id} found."
+        assets = await db.list_project_capsule_assets(project_id)
+        events = await db.list_project_capsule_events(project_id)
+        lines = [
+            f"#{project['id']} '{project['title']}' [{project['status']}]",
+            f"Goal: {project['goal']}",
+        ]
+        if project.get("outcome_summary"):
+            lines.append(f"Outcome: {project['outcome_summary']}")
+        lines.append(
+            "Vault: " + (
+                "; ".join(f"{a['description'] or '(no description)'} ({a['source_url']})" for a in assets)
+                if assets else "empty."
+            )
+        )
+        if events:
+            lines.append("Recent timeline:")
+            lines.extend(f"  - {e['created_at']}: {e['event_text']}" for e in events[:10])
+        return "\n".join(lines)
+
+    @tool
+    async def pause_project_capsule(project_id: int) -> str:
+        """Pause a project capsule's autonomous cadence checks (stops
+        firing until resumed) without losing its vault or timeline."""
+        project = await db.get_project_capsule(uid, project_id)
+        if project is None or not project.get("cron_job_id"):
+            return f"No project capsule #{project_id} found."
+        await db.set_cron_job_status(uid, project["cron_job_id"], "paused")
+        return f"Paused project capsule #{project_id}."
+
+    @tool
+    async def resume_project_capsule(project_id: int) -> str:
+        """Resume a paused project capsule's autonomous cadence checks."""
+        project = await db.get_project_capsule(uid, project_id)
+        if project is None or not project.get("cron_job_id"):
+            return f"No project capsule #{project_id} found."
+        await db.set_cron_job_status(uid, project["cron_job_id"], "active")
+        return f"Resumed project capsule #{project_id}."
+
+    @tool
+    async def cancel_project_capsule(project_id: int) -> str:
+        """Cancel a project capsule permanently -- the user gave up on it or
+        no longer wants it tracked. Distinct from finish_project_capsule,
+        which is for an objective that's actually been achieved."""
+        project = await db.get_project_capsule(uid, project_id)
+        if project is None:
+            return f"No project capsule #{project_id} found."
+        if project.get("cron_job_id"):
+            await db.set_cron_job_status(
+                uid, project["cron_job_id"], "cancelled", {"ended_reason": "cancelled_by_user"},
+            )
+        else:
+            await db.finish_project_capsule(uid, project_id, "Cancelled by user.")
+        return f"Cancelled project capsule #{project_id}."
+
+    @tool
+    async def finish_project_capsule(project_id: int, outcome_summary: str) -> str:
+        """Call this when a project capsule's goal has actually been
+        achieved (the refund came through, the apartment got signed) --
+        typically from WITHIN the project's own autonomous cadence
+        check-in. Stops future check-ins and records the outcome. Do NOT
+        call this if the project is just quiet/no news this cycle -- let
+        it check again on its own schedule."""
+        row = await db.finish_project_capsule(uid, project_id, outcome_summary)
+        if not row:
+            return f"No project capsule #{project_id} found."
+        await db.log_project_capsule_event(project_id, f"Completed: {outcome_summary}")
+        return f"Finished project capsule #{project_id}: {outcome_summary}"
+
+    @tool
+    async def add_project_capsule_asset(project_id: int, source_url: str, description: str = "") -> str:
+        """File a user-supplied photo/PDF/document into a project capsule's
+        vault. Use ONLY when the user just sent an attachment that
+        plausibly belongs to an active project capsule -- an inbound
+        message carrying one is tagged with its own [attachment_url: ...];
+        pass that exact URL here. Use your own judgment: an ambiguous or
+        unrelated attachment should just be asked about or left alone, not
+        filed automatically. Also logs a timeline event."""
+        project = await db.get_project_capsule(uid, project_id)
+        if project is None:
+            return f"No project capsule #{project_id} found."
+        await db.add_project_capsule_asset(project_id, source_url, description or None)
+        await db.log_project_capsule_event(project_id, f"Filed a new vault item: {description or source_url}")
+        return f"Filed into project capsule #{project_id}'s vault."
+
+    @tool
+    async def log_project_capsule_event(project_id: int, event_text: str) -> str:
+        """Record a short, plain-language timeline entry for a project
+        capsule -- what you just did or found out (e.g. 'Emailed Delta
+        support asking for a status update on the refund'). Skip this on a
+        cadence check-in that found nothing new to report -- don't log a
+        no-op just to have logged something."""
+        project = await db.get_project_capsule(uid, project_id)
+        if project is None:
+            return f"No project capsule #{project_id} found."
+        await db.log_project_capsule_event(project_id, event_text)
+        return "Logged."
+
     raw_tools: list[BaseTool] = [
         list_cron_jobs, propose_create_routine, pause_cron_job, resume_cron_job,
         cancel_cron_job, reschedule_routine, finish_routine,
     ]
+    if config.PROJECT_CAPSULES_ENABLED:
+        raw_tools += [
+            propose_create_project_capsule, list_my_project_capsules, get_project_capsule_details,
+            pause_project_capsule, resume_project_capsule, cancel_project_capsule,
+            finish_project_capsule, add_project_capsule_asset, log_project_capsule_event,
+        ]
     return trace_all(raw_tools, LABEL)
 
 
@@ -326,6 +574,24 @@ ROUTINES_SYSTEM_PROMPT = (
     "again on its own.\n"
 )
 
+# Spliced onto ROUTINES_SYSTEM_PROMPT only when config.PROJECT_CAPSULES_ENABLED
+# (see build_routines_subagent below) -- kept in its own short constant,
+# not folded into ROUTINES_SYSTEM_PROMPT unconditionally, so the ordinary
+# routines-only prompt stays exactly as lean as it was before this feature
+# existed on any deployment that has it turned off.
+PROJECT_CAPSULES_SYSTEM_PROMPT = (
+    "- A PROJECT CAPSULE (propose_create_project_capsule) is for a whole delegated, "
+    "multi-day/multi-week OBJECTIVE with an uncertain path to done (a refund dispute, an "
+    "apartment search, an outreach campaign) -- not a single recurring check. It's still an "
+    "'autonomous' routine underneath, just wrapped with its own vault (file an attachment via "
+    "add_project_capsule_asset only when it plausibly belongs, using your own judgment -- never "
+    "automatically) and timeline (log_project_capsule_event, kept short). Call "
+    "get_project_capsule_details first on a cadence check-in so you know what's already been "
+    "done. Stay low-noise: on a check-in with genuinely nothing new, keep your reply short "
+    "rather than padding it out. Call finish_project_capsule only once the actual goal is "
+    "achieved, same convention as finish_routine.\n"
+)
+
 
 def build_routines_subagent(user: config.UserContext, model: BaseChatModel) -> dict[str, Any]:
     """Returns a deepagents `CompiledSubAgent` spec (feature/agentic-upgrade
@@ -339,7 +605,10 @@ def build_routines_subagent(user: config.UserContext, model: BaseChatModel) -> d
     async def _run(state: dict[str, Any]) -> dict[str, Any]:
         messages = list(state["messages"])
         tools = build_routines_tools(user)
-        system_prompt = ROUTINES_SYSTEM_PROMPT + reliability.RELIABILITY_GUARDRAIL_STR
+        system_prompt = ROUTINES_SYSTEM_PROMPT
+        if config.PROJECT_CAPSULES_ENABLED:
+            system_prompt = system_prompt + PROJECT_CAPSULES_SYSTEM_PROMPT
+        system_prompt = system_prompt + reliability.RELIABILITY_GUARDRAIL_STR
         if config.SCRATCHPAD_AND_SKILLS_ENABLED:
             tools = tools + build_scratchpad_tools(user, "routines_agent")
             system_prompt = system_prompt + await scratchpad_prompt_block(user, "routines_agent")
@@ -355,15 +624,24 @@ def build_routines_subagent(user: config.UserContext, model: BaseChatModel) -> d
         )
         return {"messages": [AIMessage(content=last_ai_text(final_messages))]}
 
+    description = (
+        "Sets up, lists, pauses, resumes, cancels, and reschedules task routines -- "
+        "both recurring and one-time, both plain reminders (the user does something) "
+        "and autonomous background tasks (you do something yourself later and report "
+        "back, e.g. watchers, deadline-aware follow-ups, digests). Use for anything "
+        "recurring/scheduled, or anything you're telling the user you'll check on or "
+        "follow up about later."
+    )
+    if config.PROJECT_CAPSULES_ENABLED:
+        description += (
+            " Also owns PROJECT CAPSULES: delegated multi-day/multi-week objectives with "
+            "their own vault and timeline (an airline refund dispute, an apartment search, "
+            "an outreach campaign) -- use when the user hands off a whole open-ended goal "
+            "to manage and walk away from, not just a single scheduled check."
+        )
+
     return {
         "name": "routines_agent",
-        "description": (
-            "Sets up, lists, pauses, resumes, cancels, and reschedules task routines -- "
-            "both recurring and one-time, both plain reminders (the user does something) "
-            "and autonomous background tasks (you do something yourself later and report "
-            "back, e.g. watchers, deadline-aware follow-ups, digests). Use for anything "
-            "recurring/scheduled, or anything you're telling the user you'll check on or "
-            "follow up about later."
-        ),
+        "description": description,
         "runnable": RunnableLambda(_run),
     }

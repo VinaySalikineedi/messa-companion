@@ -1653,6 +1653,19 @@ async def _process_inbound(
         media_note, is_audio_failure = await _maybe_understand_inbound_media(media_url)
         if media_note:
             effective_content = f"{content}\n\n{media_note}".strip() if content else media_note
+            if config.PROJECT_CAPSULES_ENABLED:
+                # V3-autonomous.md Phase 6: the human-readable media_note
+                # above already describes WHAT this attachment is, but the
+                # orchestrator also needs the raw URL itself to actually
+                # file it into a project capsule's vault (routines_tools.py's
+                # add_project_capsule_asset) -- media_url is otherwise
+                # discarded the moment this function returns. One compact
+                # bracketed line, not a paragraph, so this costs nothing on
+                # a turn that has no active project capsule to file into
+                # (_active_project_capsules_paragraph is itself empty then,
+                # and the model has nothing prompting it to even look for
+                # this tag).
+                effective_content += f"\n[attachment_url: {media_url}]"
         elif is_audio_failure:
             # Asymmetric fallback contract (see config.py's own comment
             # above MEDIA_UNDERSTANDING_ENABLED): a voice memo that
