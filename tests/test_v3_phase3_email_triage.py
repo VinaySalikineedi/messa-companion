@@ -207,6 +207,13 @@ async def part1_classify_heuristic():
             "classify: a real-looking sender with a casual, non-automated subject -> 'vip'",
             tier == email_triage.TIER_VIP,
         )
+
+        # RFC 2822 "Display Name <addr>" header with automated localpart
+        tier = await email_triage.classify_inbound_email(
+            1, "Amazon Orders <no-reply@amazon.com>", "Hello from Amazon", "Check out your account",
+        )
+        check("classify: RFC 2822 'Display Name <addr>' extracts localpart correctly -> 'daily'",
+              tier == email_triage.TIER_DAILY)
     finally:
         config.USER_LISTS_ENABLED = real_flag
 
@@ -285,6 +292,10 @@ async def part3_summarize_and_tiers():
     summary = email_triage.summarize_for_digest("no-reply@amazon.com", "")
     check("summarize_for_digest: falls back to '(no subject)' for an empty subject",
           summary == "amazon.com -- (no subject)")
+
+    summary = email_triage.summarize_for_digest("Amazon Orders <no-reply@amazon.com>", "Your order has shipped")
+    check("summarize_for_digest: strips Display Name and extracts clean domain without brackets",
+          summary == "amazon.com -- Your order has shipped")
 
     tiers = email_triage.tiers_for_briefing_kind("morning_briefing", datetime(2023, 1, 2))  # a Monday
     check("tiers_for_briefing_kind: morning_briefing always carries the daily tier",

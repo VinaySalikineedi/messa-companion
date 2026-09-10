@@ -33,6 +33,8 @@ from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from email.utils import parseaddr
+
 from . import config, db
 
 TIER_VIP = "vip"
@@ -79,8 +81,14 @@ _RECEIPT_UPDATE_RE = re.compile(
 )
 
 
+def _clean_address(from_address: str) -> str:
+    parsed = parseaddr(from_address or "")[1].strip().lower()
+    return parsed or (from_address or "").strip().lower()
+
+
 def _local_part(from_address: str) -> str:
-    return (from_address.split("@", 1)[0] if "@" in from_address else from_address).strip()
+    addr = _clean_address(from_address)
+    return (addr.split("@", 1)[0] if "@" in addr else addr).strip()
 
 
 async def classify_inbound_email(user_id: int, from_address: str, subject: str, body_text: str) -> str:
@@ -117,8 +125,9 @@ def summarize_for_digest(from_address: str, subject: str) -> str:
     """One short line for a queued item -- shown a sender's domain (what a
     person actually recognizes at a glance, e.g. "amazon.com") rather than
     the full mailbox address, plus the subject."""
-    domain = from_address.rsplit("@", 1)[1].strip().lower() if "@" in from_address else from_address.strip()
-    label = domain or from_address or "unknown sender"
+    addr = _clean_address(from_address)
+    domain = addr.rsplit("@", 1)[1].strip().lower() if "@" in addr else addr.strip()
+    label = domain or addr or "unknown sender"
     clean_subject = (subject or "(no subject)").strip() or "(no subject)"
     return f"{label} -- {clean_subject}"
 
