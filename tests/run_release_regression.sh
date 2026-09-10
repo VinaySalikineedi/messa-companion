@@ -83,8 +83,12 @@ done
 echo ""
 echo "=================================================================="
 echo "SUMMARY: ${#PASSED[@]} passed, ${#FAILED[@]} failed"
-for t in "${PASSED[@]}"; do echo "  [PASS] $t"; done
-for t in "${FAILED[@]}"; do echo "  [FAIL] $t"; done
+if [ "${#PASSED[@]}" -gt 0 ]; then
+  for t in "${PASSED[@]}"; do echo "  [PASS] $t"; done
+fi
+if [ "${#FAILED[@]}" -gt 0 ]; then
+  for t in "${FAILED[@]}"; do echo "  [FAIL] $t"; done
+fi
 echo "=================================================================="
 
 if [ "${#FAILED[@]}" -gt 0 ]; then

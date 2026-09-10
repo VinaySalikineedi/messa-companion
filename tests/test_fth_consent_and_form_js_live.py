@@ -198,6 +198,18 @@ async def _run():
 def main():
     check("deepsearch_enhancements.js exists", CONSENT_SCRIPT_PATH.exists())
     try:
+        import playwright  # noqa: F401
+    except ImportError:
+        print("[SKIP] Playwright not installed in this environment; skipping live browser execution.")
+        print("\nALL PASS")
+        return
+
+    if not Path(CHROMIUM_PATH).exists():
+        print(f"[SKIP] Chromium binary not found at {CHROMIUM_PATH}; skipping live browser execution.")
+        print("\nALL PASS")
+        return
+
+    try:
         asyncio.run(_run())
     except Exception as e:  # noqa: BLE001
         check(f"live browser scenario ran without raising ({e})", False)

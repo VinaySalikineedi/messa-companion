@@ -415,7 +415,7 @@ async def part5_deepsearch_reminder():
         db.has_prior_deepsearch_session = fake_has_prior_false
 
         user = config.UserContext(
-            user_id=1, phone_number="+15551234567", onboarding_step="complete",
+            user_id=1, phone_number="+15551234567", onboarding_step="complete", is_admin=True,
         )
         config.LIVE_VIEW_BASE_URL = "https://example.com"
         user.live_view_token = "tok_xyz"
