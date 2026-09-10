@@ -1916,6 +1916,15 @@ PROJECT_CAPSULES_ENABLED = os.environ.get("MESSA_PROJECT_CAPSULES_ENABLED", "tru
 )
 PROJECT_DEFAULT_EXPIRE_HOURS = float(os.environ.get("MESSA_PROJECT_DEFAULT_EXPIRE_HOURS", "720"))  # 30 days
 PROJECT_MAX_EXPIRE_HOURS = float(os.environ.get("MESSA_PROJECT_MAX_EXPIRE_HOURS", "2160"))  # 90 days
+# project_capsules.title is VARCHAR(255) (migrations/041_project_capsules.sql)
+# -- kept well under that hard DB ceiling, not flush against it, so there's
+# always room for routines_tools.py to append its own disambiguating suffix
+# later without a second length check. Validated BEFORE the gated proposal
+# is ever staged (see propose_create_project_capsule) -- a QA pass found
+# that an over-length title used to sail through staging and only blow up
+# with an unhandled asyncpg.StringDataRightTruncationError at confirmation
+# time, well after the user already said "yes."
+PROJECT_CAPSULE_TITLE_MAX_LENGTH = 200
 
 # ---- US-only launch gate (messa/region_gate.py) ----
 # This is a US-market-only launch: a brand-new phone number that isn't a

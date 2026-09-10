@@ -1653,19 +1653,6 @@ async def _process_inbound(
         media_note, is_audio_failure = await _maybe_understand_inbound_media(media_url)
         if media_note:
             effective_content = f"{content}\n\n{media_note}".strip() if content else media_note
-            if config.PROJECT_CAPSULES_ENABLED:
-                # V3-autonomous.md Phase 6: the human-readable media_note
-                # above already describes WHAT this attachment is, but the
-                # orchestrator also needs the raw URL itself to actually
-                # file it into a project capsule's vault (routines_tools.py's
-                # add_project_capsule_asset) -- media_url is otherwise
-                # discarded the moment this function returns. One compact
-                # bracketed line, not a paragraph, so this costs nothing on
-                # a turn that has no active project capsule to file into
-                # (_active_project_capsules_paragraph is itself empty then,
-                # and the model has nothing prompting it to even look for
-                # this tag).
-                effective_content += f"\n[attachment_url: {media_url}]"
         elif is_audio_failure:
             # Asymmetric fallback contract (see config.py's own comment
             # above MEDIA_UNDERSTANDING_ENABLED): a voice memo that
@@ -1674,13 +1661,40 @@ async def _process_inbound(
             # swallow a deliberate voice memo the way it's fine to
             # silently swallow a captionless, undescribable photo.
             effective_content = content or "[Voice memo received but couldn't be transcribed]"
+        elif config.PROJECT_CAPSULES_ENABLED:
+            # V3-autonomous.md Phase 6, fix for a QA-caught gap: media_note
+            # is only non-None when _maybe_understand_inbound_media both
+            # recognized AND successfully described/transcribed the
+            # attachment. A vision/audio call timeout, an upstream error,
+            # or a format it just doesn't inspect (a .docx, a .zip) all
+            # produce a bare None here -- which used to mean the
+            # attachment_url tag below was never attached either, so an
+            # otherwise-perfectly-good receipt or document a user meant to
+            # file into a project's vault silently never reached the model
+            # at all. This still gives the model SOMETHING to work with
+            # even when Messa couldn't read the file's contents.
+            effective_content = content or "[Attachment received -- couldn't automatically read its contents.]"
     if not effective_content:
-        # A captionless MMS that wasn't a PDF either (a plain photo, most
-        # likely) -- nothing here for Messa to act on. Same "silently
-        # ignored" behavior this had before media_url was accepted into
-        # this webhook at all; not a regression, just now reachable via a
-        # different path than a genuinely empty payload.
+        # A captionless MMS with genuinely nothing to act on (project
+        # capsules off, or no media_url at all) -- same "silently ignored"
+        # behavior this had before media_url was accepted into this
+        # webhook at all.
         return
+    if media_url and config.PROJECT_CAPSULES_ENABLED:
+        # V3-autonomous.md Phase 6: the orchestrator needs the raw URL
+        # itself (not just a human-readable description) to actually file
+        # this into a project capsule's vault (routines_tools.py's
+        # add_project_capsule_asset) -- media_url is otherwise discarded
+        # the moment this function returns. Deliberately OUTSIDE the
+        # media_note/is_audio_failure branching above (a QA pass found the
+        # tag used to live inside `if media_note:`, so it silently vanished
+        # on exactly the attachments most likely to need manual filing --
+        # ones Messa's own media understanding couldn't make sense of) --
+        # this fires whenever there's an attachment at all, and costs
+        # nothing on a turn with no active project capsule to file into
+        # (_active_project_capsules_paragraph is itself empty then, and the
+        # model has nothing prompting it to even look for this tag).
+        effective_content += f"\n[attachment_url: {media_url}]"
 
     # Pure-acknowledgment short-circuit (see _handle_pure_acknowledgment's
     # own docstring for the four guards) -- checked BEFORE mark_read/the
@@ -2285,14 +2299,34 @@ async def _fire_autonomous_routine(job: dict[str, Any], meta: dict[str, Any]) ->
     is_one_shot = job["cron_expression"] == ONE_SHOT_SENTINEL
     now = datetime.now(timezone.utc)
 
+    # V3-autonomous.md Phase 6: if this cron job actually drives a project
+    # capsule, hand the model the capsule's own id/title/goal (and steer it
+    # to the project-specific tools) instead of treating this as a bare,
+    # context-free routine firing -- a QA pass found the wrapped_task below
+    # never told the model a project_id even existed, so it had no way to
+    # call get_project_capsule_details/finish_project_capsule/
+    # log_project_capsule_event on itself at all. Best-effort/non-fatal,
+    # same "cheap local read, never breaks the firing" shape as every other
+    # optional lookup in this module -- a lookup failure just falls back to
+    # the plain-routine wrapping below, unchanged.
+    project_capsule: dict[str, Any] | None = None
+    if config.PROJECT_CAPSULES_ENABLED:
+        try:
+            project_capsule = await db.get_project_capsule_by_cron_job(job["id"])
+        except Exception as e:  # noqa: BLE001 - a hint, not load-bearing
+            console.system(f"get_project_capsule_by_cron_job failed (non-fatal): {e}")
+
     expire_at = _parse_iso(meta.get("expire_at"))
     if expire_at is not None and now >= expire_at:
+        give_up_text = (
+            f"I gave up managing the project '{project_capsule['title']}' after a while with no "
+            "resolution. Let me know if you'd like me to keep trying."
+            if project_capsule and project_capsule.get("status") == "active"
+            else f"I gave up checking on this after a while with no resolution: "
+                 f"\"{job['prompt_or_task']}\". Let me know if you'd like me to try again."
+        )
         try:
-            await sendblue.send_message(
-                phone,
-                f"I gave up checking on this after a while with no resolution: "
-                f"\"{job['prompt_or_task']}\". Let me know if you'd like me to try again.",
-            )
+            await sendblue.send_message(phone, give_up_text)
         except SendblueError as e:
             console.system(f"[routine expire notify failed] job=#{job['id']}: {e}")
         await db.set_cron_job_status(user_id, job["id"], "cancelled", {"ended_reason": "expired"})
@@ -2300,14 +2334,29 @@ async def _fire_autonomous_routine(job: dict[str, Any], meta: dict[str, Any]) ->
 
     attempt_count = int(meta.get("attempt_count", 0))
     digest_mode = bool(meta.get("digest"))
-    wrapped_task = (
-        f"(Automated check-in for routine #{job['id']} -- this is not a live message from the "
-        f"user right now, they won't see this line. Your saved task: {job['prompt_or_task']}\n"
-        f"If this is now fully resolved and no more automatic checks are needed, delegate to "
-        f"routines_agent and call finish_routine with cron_id={job['id']} and a short outcome "
-        f"summary so it stops running. Otherwise just do what the task needs -- this will check "
-        f"again automatically on its own schedule.)"
-    )
+    if project_capsule and project_capsule.get("status") == "active":
+        wrapped_task = (
+            f"(Automated cadence check-in for PROJECT CAPSULE #{project_capsule['id']} "
+            f"'{project_capsule['title']}' (routine #{job['id']} underneath) -- this is not a live "
+            f"message from the user right now, they won't see this line. The project's goal: "
+            f"{job['prompt_or_task']}\n"
+            f"Call get_project_capsule_details with project_id={project_capsule['id']} first so you "
+            f"know what's already been done and what's already in the vault. If the goal is now "
+            f"fully achieved, delegate to routines_agent and call finish_project_capsule with "
+            f"project_id={project_capsule['id']} and a short outcome summary. If something happened "
+            f"worth recording but it's not resolved yet, log it with log_project_capsule_event -- "
+            f"if there's genuinely nothing new this cycle, keep your reply short rather than padding "
+            f"it out. This will check again automatically on its own schedule.)"
+        )
+    else:
+        wrapped_task = (
+            f"(Automated check-in for routine #{job['id']} -- this is not a live message from the "
+            f"user right now, they won't see this line. Your saved task: {job['prompt_or_task']}\n"
+            f"If this is now fully resolved and no more automatic checks are needed, delegate to "
+            f"routines_agent and call finish_routine with cron_id={job['id']} and a short outcome "
+            f"summary so it stops running. Otherwise just do what the task needs -- this will check "
+            f"again automatically on its own schedule.)"
+        )
 
     captured: list[str] = []
 

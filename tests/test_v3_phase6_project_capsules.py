@@ -79,6 +79,7 @@ from langchain_core.messages import AIMessage, HumanMessage  # noqa: E402
 from messa import config, db  # noqa: E402
 from messa.agents import registry  # noqa: E402
 from messa.tools import routines_tools  # noqa: E402
+import messa.server as server  # noqa: E402
 
 failures = []
 
@@ -223,12 +224,22 @@ async def part1_insert_project_capsule():
         )
         conn2 = FakeConn(
             has_tables=True,
-            fetchrow_queue=[cron_row2, cancelled_row, project_row2],
+            # cron_row2 (the new job's own INSERT), cancelled_row (the
+            # superseded job's UPDATE), None (that superseded job -- an
+            # ordinary routine -- has no linked project_capsules row, so
+            # _sync_linked_project_capsule_status's own UPDATE...RETURNING
+            # finds nothing), project_row2 (this capsule's own INSERT).
+            fetchrow_queue=[cron_row2, cancelled_row, None, project_row2],
             fetch_queue=[[old_conflicting]],
         )
         result2 = await db._insert_project_capsule(conn2, 1, payload_with_email)
         check("_insert_project_capsule: copies up _superseded_job when the underlying cron insert superseded one",
               result2.get("_superseded_job", {}).get("id") == 77)
+        sync_attempt = next(
+            (c for c in conn2.calls if c[0] == "fetchrow" and "UPDATE project_capsules" in c[1]), None
+        )
+        check("_insert_project_capsule: the superseded job's own capsule-sync ran (found no linked capsule, safely)",
+              sync_attempt is not None)
     finally:
         config.CONFLICT_AUTO_SUPERSEDE_ENABLED = real_flag
 
@@ -248,53 +259,87 @@ async def part1_insert_project_capsule():
 # ---------------------------------------------------------------------------
 
 async def part2_set_cron_job_status_sync():
-    # 2a: 'active' maps straight across.
+    # 2a: 'active' maps straight across, no terminal-state timeline event.
     updated = FakeRow(id=501, status="active", meta=json.dumps({}))
-    conn = FakeConn(has_tables=True, fetchrow_queue=[updated])
+    capsule_row = FakeRow(id=9)
+    conn = FakeConn(has_tables=True, fetchrow_queue=[updated, capsule_row])
     install_fake_pool(conn)
     await db.set_cron_job_status(1, 501, "active")
-    sync_call = next(c for c in conn.calls if c[0] == "execute" and "project_capsules" in c[1])
+    sync_call = next(c for c in conn.calls if c[0] == "fetchrow" and "UPDATE project_capsules" in c[1])
     check("set_cron_job_status: 'active' syncs the linked capsule to 'active'",
-          sync_call[2] == (501, "active"))
+          sync_call[2] == (501, "active", None))
+    check("set_cron_job_status: 'active' logs no timeline event (not a terminal state)",
+          not any("project_timeline_events" in c[1] for c in conn.calls if c[0] == "execute"))
 
-    # 2b: 'paused' maps straight across.
+    # 2b: 'paused' maps straight across, no terminal-state timeline event.
     updated = FakeRow(id=501, status="paused", meta=json.dumps({}))
-    conn = FakeConn(has_tables=True, fetchrow_queue=[updated])
+    capsule_row = FakeRow(id=9)
+    conn = FakeConn(has_tables=True, fetchrow_queue=[updated, capsule_row])
     install_fake_pool(conn)
     await db.set_cron_job_status(1, 501, "paused")
-    sync_call = next(c for c in conn.calls if c[0] == "execute" and "project_capsules" in c[1])
+    sync_call = next(c for c in conn.calls if c[0] == "fetchrow" and "UPDATE project_capsules" in c[1])
     check("set_cron_job_status: 'paused' syncs the linked capsule to 'paused'",
-          sync_call[2] == (501, "paused"))
+          sync_call[2] == (501, "paused", None))
+    check("set_cron_job_status: 'paused' logs no timeline event", not any(
+        "project_timeline_events" in c[1] for c in conn.calls if c[0] == "execute"))
 
-    # 2c: 'cancelled' with ended_reason='completed_by_agent' -> 'completed'.
+    # 2c: 'cancelled' with ended_reason='completed_by_agent' -> 'completed',
+    # copies the outcome onto the capsule, and logs a completion event --
+    # the actual fix for Issue 3 (QA report): this now happens even when
+    # the model called the ORDINARY finish_routine, not the project-
+    # specific finish_project_capsule tool.
     existing = FakeRow(meta=json.dumps({}))
     updated = FakeRow(id=501, status="cancelled", meta=json.dumps({"ended_reason": "completed_by_agent", "outcome": "Refund received."}))
-    conn = FakeConn(has_tables=True, fetchrow_queue=[existing, updated])
+    capsule_row = FakeRow(id=9)
+    conn = FakeConn(has_tables=True, fetchrow_queue=[existing, updated, capsule_row])
     install_fake_pool(conn)
     await db.set_cron_job_status(1, 501, "cancelled", {"ended_reason": "completed_by_agent", "outcome": "Refund received."})
-    sync_call = next(c for c in conn.calls if c[0] == "execute" and "project_capsules" in c[1])
-    check("set_cron_job_status: 'cancelled'+completed_by_agent syncs the capsule to 'completed'",
-          sync_call[2] == (501, "completed"))
+    sync_call = next(c for c in conn.calls if c[0] == "fetchrow" and "UPDATE project_capsules" in c[1])
+    check("set_cron_job_status: 'cancelled'+completed_by_agent syncs the capsule to 'completed' with its outcome",
+          sync_call[2] == (501, "completed", "Refund received."))
+    event_call = next(c for c in conn.calls if c[0] == "execute" and "project_timeline_events" in c[1])
+    check("set_cron_job_status: logs a completion timeline event with the outcome text",
+          event_call[2] == (9, "Completed: Refund received."))
 
-    # 2d: 'cancelled' with ended_reason='expired' -> 'expired'.
+    # 2d: 'cancelled' with ended_reason='expired' -> 'expired', logs an
+    # expiry timeline event.
     existing = FakeRow(meta=json.dumps({}))
     updated = FakeRow(id=501, status="cancelled", meta=json.dumps({"ended_reason": "expired"}))
-    conn = FakeConn(has_tables=True, fetchrow_queue=[existing, updated])
+    capsule_row = FakeRow(id=9)
+    conn = FakeConn(has_tables=True, fetchrow_queue=[existing, updated, capsule_row])
     install_fake_pool(conn)
     await db.set_cron_job_status(1, 501, "cancelled", {"ended_reason": "expired"})
-    sync_call = next(c for c in conn.calls if c[0] == "execute" and "project_capsules" in c[1])
+    sync_call = next(c for c in conn.calls if c[0] == "fetchrow" and "UPDATE project_capsules" in c[1])
     check("set_cron_job_status: 'cancelled'+expired syncs the capsule to 'expired'",
-          sync_call[2] == (501, "expired"))
+          sync_call[2] == (501, "expired", None))
+    event_call = next(c for c in conn.calls if c[0] == "execute" and "project_timeline_events" in c[1])
+    check("set_cron_job_status: logs an expiry timeline event", "Expired" in event_call[2][1])
 
-    # 2e: 'cancelled' with any other (or no) reason -> plain 'cancelled'.
+    # 2e: 'cancelled' with any other (or no) reason -> plain 'cancelled',
+    # logs a cancellation timeline event.
     existing = FakeRow(meta=json.dumps({}))
     updated = FakeRow(id=501, status="cancelled", meta=json.dumps({"ended_reason": "cancelled_by_user"}))
-    conn = FakeConn(has_tables=True, fetchrow_queue=[existing, updated])
+    capsule_row = FakeRow(id=9)
+    conn = FakeConn(has_tables=True, fetchrow_queue=[existing, updated, capsule_row])
     install_fake_pool(conn)
     await db.set_cron_job_status(1, 501, "cancelled", {"ended_reason": "cancelled_by_user"})
-    sync_call = next(c for c in conn.calls if c[0] == "execute" and "project_capsules" in c[1])
+    sync_call = next(c for c in conn.calls if c[0] == "fetchrow" and "UPDATE project_capsules" in c[1])
     check("set_cron_job_status: 'cancelled'+cancelled_by_user syncs the capsule to 'cancelled'",
-          sync_call[2] == (501, "cancelled"))
+          sync_call[2] == (501, "cancelled", None))
+    event_call = next(c for c in conn.calls if c[0] == "execute" and "project_timeline_events" in c[1])
+    check("set_cron_job_status: logs a cancellation timeline event", "Cancelled" in event_call[2][1])
+
+    # 2e-2: 'cancelled' with ended_reason='superseded' (from conflict
+    # auto-supersede) -> plain 'cancelled', with a reason-specific event.
+    existing = FakeRow(meta=json.dumps({}))
+    updated = FakeRow(id=501, status="cancelled", meta=json.dumps({"ended_reason": "superseded"}))
+    capsule_row = FakeRow(id=9)
+    conn = FakeConn(has_tables=True, fetchrow_queue=[existing, updated, capsule_row])
+    install_fake_pool(conn)
+    await db.set_cron_job_status(1, 501, "cancelled", {"ended_reason": "superseded"})
+    event_call = next(c for c in conn.calls if c[0] == "execute" and "project_timeline_events" in c[1])
+    check("set_cron_job_status: a superseded cancel logs a reason-specific timeline event",
+          "superseded" in event_call[2][1])
 
     # 2f: pre-migration-041 (no project_capsules table) -- no sync attempted,
     # still returns the updated cron row.
@@ -305,7 +350,7 @@ async def part2_set_cron_job_status_sync():
     check("set_cron_job_status: pre-migration still returns the updated cron row",
           result["id"] == 501)
     check("set_cron_job_status: pre-migration never touches project_capsules",
-          not any("project_capsules" in c[1] for c in conn.calls if c[0] == "execute"))
+          not any("project_capsules" in c[1] for c in conn.calls if c[0] == "fetchrow"))
 
     # 2g: no matching cron job (fetchrow returns None) -- returns {} without
     # attempting any capsule sync.
@@ -314,7 +359,16 @@ async def part2_set_cron_job_status_sync():
     result = await db.set_cron_job_status(1, 999, "active")
     check("set_cron_job_status: no such cron job returns {}", result == {})
     check("set_cron_job_status: no such cron job never touches project_capsules",
-          not any("project_capsules" in c[1] for c in conn.calls if c[0] == "execute"))
+          not any("project_capsules" in c[1] for c in conn.calls if c[0] == "fetchrow"))
+
+    # 2h: cron job has NO linked capsule (the UPDATE...WHERE cron_job_id=$1
+    # matches nothing) -- no timeline event, no crash.
+    updated = FakeRow(id=501, status="active", meta=json.dumps({}))
+    conn = FakeConn(has_tables=True, fetchrow_queue=[updated, None])
+    install_fake_pool(conn)
+    await db.set_cron_job_status(1, 501, "active")
+    check("set_cron_job_status: an ordinary routine (no linked capsule) logs no timeline event",
+          not any("project_timeline_events" in c[1] for c in conn.calls if c[0] == "execute"))
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +404,7 @@ async def part3_other_db_functions():
 
     # add_project_capsule_asset / list_project_capsule_assets
     asset_row = FakeRow(id=1, project_id=9, source_url="https://cdn/x.jpg", description="receipt")
-    conn = FakeConn(fetchrow_queue=[asset_row])
+    conn = FakeConn(has_tables=True, fetchrow_queue=[asset_row])
     install_fake_pool(conn)
     result = await db.add_project_capsule_asset(9, "https://cdn/x.jpg", "receipt")
     check("add_project_capsule_asset: returns the inserted row", result == dict(asset_row))
@@ -358,13 +412,13 @@ async def part3_other_db_functions():
     check("add_project_capsule_asset: inserts with project_id/source_url/description",
           insert_call[2] == (9, "https://cdn/x.jpg", "receipt"))
 
-    conn = FakeConn(fetch_queue=[[asset_row]])
+    conn = FakeConn(has_tables=True, fetch_queue=[[asset_row]])
     install_fake_pool(conn)
     result = await db.list_project_capsule_assets(9)
     check("list_project_capsule_assets: returns every asset", result == [asset_row])
 
     # log_project_capsule_event / list_project_capsule_events
-    conn = FakeConn()
+    conn = FakeConn(has_tables=True)
     install_fake_pool(conn)
     await db.log_project_capsule_event(9, "Emailed Delta support.")
     insert_call = next(c for c in conn.calls if c[0] == "execute")
@@ -372,10 +426,53 @@ async def part3_other_db_functions():
           insert_call[2] == (9, "Emailed Delta support."))
 
     event_row = FakeRow(id=1, project_id=9, event_text="Emailed Delta support.")
-    conn = FakeConn(fetch_queue=[[event_row]])
+    conn = FakeConn(has_tables=True, fetch_queue=[[event_row]])
     install_fake_pool(conn)
     result = await db.list_project_capsule_events(9)
     check("list_project_capsule_events: returns every event", result == [event_row])
+
+    # --- P6 report Issue 1 fix: these five functions used to run raw SQL
+    # with NO _has_table guard at all -- a crash (asyncpg.UndefinedTableError)
+    # pre-migration-041, not a graceful degrade. Each must now safely
+    # return {}/[]/None and touch NOTHING else pre-migration.
+    conn = FakeConn(has_tables=False)
+    install_fake_pool(conn)
+    result = await db.add_project_capsule_asset(9, "https://cdn/x.jpg", "receipt")
+    check("Issue 1 fix: add_project_capsule_asset degrades to {} pre-migration, doesn't crash", result == {})
+    check("Issue 1 fix: add_project_capsule_asset never attempts the INSERT pre-migration",
+          not any(c[0] == "fetchrow" for c in conn.calls))
+
+    conn = FakeConn(has_tables=False)
+    install_fake_pool(conn)
+    result = await db.list_project_capsule_assets(9)
+    check("Issue 1 fix: list_project_capsule_assets degrades to [] pre-migration, doesn't crash", result == [])
+
+    conn = FakeConn(has_tables=False)
+    install_fake_pool(conn)
+    await db.log_project_capsule_event(9, "x")  # must not raise
+    check("Issue 1 fix: log_project_capsule_event never attempts the INSERT pre-migration",
+          not any(c[0] == "execute" for c in conn.calls))
+
+    conn = FakeConn(has_tables=False)
+    install_fake_pool(conn)
+    result = await db.list_project_capsule_events(9)
+    check("Issue 1 fix: list_project_capsule_events degrades to [] pre-migration, doesn't crash", result == [])
+
+    # get_project_capsule_by_cron_job (new -- feeds server.py's cadence-loop
+    # project-context fix, Issue 3)
+    capsule_row = FakeRow(id=9, cron_job_id=501, title="Delta refund", status="active")
+    conn = FakeConn(has_tables=True, fetchrow_queue=[capsule_row])
+    install_fake_pool(conn)
+    result = await db.get_project_capsule_by_cron_job(501)
+    check("get_project_capsule_by_cron_job: finds the capsule linked to this cron job", result == dict(capsule_row))
+    conn = FakeConn(has_tables=True, fetchrow_queue=[None])
+    install_fake_pool(conn)
+    result = await db.get_project_capsule_by_cron_job(999)
+    check("get_project_capsule_by_cron_job: None for an ordinary routine with no linked capsule", result is None)
+    conn = FakeConn(has_tables=False)
+    install_fake_pool(conn)
+    result = await db.get_project_capsule_by_cron_job(501)
+    check("get_project_capsule_by_cron_job: pre-migration returns None, doesn't crash", result is None)
 
     # finish_project_capsule
     project_row = FakeRow(id=9, user_id=1, cron_job_id=501, title="A", goal="do it", status="active")
@@ -399,11 +496,47 @@ async def part3_other_db_functions():
     finally:
         db.set_cron_job_status = real_set_status
 
+    # finish_project_capsule: orphaned capsule (no cron_job_id) -- logs its
+    # OWN completion timeline event, since set_cron_job_status's sync never
+    # runs when there's no linked cron job.
+    orphan_project_row = FakeRow(id=10, user_id=1, cron_job_id=None, title="B", goal="do it", status="active")
+    updated_orphan_capsule = FakeRow(id=10, status="completed", outcome_summary="Done.")
+    conn = FakeConn(has_tables=True, fetchrow_queue=[orphan_project_row, updated_orphan_capsule])
+    install_fake_pool(conn)
+    result = await db.finish_project_capsule(1, 10, "Done.")
+    check("finish_project_capsule: orphaned capsule (no cron job) still completes",
+          result["status"] == "completed")
+    event_call = next((c for c in conn.calls if c[0] == "execute" and "project_timeline_events" in c[1]), None)
+    check("finish_project_capsule: orphaned capsule logs its own completion timeline event",
+          event_call is not None and event_call[2] == (10, "Completed: Done."))
+
     # finish_project_capsule: no such capsule for this user -> {}
-    conn = FakeConn(fetchrow_queue=[None])
+    conn = FakeConn(has_tables=True, fetchrow_queue=[None])
     install_fake_pool(conn)
     result = await db.finish_project_capsule(1, 999, "x")
     check("finish_project_capsule: returns {} for an unknown/foreign capsule", result == {})
+
+    # finish_project_capsule: pre-migration -- {} without crashing (Issue 1 fix)
+    conn = FakeConn(has_tables=False)
+    install_fake_pool(conn)
+    result = await db.finish_project_capsule(1, 9, "x")
+    check("Issue 1 fix: finish_project_capsule degrades to {} pre-migration, doesn't crash", result == {})
+
+    # cancel_orphaned_project_capsule (new -- Issue 6 fix: cancelling an
+    # orphaned capsule must set 'cancelled', never 'completed')
+    cancelled_row = FakeRow(id=10, status="cancelled")
+    conn = FakeConn(has_tables=True, fetchrow_queue=[cancelled_row])
+    install_fake_pool(conn)
+    result = await db.cancel_orphaned_project_capsule(1, 10)
+    check("cancel_orphaned_project_capsule: sets status to 'cancelled', not 'completed'",
+          result["status"] == "cancelled")
+    update_call = next(c for c in conn.calls if c[0] == "fetchrow")
+    check("cancel_orphaned_project_capsule: the UPDATE itself sets status = 'cancelled'",
+          "status = 'cancelled'" in update_call[1])
+    conn = FakeConn(has_tables=False)
+    install_fake_pool(conn)
+    result = await db.cancel_orphaned_project_capsule(1, 10)
+    check("cancel_orphaned_project_capsule: pre-migration returns {}, doesn't crash", result == {})
 
 
 # ---------------------------------------------------------------------------
@@ -515,6 +648,29 @@ async def part5_propose_create_project_capsule():
                   190 <= hours_out <= 200)
         finally:
             config.PROJECT_DEFAULT_EXPIRE_HOURS, config.PROJECT_MAX_EXPIRE_HOURS = real_default, real_max
+
+        # QA report Issue 4: an oversized title used to crash on the
+        # DB's VARCHAR(255) column instead of failing cleanly with a
+        # message the model can act on (shorten the title, keep detail in
+        # `goal`). config.PROJECT_CAPSULE_TITLE_MAX_LENGTH keeps headroom
+        # under that ceiling.
+        captured.clear()
+        too_long_title = "x" * (config.PROJECT_CAPSULE_TITLE_MAX_LENGTH + 1)
+        reply = await propose_project.coroutine(
+            title=too_long_title, goal="dispute the charge", cadence_cron_expression="0 9 * * *",
+        )
+        check("propose_create_project_capsule: rejects a too-long title before it ever reaches the DB",
+              reply.startswith("ERROR") and not captured)
+        check("propose_create_project_capsule: too-long-title error names the max length",
+              str(config.PROJECT_CAPSULE_TITLE_MAX_LENGTH) in reply)
+
+        captured.clear()
+        exactly_max_title = "x" * config.PROJECT_CAPSULE_TITLE_MAX_LENGTH
+        reply = await propose_project.coroutine(
+            title=exactly_max_title, goal="dispute the charge", cadence_cron_expression="0 9 * * *",
+        )
+        check("propose_create_project_capsule: a title at exactly the max length is accepted",
+              not reply.startswith("ERROR") and captured)
     finally:
         db.propose_action = real_propose
 
@@ -603,6 +759,42 @@ async def part6_project_tools():
         check("cancel_project_capsule: cancels the linked cron job with cancelled_by_user",
               status_calls == [(1, 501, "cancelled", {"ended_reason": "cancelled_by_user"})])
 
+        # cancel_project_capsule: orphaned path (QA report Issue 6) -- no
+        # linked cron job to route a status change through, so the tool
+        # must call db.cancel_orphaned_project_capsule (which marks
+        # 'cancelled', never 'completed') and log its own timeline event
+        # directly, instead of falling through to db.finish_project_capsule
+        # (which always marks 'completed' -- would misrepresent a
+        # given-up-on project as a successfully finished one).
+        async def fake_get_orphaned(uid, pid):
+            return {"id": 9, "cron_job_id": None, "status": "active"}
+
+        orphan_cancel_calls = []
+
+        async def fake_cancel_orphaned(uid, pid):
+            orphan_cancel_calls.append((uid, pid))
+
+        real_cancel_orphaned = db.cancel_orphaned_project_capsule
+        db.get_project_capsule = fake_get_orphaned
+        db.cancel_orphaned_project_capsule = fake_cancel_orphaned
+        status_calls.clear()
+        log_calls_orphan = []
+
+        async def fake_log_orphan(pid, text):
+            log_calls_orphan.append((pid, text))
+
+        db.log_project_capsule_event = fake_log_orphan
+        try:
+            reply = await by_name["cancel_project_capsule"].coroutine(project_id=9)
+            check("cancel_project_capsule: orphaned project calls cancel_orphaned_project_capsule, not set_cron_job_status",
+                  orphan_cancel_calls == [(1, 9)] and not status_calls)
+            check("cancel_project_capsule: orphaned project logs its own 'Cancelled by the user.' event",
+                  log_calls_orphan == [(9, "Cancelled by the user.")])
+            check("cancel_project_capsule: orphaned project still replies with confirmation", "#9" in reply)
+        finally:
+            db.cancel_orphaned_project_capsule = real_cancel_orphaned
+            db.get_project_capsule = fake_get_with_cron
+
         # finish_project_capsule
         finish_calls = []
 
@@ -620,8 +812,10 @@ async def part6_project_tools():
         reply = await by_name["finish_project_capsule"].coroutine(project_id=9, outcome_summary="Refund received.")
         check("finish_project_capsule tool: calls db.finish_project_capsule",
               finish_calls == [(1, 9, "Refund received.")])
-        check("finish_project_capsule tool: also logs a completion timeline event",
-              log_calls and "Refund received." in log_calls[0][1])
+        check("finish_project_capsule tool: does NOT also log a manual timeline event -- "
+              "db.finish_project_capsule's own set_cron_job_status sync already does it exactly "
+              "once (a second call here would double-log it, QA report Issue 2)",
+              log_calls == [])
 
         # add_project_capsule_asset
         db.get_project_capsule = fake_get_with_cron
@@ -751,6 +945,140 @@ async def part8_registry_wiring():
           "add_project_capsule_asset" in paragraph and "[attachment_url:" in paragraph)
 
 
+# ---------------------------------------------------------------------------
+# Part 9: server._fire_autonomous_routine's project-capsule-aware wrapped_task
+# ---------------------------------------------------------------------------
+
+async def part9_fire_autonomous_routine_project_context():
+    """QA report Issue 3 (first bullet): the cadence loop's wrapped_task
+    never told the model a firing cron job was actually driving a project
+    capsule, so it had no way to call get_project_capsule_details/
+    finish_project_capsule/log_project_capsule_event on itself. Confirms
+    the fix: server._fire_autonomous_routine now looks up the linked
+    capsule and branches its wrapped_task (and its expiry give-up message)
+    accordingly, falling back to the original plain-routine wording
+    whenever there isn't one (or it isn't 'active')."""
+    real_get_capsule = db.get_project_capsule_by_cron_job
+    real_load_user = server.cli.load_user_context
+    real_build_orch = server.build_orchestrator
+    real_run_message = server.cli.run_message
+    real_list_jobs = db.list_cron_jobs
+    real_reschedule = db.reschedule_cron_job
+    real_set_status = db.set_cron_job_status
+    real_send = server.sendblue.send_message
+
+    captured_tasks = []
+    status_calls = []
+    send_calls = []
+
+    async def fake_load_user_context(phone, channel="sms"):
+        return object()
+
+    async def fake_build_orchestrator(user, gate):
+        return object()
+
+    async def fake_run_message(user, agent, task, send=None):
+        captured_tasks.append(task)
+
+    async def fake_list_cron_jobs(uid):
+        return [{"id": 501, "status": "active"}]
+
+    async def fake_reschedule(cron_id, next_run, meta_patch=None):
+        pass
+
+    async def fake_set_status(uid, cron_id, status, meta_patch=None):
+        status_calls.append((uid, cron_id, status, meta_patch))
+        return {"id": cron_id}
+
+    async def fake_send(phone, text):
+        send_calls.append((phone, text))
+
+    server.cli.load_user_context = fake_load_user_context
+    server.build_orchestrator = fake_build_orchestrator
+    server.cli.run_message = fake_run_message
+    db.list_cron_jobs = fake_list_cron_jobs
+    db.reschedule_cron_job = fake_reschedule
+    db.set_cron_job_status = fake_set_status
+    server.sendblue.send_message = fake_send
+
+    job = {
+        "id": 501, "user_id": 1, "phone_number": "+15551234567",
+        "cron_expression": "0 9 * * *", "user_timezone": "UTC",
+        "prompt_or_task": "dispute the $850 charge",
+    }
+
+    try:
+        # 9a: linked, active project capsule -> project-aware wrapped_task.
+        async def fake_get_active(cron_job_id):
+            return {"id": 9, "title": "Delta refund", "status": "active"}
+
+        db.get_project_capsule_by_cron_job = fake_get_active
+        captured_tasks.clear()
+        await server._fire_autonomous_routine(dict(job), {})
+        task = captured_tasks[0]
+        check("_fire_autonomous_routine: project-aware task names the capsule",
+              "PROJECT CAPSULE #9" in task and "Delta refund" in task)
+        check("_fire_autonomous_routine: project-aware task steers to get_project_capsule_details",
+              "get_project_capsule_details" in task and "project_id=9" in task)
+        check("_fire_autonomous_routine: project-aware task steers to finish_project_capsule",
+              "finish_project_capsule" in task)
+        check("_fire_autonomous_routine: project-aware task omits the plain-routine wording",
+              "finish_routine" not in task and "cron_id=" not in task)
+
+        # 9b: no linked capsule at all -> original plain-routine wording, unchanged.
+        async def fake_get_none(cron_job_id):
+            return None
+
+        db.get_project_capsule_by_cron_job = fake_get_none
+        captured_tasks.clear()
+        await server._fire_autonomous_routine(dict(job), {})
+        task = captured_tasks[0]
+        check("_fire_autonomous_routine: plain routine task mentions finish_routine/cron_id",
+              "finish_routine" in task and "cron_id=501" in task)
+        check("_fire_autonomous_routine: plain routine task never mentions a project capsule",
+              "PROJECT CAPSULE" not in task)
+
+        # 9c: linked capsule but not active (e.g. already completed) -> falls
+        # back to the plain-routine wording too, same as no capsule at all.
+        async def fake_get_completed(cron_job_id):
+            return {"id": 9, "title": "Delta refund", "status": "completed"}
+
+        db.get_project_capsule_by_cron_job = fake_get_completed
+        captured_tasks.clear()
+        await server._fire_autonomous_routine(dict(job), {})
+        task = captured_tasks[0]
+        check("_fire_autonomous_routine: non-active linked capsule still falls back to plain wording",
+              "finish_routine" in task and "PROJECT CAPSULE" not in task)
+
+        # 9d: expiry give-up message names the project when it's active.
+        db.get_project_capsule_by_cron_job = fake_get_active
+        send_calls.clear()
+        status_calls.clear()
+        expired_meta = {"expire_at": (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()}
+        await server._fire_autonomous_routine(dict(job), dict(expired_meta))
+        check("_fire_autonomous_routine: expiry message names the active project by title",
+              send_calls and "Delta refund" in send_calls[0][1])
+        check("_fire_autonomous_routine: expiry still cancels with ended_reason=expired",
+              status_calls == [(1, 501, "cancelled", {"ended_reason": "expired"})])
+
+        # 9e: expiry give-up message for a plain routine (no linked capsule) is unchanged.
+        db.get_project_capsule_by_cron_job = fake_get_none
+        send_calls.clear()
+        await server._fire_autonomous_routine(dict(job), dict(expired_meta))
+        check("_fire_autonomous_routine: plain-routine expiry message keeps the original wording",
+              send_calls and "dispute the $850 charge" in send_calls[0][1]
+              and "Delta refund" not in send_calls[0][1])
+    finally:
+        db.get_project_capsule_by_cron_job = real_get_capsule
+        server.cli.load_user_context = real_load_user
+        server.build_orchestrator = real_build_orch
+        server.cli.run_message = real_run_message
+        db.list_cron_jobs = real_list_jobs
+        db.reschedule_cron_job = real_reschedule
+        db.set_cron_job_status = real_set_status
+        server.sendblue.send_message = real_send
+
+
 async def main() -> None:
     await part1_insert_project_capsule()
     await part2_set_cron_job_status_sync()
@@ -760,6 +1088,7 @@ async def main() -> None:
     await part6_project_tools()
     await part7_kill_switch()
     await part8_registry_wiring()
+    await part9_fire_autonomous_routine_project_context()
 
     if failures:
         print(f"\n{len(failures)} FAILURE(S): {failures}")

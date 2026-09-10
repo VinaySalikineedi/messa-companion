@@ -450,35 +450,81 @@ async def part4_dispatcher_routing():
 # leave it empty so the existing "nothing to act on" guard still fires.
 # ---------------------------------------------------------------------------
 
-def _apply_splice(content, media_note, is_audio_failure):
-    """Exact mirror of _process_inbound's own splice logic -- kept as a
-    tiny standalone function here so this test doesn't have to stand up
-    the entire webhook pipeline (waitlist/db/sendblue/cli.run_message) just
-    to exercise four lines of string logic."""
+def _apply_splice(content, media_url, media_note, is_audio_failure, project_capsules_enabled):
+    """Exact mirror of _process_inbound's own splice logic (see server.py,
+    right after the `if media_url:` block) -- kept as a tiny standalone
+    function here so this test doesn't have to stand up the entire webhook
+    pipeline (waitlist/db/sendblue/cli.run_message) just to exercise a
+    dozen lines of string logic.
+
+    Updated for V3-autonomous.md Phase 6's fix to a QA-caught gap (P6
+    report, Issue 5): the [attachment_url: ...] tag used to live INSIDE
+    `if media_note:`, so it silently vanished whenever media_note was None
+    for ANY reason -- not just a captionless plain photo, but also a
+    vision/audio call failure or an unrecognized format (.docx, .zip) --
+    meaning a document a user meant to file into a project's vault could
+    never actually reach the model. It's now decoupled: it fires whenever
+    media_url is present at all (still gated on project_capsules_enabled),
+    and an otherwise-undescribable attachment gets a neutral placeholder
+    instead of being silently dropped."""
     effective_content = content
-    if media_note:
-        effective_content = f"{content}\n\n{media_note}".strip() if content else media_note
-    elif is_audio_failure:
-        effective_content = content or "[Voice memo received but couldn't be transcribed]"
+    if media_url:
+        if media_note:
+            effective_content = f"{content}\n\n{media_note}".strip() if content else media_note
+        elif is_audio_failure:
+            effective_content = content or "[Voice memo received but couldn't be transcribed]"
+        elif project_capsules_enabled:
+            effective_content = content or "[Attachment received -- couldn't automatically read its contents.]"
+    if not effective_content:
+        return effective_content
+    if media_url and project_capsules_enabled:
+        effective_content += f"\n[attachment_url: {media_url}]"
     return effective_content
 
 
 def part5_asymmetric_fallback_contract():
     check(
         "asymmetric contract: failed audio (no caption) still yields non-empty effective_content",
-        bool(_apply_splice("", None, True)),
+        bool(_apply_splice("", "http://cdn/x", None, True, False)),
     )
     check(
-        "asymmetric contract: failed image (no caption) yields empty effective_content (tolerant, like today)",
-        _apply_splice("", None, False) == "",
+        "asymmetric contract: failed image (no caption), project capsules OFF, still yields empty "
+        "(tolerant, exactly like before this feature existed)",
+        _apply_splice("", "http://cdn/x", None, False, False) == "",
     )
     check(
         "asymmetric contract: failed audio WITH a caption keeps the caption, not the apology",
-        _apply_splice("here's a memo", None, True) == "here's a memo",
+        _apply_splice("here's a memo", "http://cdn/x", None, True, False) == "here's a memo",
     )
     check(
         "asymmetric contract: successful media note is spliced onto an existing caption",
-        _apply_splice("check this out", "[NOTE]", False) == "check this out\n\n[NOTE]",
+        _apply_splice("check this out", "http://cdn/x", "[NOTE]", False, False) == "check this out\n\n[NOTE]",
+    )
+
+    # --- P6 report Issue 5 fix: the attachment_url tag is decoupled from
+    # media_note's own success/failure, so a document Messa couldn't
+    # understand the CONTENTS of still reaches the model for vault filing.
+    check(
+        "Issue 5 fix: an unrecognized/failed attachment, project capsules ON, is no longer silently dropped",
+        _apply_splice("", "http://cdn/receipt.docx", None, False, True) != "",
+    )
+    check(
+        "Issue 5 fix: that same unrecognized attachment still carries the attachment_url tag",
+        "[attachment_url: http://cdn/receipt.docx]"
+        in _apply_splice("", "http://cdn/receipt.docx", None, False, True),
+    )
+    check(
+        "Issue 5 fix: a SUCCESSFULLY understood attachment also carries the tag",
+        "[attachment_url: http://cdn/x.jpg]"
+        in _apply_splice("", "http://cdn/x.jpg", "[a photo of a receipt]", False, True),
+    )
+    check(
+        "Issue 5 fix: a failed audio transcription also carries the tag",
+        "[attachment_url: http://cdn/memo.wav]" in _apply_splice("", "http://cdn/memo.wav", None, True, True),
+    )
+    check(
+        "Issue 5 fix: project capsules OFF -- no tag at all, byte-identical to pre-Phase-6 behavior",
+        "[attachment_url:" not in _apply_splice("check this out", "http://cdn/x", "[NOTE]", False, False),
     )
 
     # Structural check: the actual wiring in server.py contains this exact
@@ -495,6 +541,12 @@ def part5_asymmetric_fallback_contract():
     check(
         "server.py: _maybe_read_inbound_pdf itself is untouched (still exists, still PDF-only)",
         "async def _maybe_read_inbound_pdf(media_url: str) -> str | None:" in server_src,
+    )
+    check(
+        "Issue 5 fix, structurally: the attachment_url tag is applied AFTER the "
+        "'if not effective_content: return' guard -- i.e. outside/decoupled from the "
+        "media_note/is_audio_failure branching above it, not nested inside it",
+        server_src.index("[attachment_url: {media_url}]") > server_src.index("if not effective_content:"),
     )
 
 

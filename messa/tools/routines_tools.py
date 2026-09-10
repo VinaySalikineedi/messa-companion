@@ -380,6 +380,12 @@ def build_routines_tools(user: config.UserContext) -> list[BaseTool]:
         """
         if not title.strip() or not goal.strip():
             return "ERROR: title and goal can't be empty."
+        if len(title) > config.PROJECT_CAPSULE_TITLE_MAX_LENGTH:
+            return (
+                f"ERROR: title is too long ({len(title)} characters, max "
+                f"{config.PROJECT_CAPSULE_TITLE_MAX_LENGTH}) -- shorten it to a short label, "
+                "put any extra detail in `goal` instead."
+            )
         result = _build_schedule_and_meta(
             user,
             cron_expression=cadence_cron_expression, run_once_in_minutes=None,
@@ -485,11 +491,20 @@ def build_routines_tools(user: config.UserContext) -> list[BaseTool]:
         if project is None:
             return f"No project capsule #{project_id} found."
         if project.get("cron_job_id"):
+            # set_cron_job_status's own project-capsule sync marks this
+            # 'cancelled' (not 'completed') and logs the timeline event --
+            # nothing more to do here.
             await db.set_cron_job_status(
                 uid, project["cron_job_id"], "cancelled", {"ended_reason": "cancelled_by_user"},
             )
         else:
-            await db.finish_project_capsule(uid, project_id, "Cancelled by user.")
+            # No linked cron job to change the status of (e.g. it was
+            # deleted out from under this capsule) -- direct status-only
+            # cancel. Deliberately NOT finish_project_capsule, which always
+            # marks 'completed': a cancelled-with-nothing-achieved project
+            # must never look like a successfully finished one.
+            await db.cancel_orphaned_project_capsule(uid, project_id)
+            await db.log_project_capsule_event(project_id, "Cancelled by the user.")
         return f"Cancelled project capsule #{project_id}."
 
     @tool
@@ -503,7 +518,11 @@ def build_routines_tools(user: config.UserContext) -> list[BaseTool]:
         row = await db.finish_project_capsule(uid, project_id, outcome_summary)
         if not row:
             return f"No project capsule #{project_id} found."
-        await db.log_project_capsule_event(project_id, f"Completed: {outcome_summary}")
+        # No manual log_project_capsule_event call here: when this capsule
+        # has a linked cron job, db.finish_project_capsule already routed
+        # through set_cron_job_status, whose own project-capsule sync logs
+        # the completion timeline event exactly once -- a second call here
+        # would double it.
         return f"Finished project capsule #{project_id}: {outcome_summary}"
 
     @tool

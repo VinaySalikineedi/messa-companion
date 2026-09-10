@@ -32,6 +32,7 @@ feature/agentic-upgrade:
 No live Postgres, no live LLM call.
 """
 import asyncio
+import json
 import os
 import sys
 
@@ -194,7 +195,18 @@ async def part2_auto_supersede_conflicting_routine():
         update_calls = [c for c in conn.calls if c[0] == "fetchrow" and "UPDATE cron_jobs" in c[1]]
         check("exactly one match: issues exactly one UPDATE...cancelled call", len(update_calls) == 1)
         check("exactly one match: cancels the OLD routine's id, not the new one",
-              update_calls[0][2] == (42,))
+              update_calls[0][2][0] == 42)
+        # V3-autonomous.md Phase 6 QA fix: the superseded job's own meta now
+        # records WHY (ended_reason='superseded' + which job replaced it),
+        # merged into its (here empty) existing meta -- see
+        # _auto_supersede_conflicting_routine's own docstring. This is what
+        # lets _sync_linked_project_capsule_status log a clear timeline
+        # event on a linked capsule, instead of a bare, unexplained cancel.
+        superseded_meta = json.loads(update_calls[0][2][1])
+        check("exactly one match: the superseded job's meta records ended_reason=superseded",
+              superseded_meta.get("ended_reason") == "superseded")
+        check("exactly one match: the superseded job's meta names which job replaced it",
+              superseded_meta.get("superseded_by_job_id") == 99)
 
         # 2c-bis: email casing differences match cleanly (e.g. KJ@ vs kj@)
         old_row_upper = FakeRow(id=45, prompt_or_task="email KJ@MANGUSTACAP.COM every day", status="active")
