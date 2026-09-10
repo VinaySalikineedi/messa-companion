@@ -47,7 +47,7 @@ import websockets
 from fastapi import BackgroundTasks, FastAPI, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
-from . import asset_consolidation, background, briefings, call_activity, call_control, cli, config, console, db, email_triage, live_activity, media_understanding, memory, pdf_reader, region_gate, turn_control, waitlist
+from . import asset_consolidation, background, briefings, call_activity, call_control, cli, config, console, db, email_triage, live_activity, media_understanding, meeting_dossiers, memory, pdf_reader, region_gate, turn_control, waitlist
 from .agents.registry import build_orchestrator
 from .approval import AutoApproveGate, DenyApprovalGate
 from .call_live_view_page import render_call_live_view_page
@@ -2507,6 +2507,96 @@ async def _production_briefing_loop() -> None:
         await asyncio.sleep(background.POLL_INTERVAL_SECONDS)
 
 
+async def _send_one_pre_meeting_brief(item: dict[str, Any]) -> None:
+    """Send + mark-sent ONE due pre-meeting brief (see
+    meeting_dossiers.get_due_pre_meeting_briefs) -- same
+    render-already-done/send-here/mark-on-success split as
+    _send_one_briefing above. Only marked sent on an actual successful
+    Sendblue delivery, so a transient send failure just means the next
+    poll tick (config.MEETING_DOSSIER_POLL_INTERVAL_SECONDS) tries again
+    rather than silently skipping the brief forever."""
+    try:
+        await sendblue.send_message(item["phone_number"], item["text"])
+        await db.mark_pre_brief_sent(item["user_id"], item["event_key"])
+    except Exception as e:  # noqa: BLE001
+        console.system(f"[meeting dossier] pre-brief delivery failed user={item['user_id']}: {e}")
+
+
+async def _send_one_post_meeting_harvest(item: dict[str, Any]) -> None:
+    """Send + mark-sent ONE due post-meeting voice-note prompt, and leave
+    the short-lived pending_post_meeting_notes breadcrumb (see
+    db.set_pending_post_meeting_note's own docstring) so agents/
+    registry.py's system prompt treats this user's very next reply as
+    meeting notes worth turning into follow-ups, not an ordinary text."""
+    event = item.get("event") or {}
+    try:
+        await sendblue.send_message(item["phone_number"], item["text"])
+        await db.mark_post_harvest_sent(item["user_id"], item["event_key"])
+        counterparty = None
+        attendees = event.get("attendees") or []
+        if attendees:
+            counterparty = attendees[0].get("name") or attendees[0].get("email")
+        await db.set_pending_post_meeting_note(item["user_id"], event.get("title"), counterparty)
+    except Exception as e:  # noqa: BLE001
+        console.system(f"[meeting dossier] post-harvest delivery failed user={item['user_id']}: {e}")
+
+
+async def _production_meeting_dossier_loop() -> None:
+    """V3-autonomous.md Phase 5's real delivery for the T-10-minute
+    pre-meeting brief and T+3-minute post-meeting voice-note prompt (see
+    messa/meeting_dossiers.py's own module docstring for the full design).
+    Its own, coarser poll cadence (config.MEETING_DOSSIER_POLL_INTERVAL_
+    SECONDS, default 2 minutes) rather than background.POLL_INTERVAL_
+    SECONDS -- see that constant's own comment for why: a connected
+    calendar costs one real Composio API call per user with a connected
+    primary calendar on every tick. asyncio.gather over each due batch,
+    same "one user's slow/failed send never blocks another's" shape as
+    _production_briefing_loop above."""
+    while True:
+        try:
+            pre_briefs, harvests = await asyncio.gather(
+                meeting_dossiers.get_due_pre_meeting_briefs(),
+                meeting_dossiers.get_due_post_meeting_harvests(),
+            )
+            if pre_briefs:
+                await asyncio.gather(*(_send_one_pre_meeting_brief(i) for i in pre_briefs), return_exceptions=True)
+            if harvests:
+                await asyncio.gather(*(_send_one_post_meeting_harvest(i) for i in harvests), return_exceptions=True)
+        except Exception as e:  # noqa: BLE001
+            console.system(f"[meeting dossier poller error] {e}")
+        await asyncio.sleep(config.MEETING_DOSSIER_POLL_INTERVAL_SECONDS)
+
+
+async def _send_one_commitment_nudge(c: dict[str, Any]) -> None:
+    """Delivers ONE due "did you get to that?" nudge (see
+    db.list_commitments_due_for_nudge) and marks it nudged so it's never
+    sent twice, regardless of whether the user follows up."""
+    try:
+        who = f" to {c['counterparty_name']}" if c.get("counterparty_name") else ""
+        text = f"Reminder: you told{who} you'd {c['commitment_summary']}. Want me to draft that now?"
+        await sendblue.send_message(c["phone_number"], text)
+        await db.mark_commitment_nudge_sent(c["id"])
+    except Exception as e:  # noqa: BLE001
+        console.system(f"[commitment nudge] delivery failed commitment=#{c.get('id')}: {e}")
+
+
+async def _production_commitment_nudge_loop() -> None:
+    """V3-autonomous.md Phase 5's commitment-ledger nudge: *"nudges the
+    user with a ready-made draft on Wednesday afternoon"* once a promise's
+    due_date arrives. Coarser cadence (config.COMMITMENT_NUDGE_POLL_
+    INTERVAL_SECONDS, default 30 min) -- this is a once-a-day-ish
+    notification, not time-critical, same reasoning as the memory-batch/
+    scratchpad-cleanup loops' own cadence."""
+    while True:
+        try:
+            due = await db.list_commitments_due_for_nudge()
+            if due:
+                await asyncio.gather(*(_send_one_commitment_nudge(c) for c in due), return_exceptions=True)
+        except Exception as e:  # noqa: BLE001
+            console.system(f"[commitment nudge poller error] {e}")
+        await asyncio.sleep(config.COMMITMENT_NUDGE_POLL_INTERVAL_SECONDS)
+
+
 async def _run_one_broadcast(b: dict[str, Any]) -> None:
     """Fans one already-claimed broadcast out to every current user,
     bounded to config.BROADCAST_MAX_CONCURRENT_SENDS concurrent Sendblue
@@ -2899,6 +2989,8 @@ async def _startup() -> None:
         asyncio.create_task(_production_reminder_loop()),
         asyncio.create_task(_production_cron_loop()),
         asyncio.create_task(_production_briefing_loop()),
+        asyncio.create_task(_production_meeting_dossier_loop()),
+        asyncio.create_task(_production_commitment_nudge_loop()),
         asyncio.create_task(_production_digest_loop()),
         asyncio.create_task(_production_broadcast_loop()),
         asyncio.create_task(_production_deepsearch_pause_loop()),

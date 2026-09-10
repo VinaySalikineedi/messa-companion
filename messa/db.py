@@ -4895,3 +4895,313 @@ async def clear_email_digest_items(user_id: int, tier: str) -> None:
             "DELETE FROM email_digest_queue WHERE user_id = $1 AND tier = $2",
             user_id, tier,
         )
+
+
+# ---------------------------------------------------------------------------
+# Commitment ledger (V3-autonomous.md Phase 5, migrations/040_meeting_
+# dossiers_and_commitments.sql) -- see messa/commitments.py's module
+# docstring for the full "why". Every function below is a no-op (returns
+# None/[]/False) on a pre-migration DB, same additive-safety convention as
+# email_digest_queue above.
+# ---------------------------------------------------------------------------
+
+async def insert_commitment(
+    user_id: int,
+    commitment_summary: str,
+    *,
+    source_excerpt: str | None = None,
+    due_date: Any = None,
+    counterparty_name: str | None = None,
+    counterparty_email: str | None = None,
+    source_type: str = "OUTBOUND_EMAIL",
+) -> dict[str, Any] | None:
+    """Records one implicit promise messa/commitments.py's extract_commitment
+    found in an outbound message. Called fire-and-forget, AFTER the send
+    already succeeded -- see tools/email_tools.py/personal_inbox_tools.py's
+    send_email/reply_to_email -- so this never affects whether that send
+    goes through."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_commitments"):
+            return None
+        row = await conn.fetchrow(
+            """
+            INSERT INTO user_commitments
+                (user_id, counterparty_name, counterparty_email, commitment_summary,
+                 source_excerpt, due_date, source_type)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING *
+            """,
+            user_id, counterparty_name, counterparty_email, commitment_summary,
+            source_excerpt, due_date, source_type,
+        )
+        return dict(row) if row else None
+
+
+async def list_open_commitments_for_hints(
+    user_id: int, name_hints: list[str] | None = None, email_hints: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """PENDING commitments for `user_id` whose counterparty_email exactly
+    matches one of `email_hints`, or whose counterparty_name loosely
+    matches (ILIKE '%hint%') one of `name_hints` -- used by
+    meeting_dossiers.py's pre-meeting brief to answer "did I promise this
+    person anything?" from an event's title/notes/attendees. Empty/None
+    hints just returns []; never raises on a hint list with blank/whitespace
+    entries (those are simply dropped)."""
+    name_hints = [h.strip() for h in (name_hints or []) if h and h.strip()]
+    email_hints = [h.strip().lower() for h in (email_hints or []) if h and h.strip()]
+    if not name_hints and not email_hints:
+        return []
+    patterns = [f"%{h}%" for h in name_hints]
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_commitments"):
+            return []
+        rows = await conn.fetch(
+            """
+            SELECT * FROM user_commitments
+            WHERE user_id = $1 AND status = 'PENDING'
+              AND (
+                    ($2::text[] IS NOT NULL AND cardinality($2::text[]) > 0 AND counterparty_email = ANY($2::text[]))
+                 OR ($3::text[] IS NOT NULL AND cardinality($3::text[]) > 0 AND counterparty_name ILIKE ANY($3::text[]))
+              )
+            ORDER BY due_date NULLS LAST, created_at
+            """,
+            user_id, email_hints or None, patterns or None,
+        )
+        return _rows(rows)
+
+
+async def list_commitments_due_for_nudge(now: datetime | None = None) -> list[dict[str, Any]]:
+    """PENDING commitments whose due_date has arrived (or already passed)
+    and haven't been nudged yet -- joined with users for the phone_number
+    server.py's _production_commitment_nudge_loop needs to actually deliver
+    the nudge. Compared against the due_date column's own (date-only,
+    server-local) value, same coarse-enough-for-a-once-a-day-nudge
+    precision as briefings.py's own date comparisons -- this is a "did you
+    get to that yet" nudge, not a time-critical alert."""
+    now = now or datetime.now(timezone.utc)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_commitments"):
+            return []
+        rows = await conn.fetch(
+            """
+            SELECT c.*, u.phone_number, u.timezone AS user_timezone
+            FROM user_commitments c
+            JOIN users u ON u.id = c.user_id
+            WHERE c.status = 'PENDING' AND c.nudge_sent_at IS NULL
+              AND c.due_date IS NOT NULL AND c.due_date <= $1::date
+            """,
+            now,
+        )
+        return _rows(rows)
+
+
+async def mark_commitment_nudge_sent(commitment_id: int) -> None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_commitments"):
+            return
+        await conn.execute(
+            "UPDATE user_commitments SET nudge_sent_at = NOW(), updated_at = NOW() WHERE id = $1",
+            commitment_id,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Meeting dossiers (V3-autonomous.md Phase 5, same migration as the
+# commitment ledger above) -- see messa/meeting_dossiers.py's module
+# docstring for the full design, in particular why native and connected-
+# calendar events share one generic dedup ledger (meeting_dossier_events)
+# keyed by a synthetic event_key rather than two source-specific
+# mechanisms.
+# ---------------------------------------------------------------------------
+
+async def get_due_native_pre_meeting_events(
+    now: datetime | None = None, lead_minutes: int | None = None,
+) -> list[dict[str, Any]]:
+    """Messa's own native calendar_events rows starting within the next
+    `lead_minutes` (default config.PRE_MEETING_BRIEF_LEAD_MINUTES) for
+    users whose primary calendar is 'messa' (the default when they've never
+    set a preference at all) -- NEVER for a user whose primary calendar is
+    a connected app; see meeting_dossiers.py for that half. Excludes any
+    event already recorded with a pre_brief_sent_at in
+    meeting_dossier_events, and any cancelled event."""
+    now = now or datetime.now(timezone.utc)
+    lead_minutes = lead_minutes if lead_minutes is not None else config.PRE_MEETING_BRIEF_LEAD_MINUTES
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "meeting_dossier_events"):
+            return []
+        rows = await conn.fetch(
+            """
+            SELECT ce.*, u.phone_number, u.timezone AS user_timezone
+            FROM calendar_events ce
+            JOIN users u ON u.id = ce.user_id
+            LEFT JOIN user_app_preferences p
+                   ON p.user_id = ce.user_id AND p.app_category = 'calendar'
+            LEFT JOIN meeting_dossier_events mde
+                   ON mde.user_id = ce.user_id AND mde.event_key = 'native:' || ce.id::text
+            WHERE ce.status = 'scheduled'
+              AND ce.start_time > $1
+              AND ce.start_time <= $1 + ($2 || ' minutes')::interval
+              AND (p.preferred_app IS NULL OR p.preferred_app = 'messa')
+              AND mde.pre_brief_sent_at IS NULL
+            """,
+            now, str(lead_minutes),
+        )
+        return _rows(rows)
+
+
+async def get_due_native_post_meeting_events(
+    now: datetime | None = None, delay_minutes: int | None = None,
+) -> list[dict[str, Any]]:
+    """The post-meeting-harvest counterpart to get_due_native_pre_meeting_
+    events above: native events that ENDED within the last `delay_minutes`
+    (default config.POST_MEETING_HARVEST_DELAY_MINUTES), for 'messa'-primary
+    users, not yet harvested."""
+    now = now or datetime.now(timezone.utc)
+    delay_minutes = delay_minutes if delay_minutes is not None else config.POST_MEETING_HARVEST_DELAY_MINUTES
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "meeting_dossier_events"):
+            return []
+        rows = await conn.fetch(
+            """
+            SELECT ce.*, u.phone_number, u.timezone AS user_timezone
+            FROM calendar_events ce
+            JOIN users u ON u.id = ce.user_id
+            LEFT JOIN user_app_preferences p
+                   ON p.user_id = ce.user_id AND p.app_category = 'calendar'
+            LEFT JOIN meeting_dossier_events mde
+                   ON mde.user_id = ce.user_id AND mde.event_key = 'native:' || ce.id::text
+            WHERE ce.status != 'cancelled'
+              AND ce.end_time <= $1
+              AND ce.end_time > $1 - ($2 || ' minutes')::interval
+              AND (p.preferred_app IS NULL OR p.preferred_app = 'messa')
+              AND mde.post_harvest_sent_at IS NULL
+            """,
+            now, str(delay_minutes),
+        )
+        return _rows(rows)
+
+
+async def list_users_with_connected_calendar_primary() -> list[dict[str, Any]]:
+    """Every user whose app-preference for 'calendar' is a connected app
+    (NOT 'messa') -- meeting_dossiers.py polls each of these live against
+    Composio (there's no local cache of a toolkit's connection status, only
+    Gmail gets that treatment -- see migrations/020_dynamic_integrations.sql's
+    own header comment), so this intentionally does NOT try to pre-filter
+    by whether that connection is still ACTIVE."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_app_preferences"):
+            return []
+        rows = await conn.fetch(
+            """
+            SELECT u.id AS user_id, u.phone_number, u.timezone AS user_timezone, p.preferred_app
+            FROM user_app_preferences p
+            JOIN users u ON u.id = p.user_id
+            WHERE p.app_category = 'calendar' AND p.preferred_app != 'messa'
+            """,
+        )
+        return _rows(rows)
+
+
+async def mark_pre_brief_sent(user_id: int, event_key: str) -> None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "meeting_dossier_events"):
+            return
+        await conn.execute(
+            """
+            INSERT INTO meeting_dossier_events (user_id, event_key, pre_brief_sent_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (user_id, event_key) DO UPDATE SET pre_brief_sent_at = NOW()
+            """,
+            user_id, event_key,
+        )
+
+
+async def mark_post_harvest_sent(user_id: int, event_key: str) -> None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "meeting_dossier_events"):
+            return
+        await conn.execute(
+            """
+            INSERT INTO meeting_dossier_events (user_id, event_key, post_harvest_sent_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (user_id, event_key) DO UPDATE SET post_harvest_sent_at = NOW()
+            """,
+            user_id, event_key,
+        )
+
+
+async def is_dossier_event_already_sent(user_id: int, event_key: str, kind: str) -> bool:
+    """kind is 'pre_brief' or 'post_harvest' -- used by meeting_dossiers.py's
+    connected-calendar path (fetched fresh from Composio every poll tick,
+    so dedup has to be checked explicitly per event rather than via a SQL
+    join the way the native path above does it in one query)."""
+    column = "pre_brief_sent_at" if kind == "pre_brief" else "post_harvest_sent_at"
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "meeting_dossier_events"):
+            return False
+        value = await conn.fetchval(
+            f"SELECT {column} FROM meeting_dossier_events WHERE user_id = $1 AND event_key = $2",
+            user_id, event_key,
+        )
+        return value is not None
+
+
+async def set_pending_post_meeting_note(
+    user_id: int, event_title: str | None, counterparty_name: str | None, ttl_seconds: int | None = None,
+) -> None:
+    """Upserts the one-row-per-user flag agents/registry.py's system prompt
+    checks so the user's very next message after a T+3 voice-note prompt
+    gets treated as meeting notes -- see this module's own docstring on
+    pending_post_meeting_notes for why this is a single upserted row, not a
+    history table."""
+    ttl_seconds = ttl_seconds if ttl_seconds is not None else config.POST_MEETING_CONTEXT_TTL_SECONDS
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "pending_post_meeting_notes"):
+            return
+        await conn.execute(
+            """
+            INSERT INTO pending_post_meeting_notes (user_id, event_title, counterparty_name, expires_at)
+            VALUES ($1, $2, $3, NOW() + ($4 || ' seconds')::interval)
+            ON CONFLICT (user_id) DO UPDATE SET
+                event_title = $2, counterparty_name = $3, expires_at = NOW() + ($4 || ' seconds')::interval,
+                created_at = NOW()
+            """,
+            user_id, event_title, counterparty_name, str(ttl_seconds),
+        )
+
+
+async def pop_pending_post_meeting_note(user_id: int) -> dict[str, Any] | None:
+    """Reads AND clears this user's pending post-meeting-note context in one
+    call -- registry.py's system prompt builder calls this once per turn, so
+    the context is only ever injected for the single next message, never
+    lingering across a whole conversation. Returns None (without touching
+    the row) if it's missing or already expired; an expired row is deleted
+    here too so it doesn't need its own separate cleanup poller."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "pending_post_meeting_notes"):
+            return None
+        row = await conn.fetchrow(
+            "DELETE FROM pending_post_meeting_notes WHERE user_id = $1 AND expires_at > NOW() RETURNING *",
+            user_id,
+        )
+        if row is None:
+            # Either no row, or an expired one -- delete an expired one too
+            # so it doesn't sit around forever (best-effort, non-fatal).
+            await conn.execute(
+                "DELETE FROM pending_post_meeting_notes WHERE user_id = $1 AND expires_at <= NOW()",
+                user_id,
+            )
+            return None
+        return dict(row)

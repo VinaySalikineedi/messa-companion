@@ -950,6 +950,95 @@ LATENCY_OPTIMIZATIONS_ENABLED = os.environ.get("MESSA_LATENCY_OPTIMIZATIONS_ENAB
 # immediately on every successful save, regardless of this TTL).
 SKILLS_EXISTENCE_CACHE_TTL_SECONDS = int(os.environ.get("MESSA_SKILLS_EXISTENCE_CACHE_TTL_SECONDS", "300"))
 
+# ---- V3-autonomous.md Phase 5: Meeting Dossiers & Commitment Ledger.
+# Three features under one flag (same "one switch per phase" convention as
+# EMAIL_TRIAGE_ENABLED/LATENCY_OPTIMIZATIONS_ENABLED above):
+#   1. A T-10-minute pre-meeting SMS brief and a T+3-minute post-meeting
+#      "send me a quick voice note" prompt (messa/meeting_dossiers.py),
+#      watching whichever calendar is the user's actual primary --
+#      Messa's own native calendar_events, or a connected app (Google/
+#      Outlook Calendar via Composio) -- per db.get_app_preference(uid,
+#      'calendar'), exactly as directed: never a native-only default.
+#   2. An implicit commitment ledger (messa/commitments.py): one isolated,
+#      bounded LLM call (same proven shape as media_understanding.py) runs
+#      AFTER a real outbound email send succeeds, and silently records any
+#      concrete promise-with-a-deadline it finds ("I'll send the updated
+#      deck by Thursday"). Deliberately scoped to outbound EMAIL only, not
+#      every message Messa touches (inbound email, SMS) -- email is where
+#      this kind of promise naturally has a named counterparty and a
+#      clean, already-instrumented hook point (email_tools.py/
+#      personal_inbox_tools.py's send_email/reply_to_email), and scanning
+#      every inbound message too would be a real, continuous LLM-call tax
+#      on ordinary texting for a benefit this phase doesn't ask for.
+# When false, every one of the above is inert: no poller does anything, no
+# commitment is ever recorded, and nothing about a normal turn changes --
+# same "instantly flippable, no redeploy" kill switch as every prior phase.
+MEETING_DOSSIERS_ENABLED = os.environ.get("MESSA_MEETING_DOSSIERS_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+# How far ahead of a meeting's start time messa/meeting_dossiers.py sends
+# the pre-meeting brief, and how long after a meeting's end time it sends
+# the post-meeting voice-note prompt. Both loops actually poll on
+# MEETING_DOSSIER_POLL_INTERVAL_SECONDS below, not continuously, so the
+# real lead time a user sees is "somewhere between this value and this
+# value minus one poll interval" -- see that constant's own comment for
+# why polling isn't second-granular here.
+PRE_MEETING_BRIEF_LEAD_MINUTES = int(os.environ.get("MESSA_PRE_MEETING_BRIEF_LEAD_MINUTES", "10"))
+POST_MEETING_HARVEST_DELAY_MINUTES = int(os.environ.get("MESSA_POST_MEETING_HARVEST_DELAY_MINUTES", "3"))
+
+# How often server.py's _production_meeting_dossier_loop checks for
+# due pre-briefs/post-harvests. Deliberately its own, coarser cadence
+# (default 2 min) rather than reusing background.POLL_INTERVAL_SECONDS'
+# 30s -- a connected calendar's events require one real Composio API call
+# per user with a connected primary calendar on every tick (see
+# meeting_dossiers.py's _list_connected_calendar_events), and a meeting
+# brief doesn't need second-level precision the way an inbound webhook
+# reply does. A 2-minute cadence still comfortably delivers a "T-10
+# minute" brief with 8-10 minutes of real lead time.
+MEETING_DOSSIER_POLL_INTERVAL_SECONDS = int(
+    os.environ.get("MESSA_MEETING_DOSSIER_POLL_INTERVAL_SECONDS", "120")
+)
+
+# How long a pending_post_meeting_notes row stays valid before
+# agents/registry.py's system prompt stops treating the user's next
+# message as meeting notes -- past this, an unrelated message sent long
+# after the prompt went out would otherwise get misread as a meeting
+# recap. 30 minutes comfortably covers "replied a little late" without
+# staying live long enough to misfire on a genuinely unrelated later text.
+POST_MEETING_CONTEXT_TTL_SECONDS = int(os.environ.get("MESSA_POST_MEETING_CONTEXT_TTL_SECONDS", "1800"))
+
+# How often server.py's _production_commitment_nudge_loop checks for
+# PENDING commitments whose due_date has arrived (or passed) and hasn't
+# been nudged yet -- a "did you send that deck?" nudge is inherently a
+# once-a-day-ish, not time-critical, notification (V3-autonomous.md's own
+# example is "nudges the user ... on Wednesday afternoon"), so this reuses
+# the same coarse-cadence reasoning as MEMORY_BATCH_POLL_INTERVAL_SECONDS/
+# SCRATCHPAD_CLEANUP_POLL_INTERVAL_SECONDS rather than the fast 30s tick.
+COMMITMENT_NUDGE_POLL_INTERVAL_SECONDS = int(
+    os.environ.get("MESSA_COMMITMENT_NUDGE_POLL_INTERVAL_SECONDS", "1800")
+)
+
+# The model messa/commitments.py's extract_commitment uses for its one
+# isolated, bounded classification call -- defaults to the exact same
+# model+routing MEDIA_UNDERSTANDING_MODEL_NAME already uses (a proven
+# combination in this codebase), kept as its own separate setting rather
+# than literally reusing that constant so the two can be tuned
+# independently later without a naming collision implying they must
+# always match.
+COMMITMENT_EXTRACTION_MODEL_NAME = os.environ.get(
+    "MESSA_COMMITMENT_EXTRACTION_MODEL_NAME", "google/gemini-2.5-flash"
+).strip()
+
+# Same "safety-net ceiling, not a normal-path limit" reasoning as
+# MEDIA_UNDERSTANDING_TIMEOUT_SECONDS -- this call runs detached
+# (asyncio.create_task, never awaited by the send/reply tool itself), so
+# it never adds latency to a send confirmation, but it must still not hang
+# forever.
+COMMITMENT_EXTRACTION_TIMEOUT_SECONDS = float(
+    os.environ.get("MESSA_COMMITMENT_EXTRACTION_TIMEOUT_SECONDS", "20")
+)
+
 # ---- Voice and image input (messa/media_understanding.py) -- lets a user
 # text Messa a voice memo or a photo and have it actually understood,
 # instead of the SMS/iMessage path silently ignoring anything that isn't a

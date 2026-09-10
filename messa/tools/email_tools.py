@@ -64,7 +64,7 @@ from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import BaseTool, tool
 
-from .. import config, console, db, pdf_reader, reliability, usage
+from .. import commitments, config, console, db, pdf_reader, reliability, usage
 from ..approval import ApprovalGate
 from ..channels.sendblue import SendblueError, send_message
 from .common import last_ai_text, run_inner_agent_with_claim_check, trace_tool
@@ -456,6 +456,13 @@ def build_email_tools(user: config.UserContext, approval_gate: ApprovalGate | No
             result = await _execute(_SLUG_SEND, recipient_email=to, subject=subject, body=body)
         except _NotConfigured as e:
             return str(e)
+        if not isinstance(result, dict) or result.get("successful", True):
+            # V3-autonomous.md Phase 5 commitment ledger: fire-and-forget,
+            # never awaited -- see commitments.py's own docstring for why
+            # this can never add latency to (or fail) the send itself.
+            commitments.maybe_record_commitment(
+                user.user_id, to, body, sender_timezone=user.timezone,
+            )
         return str(result)
 
     @tool

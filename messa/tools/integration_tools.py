@@ -90,6 +90,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime
 from typing import Any, Callable
 
 from langchain.agents import create_agent
@@ -253,6 +254,194 @@ def _extract_tool_fields(item: Any) -> dict[str, str | None]:
     elif toolkit is not None and not isinstance(toolkit, str):
         toolkit = getattr(toolkit, "slug", None) or getattr(toolkit, "name", None)
     return {"slug": str(slug or ""), "description": str(description or ""), "toolkit": toolkit}
+
+
+# ---------------------------------------------------------------------------
+# Connected-calendar read path (V3-autonomous.md Phase 5) -- used ONLY by
+# messa/meeting_dossiers.py's background poller, never by the interactive
+# integrations_agent above. That subagent still reaches Google/Outlook
+# Calendar the fully generic way (search_integration_tools +
+# execute_integration_tool), same as every other Composio toolkit -- see
+# this module's own docstring and README's "Orchestrator routing" section
+# for why that's deliberate (no per-app special-casing in the live agent
+# path). A background poller can't spend a model turn every 2 minutes just
+# to look up "what's the list-events action called," though, so this
+# resolves and CACHES the real action slug once per toolkit per process
+# (same _auth_config_id_cache-style memoization already used above) -- the
+# one deliberate exception in this file to "never hardcode a Composio
+# action slug." See list_connected_calendar_events' own docstring for the
+# real caveat this exception carries: it has NOT been verified against a
+# live Google-Calendar-connected account.
+# ---------------------------------------------------------------------------
+
+_calendar_list_slug_cache: dict[str, str | None] = {}
+
+
+def _discover_calendar_list_events_slug(client, composio_user_id: str, toolkit_slug: str) -> str | None:
+    """Finds the real Composio action slug for "list this toolkit's
+    calendar events" the SAME way search_integration_tools already does --
+    client.tools.get(toolkits=[...], search=...) -- never a hand-guessed
+    slug string. Cached per toolkit per process: a cache miss costs one
+    extra Composio search call, a cache hit costs nothing. Caches (and
+    returns) None if nothing usable is found, so a broken/unsupported
+    toolkit doesn't retry a failing search on every single poll tick."""
+    if toolkit_slug in _calendar_list_slug_cache:
+        return _calendar_list_slug_cache[toolkit_slug]
+    slug = None
+    try:
+        result = client.tools.get(
+            user_id=composio_user_id, search="list calendar events", toolkits=[toolkit_slug],
+            limit=5,
+        )
+        items = result if isinstance(result, list) else (
+            getattr(result, "items", None) or getattr(result, "tools", None) or list(result)
+        )
+        for item in items:
+            fields = _extract_tool_fields(item)
+            candidate = (fields.get("slug") or "").upper()
+            if candidate and "LIST" in candidate and "EVENT" in candidate:
+                slug = candidate
+                break
+        if slug is None and items:
+            # Fall back to the top-ranked result even if its name doesn't
+            # literally contain LIST/EVENT -- Composio's own search
+            # ranking already scored it highest for this exact query.
+            slug = (_extract_tool_fields(items[0]).get("slug") or "").upper() or None
+    except Exception as e:  # noqa: BLE001 - a discovery failure must never crash the poller
+        console.system(f"[meeting_dossiers] couldn't discover list-events action for {toolkit_slug!r}: {e}")
+    _calendar_list_slug_cache[toolkit_slug] = slug
+    return slug
+
+
+def _normalize_connected_event(raw: Any) -> dict[str, Any] | None:
+    """Best-effort mapping of one Composio Google-Calendar-shaped event
+    object to this codebase's own {event_key, title, start_time, end_time,
+    location, notes, attendees} shape (see messa/meeting_dossiers.py).
+    Grounded in the PUBLIC, stable Google Calendar API v3 event resource
+    shape (summary/start/end/location/description/attendees) -- Composio's
+    toolkits are thin wrappers over each app's real API, so this is a much
+    safer assumption than guessing at Composio's own internal field
+    naming. Still fully defensive: returns None rather than raising for
+    any event missing a usable id or start time."""
+    def _get(obj: Any, key: str, default: Any = None) -> Any:
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    event_id = _get(raw, "id")
+    if not event_id:
+        return None
+
+    def _parse_time(node: Any) -> datetime | None:
+        # Only a real dateTime (a timed event) is usable here -- an
+        # all-day event's bare "date" (no time-of-day at all) parses to a
+        # naive datetime that can't be compared against the timezone-aware
+        # UTC window meeting_dossiers.py uses, and "10 minutes before an
+        # all-day event" isn't a meaningful pre-meeting brief anyway, so
+        # those are skipped entirely (returns None, same as any other
+        # unusable event here) rather than guessed at.
+        if node is None:
+            return None
+        raw_dt = _get(node, "dateTime")
+        if not raw_dt:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(raw_dt).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo is not None else None
+
+    start = _parse_time(_get(raw, "start"))
+    if start is None:
+        return None
+    end = _parse_time(_get(raw, "end")) or start
+
+    attendees = []
+    for a in (_get(raw, "attendees") or []):
+        email, name = _get(a, "email"), _get(a, "displayName")
+        if email or name:
+            attendees.append({"email": email, "name": name})
+
+    return {
+        "event_key": f"googlecalendar:{event_id}",
+        "title": _get(raw, "summary") or "Untitled event",
+        "start_time": start,
+        "end_time": end,
+        "location": _get(raw, "location"),
+        "notes": _get(raw, "description"),
+        "attendees": attendees,
+    }
+
+
+async def list_connected_calendar_events(
+    user: config.UserContext, toolkit_slug: str, start: datetime, end: datetime,
+) -> list[dict[str, Any]]:
+    """Reads `user`'s connected `toolkit_slug` calendar for events between
+    `start` and `end`, normalized into this codebase's own event shape.
+    Only 'googlecalendar' resolves to anything today -- 'outlookcalendar'
+    is a valid app-preference value (see TOOLKIT_APP_CATEGORY) but has no
+    read path here yet, and this returns [] for it rather than guessing.
+
+    Returns [] -- never raises -- on ANY failure: not connected, action
+    discovery failed, the API call itself failed, or the result couldn't
+    be parsed. This is the ONE place in this file that calls a specific
+    Composio action slug outside the fully-generic execute_integration_tool
+    path the interactive integrations_agent uses (see the section comment
+    above). Real, disclosed caveat: unlike every other Composio call in
+    this file, this has NOT been verified against a live
+    Google-Calendar-connected account -- only reasoned from Composio's and
+    Google's own public documentation. A silent [] for a user who should
+    have upcoming events is a signal to verify this against a real
+    connected account, not proof there's nothing on their calendar."""
+    if toolkit_slug != "googlecalendar":
+        return []
+    try:
+        client = _get_client()
+    except _NotConfigured:
+        return []
+    composio_user_id = _composio_user_id(user)
+
+    def _list_sync() -> list[Any]:
+        slug = _discover_calendar_list_events_slug(client, composio_user_id, toolkit_slug)
+        if not slug:
+            return []
+        kwargs: dict = {"slug": slug, "user_id": composio_user_id, "arguments": {"calendarId": "primary"}}
+        if config.COMPOSIO_TOOLKIT_VERSION:
+            kwargs["version"] = config.COMPOSIO_TOOLKIT_VERSION
+        else:
+            kwargs["dangerously_skip_version_check"] = True
+        result = client.tools.execute(**kwargs)
+        data = result.get("data") if isinstance(result, dict) else getattr(result, "data", None)
+        if isinstance(data, dict):
+            return data.get("items") or data.get("events") or []
+        return []
+
+    try:
+        raw_events = await asyncio.to_thread(_list_sync)
+    except Exception as e:  # noqa: BLE001 - a poller must never crash on one user's bad connection
+        console.system(f"[meeting_dossiers] connected-calendar read failed for user #{user.user_id}: {e}")
+        return []
+
+    normalized: list[dict[str, Any]] = []
+    for raw in raw_events:
+        event = _normalize_connected_event(raw)
+        if event is None:
+            continue
+        # Client-side filtering: the discovered list action's own
+        # parameter names for a server-side time range aren't verified
+        # (see this function's docstring), so this fetches whatever it
+        # returns by default (Google's own API defaults to "upcoming,
+        # soonest first") and filters client-side instead of trusting an
+        # unverified timeMin/timeMax argument name to narrow the request
+        # itself. Kept if the event's own [start_time, end_time] span
+        # overlaps [start, end] at all -- a superset of "starts in this
+        # window" or "ends in this window" -- so meeting_dossiers.py can
+        # apply whichever exact test (pre-meeting vs. post-meeting) it
+        # actually needs on top of this.
+        if event["end_time"] < start or event["start_time"] > end:
+            continue
+        normalized.append(event)
+    return normalized
 
 
 async def get_connection_status(connected_account_id: str) -> str | None:

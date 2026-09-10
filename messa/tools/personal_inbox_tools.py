@@ -88,7 +88,7 @@ from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda
 from langchain_core.tools import BaseTool, tool
 
-from .. import config, db, reliability, timeutil
+from .. import commitments, config, db, reliability, timeutil
 from ..approval import ApprovalGate
 from ..channels.resend import ResendError, send_email as resend_send_email
 from .common import last_ai_text, run_inner_agent_with_claim_check, trace_tool
@@ -203,6 +203,10 @@ def build_personal_inbox_tools(
             )
         except ResendError as e:
             return f"Couldn't send that email: {e}"
+        # V3-autonomous.md Phase 5 commitment ledger: fire-and-forget, never
+        # awaited -- see commitments.py's own docstring for why this can
+        # never add latency to (or fail) the send itself.
+        commitments.maybe_record_commitment(user.user_id, to, body, sender_timezone=user.timezone)
         attached_note = f" (attached {attachment_path.rsplit('/', 1)[-1]})" if attachment_path else ""
         return f"Sent from {local_part}@{config.TEXTMESSA_EMAIL_DOMAIN} to {to}{attached_note}."
 
@@ -283,6 +287,10 @@ def build_personal_inbox_tools(
             )
         except ResendError as e:
             return f"Couldn't send the reply: {e}"
+        # V3-autonomous.md Phase 5 commitment ledger: fire-and-forget, never
+        # awaited -- see commitments.py's own docstring for why this can
+        # never add latency to (or fail) the send itself.
+        commitments.maybe_record_commitment(user.user_id, from_address, body, sender_timezone=user.timezone)
         attached_note = f" (attached {attachment_path.rsplit('/', 1)[-1]})" if attachment_path else ""
         return f"Replied to {from_address}{' (autonomously)' if autonomous else ''}{attached_note}."
 

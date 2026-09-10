@@ -821,6 +821,29 @@ def _category_known_line(
     )
 
 
+def _pending_meeting_note_paragraph(pending_meeting_note: dict[str, Any] | None) -> str:
+    """V3-autonomous.md Phase 5: the extra system-prompt paragraph spliced
+    onto the orchestrator's prompt for exactly one turn when
+    db.pop_pending_post_meeting_note found a live breadcrumb -- see
+    build_orchestrator's own call site and messa/meeting_dossiers.py's
+    module docstring for the full design. Pulled out as its own pure
+    function (rather than inlined at the call site) so it's unit-testable
+    without spinning up a whole build_orchestrator call. Returns "" (a
+    pure no-op string append) when there's no pending note."""
+    if not pending_meeting_note:
+        return ""
+    title = pending_meeting_note.get("event_title") or "their recent meeting"
+    counterpart = pending_meeting_note.get("counterparty_name")
+    who_note = f" with {counterpart}" if counterpart else ""
+    return (
+        f"\n\nYou just asked the user for a quick voice note about \"{title}\"{who_note}. "
+        "If THIS message describes how that meeting went (a voice memo transcript or a typed "
+        "recap), treat it as meeting notes: offer to draft a follow-up email/message, an "
+        "intro, or a note recapping it for their records -- don't just acknowledge it. If "
+        "this message is clearly about something else, just handle it normally."
+    )
+
+
 def _build_system_prompt(
     user: config.UserContext,
     connected_slugs: list[str] | None = None,
@@ -1395,6 +1418,20 @@ async def build_orchestrator(
     if user.is_admin:
         subagents.append(build_admin_subagent(user, _subagent_model_for("admin_agent")))
 
+    # V3-autonomous.md Phase 5: if the T+3 post-meeting voice-note prompt
+    # (messa/meeting_dossiers.py) went out recently and hasn't been
+    # consumed yet, this user's very next message is very likely a recap
+    # of how that meeting went. pop_pending_post_meeting_note reads AND
+    # clears that breadcrumb in one call, so it's surfaced exactly once,
+    # for exactly this turn -- same "cheap local read, never fatal to a
+    # turn" shape as connected_slugs/app_preferences above.
+    pending_meeting_note: dict[str, Any] | None = None
+    if config.MEETING_DOSSIERS_ENABLED:
+        try:
+            pending_meeting_note = await db.pop_pending_post_meeting_note(user.user_id)
+        except Exception as e:  # noqa: BLE001 - a hint, not load-bearing
+            console.system(f"pop_pending_post_meeting_note failed (non-fatal): {e}")
+
     # Active Task Scratchpad + Skills Playbook (docs/autonomous_
     # integrations_and_task_memory_spec.md) for the ORCHESTRATOR's own
     # prompt/tools only -- every subagent above now attaches this same
@@ -1413,6 +1450,7 @@ async def build_orchestrator(
         _build_system_prompt(user, connected_slugs, app_preferences, recent_assets)
         + reliability.RELIABILITY_GUARDRAIL_STR
     )
+    orchestrator_system_prompt += _pending_meeting_note_paragraph(pending_meeting_note)
     if config.SCRATCHPAD_AND_SKILLS_ENABLED:
         orchestrator_tools = orchestrator_tools + build_scratchpad_tools(user, "messa_orchestrator", approval_gate)
         orchestrator_system_prompt = orchestrator_system_prompt + await scratchpad_prompt_block(user, "messa_orchestrator")
