@@ -1333,6 +1333,71 @@ async def update_cron_job_meta(cron_id: int, patch: dict[str, Any]) -> None:
         )
 
 
+async def _sync_linked_project_capsule_status(
+    conn: asyncpg.Connection, cron_id: int, cron_status: str, cron_meta: dict[str, Any] | None,
+) -> None:
+    """THE ONE place a cron_jobs status change gets mirrored onto its
+    linked project_capsules row (migrations/041_project_capsules.sql,
+    V3-autonomous.md Phase 6) -- called from both set_cron_job_status
+    (the normal pause/resume/cancel/finish path every routines_tools.py
+    tool funnels through) AND _auto_supersede_conflicting_routine (the ONE
+    other place this codebase cancels a cron_jobs row directly, outside
+    that function -- a real gap a QA pass caught: without this, a
+    superseded routine's linked capsule was left showing status='active'
+    forever, with a dead cadence clock underneath it).
+
+    'active'/'paused' map straight across; 'cancelled' maps to
+    'completed' when cron_meta.ended_reason is 'completed_by_agent', to
+    'expired' when it's 'expired', and to plain 'cancelled' for any other
+    reason (a user cancel, or _auto_supersede_conflicting_routine's own
+    'superseded'). On a terminal transition (completed/expired/cancelled)
+    this ALSO copies cron_meta.outcome onto the capsule's own
+    outcome_summary column and appends one project_timeline_events row --
+    so a completion recorded via the ORDINARY finish_routine tool (a model
+    that didn't know or bother to call the project-specific
+    finish_project_capsule) still leaves the capsule's own outcome and
+    timeline fully populated, not blank. A no-op (same "degrade the
+    optional part" pattern as the rest of this module) pre-migration-041,
+    or when this cron job has no linked capsule."""
+    if not await _has_table(conn, "project_capsules"):
+        return
+    if cron_status == "cancelled":
+        ended_reason = (cron_meta or {}).get("ended_reason")
+        capsule_status = {
+            "completed_by_agent": "completed",
+            "expired": "expired",
+        }.get(ended_reason, "cancelled")
+    else:
+        capsule_status = cron_status
+    outcome = (cron_meta or {}).get("outcome") if capsule_status == "completed" else None
+    row = await conn.fetchrow(
+        """
+        UPDATE project_capsules
+        SET status = $2, outcome_summary = COALESCE($3, outcome_summary), updated_at = NOW()
+        WHERE cron_job_id = $1
+        RETURNING id
+        """,
+        cron_id, capsule_status, outcome,
+    )
+    if row is None or capsule_status not in ("completed", "expired", "cancelled"):
+        return
+    if not await _has_table(conn, "project_timeline_events"):
+        return
+    if capsule_status == "completed":
+        event_text = f"Completed: {outcome}" if outcome else "Completed."
+    elif capsule_status == "expired":
+        event_text = "Expired with no resolution -- automatic checks stopped."
+    else:
+        reason = (cron_meta or {}).get("ended_reason")
+        event_text = {
+            "superseded": "Cancelled -- superseded by a newer routine covering the same recipient.",
+        }.get(reason, "Cancelled.")
+    await conn.execute(
+        "INSERT INTO project_timeline_events (project_id, event_text) VALUES ($1, $2)",
+        row["id"], event_text,
+    )
+
+
 async def set_cron_job_status(
     user_id: int, cron_id: int, status: str, meta_patch: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -1340,27 +1405,38 @@ async def set_cron_job_status(
     used when a status change also needs to record WHY (e.g. finish_routine
     setting status='cancelled' alongside meta.ended_reason='completed_by_agent'
     and meta.outcome, or the cron loop retiring an expired/exhausted
-    autonomous job with meta.ended_reason='expired'/'max_attempts')."""
+    autonomous job with meta.ended_reason='expired'/'max_attempts').
+
+    Project-capsule sync (V3-autonomous.md Phase 6): if this cron job
+    drives a project_capsules row, _sync_linked_project_capsule_status
+    (above) mirrors the SAME status change onto that capsule, in the SAME
+    transaction -- see that function's own docstring for the full mapping
+    and why it's centralized here rather than scattered across every
+    routines_tools.py tool that can change a cron job's status."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        if meta_patch and await _has_column(conn, "cron_jobs", "meta"):
-            existing = await conn.fetchrow(
-                "SELECT meta FROM cron_jobs WHERE id = $1 AND user_id = $2", cron_id, user_id
-            )
-            if existing is None:
-                return {}
-            current = _load_meta(dict(existing))
-            current.update(meta_patch)
-            row = await conn.fetchrow(
-                "UPDATE cron_jobs SET status = $3, meta = $4 WHERE id = $1 AND user_id = $2 RETURNING *",
-                cron_id, user_id, status, json.dumps(current, default=_json_default),
-            )
-        else:
-            row = await conn.fetchrow(
-                "UPDATE cron_jobs SET status = $3 WHERE id = $1 AND user_id = $2 RETURNING *",
-                cron_id, user_id, status,
-            )
-        return dict(row) if row else {}
+        async with conn.transaction():
+            if meta_patch and await _has_column(conn, "cron_jobs", "meta"):
+                existing = await conn.fetchrow(
+                    "SELECT meta FROM cron_jobs WHERE id = $1 AND user_id = $2", cron_id, user_id
+                )
+                if existing is None:
+                    return {}
+                current = _load_meta(dict(existing))
+                current.update(meta_patch)
+                row = await conn.fetchrow(
+                    "UPDATE cron_jobs SET status = $3, meta = $4 WHERE id = $1 AND user_id = $2 RETURNING *",
+                    cron_id, user_id, status, json.dumps(current, default=_json_default),
+                )
+            else:
+                current = {}
+                row = await conn.fetchrow(
+                    "UPDATE cron_jobs SET status = $3 WHERE id = $1 AND user_id = $2 RETURNING *",
+                    cron_id, user_id, status,
+                )
+            if row is not None:
+                await _sync_linked_project_capsule_status(conn, cron_id, status, current)
+            return dict(row) if row else {}
 
 
 async def has_user_replied_since(user_id: int, since: datetime) -> bool:
@@ -1464,12 +1540,23 @@ async def _auto_supersede_conflicting_routine(
     ambiguous which one this is meant to replace, if any) both mean don't
     touch anything. Guessing wrong here means silently cancelling a real
     user's real automation, which is a far worse failure than occasionally
-    leaving a genuine duplicate for the user to clean up themselves."""
+    leaving a genuine duplicate for the user to clean up themselves.
+
+    Also runs _sync_linked_project_capsule_status on the superseded job --
+    a real gap a QA pass caught: this function used to cancel the row with
+    a bare UPDATE, bypassing set_cron_job_status entirely, which left any
+    project_capsules row linked to that superseded job stuck showing
+    status='active' forever with a dead cadence clock underneath it. The
+    superseded job's own meta now records ended_reason='superseded' (merged
+    in, not overwritten -- pre-existing meta like a digest flag survives),
+    so the capsule sync above can log a clear timeline event too."""
     emails = {e.lower() for e in _ROUTINE_EMAIL_RE.findall(prompt_or_task or "")}
     if not emails:
         return None
+    has_meta = await _has_column(conn, "cron_jobs", "meta")
+    select_cols = "id, prompt_or_task, meta" if has_meta else "id, prompt_or_task"
     candidates = await conn.fetch(
-        "SELECT id, prompt_or_task FROM cron_jobs WHERE user_id = $1 AND id != $2 "
+        f"SELECT {select_cols} FROM cron_jobs WHERE user_id = $1 AND id != $2 "
         "AND status IN ('active', 'paused')",
         user_id, new_job_id,
     )
@@ -1479,9 +1566,22 @@ async def _auto_supersede_conflicting_routine(
     ]
     if len(matches) != 1:
         return None
-    row = await conn.fetchrow(
-        "UPDATE cron_jobs SET status = 'cancelled' WHERE id = $1 RETURNING *", matches[0]["id"],
-    )
+    matched = matches[0]
+    if has_meta:
+        current_meta = _load_meta(dict(matched))
+        current_meta["ended_reason"] = "superseded"
+        current_meta["superseded_by_job_id"] = new_job_id
+        row = await conn.fetchrow(
+            "UPDATE cron_jobs SET status = 'cancelled', meta = $2 WHERE id = $1 RETURNING *",
+            matched["id"], json.dumps(current_meta, default=_json_default),
+        )
+    else:
+        current_meta = {"ended_reason": "superseded", "superseded_by_job_id": new_job_id}
+        row = await conn.fetchrow(
+            "UPDATE cron_jobs SET status = 'cancelled' WHERE id = $1 RETURNING *", matched["id"],
+        )
+    if row is not None:
+        await _sync_linked_project_capsule_status(conn, matched["id"], "cancelled", current_meta)
     return dict(row) if row else None
 
 
@@ -1543,6 +1643,246 @@ async def _insert_cron_job(conn: asyncpg.Connection, user_id: int, payload: dict
         if superseded:
             result["_superseded_job"] = superseded
     return result
+
+
+# ---------------------------------------------------------------------------
+# Project Capsules (migrations/041_project_capsules.sql, V3-autonomous.md
+# Phase 6) -- a delegated, multi-week objective ("dispute this $850 airline
+# charge", "find me a 1BR under $2800") that Messa manages autonomously
+# until it's resolved, wrapped around the SAME cron_jobs/routines_agent
+# engine every ordinary routine already uses (see _insert_project_capsule
+# and set_cron_job_status's own project-capsule-sync comment above) --
+# plus its own multi-modal vault (project_vault_assets) and plain-language
+# timeline (project_timeline_events). See routines_tools.py for the
+# model-facing tools built on top of these.
+# ---------------------------------------------------------------------------
+
+async def _insert_project_capsule(conn: asyncpg.Connection, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    """Applier for the 'create_project' gated action (routines_tools.py's
+    propose_create_project_capsule). A project capsule is a THIN WRAPPER
+    around an ordinary autonomous cron_jobs row -- reuses _insert_cron_job
+    verbatim, on this SAME connection/transaction (confirm_pending_action
+    wraps every applier call in one), so a capsule's cadence checks get
+    every existing routine behavior (retry/backoff, expiry, conflict
+    auto-supersede, digest) for free rather than any of it being
+    reimplemented here. payload needs everything _insert_cron_job needs
+    (prompt_or_task holds the capsule's own `goal`) plus `title`.
+
+    Pre-migration-041 (no project_capsules table yet), this degrades to
+    exactly _insert_cron_job's own behavior -- a plain autonomous routine
+    with no project wrapper at all -- rather than raising, same "degrade
+    the optional part" pattern as the rest of this module. The result's
+    `_superseded_job` key (when _insert_cron_job's own conflict-supersede
+    fired) is copied up to this function's own top level so registry.py's
+    confirm_pending_action tool can read it the exact same way it already
+    does for a plain 'create_routine'."""
+    cron_result = await _insert_cron_job(conn, user_id, payload)
+    if not await _has_table(conn, "project_capsules"):
+        return cron_result
+    row = await conn.fetchrow(
+        """
+        INSERT INTO project_capsules (user_id, cron_job_id, title, goal, status)
+        VALUES ($1, $2, $3, $4, 'active') RETURNING *
+        """,
+        user_id, cron_result["id"], payload["title"], payload["prompt_or_task"],
+    )
+    result = dict(row)
+    result["cron_job"] = cron_result
+    if "_superseded_job" in cron_result:
+        result["_superseded_job"] = cron_result["_superseded_job"]
+    return result
+
+
+async def list_project_capsules(user_id: int) -> list[dict[str, Any]]:
+    """Every project capsule for this user (any status), each joined with
+    its linked cron job's own live status/next_run_at/cron_expression --
+    so a caller never has to make a second round trip to describe when a
+    capsule next checks in. Returns [] pre-migration-041, same "degrade
+    the optional part" pattern as the rest of this module."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "project_capsules"):
+            return []
+        rows = await conn.fetch(
+            """
+            SELECT p.*, c.status AS cron_status, c.next_run_at, c.cron_expression
+            FROM project_capsules p
+            LEFT JOIN cron_jobs c ON c.id = p.cron_job_id
+            WHERE p.user_id = $1
+            ORDER BY p.created_at DESC
+            """,
+            user_id,
+        )
+        return _rows(rows)
+
+
+async def get_project_capsule(user_id: int, project_id: int) -> dict[str, Any] | None:
+    """One project capsule, scoped to `user_id` (so one user's tools can
+    never read or act on another's capsule by id), same cron-job join as
+    list_project_capsules above. None pre-migration-041 or when no such
+    capsule exists for this user."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "project_capsules"):
+            return None
+        row = await conn.fetchrow(
+            """
+            SELECT p.*, c.status AS cron_status, c.next_run_at, c.cron_expression
+            FROM project_capsules p
+            LEFT JOIN cron_jobs c ON c.id = p.cron_job_id
+            WHERE p.id = $1 AND p.user_id = $2
+            """,
+            project_id, user_id,
+        )
+        return dict(row) if row else None
+
+
+async def get_project_capsule_by_cron_job(cron_job_id: int) -> dict[str, Any] | None:
+    """Looks up a project capsule by its LINKED cron job id, not by its own
+    id -- used by server.py's autonomous-routine firing to tell whether a
+    given due cron job is actually a project capsule's own cadence check,
+    so it can hand the model the capsule's own id/title/goal (and the
+    project-specific finish_project_capsule/get_project_capsule_details/
+    log_project_capsule_event tools) instead of treating it as a bare,
+    context-free routine. Not scoped to user_id (server.py's cron loop
+    already has the row from the user-scoped cron_jobs query that found
+    this job due; this is purely the reverse lookup). None pre-migration-041
+    or when this cron job has no linked capsule."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "project_capsules"):
+            return None
+        row = await conn.fetchrow("SELECT * FROM project_capsules WHERE cron_job_id = $1", cron_job_id)
+        return dict(row) if row else None
+
+
+async def finish_project_capsule(user_id: int, project_id: int, outcome_summary: str) -> dict[str, Any]:
+    """The project-capsule analogue of routines_tools.py's finish_routine,
+    called from WITHIN a capsule's own autonomous cadence check once its
+    goal is actually resolved. Cancels the underlying cron job (same
+    status-change path pause/resume/cancel_cron_job already use) with
+    meta.ended_reason='completed_by_agent' -- set_cron_job_status's own
+    project-capsule sync (see _sync_linked_project_capsule_status's
+    docstring) mirrors this into project_capsules.status='completed' and
+    outcome_summary automatically; this function's own final UPDATE is
+    what ALSO covers the one case that sync can't reach -- an orphaned
+    capsule with no linked cron job at all (cron_job_id is NULL). Scoped
+    to `user_id`; returns {} if no such capsule exists for them, or
+    pre-migration-041."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "project_capsules"):
+            return {}
+        project = await conn.fetchrow(
+            "SELECT * FROM project_capsules WHERE id = $1 AND user_id = $2", project_id, user_id,
+        )
+        if project is None:
+            return {}
+        if project["cron_job_id"]:
+            # set_cron_job_status's own project-capsule sync
+            # (_sync_linked_project_capsule_status) will mirror status +
+            # outcome_summary onto this same row AND log the completion
+            # timeline event -- the UPDATE just below still runs too (cheap,
+            # idempotent, same final values), but the timeline event must
+            # NOT also be logged here, or it would be logged twice.
+            await set_cron_job_status(
+                user_id, project["cron_job_id"], "cancelled",
+                {"ended_reason": "completed_by_agent", "outcome": outcome_summary},
+            )
+        else:
+            # No linked cron job -- set_cron_job_status's sync never runs,
+            # so this is the only place the completion timeline event gets
+            # logged for an orphaned capsule finished directly.
+            if await _has_table(conn, "project_timeline_events"):
+                await conn.execute(
+                    "INSERT INTO project_timeline_events (project_id, event_text) VALUES ($1, $2)",
+                    project_id, f"Completed: {outcome_summary}" if outcome_summary else "Completed.",
+                )
+        row = await conn.fetchrow(
+            """
+            UPDATE project_capsules SET outcome_summary = $2, status = 'completed', updated_at = NOW()
+            WHERE id = $1 RETURNING *
+            """,
+            project_id, outcome_summary,
+        )
+        return dict(row) if row else {}
+
+
+async def cancel_orphaned_project_capsule(user_id: int, project_id: int) -> dict[str, Any]:
+    """Direct status-only cancel for a project capsule that has NO linked
+    cron job (cron_job_id is NULL -- e.g. its underlying routine was
+    deleted out from under it, or never linked in the first place). The
+    normal cancel path goes through set_cron_job_status, which mirrors the
+    new status onto the capsule automatically; this is the fallback for
+    the one case that path can't reach at all, since there's no cron job
+    to change the status of. Deliberately NOT finish_project_capsule --
+    that always marks 'completed', which would be actively wrong here (an
+    orphaned capsule being cancelled was not achieved). Scoped to
+    `user_id`; returns {} if no such capsule exists for them, or
+    pre-migration-041."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "project_capsules"):
+            return {}
+        row = await conn.fetchrow(
+            "UPDATE project_capsules SET status = 'cancelled', updated_at = NOW() WHERE id = $1 AND user_id = $2 RETURNING *",
+            project_id, user_id,
+        )
+        return dict(row) if row else {}
+
+
+async def add_project_capsule_asset(project_id: int, source_url: str, description: str | None = None) -> dict[str, Any]:
+    """Files one vault item (a user-supplied photo/PDF/document URL) against
+    a project capsule -- see routines_tools.py's add_project_capsule_asset
+    tool for the model-facing judgment call on WHEN to call this. {}
+    pre-migration-041 (degrades safely rather than raising UndefinedTable)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "project_vault_assets"):
+            return {}
+        row = await conn.fetchrow(
+            "INSERT INTO project_vault_assets (project_id, source_url, description) VALUES ($1, $2, $3) RETURNING *",
+            project_id, source_url, description,
+        )
+        return dict(row)
+
+
+async def list_project_capsule_assets(project_id: int) -> list[dict[str, Any]]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "project_vault_assets"):
+            return []
+        rows = await conn.fetch(
+            "SELECT * FROM project_vault_assets WHERE project_id = $1 ORDER BY created_at", project_id,
+        )
+        return _rows(rows)
+
+
+async def log_project_capsule_event(project_id: int, event_text: str) -> None:
+    """Appends one plain-language timeline entry -- see
+    project_timeline_events' own migration comment for why this is a
+    single TEXT column rather than a structured payload. No-ops
+    pre-migration-041 rather than raising."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "project_timeline_events"):
+            return
+        await conn.execute(
+            "INSERT INTO project_timeline_events (project_id, event_text) VALUES ($1, $2)",
+            project_id, event_text,
+        )
+
+
+async def list_project_capsule_events(project_id: int, limit: int = 20) -> list[dict[str, Any]]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "project_timeline_events"):
+            return []
+        rows = await conn.fetch(
+            "SELECT * FROM project_timeline_events WHERE project_id = $1 ORDER BY created_at DESC LIMIT $2",
+            project_id, limit,
+        )
+        return _rows(rows)
 
 
 def _compute_next_run_local(cron_expression: str, tz_name: str) -> datetime:
@@ -1778,6 +2118,7 @@ _APPLIERS = {
     "update_calendar_event": _update_calendar_event,
     "delete_calendar_event": _delete_calendar_event,
     "create_routine": _insert_cron_job,
+    "create_project": _insert_project_capsule,
     "broadcast_message": _insert_broadcast,
     "place_call": _insert_call_session_confirmed,
 }

@@ -122,11 +122,14 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
             # call_tools.dial_confirmed_call's own docstring.
             outcome = await call_tools.dial_confirmed_call(result["result"])
             return f"{base} {outcome}"
-        if result["action_type"] == "create_routine":
+        if result["action_type"] in ("create_routine", "create_project"):
             # V3-autonomous.md Pillar 1: conflict auto-supersede. See
             # db._auto_supersede_conflicting_routine's own docstring --
             # this key is only ever present when it actually cancelled
-            # something, never set to None otherwise.
+            # something, never set to None otherwise. 'create_project'
+            # (Phase 6) shares this same key: db._insert_project_capsule
+            # copies it up from the underlying cron job's own result, so
+            # this branch needs no project-specific duplicate.
             superseded = (result.get("result") or {}).get("_superseded_job")
             if superseded:
                 base += (
@@ -844,6 +847,30 @@ def _pending_meeting_note_paragraph(pending_meeting_note: dict[str, Any] | None)
     )
 
 
+def _active_project_capsules_paragraph(active_capsules: list[dict[str, Any]]) -> str:
+    """V3-autonomous.md Phase 6: tells the orchestrator which project
+    capsules (delegated multi-week objectives -- see routines_tools.py) are
+    currently active for this user, so it can use its own judgment about
+    whether an inbound photo/PDF attachment belongs in one of their vaults
+    (routines_tools.py's add_project_capsule_asset) instead of either
+    ignoring every attachment or filing everything automatically. Same
+    "pure function, unit-testable without a full build_orchestrator call"
+    shape as _pending_meeting_note_paragraph above. Returns "" when there
+    are none, so a user with no active project capsule keeps today's exact
+    prompt, byte for byte -- this feature adds nothing to their turn at
+    all until they actually have one running."""
+    if not active_capsules:
+        return ""
+    listing = "; ".join(f"#{c['id']} '{c['title']}'" for c in active_capsules)
+    return (
+        f"\n\nActive project capsules you're managing in the background: {listing}. If this "
+        "message includes a photo/PDF attachment (tagged with its own [attachment_url: ...]) "
+        "that plausibly belongs to one of these, delegate to routines_agent to file it via "
+        "add_project_capsule_asset -- use your own judgment, don't file something ambiguous "
+        "or unrelated."
+    )
+
+
 def _build_system_prompt(
     user: config.UserContext,
     connected_slugs: list[str] | None = None,
@@ -1432,6 +1459,20 @@ async def build_orchestrator(
         except Exception as e:  # noqa: BLE001 - a hint, not load-bearing
             console.system(f"pop_pending_post_meeting_note failed (non-fatal): {e}")
 
+    # V3-autonomous.md Phase 6: which project capsules (see
+    # tools/routines_tools.py) are currently active, so the orchestrator can
+    # judge whether THIS turn's attachment (if any) belongs in one of their
+    # vaults -- see _active_project_capsules_paragraph above. Same "cheap
+    # local read, never fatal to a turn" shape as connected_slugs/
+    # app_preferences above.
+    active_project_capsules: list[dict[str, Any]] = []
+    if config.PROJECT_CAPSULES_ENABLED:
+        try:
+            all_capsules = await db.list_project_capsules(user.user_id)
+            active_project_capsules = [c for c in all_capsules if c.get("status") == "active"]
+        except Exception as e:  # noqa: BLE001 - a hint, not load-bearing
+            console.system(f"list_project_capsules failed (non-fatal): {e}")
+
     # Active Task Scratchpad + Skills Playbook (docs/autonomous_
     # integrations_and_task_memory_spec.md) for the ORCHESTRATOR's own
     # prompt/tools only -- every subagent above now attaches this same
@@ -1451,6 +1492,7 @@ async def build_orchestrator(
         + reliability.RELIABILITY_GUARDRAIL_STR
     )
     orchestrator_system_prompt += _pending_meeting_note_paragraph(pending_meeting_note)
+    orchestrator_system_prompt += _active_project_capsules_paragraph(active_project_capsules)
     if config.SCRATCHPAD_AND_SKILLS_ENABLED:
         orchestrator_tools = orchestrator_tools + build_scratchpad_tools(user, "messa_orchestrator", approval_gate)
         orchestrator_system_prompt = orchestrator_system_prompt + await scratchpad_prompt_block(user, "messa_orchestrator")
