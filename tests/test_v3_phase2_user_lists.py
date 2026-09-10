@@ -212,13 +212,22 @@ async def part2_is_muted_sender():
         check("is_muted_sender: exact address match returns True", result is True)
         lookup_call = next(c for c in conn.calls if c[0] == "fetchval" and "user_lists" in c[1])
         check("is_muted_sender: checks both the exact address AND its domain in one query",
-              lookup_call[2] == (1, "spam@metricool.com", "metricool.com"))
+              lookup_call[2] == (1, ["spam@metricool.com", "metricool.com"]))
 
         # 2b: domain-only match (a different local part at a muted domain).
         conn = FakeConn(fetchval_queue=[1])
         install_fake_pool(conn)
         result = await db.is_muted_sender(1, "newsletter@metricool.com")
         check("is_muted_sender: a domain-level mute matches any sender at that domain", result is True)
+
+        # 2b-bis: subdomain sender matches parent domain
+        conn = FakeConn(fetchval_queue=[1])
+        install_fake_pool(conn)
+        result = await db.is_muted_sender(1, "newsletter@marketing.metricool.com")
+        check("is_muted_sender: a subdomain sender matches parent domain", result is True)
+        sub_call = next(c for c in conn.calls if c[0] == "fetchval" and "user_lists" in c[1])
+        check("is_muted_sender: includes address, subdomain, and parent domain in candidates",
+              sub_call[2] == (1, ["newsletter@marketing.metricool.com", "marketing.metricool.com", "metricool.com"]))
 
         # 2c: "Display Name <addr>" form is parsed correctly (RFC 2822 style,
         # exactly what a real inbound email's From header looks like).
@@ -290,6 +299,14 @@ async def part3_mute_tools():
         check("mute_email_sender: accepts a bare domain",
               add_calls == [(9, "muted_email_senders", "metricool.com")])
         check("mute_email_sender: confirms muting an 'entire domain' for a bare domain",
+              "entire domain" in reply)
+
+        # 3b-bis: muting a domain with leading @ (@metricool.com).
+        add_calls.clear()
+        reply = await mute_tool.coroutine(sender_or_domain="@metricool.com")
+        check("mute_email_sender: accepts a domain with leading @",
+              add_calls == [(9, "muted_email_senders", "metricool.com")])
+        check("mute_email_sender: confirms muting an 'entire domain' for leading @",
               "entire domain" in reply)
 
         # 3c: rejects garbage input BEFORE ever touching the DB.

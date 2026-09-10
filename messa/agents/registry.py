@@ -321,6 +321,8 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
         cleaned = (sender_or_domain or "").strip().lower()
         if not cleaned:
             return "Give me a sender's email address or a domain to mute."
+        if cleaned.startswith("@") and "." in cleaned and "@" not in cleaned[1:]:
+            cleaned = cleaned[1:]
         if "@" in cleaned:
             local, _, domain_part = cleaned.partition("@")
             if not local or not domain_part or "@" in domain_part:
@@ -346,6 +348,8 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
         cleaned = (sender_or_domain or "").strip().lower()
         if not cleaned:
             return "Give me a sender's email address or a domain to unmute."
+        if cleaned.startswith("@") and "." in cleaned and "@" not in cleaned[1:]:
+            cleaned = cleaned[1:]
         removed = await db.remove_user_list_item(uid, "muted_email_senders", cleaned)
         if removed:
             return f"Unmuted '{cleaned}' -- you'll be notified about emails from it again."

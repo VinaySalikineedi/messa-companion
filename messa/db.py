@@ -4722,6 +4722,12 @@ async def is_muted_sender(user_id: int, from_address: str) -> bool:
     if not address or "@" not in address:
         return False
     domain = address.rsplit("@", 1)[1]
+    candidates = [address, domain]
+    parts = domain.split(".")
+    for i in range(1, len(parts) - 1):
+        parent = ".".join(parts[i:])
+        if "." in parent and parent not in candidates:
+            candidates.append(parent)
     pool = await get_pool()
     async with pool.acquire() as conn:
         if not await _has_table(conn, "user_lists"):
@@ -4730,9 +4736,9 @@ async def is_muted_sender(user_id: int, from_address: str) -> bool:
             """
             SELECT 1 FROM user_lists
             WHERE user_id = $1 AND list_name = 'muted_email_senders'
-              AND item_value IN ($2, $3)
+              AND item_value = ANY($2)
             LIMIT 1
             """,
-            user_id, address, domain,
+            user_id, candidates,
         )
         return row is not None
