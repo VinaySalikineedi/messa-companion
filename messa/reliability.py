@@ -128,3 +128,55 @@ RELIABILITY_GUARDRAIL_STR = (
     "messages to the user -- translate a failure into one plain, professional "
     "sentence about what happened and what you're doing about it."
 )
+
+
+# --- V3-autonomous.md Pillar 1: one-touch approvals ---
+#
+# Field incident this targets: the user replies "I like this version!
+# Approved" to a staged draft/routine and Messa still asks "say yes and
+# I'll arm it" instead of confirming in that same turn -- confirm_pending_
+# action/reject_pending_action already exist and the persona prompt
+# already tells the orchestrator to call confirm_pending_action the
+# moment the user says yes (see registry.py's own "Confirmation flow"
+# paragraph), so this ISN'T a missing capability, it's the same
+# probabilistic-steer-isn't-a-guarantee gap _STALL_PATTERN/
+# unverified_claim_reason above exist to backstop, just for a third shape:
+# a clear approval that should have triggered a tool call and didn't.
+#
+# is_bare_affirmation is intentionally generous (see this module's own
+# "cheap enough to false-positive occasionally" tradeoff, restated in
+# looks_like_tool_failure's docstring) -- a false positive here just costs
+# one bounded extra model call (cli.py's run_message re-invokes the turn
+# once with a nudge, same shape as run_turn's own retries), which either
+# confirms a real pending action or explains there's nothing to confirm.
+# It is NEVER used to auto-confirm anything itself -- the model still
+# decides, this only makes sure it gets asked again when its own reply
+# suggests it missed an obvious yes.
+_AFFIRMATION_PATTERN = re.compile(
+    r"^(?:ok(?:ay)?|yes|yep|yeah|yup|sure|approved?|confirmed?|correct|affirmative|"
+    r"do it|send it|go ahead|go for it|go|lock it in|ship it|sounds? good|looks? good|"
+    r"perfect|great|lgtm|all good|good to go|makes sense|that works|works for me)$",
+    re.IGNORECASE,
+)
+
+
+def is_bare_affirmation(text: str) -> bool:
+    """True for a short, purely-affirmative reply with no other substantive
+    content riding along -- "yes", "Approved.", "sounds good, send it" --
+    checked as EITHER the whole (trimmed) message OR just its last clause,
+    so "I like this version! Approved" (real content, then a short, clear
+    affirmation tacked on the end -- the exact shape of the field incident
+    this exists for) matches too. Deliberately NOT matched: "yes but move
+    it to 3pm" (the last clause is "move it to 3pm", not an affirmation
+    word on its own) and "yesterday I approved this" (the whole string and
+    its last clause are both longer than any single affirmation phrase) --
+    this is about catching a clean, standalone yes, not scanning for the
+    word "yes" anywhere in a longer message that needs actually reading."""
+    stripped = (text or "").strip()
+    if not stripped or len(stripped) > 200:
+        return False
+    candidates = [stripped.strip(" !.,")]
+    clauses = [c.strip(" !.,") for c in re.split(r"[.!?\n]+", stripped) if c.strip(" !.,")]
+    if clauses:
+        candidates.append(clauses[-1])
+    return any(_AFFIRMATION_PATTERN.match(c) for c in candidates if c)

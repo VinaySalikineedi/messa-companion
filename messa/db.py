@@ -1436,6 +1436,53 @@ async def clear_digest_items_for_user(user_id: int) -> None:
         await conn.execute("DELETE FROM digest_queue WHERE user_id = $1", user_id)
 
 
+# V3-autonomous.md Pillar 1: conflict auto-supersede -- deterministic,
+# zero-token recipient-collision detection for routines. Extraction only
+# (findall, not a validator): a false-positive-looking "email" here just
+# means two routines fail to match each other, the safe direction to be
+# wrong in.
+_ROUTINE_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[a-z]{2,}", re.IGNORECASE)
+
+
+async def _auto_supersede_conflicting_routine(
+    conn: asyncpg.Connection, user_id: int, new_job_id: int, prompt_or_task: str,
+) -> dict[str, Any] | None:
+    """If the brand-new routine `new_job_id` targets the same recipient
+    email address as exactly one other still-active/paused routine for
+    this user, cancel that older one and return its (now-cancelled) row so
+    the caller can mention it in its reply -- the field incident this
+    fixes: a schedule created for a recipient (e.g. kj@mangustacap.com)
+    twice, once via Gmail and again over SMS, left BOTH live instead of
+    the second replacing the first.
+
+    Same "match on exactly ONE candidate only" safety rule as
+    _retire_legacy_briefing_if_any above: zero matches (no email in this
+    routine, or no other routine shares one) or MULTIPLE matches (more
+    than one existing routine mentions the same address -- genuinely
+    ambiguous which one this is meant to replace, if any) both mean don't
+    touch anything. Guessing wrong here means silently cancelling a real
+    user's real automation, which is a far worse failure than occasionally
+    leaving a genuine duplicate for the user to clean up themselves."""
+    emails = set(_ROUTINE_EMAIL_RE.findall(prompt_or_task or ""))
+    if not emails:
+        return None
+    candidates = await conn.fetch(
+        "SELECT id, prompt_or_task FROM cron_jobs WHERE user_id = $1 AND id != $2 "
+        "AND status IN ('active', 'paused')",
+        user_id, new_job_id,
+    )
+    matches = [
+        c for c in candidates
+        if emails & set(_ROUTINE_EMAIL_RE.findall(c["prompt_or_task"] or ""))
+    ]
+    if len(matches) != 1:
+        return None
+    row = await conn.fetchrow(
+        "UPDATE cron_jobs SET status = 'cancelled' WHERE id = $1 RETURNING *", matches[0]["id"],
+    )
+    return dict(row) if row else None
+
+
 async def _insert_cron_job(conn: asyncpg.Connection, user_id: int, payload: dict[str, Any]) -> dict[str, Any]:
     """Applier for the 'create_routine' gated action (routines_tools.py's
     propose_create_routine) -- confirm_pending_action hands this a payload
@@ -1450,7 +1497,18 @@ async def _insert_cron_job(conn: asyncpg.Connection, user_id: int, payload: dict
 
     execution_mode/meta are written only if migration 024 has run
     (_has_column-guarded) -- pre-migration, this behaves exactly as it did
-    before this feature existed: a plain recurring job, no meta."""
+    before this feature existed: a plain recurring job, no meta.
+
+    Conflict auto-supersede (see _auto_supersede_conflicting_routine just
+    above) runs AFTER the insert, on this same connection/transaction
+    (confirm_pending_action wraps every applier call in one), and is
+    gated behind config.CONFLICT_AUTO_SUPERSEDE_ENABLED -- when it fires,
+    the cancelled row is stashed under the "_superseded_job" key so
+    registry.py's confirm_pending_action tool can mention it; when it
+    doesn't, that key is simply absent (never set to None), so a plain
+    `"_superseded_job" in result` check is exactly as good as a truthy
+    check and neither breaks any existing caller that doesn't know this
+    key exists at all."""
     user_tz = payload.get("user_timezone", config.DEFAULT_TIMEZONE)
     next_run_at = _parse_dt(payload["next_run_at"], user_tz)
     has_mode = await _has_column(conn, "cron_jobs", "execution_mode")
@@ -1475,7 +1533,14 @@ async def _insert_cron_job(conn: asyncpg.Connection, user_id: int, payload: dict
             """,
             user_id, payload["prompt_or_task"], payload["cron_expression"], user_tz, next_run_at,
         )
-    return dict(row)
+    result = dict(row)
+    if config.CONFLICT_AUTO_SUPERSEDE_ENABLED:
+        superseded = await _auto_supersede_conflicting_routine(
+            conn, user_id, row["id"], payload["prompt_or_task"],
+        )
+        if superseded:
+            result["_superseded_job"] = superseded
+    return result
 
 
 def _compute_next_run_local(cron_expression: str, tz_name: str) -> datetime:

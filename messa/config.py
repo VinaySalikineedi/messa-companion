@@ -848,6 +848,36 @@ USER_ASSETS_MAX_INJECTED = int(os.environ.get("MESSA_USER_ASSETS_MAX_INJECTED", 
 # already handles active_tasks retention (see that loop's own docstring).
 USER_ASSETS_ROW_RETENTION_DAYS = int(os.environ.get("MESSA_USER_ASSETS_ROW_RETENTION_DAYS", "180"))
 
+# ---- V3-autonomous.md Phase 1: one-touch approvals + conflict auto-
+# supersede (both independently flippable, both additive/backstop-only --
+# neither changes what the model is ALLOWED to do, only catches it missing
+# something it already should have done) ----
+#
+# Structural backstop for cli.py's run_message: when the user's reply
+# reads as a clear, bare approval (reliability.is_bare_affirmation) and
+# this turn didn't call confirm_pending_action/reject_pending_action even
+# though at least one action is still pending, retry once with a nudge --
+# same bounded-single-retry shape as run_turn's own _STALL_PATTERN/
+# unverified_claim_reason backstops just above. Never auto-confirms
+# anything itself; only makes sure the model gets asked again.
+ONE_TOUCH_APPROVAL_NUDGE_ENABLED = os.environ.get(
+    "MESSA_ONE_TOUCH_APPROVAL_NUDGE_ENABLED", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+
+# Deterministic (zero-token) conflict auto-supersede for routines: when a
+# newly-CONFIRMED routine (db._insert_cron_job) targets the same recipient
+# email address as exactly one other still-active/paused routine, the
+# older one is cancelled automatically instead of leaving both live side
+# by side -- the field incident this fixes is a schedule created twice for
+# the same recipient (once via Gmail, once over SMS) with neither ever
+# getting cleaned up. "Exactly one other candidate" only, same safety rule
+# as db._retire_legacy_briefing_if_any right above it -- zero or multiple
+# matches means don't touch anything, since guessing wrong here means
+# silently cancelling a real user's real automation.
+CONFLICT_AUTO_SUPERSEDE_ENABLED = os.environ.get(
+    "MESSA_CONFLICT_AUTO_SUPERSEDE_ENABLED", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+
 # ---- Voice and image input (messa/media_understanding.py) -- lets a user
 # text Messa a voice memo or a photo and have it actually understood,
 # instead of the SMS/iMessage path silently ignoring anything that isn't a

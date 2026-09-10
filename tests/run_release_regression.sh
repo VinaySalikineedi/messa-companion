@@ -58,6 +58,7 @@ TESTS=(
   tests/test_reliability_hardening.py
   tests/test_subagent_freshness.py
   tests/test_workspace_asset_registry.py
+  tests/test_v3_phase1_approvals_and_supersede.py
 )
 
 PASSED=()

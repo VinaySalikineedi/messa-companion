@@ -112,6 +112,18 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
             # call_tools.dial_confirmed_call's own docstring.
             outcome = await call_tools.dial_confirmed_call(result["result"])
             return f"{base} {outcome}"
+        if result["action_type"] == "create_routine":
+            # V3-autonomous.md Pillar 1: conflict auto-supersede. See
+            # db._auto_supersede_conflicting_routine's own docstring --
+            # this key is only ever present when it actually cancelled
+            # something, never set to None otherwise.
+            superseded = (result.get("result") or {}).get("_superseded_job")
+            if superseded:
+                base += (
+                    f" (I also cancelled routine #{superseded['id']} "
+                    f"('{superseded['prompt_or_task']}') since this one replaces it -- "
+                    "same recipient.)"
+                )
         return base
 
     @tool

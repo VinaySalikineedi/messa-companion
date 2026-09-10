@@ -822,6 +822,44 @@ async def run_message(
 
     final = await run_turn(agent, history, on_ai_message=_on_ai_message)
 
+    # V3-autonomous.md Pillar 1: one-touch approvals -- structural backstop
+    # for the "user says a clear yes, Messa asks to confirm again anyway"
+    # failure mode. The persona prompt already tells the orchestrator to
+    # call confirm_pending_action the instant the user approves (see
+    # registry.py's "Confirmation flow" paragraph); this catches it when
+    # that doesn't happen, same bounded-single-retry shape as run_turn's
+    # own _STALL_PATTERN/unverified_claim_reason backstops above (never a
+    # loop -- this whole block runs at most once per turn). A false
+    # positive here (the user's "yes" was about something else entirely)
+    # just costs one extra model call that finds nothing to confirm and
+    # says so; it never confirms anything on its own.
+    if config.ONE_TOUCH_APPROVAL_NUDGE_ENABLED and reliability.is_bare_affirmation(text):
+        new_messages = final[len(history):]
+        confirmed_or_rejected = any(
+            tc.get("name") in ("confirm_pending_action", "reject_pending_action")
+            for m in new_messages
+            for tc in (getattr(m, "tool_calls", None) or [])
+        )
+        if not confirmed_or_rejected:
+            pending = await db.list_pending_actions(user.user_id)
+            if pending:
+                console.system(
+                    "Messa: this reply reads as a clear approval but nothing was "
+                    "confirmed or rejected this turn, and an action is still pending -- "
+                    "retrying once with a nudge."
+                )
+                nudge_text = (
+                    "(auto-check, not from the user: their last message reads as a clear "
+                    "approval, and there's at least one action still awaiting confirmation "
+                    "-- check list_pending_actions. If it's for that, call "
+                    "confirm_pending_action now. If their message was about something "
+                    "else, ignore this.)"
+                )
+                final = await run_turn(
+                    agent, final + [HumanMessage(content=nudge_text)],
+                    on_ai_message=_on_ai_message, _allow_retry=False,
+                )
+
     # "Sleep & dream" post-turn consolidation (docs/executive_agent_
     # architecture_proposal.md 3.C) -- fired here, the earliest point
     # `final` (this turn's full message list, tool calls included) is
