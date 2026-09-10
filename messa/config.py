@@ -878,6 +878,20 @@ CONFLICT_AUTO_SUPERSEDE_ENABLED = os.environ.get(
     "MESSA_CONFLICT_AUTO_SUPERSEDE_ENABLED", "true"
 ).strip().lower() in ("1", "true", "yes", "on")
 
+# ---- V3-autonomous.md Phase 2: deterministic user lists (migration 038,
+# db.py's add/remove/get_user_list_items + is_muted_sender,
+# registry.py's mute_email_sender/unmute_email_sender/
+# list_muted_email_senders tools, server.py's personal-email webhook
+# check) -- one kill switch for all of it, same "instantly flippable, no
+# redeploy" reasoning as WORKSPACE_ASSETS_ENABLED above. When false, the
+# mute tools tell the user list management isn't enabled right now
+# instead of silently no-op'ing, and the webhook's mute check is skipped
+# entirely (every inbound email is treated as unmuted, i.e. today's
+# exact pre-Phase-2 behavior).
+USER_LISTS_ENABLED = os.environ.get("MESSA_USER_LISTS_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
 # ---- Voice and image input (messa/media_understanding.py) -- lets a user
 # text Messa a voice memo or a photo and have it actually understood,
 # instead of the SMS/iMessage path silently ignoring anything that isn't a

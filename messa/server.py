@@ -1978,6 +1978,25 @@ async def personal_email_inbound_webhook(
             )
             return JSONResponse({"status": "accepted (otp reserved for active deepsearch)"})
 
+    # V3-autonomous.md Phase 2/Pillar 3: deterministic (zero-token) mute
+    # check -- runs LAST, right before the one line that actually spends
+    # anything (an agent turn + an SMS), so muting can never interfere
+    # with the OTP-consumption paths above it (the email is already
+    # durably logged either way, so a muted OTP sender's code is still
+    # readable from the dashboard/messa_email_messages if genuinely
+    # needed). A muted sender's mail is still received and still shows up
+    # in the dashboard -- this only skips the "notify the user" step, the
+    # actual "$0 token spend, silently archived" behavior the field
+    # incident asked for. See db.is_muted_sender's own docstring for the
+    # exact/domain matching rule, and registry.py's mute_email_sender for
+    # how a sender/domain gets onto this list in the first place.
+    if config.USER_LISTS_ENABLED and await db.is_muted_sender(user["id"], from_address):
+        console.system(
+            f"Personal-email: sender {from_address!r} is muted for user #{user['id']} -- "
+            "logged, but suppressing the notification turn entirely."
+        )
+        return JSONResponse({"status": "accepted (muted sender, notification suppressed)"})
+
     background_tasks.add_task(_process_inbound_personal_email, user["id"], logged, pdf_note)
     return JSONResponse({"status": "accepted"})
 

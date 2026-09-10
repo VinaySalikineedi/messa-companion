@@ -50,6 +50,7 @@ below strips them once, globally, for every agent built on our model.
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -88,6 +89,15 @@ register_harness_profile(
         excluded_tools=frozenset({"ls", "read_file", "write_file", "edit_file", "delete", "glob", "grep", "execute"}),
         general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
     ),
+)
+
+
+# V3-autonomous.md Phase 2: a bare domain worth muting ('metricool.com'),
+# as opposed to a full address ('newsletter@metricool.com', validated
+# separately in mute_email_sender below) -- requires at least one dot so
+# a plain word ('metricool') is never silently accepted as "a domain".
+_BARE_DOMAIN_RE = re.compile(
+    r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$", re.IGNORECASE,
 )
 
 
@@ -286,6 +296,72 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
                 + ", ".join(other) + "."
             )
         return "\n".join(lines)
+
+    @tool
+    async def mute_email_sender(sender_or_domain: str) -> str:
+        """Stop Messa from ever notifying you about emails from a specific
+        sender or an entire domain -- deterministic and instant (a plain
+        database check on every future email, zero LLM calls; NOT a
+        recurring routine that re-checks the inbox on a timer, which is
+        what muting used to require before this tool existed). Pass either
+        a full address ('newsletter@metricool.com') to mute just that one
+        sender, or a bare domain ('metricool.com') to mute EVERY sender at
+        that domain. Muted mail is still received and still shows up in
+        the dashboard -- it just never triggers an SMS notification or an
+        agent turn (see personal_inbox_agent for reading/searching mail
+        that already arrived, muted or not).
+
+        Call this immediately on a clear request ('mute Metricool', 'stop
+        notifying me about newsletters from X', 'I don't want to hear
+        about emails from spam@y.com') -- this is a low-risk, trivially
+        reversible preference change (unmute_email_sender undoes it), so
+        it needs no confirmation, same as set_app_preference above."""
+        if not config.USER_LISTS_ENABLED:
+            return "Muting senders isn't enabled on this deployment right now."
+        cleaned = (sender_or_domain or "").strip().lower()
+        if not cleaned:
+            return "Give me a sender's email address or a domain to mute."
+        if "@" in cleaned:
+            local, _, domain_part = cleaned.partition("@")
+            if not local or not domain_part or "@" in domain_part:
+                return f"{sender_or_domain!r} doesn't look like a valid email address."
+        elif not _BARE_DOMAIN_RE.match(cleaned):
+            return f"{sender_or_domain!r} doesn't look like a valid email address or domain."
+        row = await db.add_user_list_item(uid, "muted_email_senders", cleaned)
+        if row is None:
+            return "Muting senders isn't set up on this deployment yet (run migrations/038_user_lists.sql)."
+        kind = "sender" if "@" in cleaned else "entire domain"
+        return (
+            f"Muted the {kind} '{row['item_value']}' -- you won't be notified about emails "
+            "from it anymore (still received, just silent). Say 'unmute' any time to undo this."
+        )
+
+    @tool
+    async def unmute_email_sender(sender_or_domain: str) -> str:
+        """Undo mute_email_sender for a specific address or domain -- you'll
+        get notified about emails from it again. Safe to call even if it
+        was never actually muted (just says so, changes nothing)."""
+        if not config.USER_LISTS_ENABLED:
+            return "Muting senders isn't enabled on this deployment right now."
+        cleaned = (sender_or_domain or "").strip().lower()
+        if not cleaned:
+            return "Give me a sender's email address or a domain to unmute."
+        removed = await db.remove_user_list_item(uid, "muted_email_senders", cleaned)
+        if removed:
+            return f"Unmuted '{cleaned}' -- you'll be notified about emails from it again."
+        return f"'{cleaned}' wasn't on your muted list -- nothing to change."
+
+    @tool
+    async def list_muted_email_senders() -> str:
+        """List every sender/domain you've currently muted. Call this when
+        the user asks what's muted, or before muting/unmuting something if
+        you want to check the current state first."""
+        if not config.USER_LISTS_ENABLED:
+            return "Muting senders isn't enabled on this deployment right now."
+        rows = await db.get_user_list_items(uid, "muted_email_senders")
+        if not rows:
+            return "Nothing muted right now."
+        return "Muted senders/domains: " + ", ".join(r["item_value"] for r in rows)
 
     @tool
     async def list_deepsearch_sessions(status: str | None = None) -> str:
@@ -538,6 +614,7 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
         confirm_pending_action, reject_pending_action, list_pending_actions,
         track_project, list_active_projects, save_profile_info,
         set_app_preference, list_my_connected_apps,
+        mute_email_sender, unmute_email_sender, list_muted_email_senders,
         get_system_status, get_session_details, get_recent_message_activity,
         react_to_message, send_styled_message,
         list_deepsearch_sessions, find_contact, send_pdf_over_text,

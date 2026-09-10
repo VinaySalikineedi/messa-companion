@@ -15,6 +15,7 @@ import re
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
+from email.utils import parseaddr
 from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
@@ -4612,3 +4613,126 @@ async def set_cached_app_entity(
             user_id, toolkit_slug.lower().strip(), entity_type, entity_id, label,
         )
         return dict(row) if row else None
+
+
+# ---------------------------------------------------------------------------
+# V3-autonomous.md Phase 2: deterministic user lists (migration 038).
+#
+# One deliberately GENERIC table for "a small set of things the user has
+# told Messa to remember, checked without spending an LLM call on it" --
+# 'muted_email_senders' is the only real consumer today; a second list
+# type later (vip_contacts, preferred_airlines, ...) is just new consumer
+# code against this same schema, not a new migration. See migrations/
+# 038_user_lists.sql's own comment for why V3-autonomous.md's own
+# user_policies table is deliberately NOT part of this migration --
+# nothing reads from it until a real consumer (Phase 3's priority
+# classifier) actually exists.
+# ---------------------------------------------------------------------------
+
+def _normalize_list_item(item_value: str) -> str:
+    """Case- and whitespace-insensitive storage/lookup -- 'Metricool.COM'
+    and 'metricool.com' are the same list entry, same reasoning as V3
+    Phase 1's own case-insensitive email matching
+    (_auto_supersede_conflicting_routine)."""
+    return (item_value or "").strip().lower()
+
+
+async def add_user_list_item(
+    user_id: int, list_name: str, item_value: str, metadata: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Upsert -- adding the same item twice is a no-op that just refreshes
+    metadata rather than duplicating the row, same ON CONFLICT DO UPDATE
+    shape as set_app_preference/set_cached_app_entity above. Returns None
+    (never raises) both for an empty/whitespace-only item_value and if
+    migrations/038_user_lists.sql hasn't run yet -- registry.py's tools
+    turn either into a plain, honest message rather than a stack trace."""
+    normalized = _normalize_list_item(item_value)
+    if not normalized:
+        return None
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_lists"):
+            return None
+        row = await conn.fetchrow(
+            """
+            INSERT INTO user_lists (user_id, list_name, item_value, metadata)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (user_id, list_name, item_value) DO UPDATE SET metadata = EXCLUDED.metadata
+            RETURNING *
+            """,
+            user_id, list_name, normalized, json.dumps(metadata or {}, default=_json_default),
+        )
+        return dict(row) if row else None
+
+
+async def remove_user_list_item(user_id: int, list_name: str, item_value: str) -> bool:
+    """True if a row actually existed and was deleted; False otherwise
+    (already absent, empty item_value, or pre-migration) -- never raises,
+    so a caller can always treat False as "already not on the list"
+    rather than needing to distinguish the reasons."""
+    normalized = _normalize_list_item(item_value)
+    if not normalized:
+        return False
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_lists"):
+            return False
+        deleted_id = await conn.fetchval(
+            "DELETE FROM user_lists WHERE user_id = $1 AND list_name = $2 AND item_value = $3 RETURNING id",
+            user_id, list_name, normalized,
+        )
+        return deleted_id is not None
+
+
+async def get_user_list_items(user_id: int, list_name: str) -> list[dict[str, Any]]:
+    """Every item on one of the user's lists, oldest-added first. An empty
+    list either way (never an error) -- pre-migration and "no items yet"
+    look identical to a caller, which is the correct behavior for both."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_lists"):
+            return []
+        rows = await conn.fetch(
+            "SELECT * FROM user_lists WHERE user_id = $1 AND list_name = $2 ORDER BY created_at",
+            user_id, list_name,
+        )
+        return _rows(rows)
+
+
+async def is_muted_sender(user_id: int, from_address: str) -> bool:
+    """The zero-token check (V3-autonomous.md Pillar 3): True if
+    `from_address` -- or just its domain -- is on this user's
+    'muted_email_senders' list. Called from server.py's personal-email
+    webhook, on EVERY inbound email, BEFORE deciding whether to spend an
+    agent turn (and an SMS notification) on it at all -- one indexed
+    query, never an LLM call, which is the actual fix for the incident
+    this exists for (muting a sender used to mean Messa improvising a
+    30-minute recurring cron job that re-checked the inbox 48 times a
+    day just to keep ignoring it).
+
+    Matches two independent shapes stored under the same list_name: an
+    exact address ('newsletter@metricool.com', muting just that one
+    sender) or a bare domain ('metricool.com', muting every sender at
+    that domain) -- whichever the user actually asked to mute (see
+    registry.py's mute_email_sender tool). `from_address` may still be in
+    raw "Display Name <addr>" form here (this webhook doesn't normalize
+    it before calling in) -- email.utils.parseaddr handles that the same
+    way every other mail-parsing library would, no bespoke regex needed."""
+    address = parseaddr(from_address or "")[1].strip().lower()
+    if not address or "@" not in address:
+        return False
+    domain = address.rsplit("@", 1)[1]
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_lists"):
+            return False
+        row = await conn.fetchval(
+            """
+            SELECT 1 FROM user_lists
+            WHERE user_id = $1 AND list_name = 'muted_email_senders'
+              AND item_value IN ($2, $3)
+            LIMIT 1
+            """,
+            user_id, address, domain,
+        )
+        return row is not None
