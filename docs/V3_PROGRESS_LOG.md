@@ -7,11 +7,11 @@
 ## 1. Quick Resume Check (Read This First After Restart)
 
 - **Current Repository Directory**: `/Users/robocafedesktop/Documents/textMessa`
-- **Active Git Branch**: `feature/v3-phase5-meeting-dossiers-commitments`
-- **Latest Commit**: `b10fc8fb` (`feat(v3-phase5): meeting dossiers & commitment ledger`)
+- **Active Git Branch**: `main`
+- **Latest Commit**: `63b11a0` (`test(regression): harden regression harness, skip missing playwright, isolate usage limit`)
 - **Python Virtualenv**: `./venv/bin/python` (Python 3.12)
-- **Live Production Service**: `https://live.textmessa.com/health` (Healthy)
-- **Immediate Task on Resume**: **Rigorously audit and test Phase 5 for production readiness.**
+- **Live Production Service**: `https://live.textmessa.com/health` (Healthy, 200 OK)
+- **Immediate Task on Resume**: **Architect and implement Phase 6: Project Capsule System (Multi-Week Autonomous Missions).**
 
 ---
 
@@ -23,8 +23,8 @@
 | **Phase 2** | Deterministic User Lists & Mute Engine | **DONE** | `1d1a7d4` | Deployed to `main`. Migration `038_user_lists.sql` applied to Neon DB. |
 | **Phase 3** | Three-Tier Inbound Email Triage (VIP / Daily / Weekly) | **DONE** | `cfb1ac1` | Deployed to `main`. Migration `039_email_digest_queue.sql` applied to Neon DB. |
 | **Phase 4** | Subagent Concurrency & Latency Drop | **DONE** | `9b58ae3` | Deployed to `main`, pushed to GitHub & Hugging Face. Zero tool regressions. |
-| **Phase 5** | **Meeting Dossiers & Implicit Commitment Ledger** | **READY FOR AUDIT** | `b10fc8fb` | Cleanly committed on `feature/v3-phase5-meeting-dossiers-commitments`. Ready to test! |
-| **Phase 6** | Project Capsule System (Multi-Week Autonomous Missions) | **PENDING** | — | Pending Phase 5 deployment. |
+| **Phase 5** | **Meeting Dossiers & Implicit Commitment Ledger** | **DONE** | `63b11a0` | Deployed to `main`, pushed to GitHub & Hugging Face. Migration `040_meeting_dossiers_and_commitments.sql` applied to Neon DB. |
+| **Phase 6** | **Project Capsule System (Multi-Week Autonomous Missions)** | **NEXT UP** | — | Ready to plan and architect Phase 6. |
 
 ---
 
@@ -48,34 +48,23 @@
   - Release regression script updated to include Phase 5 suite.
 
 ---
-
-## 4. Exact Execution Steps When We Resume
-
-When you restart and reopen the session, here is the exact checklist:
-
-1. **Verify Git & Virtualenv**:
-   ```bash
-   git status
-   git branch  # should show feature/v3-phase5-meeting-dossiers-commitments
-   ./venv/bin/python --version
-   ```
-2. **Run Phase 5 Dedicated Test Suite**:
-   ```bash
-   ./venv/bin/python tests/test_v3_phase5_meeting_dossiers.py
-   ```
-3. **Run Full Release Regression Suite**:
-   ```bash
-   PATH="./venv/bin:$PATH" bash tests/run_release_regression.sh
-   ```
-4. **Conduct Rigorous Code Audit**:
-   - Inspect edge cases in `messa/commitments.py` and `messa/meeting_dossiers.py`.
-   - Verify non-blocking behavior of background loops in `messa/server.py`.
-   - Check fallback behavior if Google Calendar / Composio token expires.
-   - Verify `MEETING_DOSSIERS_ENABLED` kill switch cleanly disables all loops.
-5. **Database Migration Check**:
-   - Inspect `migrations/040_meeting_dossiers_and_commitments.sql`.
-   - Apply migration 040 to live Neon DB when ready.
-6. **Deploy**:
-   - Merge `feature/v3-phase5-meeting-dossiers-commitments` into `main`.
-   - Push to `origin main` and `hf main:main`.
-   - Confirm live endpoint health: `curl -s -i https://live.textmessa.com/health`.
+ 
+ ## 4. Phase 5 Completion & Verification Record
+ 
+ 1. **Phase 5 Dedicated Test Suite**: 90 checks passing (`tests/test_v3_phase5_meeting_dossiers.py`).
+ 2. **Full Release Regression Suite**: 38 test suites passing (`bash tests/run_release_regression.sh`).
+ 3. **Database Migration Applied**: `migrations/040_meeting_dossiers_and_commitments.sql` executed against live Neon PostgreSQL database (`user_commitments`, `meeting_dossier_events`, `pending_post_meeting_notes` active).
+ 4. **Deployment**: Merged into `main` and pushed to both `origin` (GitHub) and `hf` (Hugging Face Spaces).
+ 5. **Production Health**: `https://live.textmessa.com/health` returns HTTP 200 `{"status":"ok","service":"messa-sendblue-webhook"}`.
+ 
+ ---
+ 
+ ## 5. Phase 6: Project Capsule System (The Autonomous Chief of Staff)
+ 
+ The next milestone in V3 is **Autonomous Project Capsules & Multi-Modal Vault** (V3-autonomous.md Section 4):
+ - **Goal**: Enable users to delegate ongoing multi-week objectives (e.g., airline disputes, gift hunts, lease scouting) and walk away.
+ - **Core Components**:
+   1. **Isolated State & Multi-Modal Vault**: `user_projects`, `project_vault_assets` (PDFs, photos, receipts, credentials/tracking numbers), `project_timeline_events`.
+   2. **Autonomous Cadence Clocks**: Background poll loop scheduling wakeups (e.g. every 24h/48h) to check status, verify email replies, and escalate if needed.
+   3. **Surgical SMS Interrogation**: Triggered only when a critical decision or missing information arises (e.g., card last-4, approval between cash vs voucher).
+   4. **Project Orchestrator Subagent**: Dedicated subagent with access to vault assets, email, browser, and timeline management.
