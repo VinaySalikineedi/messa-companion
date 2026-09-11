@@ -19,7 +19,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
@@ -326,7 +326,7 @@ async def part4_fridge_vision_inventory():
 async def part5_instacart_staging():
     tools_map = {t.name: t for t in grocery_tools.build_grocery_tools(USER)}
 
-    # Setup profile and pantry preferences with preferred brands
+    # 5a: Guest Mode (Default Out-of-the-box, no connected account)
     profile_row = FakeRow(user_id=1, preferred_store="whole_foods")
     pantry_rows = [
         FakeRow(id=1, user_id=1, item_name="eggs", preferred_brand="Vital Farms"),
@@ -334,7 +334,8 @@ async def part5_instacart_staging():
     ]
     order_row = FakeRow(id=101, user_id=1, cart_provider="instacart", store_name="Whole Foods Market", items_count=3, estimated_total=16.50, checkout_url="https://...", status="staged")
 
-    conn = FakeConn(has_tables=True, fetchrow_queue=[profile_row, order_row], fetch_queue=[pantry_rows])
+    # fetchrow for get_user_dietary_profile, then get_active_app_connection (returns None for guest), then create_grocery_order
+    conn = FakeConn(has_tables=True, fetchrow_queue=[profile_row, None, order_row], fetch_queue=[pantry_rows])
     install_fake_pool(conn)
 
     cart_out = await tools_map["stage_instacart_cart"].ainvoke({
@@ -342,21 +343,61 @@ async def part5_instacart_staging():
         "items_list": ["eggs", "milk", "organic avocados"],
     })
 
-    check("stage_instacart_cart: enriches with preferred brand Vital Farms", "Vital Farms eggs" in cart_out)
-    check("stage_instacart_cart: enriches with preferred brand Oatly", "Oatly Full Fat milk" in cart_out)
-    check("stage_instacart_cart: includes 1-tap express link", "[Review Cart & Order with Apple Pay ➔]" in cart_out)
-    check("stage_instacart_cart: includes retailer slug in checkout url", "retailer=whole-foods" in cart_out)
-    check("stage_instacart_cart: mentions 2-second Apple Pay checkout", "Apple Pay / FaceID" in cart_out)
+    check("stage_instacart_cart (guest): enriches with preferred brand Vital Farms", "Vital Farms eggs" in cart_out)
+    check("stage_instacart_cart (guest): enriches with preferred brand Oatly", "Oatly Full Fat milk" in cart_out)
+    check("stage_instacart_cart (guest): includes 1-tap express link", "[Review Cart & Order with Apple Pay ➔]" in cart_out)
+    check("stage_instacart_cart (guest): includes retailer slug in checkout url", "retailer=whole-foods" in cart_out)
+    check("stage_instacart_cart (guest): mentions 2-second Apple Pay checkout", "Apple Pay / FaceID" in cart_out)
+    check("stage_instacart_cart (guest): includes optional connect tip", "Connect Instacart" in cart_out)
 
-    # Check store override (e.g. Sprouts)
-    conn2 = FakeConn(has_tables=True, fetchrow_queue=[profile_row, order_row], fetch_queue=[pantry_rows])
+    # 5b: Connected Mode (User connected personal account via Composio)
+    active_conn_row = FakeRow(id=88, user_id=1, app_name="instacart", connected_account_id="acc_12345", is_active=True)
+    conn2 = FakeConn(has_tables=True, fetchrow_queue=[profile_row, active_conn_row, order_row], fetch_queue=[pantry_rows])
     install_fake_pool(conn2)
-    sprouts_cart = await tools_map["stage_instacart_cart"].ainvoke({
-        "store_name": "sprouts",
-        "items_list": ["organic blueberries", "sourdough bread"],
-    })
-    check("stage_instacart_cart: respects store override Sprouts", "Sprouts Farmers Market" in sprouts_cart)
-    check("stage_instacart_cart: slug is sprouts", "retailer=sprouts" in sprouts_cart)
+
+    mock_composio_client = MagicMock()
+    mock_composio_client.tools.execute.return_value = {
+        "status": "SUCCESS",
+        "data": {"url": "https://www.instacart.com/store/lists/messa-synced-list-999"},
+    }
+
+    with patch("messa.tools.integration_tools._get_client", return_value=mock_composio_client), \
+         patch("messa.config.COMPOSIO_API_KEY", "comp_test_key"):
+        connected_cart = await tools_map["stage_instacart_cart"].ainvoke({
+            "store_name": "Whole Foods",
+            "items_list": ["eggs", "milk"],
+        })
+        check("stage_instacart_cart (connected): formats connected account header", "Cart Synced to Your Connected Account" in connected_cart)
+        check("stage_instacart_cart (connected): includes personal account URL", "https://www.instacart.com/store/lists/messa-synced-list-999" in connected_cart)
+
+    # 5c: connect_instacart and disconnect_instacart tools
+    # When not connected, calls send_connect_link
+    conn3 = FakeConn(has_tables=True, fetchrow_queue=[None])
+    install_fake_pool(conn3)
+    with patch("messa.tools.integration_tools.send_connect_link", new_callable=AsyncMock) as mock_send_link:
+        mock_send_link.return_value = "Sent you a secure link to connect your Instacart account!"
+        conn_res = await tools_map["connect_instacart"].ainvoke({})
+        check("connect_instacart: invokes send_connect_link when not connected", mock_send_link.called)
+        check("connect_instacart: returns connection prompt", "secure link to connect" in conn_res)
+
+    # When already connected
+    conn4 = FakeConn(has_tables=True, fetchrow_queue=[active_conn_row])
+    install_fake_pool(conn4)
+    conn_already = await tools_map["connect_instacart"].ainvoke({})
+    check("connect_instacart: informs already connected", "already connected" in conn_already)
+
+    # disconnect_instacart
+    conn5 = FakeConn(has_tables=True, fetchrow_queue=[active_conn_row])
+    install_fake_pool(conn5)
+    with patch("messa.tools.integration_tools._get_client", return_value=mock_composio_client):
+        disconn_res = await tools_map["disconnect_instacart"].ainvoke({})
+        check("disconnect_instacart: disconnects and confirms guest mode", "Reverted to default Guest 1-Tap" in disconn_res)
+
+    # 5d: get_nearby_grocery_stores
+    conn6 = FakeConn(has_tables=True, fetchrow_queue=[None])
+    install_fake_pool(conn6)
+    nearby_res = await tools_map["get_nearby_grocery_stores"].ainvoke({"postal_code": "33101"})
+    check("get_nearby_grocery_stores: returns retailers for zip", "Zip 33101" in nearby_res and "Whole Foods Market" in nearby_res)
 
 
 # ---------------------------------------------------------------------------

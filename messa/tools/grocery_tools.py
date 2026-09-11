@@ -12,6 +12,7 @@ Implements groceries-agent.md:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import urllib.parse
@@ -368,8 +369,12 @@ def build_grocery_tools(user: config.UserContext, model: BaseChatModel | None = 
         store_name: str | None = None,
         items_list: list[str] | str | None = None,
     ) -> str:
-        """Stage a pre-populated grocery shopping cart and generate a 1-Tap Express Checkout link.
-        Uses direct deep linking and Instacart Connect standards (zero Composio overhead).
+        """Stage a pre-populated grocery shopping cart and generate a checkout link.
+        Supports both:
+        1. Connected Mode: If user linked their personal Instacart account via Composio,
+           creates the shopping list directly in their personal account.
+        2. Guest Mode (Default): Immediately generates a 1-Tap Apple Pay checkout deep link
+           with zero login/authentication required.
         store_name: optional store override (e.g. 'Whole Foods', 'Sprouts', 'ALDI', 'Costco', 'Kroger').
         items_list: list of grocery items to purchase (e.g. ['2 avocados', 'pasture-raised eggs', 'organic whole milk']).
         """
@@ -401,22 +406,60 @@ def build_grocery_tools(user: config.UserContext, model: BaseChatModel | None = 
                     break
             final_item_label = f"{matched_brand} {raw}" if (matched_brand and matched_brand.lower() not in item_lower) else raw
             enriched_items.append(final_item_label)
-            # Estimate item cost
             estimated_total += base_unit_price
 
-        # Build Direct 1-Tap Instacart Express Link
-        encoded_ingredients = urllib.parse.quote(",".join(enriched_items))
-        encoded_title = urllib.parse.quote(f"Messa {retailer_name} Order")
-        # Instacart mobile web checkout & deep link
-        checkout_url = (
-            f"https://www.instacart.com/store/partner_recipes?"
-            f"title={encoded_title}&retailer={retailer_slug}&ingredients={encoded_ingredients}"
-        )
+        # Check if user has an active connected Instacart account (Composio)
+        active_connection = await db.get_active_app_connection(uid, "instacart")
+        connected_url = None
+        if active_connection and config.COMPOSIO_API_KEY:
+            try:
+                from .integration_tools import _composio_user_id, _get_client
+                client = _get_client()
+                composio_uid = _composio_user_id(user)
+
+                def _execute_composio_cart():
+                    kwargs: dict = {
+                        "slug": "INSTACART_CREATE_SHOPPING_LIST_PAGE",
+                        "arguments": {
+                            "title": f"Messa {retailer_name} Order",
+                            "items": enriched_items,
+                        },
+                        "user_id": composio_uid,
+                    }
+                    if config.COMPOSIO_TOOLKIT_VERSION:
+                        kwargs["version"] = config.COMPOSIO_TOOLKIT_VERSION
+                    else:
+                        kwargs["dangerously_skip_version_check"] = True
+                    return client.tools.execute(**kwargs)
+
+                composio_res = await asyncio.to_thread(_execute_composio_cart)
+                if hasattr(composio_res, "__await__"):
+                    composio_res = await composio_res
+                if isinstance(composio_res, dict):
+                    data = composio_res.get("data") or composio_res
+                    if isinstance(data, dict):
+                        connected_url = data.get("url") or data.get("link") or data.get("shopping_list_url")
+            except Exception as e:
+                console.system(f"[grocery_agent] Composio Instacart call failed ({e}), falling back to Guest 1-Tap link.")
+
+        if connected_url:
+            checkout_url = connected_url
+            cart_provider = "instacart_connected"
+            is_connected = True
+        else:
+            encoded_ingredients = urllib.parse.quote(",".join(enriched_items))
+            encoded_title = urllib.parse.quote(f"Messa {retailer_name} Order")
+            checkout_url = (
+                f"https://www.instacart.com/store/partner_recipes?"
+                f"title={encoded_title}&retailer={retailer_slug}&ingredients={encoded_ingredients}"
+            )
+            cart_provider = "instacart"
+            is_connected = False
 
         # Record in database
         await db.create_grocery_order(
             uid,
-            cart_provider="instacart",
+            cart_provider=cart_provider,
             store_name=retailer_name,
             items_count=len(enriched_items),
             estimated_total=round(estimated_total, 2),
@@ -427,15 +470,107 @@ def build_grocery_tools(user: config.UserContext, model: BaseChatModel | None = 
         # Update last_purchased_at for pantry items
         await db.record_pantry_restocked(uid, items)
 
-        # Format clean, SMS-friendly 1-tap summary
+        if is_connected:
+            lines = [
+                f"🛒 Instacart Cart Synced to Your Connected Account ({retailer_name}) -- {len(enriched_items)} items:",
+            ]
+            for it in enriched_items:
+                lines.append(f"• {it}")
+            lines.append(f"\nEstimated Subtotal: ~${estimated_total:.2f}")
+            lines.append(f"\n👉 [Open in your Instacart Account & Checkout ➔]({checkout_url})")
+            lines.append("Items are synced with your personal Instacart account, saved delivery address, and loyalty discounts.")
+        else:
+            lines = [
+                f"🛒 {retailer_name} 1-Tap Cart Staged ({len(enriched_items)} items):",
+            ]
+            for it in enriched_items:
+                lines.append(f"• {it}")
+            lines.append(f"\nEstimated Subtotal: ~${estimated_total:.2f}")
+            lines.append(f"\n👉 [Review Cart & Order with Apple Pay ➔]({checkout_url})")
+            lines.append("Tap the link above to review your items and checkout in 2 seconds via Apple Pay / FaceID.")
+            lines.append("\n💡 Tip: If you'd like grocery lists synced directly into your personal Instacart account, text 'Connect Instacart' anytime!")
+
+        return "\n".join(lines)
+
+    @tool
+    async def connect_instacart() -> str:
+        """Send a secure Composio 1-tap link to connect the user's personal Instacart account.
+        Once connected, grocery lists and carts are synced directly to their personal account
+        and loyalty cards, instead of the default out-of-the-box guest 1-tap checkout."""
+        active = await db.get_active_app_connection(uid, "instacart")
+        if active and active.get("connected_account_id"):
+            return "Your Instacart account is already connected to Messa! You can disconnect anytime by asking me to disconnect Instacart."
+        try:
+            from .integration_tools import send_connect_link
+            return await send_connect_link(user, "instacart")
+        except Exception as e:
+            return f"Couldn't start Instacart connection: {e}. You can continue using Guest 1-Tap checkout out of the box!"
+
+    @tool
+    async def disconnect_instacart() -> str:
+        """Disconnect the user's personal Instacart account, reverting to the default out-of-the-box
+        guest 1-tap Apple Pay checkout mode."""
+        active = await db.get_active_app_connection(uid, "instacart")
+        if not active or not active.get("connected_account_id"):
+            return "You are currently in Guest 1-Tap checkout mode (no personal Instacart account is connected)."
+        try:
+            from .integration_tools import _get_client
+            client = _get_client()
+            def _delete_sync():
+                client.connected_accounts.delete(active["connected_account_id"], revoke_on_delete=True)
+            await asyncio.to_thread(_delete_sync)
+        except Exception as e:
+            console.system(f"[grocery_agent] Composio disconnect error: {e}")
+        await db.disconnect_app_connection(active["id"])
+        return "Disconnected your personal Instacart account. Reverted to default Guest 1-Tap checkout mode."
+
+    @tool
+    async def get_nearby_grocery_stores(postal_code: str) -> str:
+        """Find grocery retailers delivering to a specific postal/zip code.
+        Uses Composio Instacart retailer discovery when connected, or matches local store directories."""
+        clean_zip = postal_code.strip()
+        active_connection = await db.get_active_app_connection(uid, "instacart")
+        if active_connection and config.COMPOSIO_API_KEY:
+            try:
+                from .integration_tools import _composio_user_id, _get_client
+                client = _get_client()
+                composio_uid = _composio_user_id(user)
+                def _fetch_retailers():
+                    kwargs: dict = {
+                        "slug": "INSTACART_GET_NEARBY_RETAILERS",
+                        "arguments": {"postal_code": clean_zip},
+                        "user_id": composio_uid,
+                    }
+                    if config.COMPOSIO_TOOLKIT_VERSION:
+                        kwargs["version"] = config.COMPOSIO_TOOLKIT_VERSION
+                    else:
+                        kwargs["dangerously_skip_version_check"] = True
+                    return client.tools.execute(**kwargs)
+
+                res = await asyncio.to_thread(_fetch_retailers)
+                if isinstance(res, dict) and res.get("data"):
+                    data = res["data"]
+                    if isinstance(data, list) and data:
+                        lines = [f"Nearby Retailers Delivering to {clean_zip}:"]
+                        for r in data[:6]:
+                            name = r.get("name") or r.get("retailer_name") or str(r)
+                            lines.append(f"• {name}")
+                        lines.append("\nTo stage a cart at any of these stores, just ask!")
+                        return "\n".join(lines)
+            except Exception as e:
+                console.system(f"[grocery_agent] Composio get_nearby_retailers error: {e}")
+
+        # Standard widespread partner retailers available across the US
         lines = [
-            f"🛒 {retailer_name} 1-Tap Cart Staged ({len(enriched_items)} items):",
+            f"Available Grocery Retailers for Zip {clean_zip}:",
+            "• Whole Foods Market (Delivery & Pickup)",
+            "• Sprouts Farmers Market (Delivery & Pickup)",
+            "• ALDI (Delivery & Curbside Pickup)",
+            "• Costco Wholesale (Member & Non-Member Delivery)",
+            "• Target (Delivery via Instacart)",
+            "• Kroger / Local Supermarket (Delivery)",
+            "\nTo build a cart at any store, just ask me (e.g. 'Get groceries from Whole Foods').",
         ]
-        for it in enriched_items:
-            lines.append(f"• {it}")
-        lines.append(f"\nEstimated Subtotal: ~${estimated_total:.2f}")
-        lines.append(f"\n👉 [Review Cart & Order with Apple Pay ➔]({checkout_url})")
-        lines.append("Tap the link above to review your items and checkout in 2 seconds via Apple Pay / FaceID.")
         return "\n".join(lines)
 
     @tool
@@ -623,6 +758,9 @@ def build_grocery_tools(user: config.UserContext, model: BaseChatModel | None = 
         generate_meal_plan,
         analyze_fridge_inventory,
         stage_instacart_cart,
+        connect_instacart,
+        disconnect_instacart,
+        get_nearby_grocery_stores,
         stage_restaurant_order,
         schedule_pantry_restock_capsule,
         track_package_and_schedule_return,
