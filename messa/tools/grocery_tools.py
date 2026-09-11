@@ -425,54 +425,89 @@ def build_grocery_tools(user: config.UserContext, model: BaseChatModel | None = 
 
         # Check if user has an active connected Instacart account (Composio)
         active_connection = await db.get_active_app_connection(uid, "instacart")
-        connected_url = None
-        if active_connection and config.COMPOSIO_API_KEY:
+        checkout_url = None
+        is_connected = False
+
+        if config.COMPOSIO_API_KEY:
             try:
                 from .integration_tools import _composio_user_id, _get_client
                 client = _get_client()
-                composio_uid = _composio_user_id(user)
 
-                def _execute_composio_cart():
-                    kwargs: dict = {
-                        "slug": "INSTACART_CREATE_SHOPPING_LIST_PAGE",
-                        "arguments": {
-                            "title": f"Messa {retailer_name} Order",
-                            "items": enriched_items,
-                        },
-                        "user_id": composio_uid,
-                    }
-                    if config.COMPOSIO_TOOLKIT_VERSION:
-                        kwargs["version"] = config.COMPOSIO_TOOLKIT_VERSION
-                    else:
-                        kwargs["dangerously_skip_version_check"] = True
-                    return client.tools.execute(**kwargs)
+                if active_connection:
+                    composio_uid = _composio_user_id(user)
+                    def _execute_composio_cart():
+                        kwargs: dict = {
+                            "slug": "INSTACART_CREATE_SHOPPING_LIST_PAGE",
+                            "arguments": {
+                                "title": f"Messa {retailer_name} Order",
+                                "line_items": [{"name": it} for it in enriched_items],
+                            },
+                            "user_id": composio_uid,
+                        }
+                        if config.COMPOSIO_TOOLKIT_VERSION:
+                            kwargs["version"] = config.COMPOSIO_TOOLKIT_VERSION
+                        else:
+                            kwargs["dangerously_skip_version_check"] = True
+                        return client.tools.execute(**kwargs)
 
-                composio_res = await asyncio.wait_for(
-                    asyncio.to_thread(_execute_composio_cart),
-                    timeout=6.0,
-                )
-                if hasattr(composio_res, "__await__"):
-                    composio_res = await composio_res
-                if isinstance(composio_res, dict):
-                    data = composio_res.get("data") or composio_res
-                    if isinstance(data, dict):
-                        connected_url = data.get("url") or data.get("link") or data.get("shopping_list_url")
+                    composio_res = await asyncio.wait_for(
+                        asyncio.to_thread(_execute_composio_cart),
+                        timeout=6.0,
+                    )
+                    if hasattr(composio_res, "__await__"):
+                        composio_res = await composio_res
+                    if isinstance(composio_res, dict):
+                        data = composio_res.get("data") or composio_res
+                        if isinstance(data, dict):
+                            checkout_url = data.get("url") or data.get("link") or data.get("shopping_list_url")
+                            if checkout_url:
+                                is_connected = True
+
+                # Guest Mode: Generate real live Instacart Shoppable Recipe Page via IDP (Zero Login)
+                if not checkout_url:
+                    def _execute_guest_recipe():
+                        kwargs: dict = {
+                            "slug": "INSTACART_CREATE_INSTACART_RECIPE_LINK",
+                            "arguments": {
+                                "title": f"Messa {retailer_name} Order",
+                                "question": f"Order {', '.join(enriched_items[:4])}",
+                                "ingredients": enriched_items,
+                                "instructions": ["Add ingredients to cart and proceed to checkout with Apple Pay"],
+                            },
+                            "user_id": "default",
+                        }
+                        if config.COMPOSIO_TOOLKIT_VERSION:
+                            kwargs["version"] = config.COMPOSIO_TOOLKIT_VERSION
+                        else:
+                            kwargs["dangerously_skip_version_check"] = True
+                        return client.tools.execute(**kwargs)
+
+                    recipe_res = await asyncio.wait_for(
+                        asyncio.to_thread(_execute_guest_recipe),
+                        timeout=6.0,
+                    )
+                    if hasattr(recipe_res, "__await__"):
+                        recipe_res = await recipe_res
+                    if isinstance(recipe_res, dict):
+                        data = recipe_res.get("data") or recipe_res
+                        if isinstance(data, dict):
+                            raw_url = data.get("url") or data.get("link")
+                            if raw_url:
+                                sep = "&" if "?" in raw_url else "?"
+                                checkout_url = f"{raw_url}{sep}retailer={retailer_slug}&retailer_key={retailer_slug}"
+
             except Exception as e:
-                console.system(f"[grocery_agent] Composio Instacart call failed ({e}), falling back to Guest 1-Tap link.")
+                console.system(f"[grocery_agent] Composio Instacart call failed ({e}), falling back to direct URL.")
 
-        if connected_url:
-            checkout_url = connected_url
-            cart_provider = "instacart_connected"
-            is_connected = True
-        else:
+        if not checkout_url:
             encoded_ingredients = urllib.parse.quote(",".join(enriched_items))
             encoded_title = urllib.parse.quote(f"Messa {retailer_name} Order")
             checkout_url = (
-                f"https://www.instacart.com/store/partner_recipes?"
-                f"title={encoded_title}&retailer={retailer_slug}&ingredients={encoded_ingredients}"
+                f"https://www.instacart.com/store/recipes/messa-order?"
+                f"title={encoded_title}&retailer={retailer_slug}&retailer_key={retailer_slug}&ingredients={encoded_ingredients}"
             )
-            cart_provider = "instacart"
-            is_connected = False
+
+        cart_provider = "instacart_connected" if is_connected else "instacart"
 
         # Record in database
         await db.create_grocery_order(
