@@ -1935,6 +1935,17 @@ PROJECT_MAX_EXPIRE_HOURS = float(os.environ.get("MESSA_PROJECT_MAX_EXPIRE_HOURS"
 # time, well after the user already said "yes."
 PROJECT_CAPSULE_TITLE_MAX_LENGTH = 200
 
+# ---- Autonomous Groceries & Lifestyle Concierge (migrations/042_grocery_agent.sql, groceries-agent.md) ----
+GROCERY_AGENT_ENABLED = os.environ.get("MESSA_GROCERY_AGENT_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+SPOONACULAR_API_KEY = os.environ.get("SPOONACULAR_API_KEY", "").strip()
+INSTACART_API_KEY = os.environ.get("INSTACART_API_KEY", "").strip()
+INSTACART_CLIENT_ID = os.environ.get("INSTACART_CLIENT_ID", "").strip()
+INSTACART_CLIENT_SECRET = os.environ.get("INSTACART_CLIENT_SECRET", "").strip()
+GROCERY_DEFAULT_STORE = os.environ.get("MESSA_GROCERY_DEFAULT_STORE", "whole_foods").strip()
+AFTERSHIP_API_KEY = os.environ.get("AFTERSHIP_API_KEY", "").strip()
+
 # ---- US-only launch gate (messa/region_gate.py) ----
 # This is a US-market-only launch: a brand-new phone number that isn't a
 # clean US E.164 number ("+1" then exactly 10 digits) gets a polite

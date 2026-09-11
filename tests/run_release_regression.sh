@@ -65,6 +65,7 @@ TESTS=(
   tests/test_v3_phase4_latency.py
   tests/test_v3_phase5_meeting_dossiers.py
   tests/test_v3_phase6_project_capsules.py
+  tests/test_v3_phase7_grocery_agent.py
 )
 
 PASSED=()

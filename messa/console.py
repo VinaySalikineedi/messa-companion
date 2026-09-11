@@ -25,6 +25,7 @@ COLORS = {
     "email_agent": "\033[93m",         # yellow
     "document_agent": "\033[96m",      # cyan
     "routines_agent": "\033[91m",      # red
+    "grocery_agent": "\033[92m",       # green
     "tool": "\033[90m",                # grey
     "system": "\033[90m",
 }

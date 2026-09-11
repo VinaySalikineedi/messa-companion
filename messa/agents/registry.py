@@ -71,6 +71,7 @@ from ..tools.call_tools import build_call_subagent
 from ..tools.email_tools import build_email_subagent
 from ..tools.executive_tools import _format_contact_line, build_executive_subagent
 from ..tools.integration_tools import app_category_for_toolkit, build_integration_subagent
+from ..tools.grocery_tools import build_grocery_subagent
 from ..tools.personal_inbox_tools import build_personal_inbox_subagent
 from ..tools.routines_tools import build_routines_subagent
 from ..tools.scratchpad_tools import build_scratchpad_tools, scratchpad_prompt_block
@@ -1133,6 +1134,7 @@ def _build_system_prompt(
         "something, and background tasks where YOU do something yourself and report back, "
         "e.g. watchers, deadline-aware follow-ups), integrations_agent (any other app -- "
         f"Reddit, Todoist, Slack, Notion, GitHub, Google Calendar, and 1,400+ more)"
+        f"{', grocery_agent (groceries, meal planning, recipes, pantry management, fridge vision inventory, Instacart 1-tap express checkout carts, restaurant takeout/pickup via DoorDash/Uber Eats, and lifestyle logistics)' if config.GROCERY_AGENT_ENABLED else ''}"
         f"{admin_agent_mention}."
         f"{parallel_delegation_note}\n\n"
         "Routing -- email, calendar, and tasks each have a NATIVE Messa tool and, once "
@@ -1159,7 +1161,8 @@ def _build_system_prompt(
         "you know of upcoming events that live only there.\n"
         "  - tasks: executive_assistant (Messa's own task list) vs integrations_agent (e.g. "
         "Todoist/Asana). Reminders are NOT part of this -- always executive_assistant, no "
-        "connected-app equivalent exists.\n\n"
+        "connected-app equivalent exists.\n"
+        f"{'  - food & groceries: delegate to grocery_agent for meal planning, recipe ideas, pantry restocking, fridge inventory photos, building Instacart carts, restaurant takeout orders, or package returns.\\n' if config.GROCERY_AGENT_ENABLED else ''}\n"
         "Switching or disconnecting a connected app: there's NO settings/integrations page for "
         "the user to do this themselves -- never say there is. Do it directly: to switch accounts, call "
         "request_email_connection/connect_integration_app with switch_account=True (disconnects "
@@ -1436,6 +1439,11 @@ async def build_orchestrator(
             approval_gate,
         ),
     ]
+
+    if config.GROCERY_AGENT_ENABLED:
+        subagents.append(
+            build_grocery_subagent(user, _subagent_model_for("grocery_agent"), approval_gate)
+        )
 
     # Admin-only, and only ever added here -- a non-admin's subagents list
     # simply never contains this entry, so there's no tool/delegation path

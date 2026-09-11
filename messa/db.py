@@ -5546,3 +5546,199 @@ async def pop_pending_post_meeting_note(user_id: int) -> dict[str, Any] | None:
             )
             return None
         return dict(row)
+
+
+# ---------------------------------------------------------------------------
+# Autonomous Groceries & Lifestyle Concierge (migrations/042_grocery_agent.sql,
+# groceries-agent.md, messa/tools/grocery_tools.py).
+# ---------------------------------------------------------------------------
+
+async def get_user_dietary_profile(user_id: int) -> dict[str, Any] | None:
+    """Reads household dietary profile (allergies, diets, store preferences).
+    Returns None pre-migration-042 or when no profile has been saved yet."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_dietary_profiles"):
+            return None
+        row = await conn.fetchrow("SELECT * FROM user_dietary_profiles WHERE user_id = $1", user_id)
+        return dict(row) if row else None
+
+
+async def upsert_user_dietary_profile(
+    user_id: int,
+    *,
+    dietary_flags: list[str] | None = None,
+    allergies: list[str] | None = None,
+    disliked_ingredients: list[str] | None = None,
+    household_size: int | None = None,
+    preferred_store: str | None = None,
+) -> dict[str, Any] | None:
+    """Creates or updates a user's dietary profile. Preserves existing values
+    for any fields not explicitly passed in."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_dietary_profiles"):
+            return None
+        existing = await conn.fetchrow("SELECT * FROM user_dietary_profiles WHERE user_id = $1", user_id)
+        if existing:
+            flags = dietary_flags if dietary_flags is not None else (existing.get("dietary_flags") or [])
+            al = allergies if allergies is not None else (existing.get("allergies") or [])
+            disliked = disliked_ingredients if disliked_ingredients is not None else (existing.get("disliked_ingredients") or [])
+            hsize = household_size if household_size is not None else (existing.get("household_size") or 1)
+            store = preferred_store if preferred_store is not None else (existing.get("preferred_store") or "whole_foods")
+            row = await conn.fetchrow(
+                """
+                UPDATE user_dietary_profiles
+                SET dietary_flags = $2, allergies = $3, disliked_ingredients = $4,
+                    household_size = $5, preferred_store = $6, updated_at = NOW()
+                WHERE user_id = $1
+                RETURNING *
+                """,
+                user_id, flags, al, disliked, hsize, store,
+            )
+        else:
+            flags = dietary_flags or []
+            al = allergies or []
+            disliked = disliked_ingredients or []
+            hsize = household_size or 1
+            store = preferred_store or "whole_foods"
+            row = await conn.fetchrow(
+                """
+                INSERT INTO user_dietary_profiles
+                    (user_id, dietary_flags, allergies, disliked_ingredients, household_size, preferred_store)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING *
+                """,
+                user_id, flags, al, disliked, hsize, store,
+            )
+        return dict(row) if row else None
+
+
+async def list_pantry_items(user_id: int) -> list[dict[str, Any]]:
+    """Returns the user's pantry inventory/staples. Returns [] pre-migration-042."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_pantry_items"):
+            return []
+        rows = await conn.fetch(
+            "SELECT * FROM user_pantry_items WHERE user_id = $1 ORDER BY category, item_name",
+            user_id,
+        )
+        return [dict(r) for r in rows]
+
+
+async def upsert_pantry_item(
+    user_id: int,
+    *,
+    item_name: str,
+    category: str = "staple",
+    preferred_brand: str | None = None,
+    restock_frequency_days: int | None = None,
+) -> dict[str, Any] | None:
+    """Adds or updates a pantry staple for the user. Matches case-insensitively on item_name."""
+    cleaned_name = item_name.strip()
+    if not cleaned_name:
+        return None
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_pantry_items"):
+            return None
+        existing = await conn.fetchrow(
+            "SELECT id FROM user_pantry_items WHERE user_id = $1 AND LOWER(item_name) = LOWER($2)",
+            user_id, cleaned_name,
+        )
+        if existing:
+            row = await conn.fetchrow(
+                """
+                UPDATE user_pantry_items
+                SET item_name = $3, category = $4,
+                    preferred_brand = COALESCE($5, preferred_brand),
+                    restock_frequency_days = COALESCE($6, restock_frequency_days)
+                WHERE id = $1 AND user_id = $2
+                RETURNING *
+                """,
+                existing["id"], user_id, cleaned_name, category, preferred_brand, restock_frequency_days,
+            )
+        else:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO user_pantry_items
+                    (user_id, item_name, category, preferred_brand, restock_frequency_days)
+                VALUES ($1, $2, $3, $4, $5)
+                RETURNING *
+                """,
+                user_id, cleaned_name, category, preferred_brand, restock_frequency_days,
+            )
+        return dict(row) if row else None
+
+
+async def remove_pantry_item(user_id: int, item_name: str) -> bool:
+    """Removes a pantry staple by name (case-insensitive)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_pantry_items"):
+            return False
+        res = await conn.execute(
+            "DELETE FROM user_pantry_items WHERE user_id = $1 AND LOWER(item_name) = LOWER($2)",
+            user_id, item_name.strip(),
+        )
+        return "DELETE 0" not in str(res)
+
+
+async def record_pantry_restocked(user_id: int, item_names: list[str]) -> int:
+    """Updates last_purchased_at to now for restocked pantry items."""
+    if not item_names:
+        return 0
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_pantry_items"):
+            return 0
+        cleaned = [n.strip().lower() for n in item_names if n.strip()]
+        res = await conn.execute(
+            "UPDATE user_pantry_items SET last_purchased_at = NOW() WHERE user_id = $1 AND LOWER(item_name) = ANY($2)",
+            user_id, cleaned,
+        )
+        try:
+            return int(str(res).split()[-1])
+        except Exception:
+            return 0
+
+
+async def create_grocery_order(
+    user_id: int,
+    *,
+    cart_provider: str,
+    store_name: str,
+    items_count: int,
+    estimated_total: float | None,
+    checkout_url: str,
+    status: str = "staged",
+) -> dict[str, Any] | None:
+    """Records a staged or completed grocery/takeout order with its 1-tap checkout link."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "grocery_orders"):
+            return None
+        row = await conn.fetchrow(
+            """
+            INSERT INTO grocery_orders
+                (user_id, cart_provider, store_name, items_count, estimated_total, checkout_url, status)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING *
+            """,
+            user_id, cart_provider, store_name, items_count, estimated_total, checkout_url, status,
+        )
+        return dict(row) if row else None
+
+
+async def list_grocery_orders(user_id: int, limit: int = 5) -> list[dict[str, Any]]:
+    """Returns recent grocery or food orders for the user."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "grocery_orders"):
+            return []
+        rows = await conn.fetch(
+            "SELECT * FROM grocery_orders WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2",
+            user_id, limit,
+        )
+        return [dict(r) for r in rows]
