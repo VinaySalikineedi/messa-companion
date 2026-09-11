@@ -545,7 +545,7 @@ BROWSER_PROVIDER = os.environ.get("MESSA_BROWSER_PROVIDER", "browserbase").strip
 # Kernel credentials and endpoint (https://kernel.sh). Used when BROWSER_PROVIDER="kernel".
 # Free tier includes $5/mo credits and built-in stealth residential proxies.
 KERNEL_API_KEY = os.environ.get("KERNEL_API_KEY")
-KERNEL_BASE_URL = os.environ.get("KERNEL_BASE_URL", "https://api.kernel.sh/v1").rstrip("/")
+KERNEL_BASE_URL = os.environ.get("KERNEL_BASE_URL", "https://api.onkernel.com").rstrip("/")
 
 # When running on Browserbase: whether to route traffic through US residential proxies
 # to prevent bot detection (e.g. Walmart's "Press and Hold" PerimeterX challenge).

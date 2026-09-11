@@ -39,7 +39,7 @@ def check(label: str, cond: bool) -> None:
 def test_config_defaults() -> None:
     print("\n--- TEST 1: Config Defaults ---")
     check("BROWSER_PROVIDER defaults to 'browserbase'", config.BROWSER_PROVIDER == "browserbase")
-    check("KERNEL_BASE_URL is 'https://api.kernel.sh/v1'", config.KERNEL_BASE_URL == "https://api.kernel.sh/v1")
+    check("KERNEL_BASE_URL is 'https://api.onkernel.com'", config.KERNEL_BASE_URL == "https://api.onkernel.com")
     check("BROWSERBASE_USE_RESIDENTIAL_PROXIES is a bool (True)", config.BROWSERBASE_USE_RESIDENTIAL_PROXIES is True)
 
 

@@ -23,7 +23,7 @@ import httpx
 
 from .. import config
 
-BASE_URL = config.KERNEL_BASE_URL or "https://api.kernel.sh/v1"
+BASE_URL = getattr(config, "KERNEL_BASE_URL", None) or "https://api.onkernel.com"
 
 
 class KernelError(RuntimeError):
