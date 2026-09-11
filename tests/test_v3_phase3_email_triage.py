@@ -156,8 +156,10 @@ def install_fake_pool(conn):
 
 async def part1_classify_heuristic():
     real_flag = config.USER_LISTS_ENABLED
+    real_llm_flag = config.EMAIL_TRIAGE_LLM_ENABLED
     try:
         config.USER_LISTS_ENABLED = False
+        config.EMAIL_TRIAGE_LLM_ENABLED = False
 
         tier = await email_triage.classify_inbound_email(
             1, "no-reply@amazon.com", "Your order has shipped", "Package on its way!",
@@ -214,8 +216,25 @@ async def part1_classify_heuristic():
         )
         check("classify: RFC 2822 'Display Name <addr>' extracts localpart correctly -> 'daily'",
               tier == email_triage.TIER_DAILY)
+
+        # Smart regex fix: footer at the very tail of a long email (>5000 chars) is caught
+        long_body = "Product info and updates here... " * 150 + "\n\nTo stop receiving these, please Unsubscribe."
+        tier = await email_triage.classify_inbound_email(
+            1, "marketing@explorium.ai", "New AI Platform Release", long_body,
+        )
+        check("classify: footer unsubscribe at the end of long body (>5k chars) -> 'weekly'",
+              tier == email_triage.TIER_WEEKLY)
+
+        # Smart regex fix: mass ESP sending domain (HubSpot, Mailchimp) recognized
+        tier = await email_triage.classify_inbound_email(
+            1, "campaign-12345@bf03.hubspotemail.net", "Vibe Plugin for Claude", "Check this out",
+        )
+        check("classify: bulk ESP sending domain (hubspotemail.net) -> 'weekly'",
+              tier == email_triage.TIER_WEEKLY)
+
     finally:
         config.USER_LISTS_ENABLED = real_flag
+        config.EMAIL_TRIAGE_LLM_ENABLED = real_llm_flag
 
 
 # ---------------------------------------------------------------------------
@@ -570,9 +589,12 @@ async def part7_webhook_wiring():
     server._process_inbound_personal_email = fake_process
     db.enqueue_email_digest_item = fake_enqueue
 
+    real_llm_flag = config.EMAIL_TRIAGE_LLM_ENABLED
+
     try:
         config.EMAIL_TRIAGE_ENABLED = True
         config.USER_LISTS_ENABLED = True
+        config.EMAIL_TRIAGE_LLM_ENABLED = False
 
         # 7a: a VIP-looking (ordinary human) sender -- behaves exactly as
         # before this feature: the notification turn is spawned, nothing
@@ -659,11 +681,108 @@ async def part7_webhook_wiring():
         config.PERSONAL_EMAIL_WEBHOOK_SECRET = real_secret
         config.EMAIL_TRIAGE_ENABLED = real_triage_flag
         config.USER_LISTS_ENABLED = real_lists_flag
+        config.EMAIL_TRIAGE_LLM_ENABLED = real_llm_flag
         db.get_user_by_messa_email_local_part = real_get_user
         db.log_inbound_personal_email = real_log
         db.resolve_otp_expectation_from_email = real_resolve_otp
         server._process_inbound_personal_email = real_process
         db.enqueue_email_digest_item = real_enqueue
+
+
+# ---------------------------------------------------------------------------
+# Part 8: LLM classification, asymmetric safety guardrails, and fallback
+# ---------------------------------------------------------------------------
+
+class FakeModelResponse:
+    def __init__(self, content: str):
+        self.content = content
+
+
+class FakeLLM:
+    def __init__(self, response_content: str | None = None, should_raise: bool = False):
+        self.response_content = response_content
+        self.should_raise = should_raise
+        self.invoked_calls: list = []
+
+    async def ainvoke(self, messages) -> FakeModelResponse:
+        self.invoked_calls.append(messages)
+        if self.should_raise:
+            raise RuntimeError("Rate limit exceeded on OpenRouter (HTTP 429)")
+        return FakeModelResponse(self.response_content or "")
+
+
+async def part8_llm_classification_and_fallback():
+    real_build_model = config.build_model
+    real_llm_flag = config.EMAIL_TRIAGE_LLM_ENABLED
+    real_openrouter_key = getattr(config, "OPENROUTER_API_KEY", None)
+    real_user_lists = config.USER_LISTS_ENABLED
+
+    try:
+        config.EMAIL_TRIAGE_LLM_ENABLED = True
+        config.USER_LISTS_ENABLED = False
+        config.OPENROUTER_API_KEY = "sk-fake-key"
+
+        # 8a: LLM succeeds and classifies as weekly marketing
+        fake_llm = FakeLLM(
+            '{"tier": "weekly", "is_automated_or_marketing": true, "reason": "Explorium sales prospecting blast"}'
+        )
+        config.build_model = lambda *a, **kw: fake_llm
+
+        tier = await email_triage.classify_inbound_email(
+            1, "sales@vendor.com", "Double your pipeline today", "Check out our new AI tools",
+        )
+        check("LLM success: classifies promotional email as 'weekly'", tier == email_triage.TIER_WEEKLY)
+        check("LLM success: model was actually invoked", len(fake_llm.invoked_calls) == 1)
+
+        # 8b: LLM wraps response in markdown ```json ... ```
+        fake_llm = FakeLLM(
+            '```json\n{"tier": "daily", "is_automated_or_marketing": true, "reason": "Order tracking"}\n```'
+        )
+        config.build_model = lambda *a, **kw: fake_llm
+
+        tier = await email_triage.classify_inbound_email(
+            1, "orders@store.com", "Your package is on its way", "Tracking #12345",
+        )
+        check("LLM markdown unwrapping: parses ```json wrapped output as 'daily'", tier == email_triage.TIER_DAILY)
+
+        # 8c: Asymmetric safety rule: model says is_automated_or_marketing = false -> promotes to VIP
+        fake_llm = FakeLLM(
+            '{"tier": "weekly", "is_automated_or_marketing": false, "reason": "Unsure if cold pitch or real colleague"}'
+        )
+        config.build_model = lambda *a, **kw: fake_llm
+
+        tier = await email_triage.classify_inbound_email(
+            1, "someone@company.com", "Quick question regarding our meeting", "Hey Vinay",
+        )
+        check("Asymmetric safety rule: uncertain/non-automated promotes to 'vip'", tier == email_triage.TIER_VIP)
+
+        # 8d: LLM rate limit / timeout / exception -> falls back to smart regex cleanly
+        fake_llm = FakeLLM(should_raise=True)
+        config.build_model = lambda *a, **kw: fake_llm
+
+        # Notice this sender is from hubspotemail.net with an unsubscribe footer at the tail
+        long_body = "Promo content here... " * 100 + "\n\nUnsubscribe from these emails."
+        tier = await email_triage.classify_inbound_email(
+            1, "blast@bf03.hubspotemail.net", "Vibe Plugin + Claude Code", long_body,
+        )
+        check("LLM failure fallback: catches rate-limit exception and falls back to smart regex -> 'weekly'",
+              tier == email_triage.TIER_WEEKLY)
+
+        # 8e: LLM returns completely invalid / empty JSON -> falls back to smart regex cleanly
+        fake_llm = FakeLLM(response_content="Sorry, I am unable to classify this.")
+        config.build_model = lambda *a, **kw: fake_llm
+
+        tier = await email_triage.classify_inbound_email(
+            1, "no-reply@amazon.com", "Your order has shipped", "Delivering tomorrow",
+        )
+        check("LLM invalid JSON fallback: falls back to smart regex -> 'daily'",
+              tier == email_triage.TIER_DAILY)
+
+    finally:
+        config.build_model = real_build_model
+        config.EMAIL_TRIAGE_LLM_ENABLED = real_llm_flag
+        config.OPENROUTER_API_KEY = real_openrouter_key
+        config.USER_LISTS_ENABLED = real_user_lists
 
 
 async def main() -> None:
@@ -674,6 +793,7 @@ async def main() -> None:
     await part5_render_and_clear()
     await part6_vip_registry_tools()
     await part7_webhook_wiring()
+    await part8_llm_classification_and_fallback()
 
     if failures:
         print(f"\n{len(failures)} FAILURE(S): {failures}")

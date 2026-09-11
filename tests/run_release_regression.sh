@@ -70,12 +70,17 @@ TESTS=(
 PASSED=()
 FAILED=()
 
+PYTHON_BIN="python3"
+if [ -x "./venv/bin/python" ]; then
+  PYTHON_BIN="./venv/bin/python"
+fi
+
 for t in "${TESTS[@]}"; do
   echo ""
   echo "=================================================================="
   echo "RUNNING: $t"
   echo "=================================================================="
-  if python3 "$t"; then
+  if $PYTHON_BIN "$t"; then
     PASSED+=("$t")
   else
     FAILED+=("$t")
@@ -86,7 +91,9 @@ echo ""
 echo "=================================================================="
 echo "SUMMARY: ${#PASSED[@]} passed, ${#FAILED[@]} failed"
 for t in "${PASSED[@]}"; do echo "  [PASS] $t"; done
-for t in "${FAILED[@]}"; do echo "  [FAIL] $t"; done
+if [ "${#FAILED[@]}" -gt 0 ]; then
+  for t in "${FAILED[@]}"; do echo "  [FAIL] $t"; done
+fi
 echo "=================================================================="
 
 if [ "${#FAILED[@]}" -gt 0 ]; then
