@@ -119,6 +119,19 @@ def part1_split_into_texts():
     check("re-merging overflow into the last chunk doesn't lose any paragraph's content",
           all(f"paragraph number {i}" in "\n".join(chunks3) for i in range(10)))
 
+    # URL isolation for rich preview cards in iMessage / SMS
+    cart_url = "https://www.instacart.com/store/recipes/23033553-messa-publix-order?retailer=publix"
+    publix_msg = f"Here's your Publix cart link:\n\n{cart_url}\n\nIt's got 1 gallon whole milk and 1 dozen large eggs."
+    url_chunks = cli._split_into_texts(publix_msg)
+    check("message with embedded URL splits so URL is in its own standalone chunk",
+          cart_url in url_chunks)
+    check("URL chunk contains ONLY the URL (no surrounding text or punctuation)",
+          any(c == cart_url for c in url_chunks))
+    check("standalone single URL returns as single-item list",
+          cli._split_into_texts(cart_url) == [cart_url])
+    check("markdown link is expanded and URL is isolated",
+          cart_url in cli._split_into_texts(f"Review your cart: [Publix Link]({cart_url}). Ready to order."))
+
 
 # --- Part 2: _on_ai_message's per-chunk send/usage-consumption behavior ---
 

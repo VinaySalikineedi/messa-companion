@@ -79,26 +79,51 @@ _GUARDRAIL_LENGTH_THRESHOLD = 320  # ~2 SMS segments -- tunable.
 _SPLIT_TARGET_CHARS = 200  # ~one comfortable text-message bubble
 _SPLIT_MAX_PARTS = 4  # a message needing more pieces than this should have been shortened upstream instead
 _SENTENCE_BOUNDARY_PATTERN = re.compile(r"(?<=[.!?])\s+")
+_URL_PATTERN = re.compile(r"(https?://[^\s)\]]+)", re.IGNORECASE)
+_MARKDOWN_LINK_PATTERN = re.compile(r"\[([^\]]+)\]\((https?://[^\s)]+)\)")
 
 
-def _split_into_texts(msg_text: str) -> list[str]:
-    """Splits a long reply into a handful of shorter texts of roughly even
-    size, or returns it as a single-item list unchanged when it's already
-    short -- the common case, which is the overwhelming majority of
-    replies, costs nothing here (one length check, no regex work at all).
+def _extract_url_chunks(msg_text: str) -> list[str]:
+    """Isolates URLs from surrounding text into their own standalone chunks
+    so Apple iMessage unfurls rich preview cards instead of treating them
+    as inline plain hyperlinks."""
+    if not msg_text:
+        return []
 
-    Splits on blank-line paragraph breaks first (the same "short paragraphs
-    separated by a blank line" shape the persona prompt already asks the
-    model to write in -- see agents/registry.py), which are already the
-    natural seams a person texting several bubbles in a row would break at.
-    Falls back to sentence boundaries only when there are no such breaks to
-    use (a single dense paragraph), so a reply still gets broken up
-    sensibly rather than not split at all. Never splits mid-sentence or
-    mid-word. Caps at _SPLIT_MAX_PARTS pieces -- past that, re-merges the
-    tail into the last chunk rather than fragmenting into a long stream of
-    texts, since a reply needing that many pieces means the guardrail
-    should have compressed it harder upstream, not that splitting should
-    keep going indefinitely."""
+    # Unpack markdown links like [Review Cart ➔](https://...) -> Review Cart ➔ \n\n https://...
+    cleaned = _MARKDOWN_LINK_PATTERN.sub(r"\1\n\n\2", msg_text)
+
+    matches = list(_URL_PATTERN.finditer(cleaned))
+    if not matches:
+        return []
+
+    # If the message is strictly just a single URL (e.g. "https://example.com"), keep as-is
+    if len(matches) == 1 and matches[0].group(0).strip() == cleaned.strip():
+        return [cleaned.strip()]
+
+    chunks: list[str] = []
+    last_idx = 0
+    for match in matches:
+        raw_url = match.group(0)
+        url = raw_url.rstrip(".,;:!?)>]}\"'")
+        trailing_len = len(raw_url) - len(url)
+        pre = cleaned[last_idx : match.start()].strip()
+        if pre:
+            chunks.append(pre)
+        chunks.append(url)
+        last_idx = match.end() - trailing_len
+
+    post = cleaned[last_idx:].strip().lstrip(".,;:!?)>]}\"'").strip()
+    if post:
+        chunks.append(post)
+
+    return chunks
+
+
+def _split_text_block(msg_text: str) -> list[str]:
+    """Splits a text block (with no URLs) into a handful of shorter texts of
+    roughly even size, or returns it as a single-item list unchanged when
+    it's already short."""
     if not msg_text or len(msg_text) <= _GUARDRAIL_LENGTH_THRESHOLD:
         return [msg_text] if msg_text else []
 
@@ -124,6 +149,34 @@ def _split_into_texts(msg_text: str) -> list[str]:
         head, tail = chunks[: _SPLIT_MAX_PARTS - 1], chunks[_SPLIT_MAX_PARTS - 1 :]
         chunks = head + [" ".join(tail)]
     return chunks or [msg_text]
+
+
+def _split_into_texts(msg_text: str) -> list[str]:
+    """Splits a reply into a handful of shorter texts of roughly even size,
+    or returns it as a single-item list unchanged when it's already short.
+
+    If the reply contains one or more HTTP/HTTPS URLs, extracts every URL
+    into its own standalone text bubble so Apple iMessage (and modern messaging
+    clients) can reliably unfurl rich link cards (with photo, title, and domain)
+    instead of falling back to inline plain-text hyperlinks.
+
+    Splits text blocks on blank-line paragraph breaks first, falling back to
+    sentence boundaries only when there are no such breaks. Caps non-URL chunks
+    at _SPLIT_MAX_PARTS pieces."""
+    if not msg_text:
+        return []
+
+    url_chunks = _extract_url_chunks(msg_text)
+    if url_chunks:
+        final_chunks: list[str] = []
+        for chunk in url_chunks:
+            if _URL_PATTERN.fullmatch(chunk):
+                final_chunks.append(chunk)
+            else:
+                final_chunks.extend(_split_text_block(chunk))
+        return final_chunks
+
+    return _split_text_block(msg_text)
 
 
 async def _apply_reply_guardrail(msg_text: str) -> str:

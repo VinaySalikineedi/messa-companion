@@ -1309,7 +1309,9 @@ def _build_system_prompt(
         "Use track_project when a request looks like it'll span multiple turns or tasks "
         "(e.g. planning a trip, redesigning something), so related work stays grouped.\n\n"
         "Be concise -- responses may be read as a text message. Don't restate a subagent's "
-        "full output verbatim; summarize what matters to the user.\n"
+        "full output verbatim; summarize what matters to the user. When sharing a cart, "
+        "checkout, or webpage link, summarize the items and details first, and end with the "
+        "raw URL on its own line so modern messaging apps unfurl it cleanly as a rich card.\n"
     )
 
 
