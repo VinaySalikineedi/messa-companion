@@ -407,8 +407,11 @@ async def part4_webhook_wiring():
     db.resolve_otp_expectation_from_email = fake_resolve_otp
     server._process_inbound_personal_email = fake_process
 
+    real_triage = getattr(config, "EMAIL_TRIAGE_ENABLED", False)
+
     try:
         config.USER_LISTS_ENABLED = True
+        config.EMAIL_TRIAGE_ENABLED = False
 
         # 4a: a MUTED sender -- durably logged (fake_log still ran), but
         # the notification turn is never spawned.
@@ -471,6 +474,7 @@ async def part4_webhook_wiring():
     finally:
         config.PERSONAL_EMAIL_WEBHOOK_SECRET = real_secret
         config.USER_LISTS_ENABLED = real_flag
+        config.EMAIL_TRIAGE_ENABLED = real_triage
         db.get_user_by_messa_email_local_part = real_get_user
         db.log_inbound_personal_email = real_log
         db.resolve_otp_expectation_from_email = real_resolve_otp

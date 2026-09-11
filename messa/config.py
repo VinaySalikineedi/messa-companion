@@ -913,6 +913,15 @@ USER_LISTS_ENABLED = os.environ.get("MESSA_USER_LISTS_ENABLED", "true").strip().
 EMAIL_TRIAGE_ENABLED = os.environ.get("MESSA_EMAIL_TRIAGE_ENABLED", "true").strip().lower() in (
     "1", "true", "yes", "on",
 )
+EMAIL_TRIAGE_MODEL_NAME = os.environ.get(
+    "MESSA_EMAIL_TRIAGE_MODEL", "openrouter/free"
+).strip()
+EMAIL_TRIAGE_LLM_ENABLED = os.environ.get(
+    "MESSA_EMAIL_TRIAGE_LLM_ENABLED", "true"
+).strip().lower() in ("1", "true", "yes", "on")
+EMAIL_TRIAGE_TIMEOUT_SECONDS = float(
+    os.environ.get("MESSA_EMAIL_TRIAGE_TIMEOUT_SECONDS", "20.0")
+)
 
 # ---- V3-autonomous.md Phase 4: Subagent Concurrency & Latency Drop.
 # Three related latency optimizations under one flag, deliberately NOT new

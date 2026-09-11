@@ -28,6 +28,8 @@ by) anything that runs a model turn.
 """
 from __future__ import annotations
 
+import asyncio
+import json
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -35,11 +37,21 @@ from zoneinfo import ZoneInfo
 
 from email.utils import parseaddr
 
-from . import config, db
+from . import config, console, db
 
 TIER_VIP = "vip"
 TIER_DAILY = "daily"    # rolled into the next morning_briefing
 TIER_WEEKLY = "weekly"  # rolled into the next Sunday-evening evening_briefing
+
+# Known mass-marketing / bulk email service provider (ESP) domains.
+# An email received directly from one of these is unequivocally an automated blast,
+# not a direct human-to-human personal correspondence.
+_BULK_ESP_DOMAIN_RE = re.compile(
+    r"@([a-z0-9\-_]+\.)?(hubspotemail\.net|mcsv\.net|mailchimpapp\.net|sendgrid\.net|"
+    r"klaviyomail\.com|marketo\.org|sailthru\.com|cmail\d+\.com|bmsend\.com|"
+    r"constantcontact\.com|e\.customeriomail\.com|intercom-mail\.com)$",
+    re.IGNORECASE,
+)
 
 # A sender local-part shaped like an automated mailbox -- not proof of
 # anything on its own (both a receipt and a marketing blast commonly come
@@ -56,9 +68,8 @@ _AUTOMATED_LOCALPART_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Marketing/promotional signals -- checked against the subject plus a
-# capped slice of the body (a footer's "unsubscribe" line is enough on its
-# own; there's no need to scan an entire long email to find it).
+# Marketing/promotional signals -- checked against the subject plus the
+# head and tail of the body (where footers and unsubscribe links reside).
 _MARKETING_RE = re.compile(
     r"unsubscribe|opt.?out|view (this|it) in (your )?browser|"
     r"manage (your )?(email )?preferences|update (your )?(email )?preferences|"
@@ -91,34 +102,113 @@ def _local_part(from_address: str) -> str:
     return (addr.split("@", 1)[0] if "@" in addr else addr).strip()
 
 
-async def classify_inbound_email(user_id: int, from_address: str, subject: str, body_text: str) -> str:
-    """Returns TIER_VIP / TIER_DAILY / TIER_WEEKLY for one inbound personal
-    email. Order of checks:
+def _classify_with_smart_regex(from_address: str, subject: str, body_text: str) -> str:
+    """Deterministic, zero-token regex/keyword classifier fallback.
+    Checks subject, head, and tail of the email body where footers reside."""
+    subject = subject or ""
+    body_text = body_text or ""
+    # Check subject, head (first 1500 chars), AND tail (last 2500 chars) for unsubscribe links
+    head = body_text[:1500]
+    tail = body_text[-2500:] if len(body_text) > 1500 else ""
+    haystack = f"{subject}\n{head}\n{tail}"
 
-    1. db.is_vip_sender override -- the user has explicitly said this
-       sender should always be instant, regardless of what it looks like.
-    2. Receipt/update signal in the subject -- highest-confidence
-       "this is a transactional email" check, so it wins even if a
-       marketing-shaped phrase also happens to appear in the body.
-    3. Marketing signal anywhere in subject+body.
-    4. Automated-looking local part with no specific marketing/receipt
-       match -- ambiguous, resolves to 'daily' (the safer, sooner tier).
-    5. Otherwise: TIER_VIP -- doesn't look automated at all, treated as a
-       real person (today's exact behavior)."""
+    # 1. Receipt/update signal in the subject wins
+    if _RECEIPT_UPDATE_RE.search(subject):
+        return TIER_DAILY
+    # 2. Marketing signal anywhere in subject, hero, or footer
+    if _MARKETING_RE.search(haystack):
+        return TIER_WEEKLY
+    # 3. Known bulk marketing ESP relay domain (e.g. HubSpot, Mailchimp)
+    if _BULK_ESP_DOMAIN_RE.search(from_address):
+        return TIER_WEEKLY
+    # 4. Automated mailbox localpart
+    if _AUTOMATED_LOCALPART_RE.match(_local_part(from_address)):
+        return TIER_DAILY
+    # 5. Default safe: treat as real human
+    return TIER_VIP
+
+
+async def _classify_with_llm(from_address: str, subject: str, body_text: str) -> str | None:
+    """Classifies inbound email using an isolated, fast micro-model call.
+    Returns TIER_VIP, TIER_DAILY, TIER_WEEKLY, or None on any failure/timeout.
+    """
+    if not getattr(config, "EMAIL_TRIAGE_LLM_ENABLED", True):
+        return None
+    if not getattr(config, "OPENROUTER_API_KEY", None):
+        return None
+
+    try:
+        model = config.build_model(
+            config.EMAIL_TRIAGE_MODEL_NAME,
+            api_key=config.api_key_for_agent("email_triage") if hasattr(config, "api_key_for_agent") else None,
+        )
+        system_prompt = (
+            "You are an executive email gatekeeper for a personal AI concierge. "
+            "Your job is to categorize incoming emails to protect the user from interruption while "
+            "ensuring important human messages are NEVER delayed or hidden.\n\n"
+            "Categories:\n"
+            "- 'vip': Real human communication written directly to the user (work, personal, clients, "
+            "inquiries, high-priority opportunities, investors), or any email you are unsure about.\n"
+            "- 'daily': Automated transactional updates: shipping notices, receipts, security codes, "
+            "account notifications, appointment/booking reminders.\n"
+            "- 'weekly': Marketing promos, sales pitches, newsletters, product announcements, "
+            "cold sales outreach, automated prospecting blasts, webinar invites, bulk discounts.\n\n"
+            "CRITICAL SAFETY RULE: If there is ANY doubt or ambiguity whether this is a real human writing to the user, "
+            "you MUST classify as 'vip'. Never classify as 'weekly' or 'daily' unless you are confident it is machine-generated or promotional.\n\n"
+            "Respond ONLY with a JSON object:\n"
+            '{"tier": "vip" | "daily" | "weekly", "is_automated_or_marketing": true | false, "reason": "short explanation"}'
+        )
+        excerpt_head = body_text[:1200]
+        excerpt_tail = body_text[-1000:] if len(body_text) > 1200 else ""
+        user_content = (
+            f"From: {from_address}\n"
+            f"Subject: {subject or '(no subject)'}\n"
+            f"Body excerpt:\n{excerpt_head}\n---\n{excerpt_tail}"
+        )
+        response = await asyncio.wait_for(
+            model.ainvoke([
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_content},
+            ]),
+            timeout=config.EMAIL_TRIAGE_TIMEOUT_SECONDS,
+        )
+        content = getattr(response, "content", "")
+        if isinstance(content, list):
+            content = " ".join(str(c.get("text", c)) if isinstance(c, dict) else str(c) for c in content)
+        content = str(content).strip()
+        if content.startswith("```"):
+            content = re.sub(r"^```(?:json)?\s*", "", content)
+            content = re.sub(r"\s*```$", "", content)
+        parsed = json.loads(content)
+        tier = str(parsed.get("tier", "")).lower().strip()
+        is_automated = parsed.get("is_automated_or_marketing")
+        if tier in (TIER_VIP, TIER_DAILY, TIER_WEEKLY):
+            if tier == TIER_VIP or is_automated is False:
+                return TIER_VIP
+            return tier
+    except Exception as e:
+        console.system(f"[email_triage] LLM classification error ({e}); falling back to smart regex")
+        return None
+    return None
+
+
+async def classify_inbound_email(user_id: int, from_address: str, subject: str, body_text: str) -> str:
+    """Returns TIER_VIP / TIER_DAILY / TIER_WEEKLY for one inbound personal email.
+    Order of checks:
+    1. db.is_vip_sender override (explicit user preference).
+    2. Micro-model LLM classification with asymmetric human bias.
+    3. Fallback to smart regex classifier if LLM fails, times out, or hits rate limits.
+    """
     if config.USER_LISTS_ENABLED and await db.is_vip_sender(user_id, from_address):
         return TIER_VIP
 
-    subject = subject or ""
-    body_text = body_text or ""
-    haystack = f"{subject}\n{body_text[:2000]}"
+    # Try LLM classification first
+    llm_tier = await _classify_with_llm(from_address, subject, body_text)
+    if llm_tier is not None:
+        return llm_tier
 
-    if _RECEIPT_UPDATE_RE.search(subject):
-        return TIER_DAILY
-    if _MARKETING_RE.search(haystack):
-        return TIER_WEEKLY
-    if _AUTOMATED_LOCALPART_RE.match(_local_part(from_address)):
-        return TIER_DAILY
-    return TIER_VIP
+    # Smart regex fallback
+    return _classify_with_smart_regex(from_address, subject, body_text)
 
 
 def summarize_for_digest(from_address: str, subject: str) -> str:
