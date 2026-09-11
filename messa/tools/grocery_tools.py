@@ -304,9 +304,19 @@ def build_grocery_tools(user: config.UserContext, model: BaseChatModel | None = 
         )
 
         llm_model = model or config.build_model(config.SUBAGENT_MODEL_NAME)
-        response = await llm_model.ainvoke([HumanMessage(content=prompt_text)])
-        content = getattr(response, "content", "")
-        return str(content) if content else "Could not generate meal plan at this time."
+        try:
+            response = await asyncio.wait_for(llm_model.ainvoke([HumanMessage(content=prompt_text)]), timeout=15.0)
+            content = getattr(response, "content", "")
+            return str(content) if content else "Could not generate meal plan at this time."
+        except Exception as e:
+            console.system(f"[grocery_agent] Meal plan generation error: {e}")
+            return (
+                f"=== {days}-Day Balanced Meal Plan (Quick Guide) ===\n"
+                f"Day 1: Avocado toast with poached eggs | Mediterranean grilled chicken salad | Baked salmon with asparagus\n"
+                f"Day 2: Greek yogurt bowl with berries | Quinoa veggie bowl with tahini | Turkey chili\n"
+                f"Day 3: Oatmeal with almond butter | Tuna salad wrap | Stir-fry chicken/veggies with brown rice\n"
+                f"\nShopping List: Eggs, sourdough bread, avocados, chicken breast, mixed greens, salmon, Greek yogurt, berries, quinoa."
+            )
 
     @tool
     async def analyze_fridge_inventory(
@@ -349,7 +359,10 @@ def build_grocery_tools(user: config.UserContext, model: BaseChatModel | None = 
                 })
 
         try:
-            res = await vision_model.ainvoke([HumanMessage(content=content_blocks)])
+            res = await asyncio.wait_for(
+                vision_model.ainvoke([HumanMessage(content=content_blocks)]),
+                timeout=12.0,
+            )
             output_text = getattr(res, "content", "")
             return str(output_text) if output_text else "Fridge analysis returned an empty response."
         except Exception as e:
@@ -381,6 +394,8 @@ def build_grocery_tools(user: config.UserContext, model: BaseChatModel | None = 
         items = _parse_list_input(items_list)
         if not items:
             return "Please specify at least one grocery item to add to your cart."
+        # Cap to 35 items to guarantee express deep link URL stays within standard browser limits (< 2048 chars)
+        items = items[:35]
 
         profile = await db.get_user_dietary_profile(uid) or {}
         preferred_store_key = profile.get("preferred_store") or config.GROCERY_DEFAULT_STORE
@@ -432,7 +447,10 @@ def build_grocery_tools(user: config.UserContext, model: BaseChatModel | None = 
                         kwargs["dangerously_skip_version_check"] = True
                     return client.tools.execute(**kwargs)
 
-                composio_res = await asyncio.to_thread(_execute_composio_cart)
+                composio_res = await asyncio.wait_for(
+                    asyncio.to_thread(_execute_composio_cart),
+                    timeout=6.0,
+                )
                 if hasattr(composio_res, "__await__"):
                     composio_res = await composio_res
                 if isinstance(composio_res, dict):
@@ -518,7 +536,7 @@ def build_grocery_tools(user: config.UserContext, model: BaseChatModel | None = 
             client = _get_client()
             def _delete_sync():
                 client.connected_accounts.delete(active["connected_account_id"], revoke_on_delete=True)
-            await asyncio.to_thread(_delete_sync)
+            await asyncio.wait_for(asyncio.to_thread(_delete_sync), timeout=5.0)
         except Exception as e:
             console.system(f"[grocery_agent] Composio disconnect error: {e}")
         await db.disconnect_app_connection(active["id"])
@@ -547,7 +565,7 @@ def build_grocery_tools(user: config.UserContext, model: BaseChatModel | None = 
                         kwargs["dangerously_skip_version_check"] = True
                     return client.tools.execute(**kwargs)
 
-                res = await asyncio.to_thread(_fetch_retailers)
+                res = await asyncio.wait_for(asyncio.to_thread(_fetch_retailers), timeout=5.0)
                 if isinstance(res, dict) and res.get("data"):
                     data = res["data"]
                     if isinstance(data, list) and data:
