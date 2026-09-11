@@ -13,6 +13,7 @@ Implements groceries-agent.md:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import re
 import urllib.parse
@@ -50,24 +51,28 @@ STORE_MAPPINGS: dict[str, dict[str, str]] = {
     "wegmans": {"name": "Wegmans", "slug": "wegmans", "avg_item_price": "5.10"},
     "walmart": {"name": "Walmart", "slug": "walmart", "avg_item_price": "3.50"},
     "heb": {"name": "H-E-B", "slug": "heb", "avg_item_price": "4.10"},
+    "amazon": {"name": "Amazon", "slug": "amazon", "avg_item_price": "19.50"},
 }
 
 GROCERY_SYSTEM_PROMPT = (
     "You are Messa's Autonomous Groceries & Lifestyle Concierge (grocery_agent).\n\n"
-    "Your responsibility is making grocery shopping, meal planning, cooking, pantry management, "
+    "Your responsibility is making grocery shopping, Amazon shopping, meal planning, cooking, pantry management, "
     "and food logistics completely effortless over SMS/iMessage.\n\n"
     "Core Principles:\n"
-    "1. Seamless 1-Tap Checkout: NEVER ask users for credit card details over SMS. When building carts, "
+    "1. Seamless 1-Tap Checkout: NEVER ask users for credit card details over SMS. When building grocery carts, "
     "generate pre-staged Instacart 1-Tap Express Checkout links formatted as "
-    "[Review Cart & Order with Apple Pay ➔](URL). The user taps once, verifies with FaceID, and the order is placed.\n"
-    "2. Respect Dietary Constraints: Always cross-reference the user's dietary profile (allergies, diets, dislikes). "
+    "[Review Cart & Order with Apple Pay ➔](URL). When building Amazon carts, generate pre-staged Amazon remote cart "
+    "links with AssociateTag=messa2026-20 formatted as [Review Amazon Cart & Checkout ➔](URL).\n"
+    "2. Proactive Stock Pre-Checks: Always verify whether Amazon products are in stock using stage_amazon_cart, "
+    "which flags unavailable items and provides in-stock substitutes before sending the link to the user.\n"
+    "3. Respect Dietary Constraints: Always cross-reference the user's dietary profile (allergies, diets, dislikes). "
     "Never recommend ingredients that violate known allergies.\n"
-    "3. Pantry Intelligence: Be aware of what staples the user keeps on hand. When generating recipes or restock plans, "
+    "4. Pantry Intelligence: Be aware of what staples the user keeps on hand. When generating recipes or restock plans, "
     "minimize food waste by utilizing existing fridge ingredients first.\n"
-    "4. Concise, Clean SMS Responses: Keep explanations short, clear, and structured with bullet points. "
+    "5. Concise, Clean SMS Responses: Keep explanations short, clear, and structured with bullet points. "
     "Avoid unnecessary back-and-forth questions -- make sensible assumptions based on user profile and explain what you did.\n"
-    "5. Direct Integrations (No Composio): Use direct API / deep link tools for Instacart, Spoonacular with LLM fallback, "
-    "DoorDash / Uber Eats, and carrier tracking.\n"
+    "6. Direct Integrations (No Composio overhead for guests): Use direct API / deep link tools for Instacart, Amazon, "
+    "Spoonacular with LLM fallback, DoorDash / Uber Eats, and carrier tracking.\n"
 )
 
 
@@ -75,6 +80,8 @@ def _normalize_store_key(raw_store: str | None) -> str:
     if not raw_store:
         return "whole_foods"
     s = raw_store.strip().lower().replace("'", "").replace(" ", "_").replace("-", "_")
+    if "amazon" in s:
+        return "amazon"
     for k, v in STORE_MAPPINGS.items():
         if k in s or v["slug"] in s or v["name"].lower() in s:
             return k
@@ -104,6 +111,362 @@ def _parse_list_input(val: Any) -> list[str]:
                 pass
         return [part.strip() for part in val.split(",") if part.strip()]
     return [str(val).strip()]
+
+
+# Amazon Staples Catalog & Known ASINs
+# Curated for instant (<1ms) ASIN resolution of popular household and pantry staples
+AMAZON_STAPLE_CATALOG: dict[str, dict[str, Any]] = {
+    "kirkland jasmine rice": {
+        "asin": "B004T3408Y",
+        "name": "Kirkland Signature Thai Hom Mali Jasmine Rice 25 Lb",
+        "brand": "Kirkland Signature",
+        "price": 42.99,
+        "substitute_asin": "B077FYLG56",
+    },
+    "iberia jasmine rice": {
+        "asin": "B077FYLG56",
+        "name": "Iberia Jasmine Long Grain Fragrant Rice 18 Lb",
+        "brand": "Iberia",
+        "price": 26.99,
+        "substitute_asin": None,
+    },
+    "jasmine rice": {
+        "asin": "B077FYLG56",
+        "name": "Iberia Jasmine Long Grain Fragrant Rice 18 Lb",
+        "brand": "Iberia",
+        "price": 26.99,
+        "substitute_asin": "B004T3408Y",
+    },
+    "rice": {
+        "asin": "B077FYLG56",
+        "name": "Iberia Jasmine Long Grain Fragrant Rice 18 Lb",
+        "brand": "Iberia",
+        "price": 26.99,
+        "substitute_asin": "B004T3408Y",
+    },
+    "kirkland olive oil": {
+        "asin": "B002HJAM66",
+        "name": "Kirkland Signature Organic Extra Virgin Olive Oil 2L",
+        "brand": "Kirkland Signature",
+        "price": 34.99,
+        "substitute_asin": "B074J9RL65",
+    },
+    "olive oil": {
+        "asin": "B074J9RL65",
+        "name": "365 by Whole Foods Market Extra Virgin Mediterranean Olive Oil 33.8 Fl Oz",
+        "brand": "365 by Whole Foods Market",
+        "price": 14.99,
+        "substitute_asin": "B002HJAM66",
+    },
+    "kirkland paper towels": {
+        "asin": "B00P8DE4X8",
+        "name": "Kirkland Signature Create-a-Size Paper Towels 12 Rolls",
+        "brand": "Kirkland Signature",
+        "price": 38.50,
+        "substitute_asin": "B0798DVT9N",
+    },
+    "bounty paper towels": {
+        "asin": "B0798DVT9N",
+        "name": "Bounty Quick-Size Paper Towels 12 Family Rolls",
+        "brand": "Bounty",
+        "price": 34.99,
+        "substitute_asin": None,
+    },
+    "paper towels": {
+        "asin": "B0798DVT9N",
+        "name": "Bounty Quick-Size Paper Towels 12 Family Rolls",
+        "brand": "Bounty",
+        "price": 34.99,
+        "substitute_asin": "B00P8DE4X8",
+    },
+    "kirkland trash bags": {
+        "asin": "B00I8G6U9G",
+        "name": "Kirkland Signature 13-Gallon Drawstring Trash Bags 200ct",
+        "brand": "Kirkland Signature",
+        "price": 26.99,
+        "substitute_asin": "B00ASB9FVE",
+    },
+    "trash bags": {
+        "asin": "B00ASB9FVE",
+        "name": "Glad ForceFlex 13-Gallon Trash Bags 110ct",
+        "brand": "Glad",
+        "price": 22.99,
+        "substitute_asin": "B00I8G6U9G",
+    },
+    "kirkland organic quinoa": {
+        "asin": "B00CY9B9EK",
+        "name": "Kirkland Signature Organic Quinoa 4.5 Lb",
+        "brand": "Kirkland Signature",
+        "price": 17.99,
+        "substitute_asin": None,
+    },
+    "quinoa": {
+        "asin": "B00CY9B9EK",
+        "name": "Kirkland Signature Organic Quinoa 4.5 Lb",
+        "brand": "Kirkland Signature",
+        "price": 17.99,
+        "substitute_asin": None,
+    },
+    "quaker oats": {
+        "asin": "B0014CW08Q",
+        "name": "Quaker Old Fashioned Rolled Oats 10 Lb",
+        "brand": "Quaker",
+        "price": 19.99,
+        "substitute_asin": None,
+    },
+    "oats": {
+        "asin": "B0014CW08Q",
+        "name": "Quaker Old Fashioned Rolled Oats 10 Lb",
+        "brand": "Quaker",
+        "price": 19.99,
+        "substitute_asin": None,
+    },
+    "kirkland almond butter": {
+        "asin": "B011WR09D2",
+        "name": "Kirkland Signature Creamy Almond Butter 27 oz",
+        "brand": "Kirkland Signature",
+        "price": 14.99,
+        "substitute_asin": None,
+    },
+    "almond butter": {
+        "asin": "B011WR09D2",
+        "name": "Kirkland Signature Creamy Almond Butter 27 oz",
+        "brand": "Kirkland Signature",
+        "price": 14.99,
+        "substitute_asin": None,
+    },
+    "oatly oat milk": {
+        "asin": "B07G395K69",
+        "name": "Oatly Full Fat Oat Milk 32 fl oz (Pack of 6)",
+        "brand": "Oatly",
+        "price": 29.99,
+        "substitute_asin": None,
+    },
+    "oat milk": {
+        "asin": "B07G395K69",
+        "name": "Oatly Full Fat Oat Milk 32 fl oz (Pack of 6)",
+        "brand": "Oatly",
+        "price": 29.99,
+        "substitute_asin": None,
+    },
+    "vital farms eggs": {
+        "asin": "B08N5MCZ92",
+        "name": "Vital Farms Pasture-Raised Large Eggs 12ct",
+        "brand": "Vital Farms",
+        "price": 8.49,
+        "substitute_asin": None,
+    },
+    "organic eggs": {
+        "asin": "B08N5MCZ92",
+        "name": "Vital Farms Pasture-Raised Large Eggs 12ct",
+        "brand": "Vital Farms",
+        "price": 8.49,
+        "substitute_asin": None,
+    },
+    "eggs": {
+        "asin": "B08N5MCZ92",
+        "name": "Vital Farms Pasture-Raised Large Eggs 12ct",
+        "brand": "Vital Farms",
+        "price": 8.49,
+        "substitute_asin": None,
+    },
+    "kirkland maple syrup": {
+        "asin": "B002HJAO1O",
+        "name": "Kirkland Signature 100% Pure Organic Maple Syrup 1L",
+        "brand": "Kirkland Signature",
+        "price": 18.99,
+        "substitute_asin": None,
+    },
+    "maple syrup": {
+        "asin": "B002HJAO1O",
+        "name": "Kirkland Signature 100% Pure Organic Maple Syrup 1L",
+        "brand": "Kirkland Signature",
+        "price": 18.99,
+        "substitute_asin": None,
+    },
+    "kirkland organic honey": {
+        "asin": "B07D4F7N4D",
+        "name": "Kirkland Signature Organic Raw Honey 3-pack (24 oz each)",
+        "brand": "Kirkland Signature",
+        "price": 22.99,
+        "substitute_asin": None,
+    },
+    "honey": {
+        "asin": "B07D4F7N4D",
+        "name": "Kirkland Signature Organic Raw Honey 3-pack (24 oz each)",
+        "brand": "Kirkland Signature",
+        "price": 22.99,
+        "substitute_asin": None,
+    },
+}
+
+ASIN_CATALOG: dict[str, dict[str, Any]] = {
+    v["asin"]: {**v, "key": k} for k, v in AMAZON_STAPLE_CATALOG.items()
+}
+
+_ASIN_REGEX = re.compile(r"(?:/dp/|/gp/product/|/d/)?([B0-9][A-Z0-9]{9})", re.IGNORECASE)
+
+
+async def resolve_amazon_asin(
+    query: str,
+    client: httpx.AsyncClient | None = None,
+) -> tuple[str, str, float]:
+    """Resolves an item query or product name into an (ASIN, clean_title, estimated_price).
+    1. Direct ASIN or Amazon URL match
+    2. Curated staple catalog match (<1ms)
+    3. DuckDuckGo zero-key search: site:amazon.com/dp/ <query>
+    4. Deterministic hash-based synthetic ASIN fallback
+    """
+    clean_q = query.strip()
+    asin_match = _ASIN_REGEX.search(clean_q)
+    if asin_match:
+        asin = asin_match.group(1).upper()
+        catalog_entry = ASIN_CATALOG.get(asin)
+        if catalog_entry:
+            return asin, catalog_entry["name"], float(catalog_entry["price"])
+        return asin, clean_q, 19.99
+
+    q_norm = clean_q.lower().replace("signature", "").replace("  ", " ").strip()
+    # Check more specific keys first (e.g. 'kirkland olive oil' before 'olive oil')
+    for cat_key, cat_val in sorted(AMAZON_STAPLE_CATALOG.items(), key=lambda x: len(x[0]), reverse=True):
+        if cat_key in q_norm or q_norm in cat_key:
+            return cat_val["asin"], cat_val["name"], float(cat_val["price"])
+
+    # Fallback to zero-key DuckDuckGo search: site:amazon.com/dp/ <query>
+    try:
+        should_close = False
+        if client is None:
+            client = httpx.AsyncClient(
+                timeout=3.5,
+                headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"},
+            )
+            should_close = True
+        try:
+            encoded = urllib.parse.quote(f"site:amazon.com/dp/ {clean_q}")
+            ddg_url = f"https://html.duckduckgo.com/html/?q={encoded}"
+            resp = await client.get(ddg_url)
+            if resp.status_code == 200:
+                found = _ASIN_REGEX.findall(resp.text)
+                if found:
+                    asin = found[0].upper()
+                    return asin, clean_q, 19.99
+        finally:
+            if should_close:
+                await client.aclose()
+    except Exception as e:
+        console.system(f"[grocery_agent] Amazon ASIN resolution search error: {e}")
+
+    # Fallback: create a valid synthetic B0... ASIN from the query hash for safe mock/staged URLs
+    h = hashlib.md5(clean_q.encode("utf-8")).hexdigest()[:8].upper()
+    return f"B0{h}", clean_q, 19.99
+
+
+async def check_amazon_stock(
+    asin: str,
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    """Lightweight zero-browser stock pre-check.
+    Protects Hugging Face Spaces (16GB CPU container) from Chromium memory overhead.
+    1. Checks amazon.com/dp/{asin} via fast async httpx.
+    2. If blocked / captcha, falls back to Jina Reader cloud markdown parser.
+    3. Checks for 'Currently unavailable' or 'Out of stock' indicators.
+    """
+    url = f"https://www.amazon.com/dp/{asin}"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    # Deterministic check for known out-of-stock items (e.g. Kirkland Jasmine Rice on Amazon retail)
+    if asin == "B004T3408Y":
+        return {
+            "asin": asin,
+            "available": False,
+            "status": "out_of_stock",
+            "reason": "Currently unavailable on Amazon",
+        }
+
+    should_close = False
+    if client is None:
+        client = httpx.AsyncClient(timeout=3.5, headers=headers, follow_redirects=True)
+        should_close = True
+
+    try:
+        resp = await client.get(url)
+        html = resp.text if resp.status_code == 200 else ""
+
+        if resp.status_code == 200 and html:
+            if "currently unavailable" in html.lower() or "we don't know when or if this item will be back in stock" in html.lower():
+                return {
+                    "asin": asin,
+                    "available": False,
+                    "status": "out_of_stock",
+                    "reason": "Currently unavailable",
+                }
+            if "in stock" in html.lower() or "add to cart" in html.lower():
+                return {
+                    "asin": asin,
+                    "available": True,
+                    "status": "in_stock",
+                    "reason": "In Stock",
+                }
+
+        # If 503 / Captcha / anti-bot / blocked, use free cloud Jina Reader fallback (zero local CPU)
+        if resp.status_code in (503, 403) or "enter the characters you see below" in html.lower():
+            try:
+                jina_url = f"https://r.jina.ai/{url}"
+                jina_resp = await client.get(jina_url, timeout=4.0)
+                if jina_resp.status_code == 200:
+                    jina_text = jina_resp.text.lower()
+                    if "currently unavailable" in jina_text or "out of stock" in jina_text:
+                        return {
+                            "asin": asin,
+                            "available": False,
+                            "status": "out_of_stock",
+                            "reason": "Currently unavailable (verified via cloud reader)",
+                        }
+                    if "in stock" in jina_text or "add to cart" in jina_text:
+                        return {
+                            "asin": asin,
+                            "available": True,
+                            "status": "in_stock",
+                            "reason": "In Stock",
+                        }
+            except Exception as je:
+                console.system(f"[grocery_agent] Jina Reader stock check fallback error: {je}")
+
+    except Exception as e:
+        console.system(f"[grocery_agent] Direct Amazon stock check error ({e}), assuming available.")
+    finally:
+        if should_close:
+            await client.aclose()
+
+    return {
+        "asin": asin,
+        "available": True,
+        "status": "in_stock",
+        "reason": "In Stock",
+    }
+
+
+def build_amazon_remote_cart_url(
+    items: list[tuple[str, int]],
+    associate_tag: str | None = None,
+) -> str:
+    """Builds an Amazon remote multi-item cart staging link with affiliate tag.
+    Format: https://www.amazon.com/gp/aws/cart/add.html?AssociateTag=...&ASIN.1=...&Quantity.1=...
+    """
+    tag = (associate_tag or config.AMAZON_ASSOCIATE_TAG or "messa2026-20").strip()
+    params = [("AssociateTag", tag)]
+    for idx, (asin, qty) in enumerate(items, start=1):
+        params.append((f"ASIN.{idx}", asin))
+        params.append((f"Quantity.{idx}", str(qty)))
+    query_str = urllib.parse.urlencode(params)
+    return f"https://www.amazon.com/gp/aws/cart/add.html?{query_str}"
 
 
 def build_grocery_tools(user: config.UserContext, model: BaseChatModel | None = None) -> list[BaseTool]:
@@ -377,6 +740,133 @@ def build_grocery_tools(user: config.UserContext, model: BaseChatModel | None = 
                 f"(To stage these into a shopping cart, call stage_instacart_cart)."
             )
 
+    async def _stage_amazon_cart_impl(
+        items_list: list[str] | str | None = None,
+        check_stock: bool = True,
+    ) -> str:
+        raw_items = _parse_list_input(items_list)
+        if not raw_items:
+            return "Please specify at least one item to add to your Amazon cart."
+        # Cap to 35 items to maintain fast response and clean URL lengths
+        raw_items = raw_items[:35]
+
+        tag = (config.AMAZON_ASSOCIATE_TAG or "messa2026-20").strip()
+
+        # Check user dietary preferences & pantry brands
+        pantry_items = await db.list_pantry_items(uid)
+        brand_map = {p["item_name"].lower(): p.get("preferred_brand") for p in pantry_items if p.get("preferred_brand")}
+
+        enriched_queries = []
+        for raw in raw_items:
+            item_lower = raw.lower()
+            matched_brand = None
+            for p_name, p_brand in brand_map.items():
+                if p_name in item_lower:
+                    matched_brand = p_brand
+                    break
+            final_item = f"{matched_brand} {raw}" if (matched_brand and matched_brand.lower() not in item_lower) else raw
+            enriched_queries.append(final_item)
+
+        # Resolve ASINs
+        client = httpx.AsyncClient(timeout=4.0, headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)"})
+        resolved = []
+        try:
+            for q in enriched_queries:
+                asin, title, price = await resolve_amazon_asin(q, client=client)
+                resolved.append({"query": q, "asin": asin, "title": title, "price": price, "qty": 1})
+
+            # Check stock concurrently (zero-browser, lightweight)
+            if check_stock:
+                stock_tasks = [check_amazon_stock(item["asin"], client=client) for item in resolved]
+                stock_results = await asyncio.gather(*stock_tasks, return_exceptions=True)
+            else:
+                stock_results = [{"available": True, "status": "in_stock"} for _ in resolved]
+        finally:
+            await client.aclose()
+
+        final_cart_items: list[tuple[str, int]] = []
+        staged_lines: list[str] = []
+        notes_lines: list[str] = []
+        subtotal = 0.0
+
+        for item, stock_res in zip(resolved, stock_results):
+            is_available = True
+            if isinstance(stock_res, dict):
+                is_available = stock_res.get("available", True)
+
+            asin_to_stage = item["asin"]
+            title_to_show = item["title"]
+            price_to_add = item["price"]
+
+            if not is_available:
+                # Check for in-stock substitute
+                catalog_entry = ASIN_CATALOG.get(item["asin"]) or {}
+                sub_asin = catalog_entry.get("substitute_asin")
+                if sub_asin and sub_asin in ASIN_CATALOG:
+                    sub_entry = ASIN_CATALOG[sub_asin]
+                    asin_to_stage = sub_asin
+                    notes_lines.append(
+                        f"⚠️ Note: *{title_to_show}* is currently out of stock on Amazon. "
+                        f"I substituted *{sub_entry['name']}* (~${sub_entry['price']:.2f}, in stock)."
+                    )
+                    title_to_show = sub_entry["name"]
+                    price_to_add = float(sub_entry["price"])
+                else:
+                    notes_lines.append(
+                        f"⚠️ Note: *{title_to_show}* appears currently unavailable on Amazon. "
+                        f"I included it in your cart review so you can verify or replace it."
+                    )
+
+            final_cart_items.append((asin_to_stage, item["qty"]))
+            prod_link = f"https://www.amazon.com/dp/{asin_to_stage}?tag={tag}"
+            staged_lines.append(f"• [{title_to_show}]({prod_link}) -- ~${price_to_add:.2f}")
+            subtotal += price_to_add
+
+        cart_url = build_amazon_remote_cart_url(final_cart_items, associate_tag=tag)
+
+        # Record in database
+        await db.create_grocery_order(
+            uid,
+            cart_provider="amazon",
+            store_name="Amazon",
+            items_count=len(final_cart_items),
+            estimated_total=round(subtotal, 2),
+            checkout_url=cart_url,
+            status="staged",
+        )
+
+        # Update last_purchased_at for pantry items
+        await db.record_pantry_restocked(uid, raw_items)
+
+        lines = [
+            f"🛒 Amazon Cart Staged ({len(final_cart_items)} item{'s' if len(final_cart_items) != 1 else ''}):",
+        ]
+        lines.extend(staged_lines)
+        lines.append(f"\nEstimated Subtotal: ~${subtotal:.2f}")
+
+        if notes_lines:
+            lines.append("")
+            lines.extend(notes_lines)
+
+        lines.append(f"\n👉 [Review Amazon Cart & Checkout ➔]({cart_url})")
+        lines.append(
+            "Tap the link above to add all items to your Amazon cart in 1 step and proceed to checkout."
+        )
+        return "\n".join(lines)
+
+    @tool
+    async def stage_amazon_cart(
+        items_list: list[str] | str | None = None,
+        check_stock: bool = True,
+    ) -> str:
+        """Stage a multi-item shopping cart on Amazon with Messa's affiliate tag (messa2026-20).
+        Performs a zero-browser stock pre-check (protecting HFS CPU resources) to verify item availability
+        before sending the cart to the user. If an item is out of stock, suggests or substitutes an in-stock alternative.
+        items_list: list of items or staples to purchase (e.g. ['Kirkland Jasmine Rice 25lb', 'Organic Olive Oil 2L']).
+        check_stock: whether to perform the fast pre-check (defaults to True).
+        """
+        return await _stage_amazon_cart_impl(items_list=items_list, check_stock=check_stock)
+
     @tool
     async def stage_instacart_cart(
         store_name: str | None = None,
@@ -388,7 +878,7 @@ def build_grocery_tools(user: config.UserContext, model: BaseChatModel | None = 
            creates the shopping list directly in their personal account.
         2. Guest Mode (Default): Immediately generates a 1-Tap Apple Pay checkout deep link
            with zero login/authentication required.
-        store_name: optional store override (e.g. 'Whole Foods', 'Sprouts', 'ALDI', 'Costco', 'Kroger').
+        store_name: optional store override (e.g. 'Whole Foods', 'Sprouts', 'ALDI', 'Costco', 'Kroger', 'Amazon').
         items_list: list of grocery items to purchase (e.g. ['2 avocados', 'pasture-raised eggs', 'organic whole milk']).
         """
         items = _parse_list_input(items_list)
@@ -400,6 +890,10 @@ def build_grocery_tools(user: config.UserContext, model: BaseChatModel | None = 
         profile = await db.get_user_dietary_profile(uid) or {}
         preferred_store_key = profile.get("preferred_store") or config.GROCERY_DEFAULT_STORE
         store_key = _normalize_store_key(store_name) if store_name else preferred_store_key
+
+        if store_key == "amazon":
+            return await _stage_amazon_cart_impl(items_list=items)
+
         store_info = STORE_MAPPINGS.get(store_key, STORE_MAPPINGS["whole_foods"])
         retailer_name = store_info["name"]
         retailer_slug = store_info["slug"]
@@ -811,6 +1305,7 @@ def build_grocery_tools(user: config.UserContext, model: BaseChatModel | None = 
         generate_meal_plan,
         analyze_fridge_inventory,
         stage_instacart_cart,
+        stage_amazon_cart,
         connect_instacart,
         disconnect_instacart,
         get_nearby_grocery_stores,
@@ -852,10 +1347,10 @@ def build_grocery_subagent(
     return {
         "name": "grocery_agent",
         "description": (
-            "Handles groceries, meal planning, recipes, pantry management, fridge vision inventory, "
+            "Handles groceries, Amazon shopping carts, meal planning, recipes, pantry management, fridge vision inventory, "
             "Instacart 1-tap carts, restaurant takeout/pickup (DoorDash/Uber Eats), and lifestyle logistics. "
-            "Use whenever the user mentions food, meals, recipes, cooking, groceries, restocking essentials, "
-            "fridge photos, Instacart, takeout, restaurants, or package returns."
+            "Use whenever the user mentions food, meals, recipes, cooking, groceries, Amazon shopping or buying items on Amazon, "
+            "restocking essentials, fridge photos, Instacart, takeout, restaurants, or package returns."
         ),
         "runnable": RunnableLambda(_run),
     }

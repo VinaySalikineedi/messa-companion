@@ -1945,6 +1945,8 @@ INSTACART_CLIENT_ID = os.environ.get("INSTACART_CLIENT_ID", "").strip()
 INSTACART_CLIENT_SECRET = os.environ.get("INSTACART_CLIENT_SECRET", "").strip()
 GROCERY_DEFAULT_STORE = os.environ.get("MESSA_GROCERY_DEFAULT_STORE", "whole_foods").strip()
 AFTERSHIP_API_KEY = os.environ.get("AFTERSHIP_API_KEY", "").strip()
+AMAZON_ASSOCIATE_TAG = os.environ.get("AMAZON_ASSOCIATE_TAG", "messa2026-20").strip()
+INSTACART_AFFILIATE_TAG = os.environ.get("INSTACART_AFFILIATE_TAG", "").strip()
 
 # ---- US-only launch gate (messa/region_gate.py) ----
 # This is a US-market-only launch: a brand-new phone number that isn't a

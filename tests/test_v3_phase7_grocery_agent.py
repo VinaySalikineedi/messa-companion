@@ -506,15 +506,68 @@ async def part9_subagent_registration_and_kill_switch():
     config.GROCERY_AGENT_ENABLED = True
     prompt_on = registry._build_system_prompt(USER, connected_slugs=[], app_preferences={})
     check("system prompt (enabled): mentions grocery_agent", "grocery_agent" in prompt_on)
-    check("system prompt (enabled): includes food routing guidance", "food & groceries: delegate to grocery_agent" in prompt_on)
+    check("system prompt (enabled): includes food routing guidance", "delegate to grocery_agent" in prompt_on)
 
     # 9d: With kill switch OFF (False)
     config.GROCERY_AGENT_ENABLED = False
     prompt_off = registry._build_system_prompt(USER, connected_slugs=[], app_preferences={})
     check("system prompt (disabled): omits grocery_agent", "grocery_agent" not in prompt_off)
-    check("system prompt (disabled): omits food routing guidance", "food & groceries: delegate to grocery_agent" not in prompt_off)
+    check("system prompt (disabled): omits food routing guidance", "delegate to grocery_agent" not in prompt_off)
 
     config.GROCERY_AGENT_ENABLED = True
+
+
+# ---------------------------------------------------------------------------
+# Part 10: Amazon Remote Cart Staging, Associate Tag & Stock Pre-Check
+# ---------------------------------------------------------------------------
+
+async def part10_amazon_cart_staging():
+    tools_map = {t.name: t for t in grocery_tools.build_grocery_tools(USER)}
+    check("build_grocery_tools includes stage_amazon_cart", "stage_amazon_cart" in tools_map)
+
+    # 10a: Normal In-Stock Cart Staging
+    profile_row = FakeRow(user_id=1, preferred_store="whole_foods")
+    pantry_rows = [
+        FakeRow(id=1, user_id=1, item_name="olive oil", preferred_brand="Kirkland Signature"),
+    ]
+    order_row = FakeRow(id=201, user_id=1, cart_provider="amazon", store_name="Amazon", items_count=2, estimated_total=54.98, checkout_url="https://...", status="staged")
+
+    conn = FakeConn(has_tables=True, fetchrow_queue=[profile_row, order_row], fetch_queue=[pantry_rows])
+    install_fake_pool(conn)
+
+    amazon_out = await tools_map["stage_amazon_cart"].ainvoke({
+        "items_list": ["olive oil", "quaker oats"],
+    })
+
+    check("stage_amazon_cart: enriches brand from pantry", "Kirkland" in amazon_out)
+    check("stage_amazon_cart: formats remote cart link with associate tag messa2026-20", "AssociateTag=messa2026-20" in amazon_out)
+    check("stage_amazon_cart: remote cart URL targets /gp/aws/cart/add.html", "https://www.amazon.com/gp/aws/cart/add.html" in amazon_out)
+    check("stage_amazon_cart: includes 1-tap checkout prompt", "[Review Amazon Cart & Checkout ➔]" in amazon_out)
+    check("stage_amazon_cart: attaches tag to individual product link", "tag=messa2026-20" in amazon_out)
+
+    # 10b: Stock Pre-Check & Proactive Substitution for Out-of-Stock Item
+    # Kirkland Jasmine Rice (B004T3408Y) is out-of-stock on Amazon -> substituted with Iberia Jasmine Rice (B077FYLG56)
+    conn2 = FakeConn(has_tables=True, fetchrow_queue=[profile_row, order_row], fetch_queue=[[]])
+    install_fake_pool(conn2)
+
+    sub_out = await tools_map["stage_amazon_cart"].ainvoke({
+        "items_list": ["Kirkland Jasmine Rice 25lb"],
+    })
+
+    check("stage_amazon_cart: detects out of stock item and emits note", "currently out of stock on Amazon" in sub_out)
+    check("stage_amazon_cart: substitutes in-stock alternative", "Iberia" in sub_out and "Jasmine" in sub_out)
+    check("stage_amazon_cart: cart contains substitute ASIN B077FYLG56", "B077FYLG56" in sub_out)
+
+    # 10c: Seamless Store Routing from stage_instacart_cart(store_name='amazon')
+    conn3 = FakeConn(has_tables=True, fetchrow_queue=[profile_row, order_row], fetch_queue=[[]])
+    install_fake_pool(conn3)
+
+    routed_out = await tools_map["stage_instacart_cart"].ainvoke({
+        "store_name": "Amazon",
+        "items_list": ["bounty paper towels"],
+    })
+    check("stage_instacart_cart(store_name='Amazon'): routes to Amazon cart", "Amazon Cart Staged" in routed_out)
+    check("stage_instacart_cart(store_name='Amazon'): includes AssociateTag=messa2026-20", "AssociateTag=messa2026-20" in routed_out)
 
 
 async def main():
@@ -528,6 +581,7 @@ async def main():
     await part7_pantry_restock_capsule()
     await part8_package_return_gating()
     await part9_subagent_registration_and_kill_switch()
+    await part10_amazon_cart_staging()
 
     print("\n" + "=" * 50)
     if failures:

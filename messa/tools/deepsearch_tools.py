@@ -3674,6 +3674,8 @@ def build_deepsearch_subagent(
             "before finishing -- when that happens the reply says so and gives a session id; "
             "include \"session #<id>\" in a follow-up delegation's description to resume "
             "exactly where it left off instead of starting over.\n"
+            "Do NOT use for grocery shopping, meal planning, building Instacart/Amazon carts, "
+            "or restaurant orders -- delegate those to grocery_agent.\n"
             "Do NOT use for 3rd-party apps/platforms (Reddit, Slack, Todoist, Notion, Google "
             "Calendar, and more) that integrations_agent can reach via Composio's authenticated "
             "API -- that's faster and more reliable than browsing the site by hand. Only use "
