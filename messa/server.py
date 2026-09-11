@@ -51,7 +51,7 @@ from . import asset_consolidation, background, briefings, call_activity, call_co
 from .agents.registry import build_orchestrator
 from .approval import AutoApproveGate, DenyApprovalGate
 from .call_live_view_page import render_call_live_view_page
-from .channels import browserbase, sendblue, vapi
+from .channels import browser, browserbase, sendblue, vapi
 from .channels.sendblue import SendblueError
 from .channels.vapi import VapiError
 from .landing_page import render_landing_page
@@ -338,9 +338,9 @@ async def _build_live_tiles(status: dict, activity: dict) -> list[dict]:
     pages: list[dict] = []
     if bb_session_id:
         try:
-            pages = await browserbase.get_session_pages(bb_session_id)
+            pages = await browser.get_session_pages(bb_session_id)
         except Exception as e:  # noqa: BLE001
-            console.tool_error("deepsearch", "browserbase_session_pages", str(e))
+            console.tool_error("deepsearch", "browser_session_pages", str(e))
             pages = []
 
     if not pages:

@@ -124,8 +124,9 @@ from langgraph.errors import GraphRecursionError
 
 from .. import config, console, credentials, db, deepsearch_control, live_activity, reliability, usage
 from ..approval import ApprovalGate
-from ..channels import browserbase, sendblue
+from ..channels import browser, browserbase, sendblue
 from ..channels.browserbase import BrowserbaseError
+from ..channels.kernel import KernelError
 from ..channels.sendblue import SendblueError
 from ..config import UserContext
 from .browser_circuit_breaker import StagehandZeroDeltaMiddleware
@@ -1508,22 +1509,23 @@ class BrowserToolProvider:
                 context_id = None
                 if self._user_id is not None:
                     context_id = await db.get_browserbase_context_id(self._user_id)
-                    if not context_id:
+                    if not context_id and browser.get_active_provider() == "browserbase":
                         context_id = await browserbase.create_context()
                         await db.save_browserbase_context_id(self._user_id, context_id)
 
-                session = await browserbase.create_session(context_id)
+                session = await browser.create_session(context_id, user_id=self._user_id)
                 self._bb_session_id = session["id"]
                 connect_url = session["connectUrl"]
-                console.system(f"Deepsearch: opened Browserbase session {self._bb_session_id}.")
+                provider_name = session.get("provider", "cloud")
+                console.system(f"Deepsearch: opened {provider_name} browser session {self._bb_session_id}.")
                 if self._user_id is not None:
                     live_activity.set_session_id(self._user_id, self._bb_session_id)
             except Exception as e:  # noqa: BLE001
-                console.tool_error(LABEL, "browserbase_session_create", str(e))
+                console.tool_error(LABEL, "browser_session_create", str(e))
                 raise
 
             try:
-                self.live_view_url = await browserbase.get_live_view_url(self._bb_session_id)
+                self.live_view_url = session.get("liveViewUrl") or await browser.get_live_view_url(self._bb_session_id)
                 if self._user_id is not None and self.live_view_url:
                     # Moved here from build_deepsearch_subagent._run, which
                     # used to call this right after __aenter__ returned --
@@ -1609,15 +1611,15 @@ class BrowserToolProvider:
                     self._mcp_proc.terminate()
                 if self._bb_session_id is not None:
                     try:
-                        await browserbase.release_session(self._bb_session_id)
+                        await browser.release_session(self._bb_session_id)
                     except Exception as release_err:  # noqa: BLE001
-                        console.tool_error(LABEL, "browserbase_release_after_failure", str(release_err))
+                        console.tool_error(LABEL, "browser_release_after_failure", str(release_err))
                 raise
 
             self._live_session_ready = True
 
     async def close(self) -> None:
-        """Definitively closes the MCP subprocess, client session, and releases the Browserbase session."""
+        """Definitively closes the MCP subprocess, client session, and releases the cloud browser session."""
         if self._reading_task is not None and not self._reading_task.done():
             self._reading_task.cancel()
         if self._cursor_move_task is not None and not self._cursor_move_task.done():
@@ -1644,9 +1646,9 @@ class BrowserToolProvider:
             self._mcp_proc = None
         if self._bb_session_id is not None:
             try:
-                await browserbase.release_session(self._bb_session_id)
-            except BrowserbaseError as e:
-                console.tool_error(LABEL, "browserbase_release", str(e))
+                await browser.release_session(self._bb_session_id)
+            except Exception as e:
+                console.tool_error(LABEL, "browser_release", str(e))
             console.system("Deepsearch: browser closed.")
             self._bb_session_id = None
         else:

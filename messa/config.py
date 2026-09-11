@@ -536,6 +536,23 @@ INBOUND_EMAIL_BODY_MAX_CHARS = int(os.environ.get("MESSA_INBOUND_EMAIL_BODY_MAX_
 # deepsearch to work at all now -- there's no local-Chromium fallback.
 BROWSERBASE_API_KEY = os.environ.get("BROWSERBASE_API_KEY")
 
+# Active cloud browser provider: "browserbase" or "kernel".
+# Defaults to "browserbase" so existing accounts and subscriptions continue
+# operating with zero changes. Switch to "kernel" to use Kernel's serverless
+# stealth execution and unlimited residential proxies.
+BROWSER_PROVIDER = os.environ.get("MESSA_BROWSER_PROVIDER", "browserbase").strip().lower()
+
+# Kernel credentials and endpoint (https://kernel.sh). Used when BROWSER_PROVIDER="kernel".
+# Free tier includes $5/mo credits and built-in stealth residential proxies.
+KERNEL_API_KEY = os.environ.get("KERNEL_API_KEY")
+KERNEL_BASE_URL = os.environ.get("KERNEL_BASE_URL", "https://api.kernel.sh/v1").rstrip("/")
+
+# When running on Browserbase: whether to route traffic through US residential proxies
+# to prevent bot detection (e.g. Walmart's "Press and Hold" PerimeterX challenge).
+BROWSERBASE_USE_RESIDENTIAL_PROXIES = os.environ.get(
+    "MESSA_BROWSERBASE_RESIDENTIAL_PROXIES", "true"
+).strip().lower() in ("1", "true", "yes")
+
 # Explicit session timeout (seconds), passed on every browserbase.create_session
 # call. Root-caused a real bug: whole deepsearch sessions -- including ones
 # that never touched request_human_help at all -- were cutting off at
