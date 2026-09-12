@@ -38,8 +38,8 @@ logger = logging.getLogger(__name__)
 
 class MacroStep(BaseModel):
     action: Literal["click", "type", "press_key", "press", "scroll", "select_option", "wait_for"]
-    target_id: str                      # e.g., "e3" or "f1:e2"
-    target_signature: str               # sha256(role:name:tag), captured after stabilization
+    target_id: Optional[str] = "document"                      # e.g., "e3" or "f1:e2"
+    target_signature: Optional[str] = ""               # sha256(role:name:tag), captured after stabilization
     value: Optional[str] = None         # text or token (e.g., "{{cred:password}}")
 
 
@@ -751,6 +751,9 @@ class LightWebAgent:
             "verify you are human",
             "captcha",
             "security check",
+            "image challenge",
+            "puzzle",
+            "audio challenge",
         ]):
             live_view = self.session.live_view_url or ""
             url_msg = f"\nTap here to complete verification: {live_view}" if live_view else ""
@@ -1180,9 +1183,13 @@ class LightWebAgent:
                                 step["target_id"] = step.pop("element_id")
                             elif "id" in step and "target_id" not in step:
                                 step["target_id"] = step.pop("id")
+                            elif "target" in step and "target_id" not in step:
+                                step["target_id"] = step.pop("target")
                             tid = step.get("target_id")
                             if tid and tid in elem_map and not step.get("target_signature"):
                                 step["target_signature"] = elem_map[tid].get("signature", "")
+                            elif not step.get("target_signature"):
+                                step["target_signature"] = ""
 
                 return AgentDecision(**data)
         except Exception as e:

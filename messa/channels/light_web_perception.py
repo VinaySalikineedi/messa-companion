@@ -117,7 +117,6 @@ class PerceptionEngine:
         # This provides robust element discovery even when ARIA trees are sparse
         js_extract_script = """
         () => {
-            const results = [];
             const isVisible = (el) => {
                 if (!el) return false;
                 const style = window.getComputedStyle(el);
@@ -157,7 +156,7 @@ class PerceptionEngine:
             const interactiveSelectors = 'button, a[href], input, select, textarea, [role="button"], [role="link"], [role="checkbox"], [role="tab"], [role="searchbox"], [role="dialog"] p, [role="dialog"] h1, [role="dialog"] h2, [role="dialog"] h3, .modal p, .modal h3';
             const nodes = document.querySelectorAll(interactiveSelectors);
 
-            let counter = 1;
+            const rawItems = [];
 
             nodes.forEach((el) => {
                 if (!isVisible(el)) return;
@@ -176,7 +175,37 @@ class PerceptionEngine:
                 const has_price = /\\$\\d+(\\.\\d{2})?/.test(parentText);
                 const dark_pattern_flag = is_prechecked && has_price;
                 const occluded_flag = isOccluded(el);
+                const in_modal = el.closest('[role="dialog"], [role="alertdialog"], .modal, [aria-modal="true"]') !== null;
 
+                rawItems.push({
+                    el: el,
+                    tag: tag,
+                    role: role,
+                    type: type,
+                    name: text,
+                    value: el.value || '',
+                    checked: checked,
+                    disabled: disabled,
+                    dark_pattern: dark_pattern_flag,
+                    occluded: occluded_flag,
+                    in_modal: in_modal
+                });
+            });
+
+            // Prioritize: items inside active modals/dialogs first, then non-occluded items, then occluded
+            rawItems.sort((a, b) => {
+                if (a.in_modal !== b.in_modal) return a.in_modal ? -1 : 1;
+                if (a.occluded !== b.occluded) return a.occluded ? 1 : -1;
+                return 0;
+            });
+
+            // Cap at 85 elements to ensure dynamic modals are never dropped while respecting token budget
+            const selectedItems = rawItems.slice(0, 85);
+            let counter = 1;
+            const results = [];
+
+            selectedItems.forEach((item) => {
+                const el = item.el;
                 const eid = 'e' + counter++;
                 try {
                     el.setAttribute('data-messa-id', eid);
@@ -196,20 +225,20 @@ class PerceptionEngine:
 
                 results.push({
                     id: eid,
-                    tag: tag,
-                    role: role,
-                    type: type,
-                    name: text,
-                    value: el.value || '',
-                    checked: checked,
-                    disabled: disabled,
-                    dark_pattern: dark_pattern_flag,
-                    occluded: occluded_flag,
+                    tag: item.tag,
+                    role: item.role,
+                    type: item.type,
+                    name: item.name,
+                    value: item.value,
+                    checked: item.checked,
+                    disabled: item.disabled,
+                    dark_pattern: item.dark_pattern,
+                    occluded: item.occluded,
                     selector: specificSelector
                 });
-
             });
-            return results.slice(0, 60); // Cap at 60 top elements
+
+            return results;
         }
         """
 
