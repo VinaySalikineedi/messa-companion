@@ -67,6 +67,8 @@ TESTS=(
   tests/test_v3_phase6_project_capsules.py
   tests/test_v3_phase7_grocery_agent.py
   tests/test_v3_phase7_grocery_production_readiness.py
+  tests/test_kernel_and_browser_provider.py
+  tests/test_light_web_agent.py
 )
 
 PASSED=()

@@ -72,6 +72,7 @@ from ..tools.email_tools import build_email_subagent
 from ..tools.executive_tools import _format_contact_line, build_executive_subagent, build_executive_tools
 from ..tools.integration_tools import app_category_for_toolkit, build_integration_subagent
 from ..tools.grocery_tools import build_grocery_subagent
+from ..tools.light_web_agent_tools import build_light_web_agent_subagent
 from ..tools.personal_inbox_tools import build_personal_inbox_subagent, build_personal_inbox_tools
 from ..tools.routines_tools import build_routines_subagent, build_routines_tools
 from ..tools.scratchpad_tools import build_scratchpad_tools, scratchpad_prompt_block
@@ -1114,6 +1115,24 @@ def _build_system_prompt(
         else ""
     )
 
+    light_web_agent_mention = (
+        ", light_web_agent (real-browser tasks on live websites: Instacart/Amazon cart building "
+        "and checkout, form filling, account sign-ups, any task that requires actually clicking "
+        "and typing on a site rather than just researching)"
+        if config.LIGHT_WEB_AGENT_ENABLED
+        else ""
+    )
+    light_web_agent_routing_note = (
+        "  - real-browser/transactional web tasks: delegate to light_web_agent when the user "
+        "wants Messa to navigate, fill, click, or submit something on a SINGLE website -- "
+        "e.g. 'add these 5 items to my Instacart cart', 'sign me up for X', 'complete my "
+        "checkout on Y'. Prefer light_web_agent over deepsearch for tasks on one site that "
+        "require authentication, form submission, or a checkout flow. Prefer deepsearch for "
+        "multi-site research.\n"
+        if config.LIGHT_WEB_AGENT_ENABLED
+        else ""
+    )
+
     return (
         "You are Messa -- a task-oriented personal life manager reachable by text, email, and "
         "(soon) WhatsApp, not a chatbot. Your job is taking real things off the user's plate "
@@ -1146,14 +1165,16 @@ def _build_system_prompt(
         "genuinely ambiguous between two different tasks -- not for details you could pick a "
         "sensible default for.\n\n"
         "Direct Tools vs Delegation: You have DIRECT access to core high-leverage tools: "
-        "send_email, search_inbox, create_project_capsule, update_project_capsule, "
+        "send_email, search_my_emails, create_project_capsule, update_project_capsule, "
         "create_reminder, list_tasks, search_web, and find_contact. "
         "ALWAYS use your direct tools immediately for single-turn operations instead of delegating -- "
         "it is faster, preserves your context, and eliminates unnecessary latency. "
         "Delegate via the task tool ONLY when truly necessary: deepsearch (multi-step cloud browser "
-        "navigation, form submission, and research), document_agent (compiling PDFs/contracts), or "
+        "navigation, form submission, and research), light_web_agent (fast single-page web tasks), "
+        "document_agent (compiling PDFs/contracts), or "
         "integrations_agent (1,400+ third-party connected apps, e.g. Slack, Notion, GitHub, Google Calendar)"
         f"{grocery_mention}"
+        f"{light_web_agent_mention}"
         f"{admin_agent_mention}."
         f"{parallel_delegation_note}\n\n"
         "Routing -- email, calendar, and tasks each have a NATIVE Messa tool and, once "
@@ -1185,6 +1206,7 @@ def _build_system_prompt(
         "Todoist/Asana). Reminders are NOT part of this -- always executive_assistant, no "
         "connected-app equivalent exists.\n"
         f"{grocery_routing_note}"
+        f"{light_web_agent_routing_note}"
         "Switching or disconnecting a connected app: there's NO settings/integrations page for "
         "the user to do this themselves -- never say there is. Do it directly: to switch accounts, call "
         "request_email_connection/connect_integration_app with switch_account=True (disconnects "
@@ -1472,6 +1494,11 @@ async def build_orchestrator(
     if config.GROCERY_AGENT_ENABLED:
         subagents.append(
             build_grocery_subagent(user, _subagent_model_for("grocery_agent"), approval_gate)
+        )
+
+    if config.LIGHT_WEB_AGENT_ENABLED:
+        subagents.append(
+            build_light_web_agent_subagent(user, approval_gate)
         )
 
     # Admin-only, and only ever added here -- a non-admin's subagents list

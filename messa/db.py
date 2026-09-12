@@ -4683,6 +4683,31 @@ async def set_active_task_status(task_id: str, status: str) -> None:
             )
 
 
+async def get_pending_light_web_checkpoint(user_id: int) -> dict[str, Any] | None:
+    """Read-only helper for the light-web-agent resume flow (browser.py's
+    resume_light_web_task, server.py's pre-turn checkpoint short-circuit):
+    does this user currently have a light_web_agent active task suspended
+    on a human checkpoint? Wraps get_active_task rather than a bespoke
+    query -- 'pending checkpoint' is just an active_tasks row of the right
+    task_type whose artifacts (written by LightWebAgent._persist_pending_
+    checkpoint) carry a 'pending_checkpoint' key; no separate table.
+
+    Returns None when there's no open task, it's a different task_type, or
+    it hasn't actually suspended on a checkpoint yet (e.g. a light_web_agent
+    task that's merely 'in_progress' between turns has no pending_checkpoint
+    key at all). Otherwise returns the whole task row (task_id, artifacts
+    with 'pending_checkpoint' + '_call_context', etc.) so callers don't need
+    a second round trip to get the call context needed to actually resume.
+    """
+    task = await get_active_task(user_id)
+    if not task or task.get("task_type") != "light_web_agent":
+        return None
+    artifacts = task.get("artifacts") or {}
+    if not artifacts.get("pending_checkpoint"):
+        return None
+    return task
+
+
 async def purge_stale_active_tasks() -> dict[str, int]:
     """Retention policy (explicit product decision, not "keep forever" or
     "delete the moment it's done"): a finished task's `artifacts` payload

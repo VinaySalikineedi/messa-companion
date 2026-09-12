@@ -85,9 +85,12 @@ async def create_session(context_id: str | None) -> dict[str, Any]:
         "browserSettings": {
             "viewport": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
             "blockAds": config.DEEPSEARCH_BLOCK_ADS,
+            "solveCaptchas": True,
         },
         "timeout": config.BROWSERBASE_SESSION_TIMEOUT_SECONDS,
     }
+    if getattr(config, "BROWSERBASE_USE_RESIDENTIAL_PROXIES", False):
+        body["proxies"] = [{"type": "browserbase", "geolocation": {"country": "US"}}]
     if context_id:
         body["browserSettings"]["context"] = {"id": context_id, "persist": True}
     return await _request("POST", "/sessions", json=body)
@@ -99,8 +102,11 @@ async def get_live_view_url(session_id: str) -> str | None:
     "click a link, watch the browser live" feature. Best-effort: callers
     should treat a failure here as non-fatal, it's not required for
     deepsearch to function."""
-    data = await _request("GET", f"/sessions/{session_id}/debug")
-    return data.get("debuggerFullscreenUrl") or data.get("debuggerUrl")
+    try:
+        data = await _request("GET", f"/sessions/{session_id}/debug")
+        return data.get("debuggerFullscreenUrl") or data.get("debuggerUrl")
+    except Exception:
+        return None
 
 
 async def get_session_pages(session_id: str) -> list[dict[str, Any]]:

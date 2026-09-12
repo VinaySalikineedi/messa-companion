@@ -536,6 +536,23 @@ INBOUND_EMAIL_BODY_MAX_CHARS = int(os.environ.get("MESSA_INBOUND_EMAIL_BODY_MAX_
 # deepsearch to work at all now -- there's no local-Chromium fallback.
 BROWSERBASE_API_KEY = os.environ.get("BROWSERBASE_API_KEY")
 
+# Active cloud browser provider: "browserbase" or "kernel".
+# Defaults to "browserbase" so existing accounts and subscriptions continue
+# operating with zero changes. Switch to "kernel" to use Kernel's serverless
+# stealth execution and unlimited residential proxies.
+BROWSER_PROVIDER = os.environ.get("MESSA_BROWSER_PROVIDER", "browserbase").strip().lower()
+
+# Kernel credentials and endpoint (https://kernel.sh). Used when BROWSER_PROVIDER="kernel".
+# Free tier includes $5/mo credits and built-in stealth residential proxies.
+KERNEL_API_KEY = os.environ.get("KERNEL_API_KEY")
+KERNEL_BASE_URL = os.environ.get("KERNEL_BASE_URL", "https://api.onkernel.com").rstrip("/")
+
+# When running on Browserbase: whether to route traffic through US residential proxies
+# to prevent bot detection (e.g. Walmart's "Press and Hold" PerimeterX challenge).
+BROWSERBASE_USE_RESIDENTIAL_PROXIES = os.environ.get(
+    "MESSA_BROWSERBASE_RESIDENTIAL_PROXIES", "true"
+).strip().lower() in ("1", "true", "yes")
+
 # Explicit session timeout (seconds), passed on every browserbase.create_session
 # call. Root-caused a real bug: whole deepsearch sessions -- including ones
 # that never touched request_human_help at all -- were cutting off at
@@ -587,6 +604,27 @@ STAGEHAND_MODEL = os.environ.get("MESSA_STAGEHAND_MODEL", "google/gemini-2.5-fla
 # If unset, Stagehand automatically routes through OpenRouter using OPENROUTER_API_KEY,
 # which eliminates Browserbase Model Gateway markup completely ($0.00 Browserbase model spend).
 STAGEHAND_MODEL_API_KEY = os.environ.get("MESSA_STAGEHAND_MODEL_API_KEY", "").strip()
+
+# Models for light-web-agent (Universal dynamic browser agent v2.2)
+LIGHT_WEB_AGENT_MODEL = os.environ.get("MESSA_LIGHT_WEB_AGENT_MODEL", "google/gemini-2.5-flash").strip()
+LIGHT_WEB_AGENT_CRITIC_MODEL = os.environ.get("MESSA_LIGHT_WEB_AGENT_CRITIC_MODEL", "openai/gpt-4o-mini").strip()
+
+# Optional local directory for light-web-agent debug screenshots (audit/
+# verification during development). Empty (default) disables capture
+# entirely -- deliberately NOT hardcoded to any one machine/person's
+# folder; set this explicitly in .env when debugging a live run.
+LIGHT_WEB_AGENT_DEBUG_SCREENSHOT_DIR = os.environ.get("MESSA_LIGHT_WEB_AGENT_DEBUG_SCREENSHOT_DIR", "").strip()
+
+# Master go-live switch for light-web-agent as a reachable Messa subagent
+# (registry.py gates `build_light_web_agent_subagent(...)` on this, same
+# pattern as GROCERY_AGENT_ENABLED below). Unlike that flag, this defaults
+# OFF: the engine itself is well-tested, but wiring it into real user
+# conversations (routing, checkpoint persistence/resume, TTL handling) is
+# new in this same change, so this is a deliberate opt-in rollout switch,
+# not an already-proven feature getting a kill switch.
+LIGHT_WEB_AGENT_ENABLED = os.environ.get("MESSA_LIGHT_WEB_AGENT_ENABLED", "false").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 
 
 # Maximum attempts/retries when encountering or attempting to solve a CAPTCHA.
