@@ -262,6 +262,15 @@ async def render_evening_briefing(job: dict[str, Any]) -> str:
     if not today_bits and not tomorrow_schedule_bits and not tomorrow_reminders:
         lines.append("Quiet day -- nothing done, nothing on the calendar. Let me know if you want help planning tomorrow.")
 
+    # Check for pending actions to ask if they can be marked off or kept
+    try:
+        pending_actions = await db.list_pending_actions(user_id)
+        if pending_actions:
+            items_str = ", ".join(f"{a.get('action_type', 'item')} (#{a.get('id')})" for a in pending_actions[:3])
+            lines.append(f"Pending reviews: {len(pending_actions)} item(s) awaiting approval ({items_str}). Want me to mark these off or keep them?")
+    except Exception:
+        pass
+
     # V3-autonomous.md Phase 3: on a local Sunday only, this same daily 8pm
     # evening_briefing also carries the week's accumulated marketing/promo
     # digest (messa/email_triage.py) -- reusing this existing cron/kind as
