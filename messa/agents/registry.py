@@ -157,23 +157,6 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
             return "Nothing pending confirmation."
         return "\n".join(f"#{r['id']} {r['action_type']}: {r['payload']}" for r in rows)
 
-    @tool
-    async def track_project(title: str) -> str:
-        """Get-or-create a lightweight project thread for a multi-step user request,
-        so related tasks/messages can be grouped together. Safe to call even if the
-        projects table/migration hasn't been applied -- it will just no-op."""
-        row = await db.get_or_create_project(uid, title)
-        if row is None:
-            return "Project tracking isn't enabled yet (run migrations/002_projects_and_channel.sql)."
-        return f"Tracking project '{row['title']}' (#{row['id']})."
-
-    @tool
-    async def list_active_projects() -> str:
-        """List the user's active tracked projects."""
-        rows = await db.list_projects(uid)
-        if not rows:
-            return "No active projects."
-        return "\n".join(f"#{r['id']} {r['title']}" for r in rows)
 
     @tool
     async def save_profile_info(field: str, value: str) -> str:
@@ -689,7 +672,7 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
 
     raw_tools: list[BaseTool] = [
         confirm_pending_action, reject_pending_action, list_pending_actions,
-        track_project, list_active_projects, save_profile_info,
+        save_profile_info,
         set_app_preference, list_my_connected_apps,
         mute_email_sender, unmute_email_sender, list_muted_email_senders,
         mark_email_vip, unmark_email_vip, list_vip_email_senders,
@@ -1148,6 +1131,14 @@ def _build_system_prompt(
         "short answer that actually resolves the ask beats a long one -- but run as long as a "
         "genuinely complex question needs. Separate distinct thoughts into short paragraphs "
         "with a blank line between them.\n\n"
+        "Autonomous worker execution: you are an autonomous worker agent, not an approval-seeking "
+        "chatbot. When the user hands you a goal, project, or task, take it completely off their plate "
+        "and execute it end-to-end (research, find targets, draft notes, dispatch emails, and report "
+        "outcomes). Never drip-feed questions, double-check clear instructions, or ask for permission "
+        "at every sub-step (do NOT ask 'should I find contacts?', 'can I send these drafts?', or "
+        "'give me a green light' when they already told you to lead the project). Only pause for "
+        "input if you hit a hard technical blocker that genuinely cannot proceed without user-held "
+        "credentials.\n\n"
         "Questions before acting: ask only what you genuinely can't proceed without -- never a "
         "checklist, never more than one or two at once, and bundle every question you do have "
         "into a single message rather than drip-feeding them one at a time. If a reasonable "
@@ -1163,9 +1154,9 @@ def _build_system_prompt(
         "connected calendar), email_agent (the user's own Gmail), "
         "personal_inbox_agent (the user's own Messa-owned email address -- a different "
         "inbox from their Gmail), document_agent (contracts, executive reports, and PDFs), routines_agent "
-        "(recurring or one-time task routines -- both plain reminders where the USER does "
-        "something, and background tasks where YOU do something yourself and report back, "
-        "e.g. watchers, deadline-aware follow-ups), integrations_agent (any other app -- "
+        "(owns PROJECT CAPSULES for all multi-step, ongoing projects and goals that track progress, "
+        "milestone events, and document vaults; plus recurring or one-time background routines and follow-ups), "
+        "integrations_agent (any other app -- "
         f"Reddit, Todoist, Slack, Notion, GitHub, Google Calendar, and 1,400+ more)"
         f"{grocery_mention}"
         f"{light_web_agent_mention}"
@@ -1327,12 +1318,17 @@ def _build_system_prompt(
         "specific thing. Everything else executive_assistant does (create/update/delete a task "
         "or reminder, save a note, add/remove a contact) happens immediately with no proposal "
         "step -- when it says one's done, it's done, just relay it.\n\n"
-        "Use track_project when a request looks like it'll span multiple turns or tasks "
-        "(e.g. planning a trip, redesigning something), so related work stays grouped.\n\n"
-        "Be concise -- responses may be read as a text message. Don't restate a subagent's "
-        "full output verbatim; summarize what matters to the user. When sharing a cart, "
-        "checkout, or webpage link, summarize the items and details first, and end with the "
-        "raw URL on its own line so modern messaging apps unfurl it cleanly as a rich card.\n"
+        "Projects & multi-step goals: delegate to routines_agent to create and manage PROJECT CAPSULES "
+        "(propose_create_project_capsule). A project capsule tracks the overarching goal, records progress "
+        "milestones in its timeline (log_project_capsule_event), and files documents/links into its vault "
+        "(add_project_capsule_asset). Never treat projects as a mere title tag -- manage them through "
+        "routines_agent so goals, progress, and assets are fully tracked over time.\n\n"
+        "SMS brevity and summarized updates: you are messaging over a phone thread, not writing an email "
+        "or document. Always message short, concise, summarized updates on tasks (1-2 sentences max) "
+        "giving only the bottom line: what was accomplished, what was found, or the immediate next milestone. "
+        "Never dump full explanations, internal step-by-step logs, or multi-paragraph text across several "
+        "messages. When sharing a cart, checkout, or webpage link, summarize the items and details in one "
+        "short line, and end with the raw URL on its own line so messaging apps unfurl it cleanly as a rich card.\n"
     )
 
 
