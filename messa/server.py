@@ -34,6 +34,7 @@ import asyncio
 import base64
 import json
 import mimetypes
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -1177,6 +1178,21 @@ async def _pick_contextual_reaction(text: str) -> str | None:
     design (see _react_to_inbound's own docstring)."""
     if not text or not text.strip():
         return None
+
+    # Instant fast-path regex for common actionable requests:
+    # Emits an instantaneous tapback within <1ms, avoiding OpenRouter API latency timeouts.
+    lower = text.strip().lower()
+    if re.search(r"\b(email|emails|mail|draft|reach out|outreach|message|text|reply|ping)\b", lower):
+        return _TASK_REACTION_MESSAGE
+    if re.search(r"\b(find|search|look up|research|browse|google|who is|what is|check out|details)\b", lower):
+        return _TASK_REACTION_RESEARCH
+    if re.search(r"\b(remind|schedule|calendar|book|meeting|reschedule)\b", lower):
+        return _TASK_REACTION_SCHEDULE
+    if re.search(r"\b(buy|order|purchase|cart|checkout|pay)\b", lower):
+        return _TASK_REACTION_PURCHASE
+    if re.search(r"\b(start|cancel|submit|apply|fill|handle|do this|go ahead)\b", lower):
+        return _TASK_REACTION_GENERIC
+
     try:
         model = config.build_model(
             config.SUBAGENT_MODEL_NAME, api_key=config.api_key_for_agent("reaction_classifier"),

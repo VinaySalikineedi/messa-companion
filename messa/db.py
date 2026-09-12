@@ -715,6 +715,46 @@ async def get_recent_messages(user_id: int, limit: int = 20) -> list[dict[str, A
         return list(reversed(_rows(rows)))
 
 
+async def get_recent_turns(user_id: int, limit_turns: int = 15, max_raw_rows: int = 150) -> list[dict[str, Any]]:
+    """Retrieve conversational turns (user ask + consolidated assistant answer)
+    rather than fragmented individual SMS bubbles, preventing short-term memory
+    eviction when long responses are split into several database rows."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, role, content, timestamp, channel
+            FROM message_history
+            WHERE user_id = $1
+            ORDER BY timestamp DESC LIMIT $2
+            """,
+            user_id, max_raw_rows,
+        )
+        if not rows:
+            return []
+
+        raw_msgs = list(reversed(_rows(rows)))
+        turns: list[dict[str, Any]] = []
+        for m in raw_msgs:
+            role = m["role"]
+            content = (m["content"] or "").strip()
+            if not content:
+                continue
+            if turns and turns[-1]["role"] == role:
+                turns[-1]["content"] += "\n\n" + content
+                turns[-1]["ids"].append(m["id"])
+            else:
+                turns.append({
+                    "role": role,
+                    "content": content,
+                    "timestamp": m["timestamp"],
+                    "channel": m["channel"],
+                    "id": m["id"],
+                    "ids": [m["id"]],
+                })
+        return turns[-limit_turns:]
+
+
 async def get_messages_since(user_id: int, since: datetime) -> list[dict[str, Any]]:
     """Every message for this user from `since` onward, oldest first -- the
     daily memory batch job's own input (messa/memory.py's
@@ -2163,9 +2203,23 @@ async def get_pending_action(user_id: int, pending_action_id: int) -> dict[str, 
 async def list_pending_actions(user_id: int, state: str = "pending") -> list[dict[str, Any]]:
     pool = await get_pool()
     async with pool.acquire() as conn:
+        now = datetime.now(timezone.utc)
+        # Lazily expire pending actions whose expiration time has passed
+        await conn.execute(
+            """
+            UPDATE pending_actions
+            SET state = 'expired'
+            WHERE user_id = $1 AND state = 'pending' AND expires_at <= $2
+            """,
+            user_id, now,
+        )
         rows = await conn.fetch(
-            "SELECT * FROM pending_actions WHERE user_id = $1 AND state = $2 ORDER BY created_at",
-            user_id, state,
+            """
+            SELECT * FROM pending_actions
+            WHERE user_id = $1 AND state = $2 AND (expires_at IS NULL OR expires_at > $3)
+            ORDER BY created_at
+            """,
+            user_id, state, now,
         )
         return _rows(rows)
 

@@ -69,11 +69,11 @@ from ..tools.document_tools import build_document_subagent
 from ..tools import call_tools
 from ..tools.call_tools import build_call_subagent
 from ..tools.email_tools import build_email_subagent
-from ..tools.executive_tools import _format_contact_line, build_executive_subagent
+from ..tools.executive_tools import _format_contact_line, build_executive_subagent, build_executive_tools
 from ..tools.integration_tools import app_category_for_toolkit, build_integration_subagent
 from ..tools.grocery_tools import build_grocery_subagent
-from ..tools.personal_inbox_tools import build_personal_inbox_subagent
-from ..tools.routines_tools import build_routines_subagent
+from ..tools.personal_inbox_tools import build_personal_inbox_subagent, build_personal_inbox_tools
+from ..tools.routines_tools import build_routines_subagent, build_routines_tools
 from ..tools.scratchpad_tools import build_scratchpad_tools, scratchpad_prompt_block
 from ..tools.web_search_tools import build_web_search_tools
 
@@ -156,23 +156,6 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
             return "Nothing pending confirmation."
         return "\n".join(f"#{r['id']} {r['action_type']}: {r['payload']}" for r in rows)
 
-    @tool
-    async def track_project(title: str) -> str:
-        """Get-or-create a lightweight project thread for a multi-step user request,
-        so related tasks/messages can be grouped together. Safe to call even if the
-        projects table/migration hasn't been applied -- it will just no-op."""
-        row = await db.get_or_create_project(uid, title)
-        if row is None:
-            return "Project tracking isn't enabled yet (run migrations/002_projects_and_channel.sql)."
-        return f"Tracking project '{row['title']}' (#{row['id']})."
-
-    @tool
-    async def list_active_projects() -> str:
-        """List the user's active tracked projects."""
-        rows = await db.list_projects(uid)
-        if not rows:
-            return "No active projects."
-        return "\n".join(f"#{r['id']} {r['title']}" for r in rows)
 
     @tool
     async def save_profile_info(field: str, value: str) -> str:
@@ -688,7 +671,7 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
 
     raw_tools: list[BaseTool] = [
         confirm_pending_action, reject_pending_action, list_pending_actions,
-        track_project, list_active_projects, save_profile_info,
+        save_profile_info,
         set_app_preference, list_my_connected_apps,
         mute_email_sender, unmute_email_sender, list_muted_email_senders,
         mark_email_vip, unmark_email_vip, list_vip_email_senders,
@@ -698,7 +681,24 @@ def build_orchestrator_tools(user: config.UserContext) -> list[BaseTool]:
         recall_past_conversation, cancel_active_search,
         *build_web_search_tools(),
     ]
-    return trace_all(raw_tools, ORCHESTRATOR_LABEL)
+
+    # Direct high-leverage tools: email, project capsules, and reminders
+    # are exposed directly to the orchestrator to eliminate micro-subagent
+    # delegation latency and context loss.
+    direct_tools: list[BaseTool] = [
+        *build_personal_inbox_tools(user),
+        *build_routines_tools(user),
+        *build_executive_tools(user),
+    ]
+
+    seen_names = set()
+    deduped_raw_tools: list[BaseTool] = []
+    for t in [*raw_tools, *direct_tools]:
+        if t.name not in seen_names:
+            seen_names.add(t.name)
+            deduped_raw_tools.append(t)
+
+    return trace_all(deduped_raw_tools, ORCHESTRATOR_LABEL)
 
 
 def _integrations_agent_description(connected_slugs: list[str], email_primary: str = "messa") -> str:
@@ -1015,8 +1015,7 @@ def _build_system_prompt(
     fast_path_draft_note = (
         " When the user asks you to draft, write, or preview an email WITHOUT also "
         "asking you to send/reply right now, write the draft text yourself, right "
-        "here, in the same third-person Messa-voice required at send time -- don't "
-        "delegate just to preview it. Delegate to personal_inbox_agent/email_agent "
+        "here -- don't delegate just to preview it. Delegate to personal_inbox_agent/email_agent "
         "once they confirm they want it sent (or if you need something only that "
         "subagent's own tools provide first, like a thread lookup, a contact's "
         "address, or an attachment)."
@@ -1129,6 +1128,14 @@ def _build_system_prompt(
         "short answer that actually resolves the ask beats a long one -- but run as long as a "
         "genuinely complex question needs. Separate distinct thoughts into short paragraphs "
         "with a blank line between them.\n\n"
+        "Autonomous worker execution: you are an autonomous worker agent, not an approval-seeking "
+        "chatbot. When the user hands you a goal, project, or task, take it completely off their plate "
+        "and execute it end-to-end (research, find targets, draft notes, dispatch emails, and report "
+        "outcomes). Never drip-feed questions, double-check clear instructions, or ask for permission "
+        "at every sub-step (do NOT ask 'should I find contacts?', 'can I send these drafts?', or "
+        "'give me a green light' when they already told you to lead the project). Only pause for "
+        "input if you hit a hard technical blocker that genuinely cannot proceed without user-held "
+        "credentials.\n\n"
         "Questions before acting: ask only what you genuinely can't proceed without -- never a "
         "checklist, never more than one or two at once, and bundle every question you do have "
         "into a single message rather than drip-feeding them one at a time. If a reasonable "
@@ -1138,16 +1145,14 @@ def _build_system_prompt(
         "wrong person, spending money, canceling/deleting something) or when the request is "
         "genuinely ambiguous between two different tasks -- not for details you could pick a "
         "sensible default for.\n\n"
-        "You talk to the user directly and delegate specialized work to subagents via the "
-        "task tool: deepsearch (web browsing/research), executive_assistant (tasks, "
-        "reminders, notes, contacts, and Messa's own INTERNAL calendar -- not a real "
-        "connected calendar), email_agent (the user's own Gmail), "
-        "personal_inbox_agent (the user's own Messa-owned email address -- a different "
-        "inbox from their Gmail), document_agent (contracts, executive reports, and PDFs), routines_agent "
-        "(recurring or one-time task routines -- both plain reminders where the USER does "
-        "something, and background tasks where YOU do something yourself and report back, "
-        "e.g. watchers, deadline-aware follow-ups), integrations_agent (any other app -- "
-        f"Reddit, Todoist, Slack, Notion, GitHub, Google Calendar, and 1,400+ more)"
+        "Direct Tools vs Delegation: You have DIRECT access to core high-leverage tools: "
+        "send_email, search_inbox, create_project_capsule, update_project_capsule, "
+        "create_reminder, list_tasks, search_web, and find_contact. "
+        "ALWAYS use your direct tools immediately for single-turn operations instead of delegating -- "
+        "it is faster, preserves your context, and eliminates unnecessary latency. "
+        "Delegate via the task tool ONLY when truly necessary: deepsearch (multi-step cloud browser "
+        "navigation, form submission, and research), document_agent (compiling PDFs/contracts), or "
+        "integrations_agent (1,400+ third-party connected apps, e.g. Slack, Notion, GitHub, Google Calendar)"
         f"{grocery_mention}"
         f"{admin_agent_mention}."
         f"{parallel_delegation_note}\n\n"
@@ -1161,11 +1166,13 @@ def _build_system_prompt(
         "the target needs connecting first. Connecting an app does NOT change the primary by "
         "itself, except a one-time auto-promotion the first time anything's connected with "
         "nothing else set yet (see 'Known about this user' for the live answer either way).\n"
-        "  - email: personal_inbox_agent (their Messa address) vs email_agent (connected "
-        "Gmail). 'my gmail'/'my real email' -> email_agent; 'my messa email'/'the address you "
-        "gave me' -> personal_inbox_agent. Whenever you draft or send from their Messa "
-        "address, always write third-person on their behalf ('<Name> asked me to confirm...') "
-        "-- never first-person as the user, never sign off with their name."
+        "  - email: always send emails (outreach, inquiries, partner pitches, replies) from the "
+        "user's PRIMARY email (see 'Known about this user' below, e.g. their Messa address via personal_inbox_agent) "
+        "unless the user explicitly specifies otherwise (e.g. 'send from my Gmail'). Never assume or propose that "
+        "founder outreach or partnerships should come from Gmail; never ask permission or double-check which "
+        "email to use when their primary is set. When drafting or sending from their primary email, write naturally "
+        "representing them and their goals. Only route to email_agent if the user specifically names 'Gmail' or "
+        "'my personal email'."
         f"{fast_path_draft_note}\n"
         "  - calendar: executive_assistant (Messa's own internal calendar) vs "
         "integrations_agent (a real connected calendar, e.g. Google Calendar, Composio "
@@ -1306,12 +1313,17 @@ def _build_system_prompt(
         "specific thing. Everything else executive_assistant does (create/update/delete a task "
         "or reminder, save a note, add/remove a contact) happens immediately with no proposal "
         "step -- when it says one's done, it's done, just relay it.\n\n"
-        "Use track_project when a request looks like it'll span multiple turns or tasks "
-        "(e.g. planning a trip, redesigning something), so related work stays grouped.\n\n"
-        "Be concise -- responses may be read as a text message. Don't restate a subagent's "
-        "full output verbatim; summarize what matters to the user. When sharing a cart, "
-        "checkout, or webpage link, summarize the items and details first, and end with the "
-        "raw URL on its own line so modern messaging apps unfurl it cleanly as a rich card.\n"
+        "Projects & multi-step goals: delegate to routines_agent to create and manage PROJECT CAPSULES "
+        "(propose_create_project_capsule). A project capsule tracks the overarching goal, records progress "
+        "milestones in its timeline (log_project_capsule_event), and files documents/links into its vault "
+        "(add_project_capsule_asset). Never treat projects as a mere title tag -- manage them through "
+        "routines_agent so goals, progress, and assets are fully tracked over time.\n\n"
+        "SMS brevity and summarized updates: you are messaging over a phone thread, not writing an email "
+        "or document. Always message short, concise, summarized updates on tasks (1-2 sentences max) "
+        "giving only the bottom line: what was accomplished, what was found, or the immediate next milestone. "
+        "Never dump full explanations, internal step-by-step logs, or multi-paragraph text across several "
+        "messages. When sharing a cart, checkout, or webpage link, summarize the items and details in one "
+        "short line, and end with the raw URL on its own line so messaging apps unfurl it cleanly as a rich card.\n"
     )
 
 

@@ -18,6 +18,7 @@ from .agents.registry import build_orchestrator
 from .approval import CLIApprovalGate
 from .channels import sendblue
 from .channels.sendblue import SendblueError
+from .intent_router import IntentType, triage_incoming_message
 
 # Keep-alive set for run_message's optional on_turn_complete fire-and-
 # forget task (see run_message's own docstring) -- same "asyncio.create_task
@@ -76,7 +77,7 @@ _GUARDRAIL_LENGTH_THRESHOLD = 320  # ~2 SMS segments -- tunable.
 # are deliberately different constants from the guardrail's threshold above
 # -- this is about how big each individual OUTGOING bubble should read, not
 # the trigger for the compression rewrite.
-_SPLIT_TARGET_CHARS = 200  # ~one comfortable text-message bubble
+_SPLIT_TARGET_CHARS = 600  # comfortable text-message bubble (avoid micro-splitting 2-3 sentences)
 _SPLIT_MAX_PARTS = 4  # a message needing more pieces than this should have been shortened upstream instead
 _SENTENCE_BOUNDARY_PATTERN = re.compile(r"(?<=[.!?])\s+")
 _URL_PATTERN = re.compile(r"(https?://[^\s)\]]+)", re.IGNORECASE)
@@ -421,7 +422,10 @@ async def run_turn(
                     if text:
                         console.agent_say("messa", text)
                         last_text = text
-                    if on_ai_message:
+                    # Only stream to user if this is a final answer (no tool calls pending)
+                    # OR if delegating to a long-running subagent like deepsearch where an upfront notice is expected.
+                    # Intermediate thoughts before calling a tool are kept silent on SMS.
+                    if on_ai_message and (not tool_calls or delegating_to == "deepsearch"):
                         await on_ai_message(text, delegating_to)
                 final_messages.append(m)
 
@@ -756,14 +760,17 @@ async def run_message(
             )
             return notice or ""
 
-    # Limit raised by the batch size (0 when log_texts isn't given, so this
-    # is exactly 12 as before) so combining several raw messages into one
-    # `text` below doesn't push real prior context out of the window --
-    # then the just-logged raw rows are filtered back out, since they'd
-    # otherwise duplicate the combined `text` this turn is about to append.
-    recent = await db.get_recent_messages(user.user_id, limit=12 + len(logged_ids))
-    recent = [r for r in recent if r.get("id") not in logged_ids]
-    history = [{"role": r["role"], "content": r["content"]} for r in recent]
+    # Load conversational context by turns rather than raw fragmented bubbles,
+    # preventing multi-part SMS replies from evicting context within 1-2 turns.
+    recent_turns = await db.get_recent_turns(user.user_id, limit_turns=15)
+    recent_turns = [t for t in recent_turns if not any(mid in logged_ids for mid in t.get("ids", []))]
+    history = [{"role": t["role"], "content": t["content"]} for t in recent_turns]
+
+    # Front-Door Intent Router triage
+    intent_decision = await triage_incoming_message(user, text)
+    if intent_decision.intent in (IntentType.ACTIVE_TASK_INPUT, IntentType.STATUS_QUERY):
+        history.append({"role": "system", "content": f"[Intent Triage]: {intent_decision.context_hint}"})
+
     history.append({"role": "user", "content": text})
 
     sent_texts: list[str] = []
@@ -788,53 +795,8 @@ async def run_message(
     async def _on_ai_message(msg_text: str, delegating_to: str | None = None) -> None:
         nonlocal deepsearch_extras_sent, is_first_deepsearch
         msg_text = _sanitize_live_view_urls(msg_text, user)
-        if delegating_to == "deepsearch" and not deepsearch_extras_sent:
-            # The live-view link itself is no longer attached here. It used
-            # to go out with THIS acknowledgment, the moment the model
-            # decided to delegate -- well before a real Browserbase session
-            # (or even the deepsearch subagent's own planning calls) had
-            # run, so the link routinely arrived a minute or two before
-            # there was anything to actually watch. It's now sent
-            # separately, straight from tools/deepsearch_tools.py's
-            # _ensure_live_session, the moment the browser session is
-            # genuinely live -- see that function's own comment for the
-            # full reasoning and for the "no phone_number/share_url"
-            # diagnostic that used to live here (moved there too, since
-            # that's where the send now actually happens).
-            extra_lines: list[str] = []
-            # These two are deterministic and code-authored for the same
-            # reason the link used to be (see this function's own
-            # docstring): a user's explicit ask was "remind users this'll
-            # take a while, they can sit back, and that deepsearch can do
-            # more than just browsing" -- baking that into the system
-            # prompt would mean trusting the model to remember and reword
-            # it correctly on every single delegation, forever. Appending
-            # fixed text here instead guarantees it's always said, always
-            # this short, and never balloons turn over turn the way
-            # model-authored boilerplate tends to.
-            step_away_notice = (
-                "This can take a few minutes -- go ahead and step away, I'll text you "
-                "the second it's done."
-            )
-            if "step away" not in msg_text.lower():
-                extra_lines.append(step_away_notice)
-            if is_first_deepsearch is None:
-                is_first_deepsearch = not await db.has_prior_deepsearch_session(user.user_id)
-            if is_first_deepsearch:
-                # Shown once, on this user's very first-ever deepsearch
-                # delegation only (not every single time) -- the same
-                # "repeating this reads as spammy" reasoning as the link
-                # above, just on a longer timescale: useful the first time
-                # someone sees deepsearch in action, noise on the tenth.
-                extra_lines.append(
-                    "And it's not just browsing -- I can click through logins, fill out "
-                    "forms, and handle more involved stuff too, so feel free to ask for that."
-                )
-            extra_block = "\n".join(extra_lines)
-            msg_text = f"{msg_text.rstrip()} {extra_block}" if msg_text.strip() else extra_block
-            deepsearch_extras_sent = True
         if not msg_text:
-            return  # nothing to say and no link to attach -- e.g. a silent, non-deepsearch delegation
+            return  # nothing to say -- e.g. a silent delegation
 
         msg_text = await _apply_reply_guardrail(msg_text)
 
@@ -875,43 +837,6 @@ async def run_message(
 
     final = await run_turn(agent, history, on_ai_message=_on_ai_message)
 
-    # V3-autonomous.md Pillar 1: one-touch approvals -- structural backstop
-    # for the "user says a clear yes, Messa asks to confirm again anyway"
-    # failure mode. The persona prompt already tells the orchestrator to
-    # call confirm_pending_action the instant the user approves (see
-    # registry.py's "Confirmation flow" paragraph); this catches it when
-    # that doesn't happen, same bounded-single-retry shape as run_turn's
-    # own _STALL_PATTERN/unverified_claim_reason backstops above (never a
-    # loop -- this whole block runs at most once per turn). A false
-    # positive here (the user's "yes" was about something else entirely)
-    # just costs one extra model call that finds nothing to confirm and
-    # says so; it never confirms anything on its own.
-    if config.ONE_TOUCH_APPROVAL_NUDGE_ENABLED and reliability.is_bare_affirmation(text):
-        new_messages = final[len(history):]
-        confirmed_or_rejected = any(
-            tc.get("name") in ("confirm_pending_action", "reject_pending_action")
-            for m in new_messages
-            for tc in (getattr(m, "tool_calls", None) or [])
-        )
-        if not confirmed_or_rejected:
-            pending = await db.list_pending_actions(user.user_id)
-            if pending:
-                console.system(
-                    "Messa: this reply reads as a clear approval but nothing was "
-                    "confirmed or rejected this turn, and an action is still pending -- "
-                    "retrying once with a nudge."
-                )
-                nudge_text = (
-                    "(auto-check, not from the user: their last message reads as a clear "
-                    "approval, and there's at least one action still awaiting confirmation "
-                    "-- check list_pending_actions. If it's for that, call "
-                    "confirm_pending_action now. If their message was about something "
-                    "else, ignore this.)"
-                )
-                final = await run_turn(
-                    agent, final + [HumanMessage(content=nudge_text)],
-                    on_ai_message=_on_ai_message, _allow_retry=False,
-                )
 
     # "Sleep & dream" post-turn consolidation (docs/executive_agent_
     # architecture_proposal.md 3.C) -- fired here, the earliest point
