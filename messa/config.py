@@ -605,6 +605,10 @@ STAGEHAND_MODEL = os.environ.get("MESSA_STAGEHAND_MODEL", "google/gemini-2.5-fla
 # which eliminates Browserbase Model Gateway markup completely ($0.00 Browserbase model spend).
 STAGEHAND_MODEL_API_KEY = os.environ.get("MESSA_STAGEHAND_MODEL_API_KEY", "").strip()
 
+# Models for light-web-agent (Universal dynamic browser agent v2.2)
+LIGHT_WEB_AGENT_MODEL = os.environ.get("MESSA_LIGHT_WEB_AGENT_MODEL", "google/gemini-2.5-flash").strip()
+LIGHT_WEB_AGENT_CRITIC_MODEL = os.environ.get("MESSA_LIGHT_WEB_AGENT_CRITIC_MODEL", "openai/gpt-4o-mini").strip()
+
 
 # Maximum attempts/retries when encountering or attempting to solve a CAPTCHA.
 # CAPTCHAs are generally hard to pass autonomously, so capping attempts at 2 prevents
