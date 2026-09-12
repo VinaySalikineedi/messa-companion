@@ -56,12 +56,10 @@ _STALL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Pre-send guardrail (see agents/registry.py's persona block, which asks for
-# this same shape in the prompt -- this is the deterministic backstop for
-# when prompting alone isn't enough): flags leftover markdown/bullet-list
-# formatting, or a reply that's grown too long for a text message.
+# Pre-send guardrail: flags leftover markdown artifacts (**bold**, # headers, code fences)
+# or replies that are too bulky for a text message. Numbered lists (1., 2.) are valid SMS text.
 _MARKDOWN_ARTIFACT_PATTERN = re.compile(
-    r"(\*\*[^*\n]+\*\*|^\s*#{1,6}\s|^\s*[-*]\s|^\s*\d+\.\s|```)",
+    r"(\*\*[^*\n]+\*\*|^\s*#{1,6}\s|```)",
     re.MULTILINE,
 )
 _GUARDRAIL_LENGTH_THRESHOLD = 320  # ~2 SMS segments -- tunable.
@@ -205,13 +203,18 @@ async def _apply_reply_guardrail(msg_text: str) -> str:
             {
                 "role": "system",
                 "content": (
-                    "Rewrite the following text-message reply to be short and human: plain "
-                    "paragraphs separated by a blank line, no bullet points, no numbered "
-                    "lists, no markdown (**bold**, #headers, code fences) at all. Keep every "
-                    "fact, name, and number that matters -- don't drop real information. Only "
-                    "stay as long as the original if shortening it would genuinely lose "
-                    "necessary meaning; otherwise make it meaningfully shorter. Reply with "
-                    "ONLY the rewritten text, nothing else -- no preamble, no explanation."
+                    "You format text-message replies for mobile screens. The text must be clean, concise, "
+                    "and effortless to read on a phone.\n\n"
+                    "Rules:\n"
+                    "1. Never send bulky walls of text, dense paragraphs, or lengthy bios over text.\n"
+                    "2. If the message answers a search or request with a list (e.g. names, places, options), "
+                    "give a clean, short numbered list with just the names and a 1-line summary per item.\n"
+                    "3. Do not dump the entire background research or full biographies into SMS. State that you have "
+                    "the full details/contacts saved, and ask if they want you to take the next step (e.g. draft emails, "
+                    "dig deeper, or file into a project capsule).\n"
+                    "4. Numbered lists (1., 2., 3.) and short paragraphs are encouraged. "
+                    "Strip markdown (**bold**, # headers, code fences).\n"
+                    "5. Output ONLY the clean text-message reply, nothing else."
                 ),
             },
             {"role": "user", "content": msg_text},
