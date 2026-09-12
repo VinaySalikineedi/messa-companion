@@ -105,11 +105,28 @@ class LightWebAgent:
         model_name: Optional[str] = None,
         critic_model_name: Optional[str] = None,
         user_id: Optional[Any] = None,
+        resume_checkpoint: Optional["HumanCheckpoint"] = None,
     ) -> None:
         self.session = session
         self.user_goal = user_goal
         self.credentials = credentials or {}
         self.max_steps = max_steps
+
+        # When resuming a suspended session, the human's answer to the
+        # checkpoint that suspended it (OTP digits, a CAPTCHA confirmation,
+        # a risk-review "YES", etc). Without this, nothing ever reads
+        # `HumanCheckpoint.human_input` -- resuming would just re-run
+        # `_detect_human_checkpoint`, see the exact same prompt still on
+        # the page, and re-suspend forever instead of ever submitting the
+        # answer. `_resume_checkpoint_pending` gates BOTH the one-time
+        # skip of that re-detection AND the one-time planner directive
+        # below; it's cleared the first time the planner is actually
+        # queried so normal checkpoint detection resumes for anything
+        # that comes after (e.g. a second, unrelated checkpoint later).
+        self.resume_checkpoint = resume_checkpoint
+        self._resume_checkpoint_pending = resume_checkpoint is not None
+        if resume_checkpoint is not None and resume_checkpoint.human_input:
+            self.credentials.setdefault("checkpoint_answer", resume_checkpoint.human_input)
         self.model_name = model_name or getattr(config, "LIGHT_WEB_AGENT_MODEL", "google/gemini-2.5-flash")
         self.critic_model_name = critic_model_name or getattr(config, "LIGHT_WEB_AGENT_CRITIC_MODEL", "openai/gpt-4o-mini")
         self.user_id = user_id or getattr(session, "user_id", None)
@@ -119,6 +136,18 @@ class LightWebAgent:
         self.action_history_signatures: List[str] = []
         self.is_completed = False
         self.result_summary: Optional[str] = None
+
+        # Which canonical landmark intents (search/sign_up/cart/...) have
+        # already been fast-pathed once. The fast-path used to only ever
+        # run on step 0 -- safe, but meant it only ever fired a single
+        # time per task, which isn't how a human skims a page: they look
+        # for the next obvious control on EVERY page, not just the first.
+        # Tracking "already used" per-intent (rather than gating on
+        # step_history length globally) is what lets it run every turn
+        # without blindly repeating a completed intent (e.g. re-searching
+        # or re-clicking "sign up" again once that step is already done).
+        self._used_landmark_intents: set = set()
+        self._pending_landmark_intent: Optional[str] = None
 
         # Scratchpad & Skills state (Postgres-backed with in-memory fallback)
         self.scratchpad_artifacts: Dict[str, Any] = {}
@@ -164,6 +193,41 @@ class LightWebAgent:
             except Exception as e:
                 logger.debug(f"[LightWebAgent] Scratchpad update fallback: {e}")
 
+    async def _persist_pending_checkpoint(self, checkpoint: "HumanCheckpoint") -> None:
+        """Persist enough into the Active Task Scratchpad to resume this
+        exact suspended task across a turn boundary -- reuses the existing
+        Active Task Scratchpad mechanism (no new DB table). Without this,
+        a suspended session has nowhere durable to record WHAT it's
+        waiting for or HOW to resume it once server.py/browser.py see the
+        human's answer arrive on a later, unrelated turn.
+
+        Order matters: the artifacts write must happen BEFORE the status
+        flip to 'waiting_user_input' -- db.update_active_task_artifacts
+        itself flips a 'waiting_user_input' task back to 'in_progress' on
+        any write (by design, for the normal case), which would silently
+        undo the status this call is trying to set if done in the other
+        order.
+        """
+        if not self.active_task_id or not getattr(config, "SCRATCHPAD_AND_SKILLS_ENABLED", True):
+            return
+        try:
+            await self._update_scratchpad({
+                "pending_checkpoint": {
+                    "session_id": self.session.session_id,
+                    "kind": checkpoint.kind,
+                    "prompt_to_user": checkpoint.prompt_to_user,
+                    "asked_at": time.time(),
+                },
+                "_call_context": {
+                    "goal": self.user_goal,
+                    "credentials": self.credentials,
+                    "max_steps": self.max_steps,
+                },
+            })
+            await db.set_active_task_status(self.active_task_id, "waiting_user_input")
+        except Exception as e:
+            logger.debug(f"[LightWebAgent] _persist_pending_checkpoint fallback: {e}")
+
     async def _persist_skill(self, domain: str, pattern: str, recipe: str) -> None:
         """Persist learned lesson to cross-user skills playbook."""
         GLOBAL_WEB_SKILL_CACHE[domain] = {
@@ -186,30 +250,73 @@ class LightWebAgent:
             except Exception as e:
                 logger.debug(f"[LightWebAgent] db.upsert_skill fallback: {e}")
 
+    def _cache_key(self, domain: str) -> str:
+        """Scope the zero-LLM skill cache per-user (or per-session when no
+        user_id is known) instead of sharing it globally by domain alone.
+        A bare domain-only key meant one user's completed steps --
+        including literally-typed values like a search query -- could get
+        replayed onto a DIFFERENT user's different goal on the same
+        domain, gated only by whether the old target_ids still happened to
+        exist on the page. This closes the sharpest edge of that: cross-
+        session cache entries can no longer collide at all."""
+        scope = self.int_user_id if self.int_user_id is not None else f"session:{getattr(self.session, 'session_id', 'unknown')}"
+        return f"{scope}:{domain}"
+
+    @staticmethod
+    def _goal_intent_matches(current_goal: str, cached_intent: str) -> bool:
+        """Deliberately simple keyword-overlap check -- this doesn't need
+        to be a semantic match, it needs to stop blind replay of one
+        goal's literal steps onto an unrelated goal. A verified macro-
+        action sequence is only safe to auto-replay when the NEW goal
+        looks like the same task, not just the same website/session."""
+        def _words(text: str) -> set:
+            return {w for w in re.findall(r"[a-z0-9]+", (text or "").lower()) if len(w) >= 3}
+        current_words = _words(current_goal)
+        cached_words = _words(cached_intent)
+        if not current_words or not cached_words:
+            return False
+        overlap = current_words & cached_words
+        shorter = min(len(current_words), len(cached_words))
+        return shorter > 0 and (len(overlap) / shorter) >= 0.5
+
     def _lookup_skill_cache(self, domain: str, goal: str) -> Optional[MacroAction]:
-        """Check if a verified macro-action sequence is cached for this domain & intent."""
-        if domain in GLOBAL_WEB_SKILL_CACHE:
-            entry = GLOBAL_WEB_SKILL_CACHE[domain]
-            steps_data = entry.get("steps", [])
-            if steps_data:
-                steps = [MacroStep(**s) for s in steps_data]
-                return MacroAction(steps=steps)
+        """Check if a verified macro-action sequence is cached for this
+        user/session, domain, AND intent -- all three, not just domain
+        (see _cache_key/_goal_intent_matches docstrings for why)."""
+        key = self._cache_key(domain)
+        entry = GLOBAL_WEB_SKILL_CACHE.get(key)
+        if not entry:
+            return None
+        cached_intent = entry.get("intent", "")
+        if not self._goal_intent_matches(goal, cached_intent):
+            logger.info(
+                f"[SkillCache] Entry exists for {key} but intent doesn't match closely enough "
+                f"(cached='{cached_intent}', current='{goal.lower()}') -- refusing to replay."
+            )
+            return None
+        steps_data = entry.get("steps", [])
+        if steps_data:
+            steps = [MacroStep(**s) for s in steps_data]
+            return MacroAction(steps=steps)
         return None
 
     def _write_skill_cache(self, domain: str, goal: str, history: List[Dict[str, Any]]) -> None:
-        """Cache a successful macro-action sequence for domain reuse."""
+        """Cache a successful macro-action sequence for reuse by the SAME
+        user/session on this domain and a matching intent (see
+        _cache_key/_lookup_skill_cache)."""
         collected_steps = []
         for h in history:
             act = h.get("action")
             if act and "steps" in act:
                 collected_steps.extend(act["steps"])
         if collected_steps:
-            GLOBAL_WEB_SKILL_CACHE[domain] = {
+            key = self._cache_key(domain)
+            GLOBAL_WEB_SKILL_CACHE[key] = {
                 "intent": goal.lower(),
                 "steps": collected_steps,
                 "saved_at": time.time(),
             }
-            logger.info(f"[SkillCache] Cached {len(collected_steps)} macro steps for domain: {domain}")
+            logger.info(f"[SkillCache] Cached {len(collected_steps)} macro steps for {key}")
 
     def _detect_and_uncheck_dark_patterns(
         self, elements: List[Dict[str, Any]], elem_map: Dict[str, Any]
@@ -266,24 +373,32 @@ class LightWebAgent:
                     pass
 
             # 3. REFLECT & DEFEND: Check for human checkpoints (SMS OTP, CAPTCHA) FIRST
-            checkpoint = self._detect_human_checkpoint(current_url, current_title, a11y_text)
-            if not checkpoint and page:
-                try:
-                    body_text = (await page.inner_text("body", timeout=1000)).lower()
-                    if any(w in body_text for w in [
-                        "robot or human", "press & hold", "press and hold", "verify you are human",
-                        "px-captcha", "perimeterx", "security check"
-                    ]):
-                        live_view = self.session.live_view_url or ""
-                        url_msg = f"\nTap here to complete verification: {live_view}" if live_view else ""
-                        checkpoint = HumanCheckpoint(
-                            kind="captcha",
-                            prompt_to_user=f"A verification puzzle appeared.{url_msg}\nPlease complete it so Messa can continue.",
-                            interactive_url=live_view,
-                            trigger_reason="captcha_challenge",
-                        )
-                except Exception:
-                    pass
+            # Skipped for as long as a just-resumed checkpoint answer is still
+            # pending delivery to the planner -- otherwise this immediately
+            # re-detects the very same OTP/CAPTCHA prompt still visible on the
+            # page and re-suspends the session before the human's answer ever
+            # gets submitted.
+            if self._resume_checkpoint_pending:
+                checkpoint = None
+            else:
+                checkpoint = self._detect_human_checkpoint(current_url, current_title, a11y_text)
+                if not checkpoint and page:
+                    try:
+                        body_text = (await page.inner_text("body", timeout=1000)).lower()
+                        if any(w in body_text for w in [
+                            "robot or human", "press & hold", "press and hold", "verify you are human",
+                            "px-captcha", "perimeterx", "security check"
+                        ]):
+                            live_view = self.session.live_view_url or ""
+                            url_msg = f"\nTap here to complete verification: {live_view}" if live_view else ""
+                            checkpoint = HumanCheckpoint(
+                                kind="captcha",
+                                prompt_to_user=f"A verification puzzle appeared.{url_msg}\nPlease complete it so Messa can continue.",
+                                interactive_url=live_view,
+                                trigger_reason="captcha_challenge",
+                            )
+                    except Exception:
+                        pass
 
             if checkpoint:
                 print(f"[LightWebAgent Human Checkpoint] Triggered: {checkpoint.kind.upper()} -> {checkpoint.prompt_to_user}", flush=True)
@@ -294,6 +409,7 @@ class LightWebAgent:
                     except Exception:
                         pass
                 await session_manager.suspend_session(self.session.session_id, checkpoint.dict())
+                await self._persist_pending_checkpoint(checkpoint)
                 return AgentDecision(
                     status="NEEDS_HUMAN",
                     thought=f"Detected {checkpoint.kind} requirement. Suspending session for human input.",
@@ -338,6 +454,8 @@ class LightWebAgent:
                 exec_ok, err = await self._execute_macro_action(page, landmark_action, elem_map)
                 if exec_ok:
                     self.step_history.append({"type": "landmark", "action": landmark_action.dict()})
+                    if self._pending_landmark_intent:
+                        self._used_landmark_intents.add(self._pending_landmark_intent)
                     if self.int_user_id is not None:
                         try:
                             live_activity.add_step(self.int_user_id, f"Turn {step_idx + 1}: FastPath {landmark_action.steps[0].action} {landmark_action.steps[0].target_id}")
@@ -404,6 +522,7 @@ class LightWebAgent:
                         except Exception:
                             pass
                     await session_manager.suspend_session(self.session.session_id, risk_checkpoint.dict())
+                    await self._persist_pending_checkpoint(risk_checkpoint)
                     return AgentDecision(
                         status="BLOCKED_INJECTION",
                         thought=f"Intent-Alignment Critic flagged consequential action: {reason}",
@@ -471,13 +590,30 @@ class LightWebAgent:
                 result_summary=f"Circuit Breaker: Exceeded maximum step limit ({self.max_steps}).",
             )
 
-        # 2. Oscillation detection (e.g. A -> B -> A -> B across last 4 steps)
-        if len(self.action_history_signatures) >= 4:
-            recent = self.action_history_signatures[-4:]
-            if recent[0] == recent[2] and recent[1] == recent[3]:
+        # 2. Oscillation detection across the last 6 actions (architecture
+        # doc Pillar 7 / handover brief: "short cycle detection across 6
+        # actions"). The original check only ever looked at a hardcoded
+        # 4-length window for a strict period-2 (A-B-A-B) pattern, which
+        # misses a 3-step trap (A->B->C->A->B->C) entirely, and misses a
+        # flat exact-repeat (A->A->A) too -- both real "the agent is stuck"
+        # shapes, not just alternating between exactly two actions. Scan
+        # whatever's available in the last 6 signatures for any repeating
+        # cycle of period 1, 2, or 3 -- period 2 still fires at the same
+        # minimum 4 signatures as before (this is a strict superset of the
+        # original check, not a replacement with different timing).
+        recent = self.action_history_signatures[-6:]
+        for period in (1, 2, 3):
+            need = period * 2
+            if len(recent) < need:
+                continue
+            window = recent[-need:]
+            if window[:period] == window[period:]:
                 return AgentDecision(
                     status="FAILED",
-                    thought="Circuit Breaker: Detected oscillating action cycle (A-B-A-B). Halting.",
+                    thought=(
+                        f"Circuit Breaker: Detected oscillating action cycle (period {period}) "
+                        "across the last actions. Halting."
+                    ),
                     result_summary="Agent detected an oscillating loop on the website.",
                 )
 
@@ -492,46 +628,69 @@ class LightWebAgent:
         return None
 
     def _try_landmark_fastpath(self, elem_map: Dict[str, Any]) -> Optional[MacroAction]:
-        """Check for high-confidence zero-LLM landmark matches."""
+        """Check for high-confidence zero-LLM landmark matches.
+
+        Gated per-intent (via `self._used_landmark_intents`), not by overall
+        step_history length -- a human doesn't stop skimming for the next
+        obvious control after the first page, they do it on every page. So
+        this now runs every turn, but each canonical intent (search /
+        sign_up / cart) can only fast-path once per task: once "search" has
+        actually been executed via this path, it's marked used and won't
+        fire again even though the gate now opens on every turn, so a later
+        turn can't blindly re-type the same query or re-click "sign up"
+        a second time. `WebConventionPrior.match_canonical_landmark` also
+        independently skips any element flagged `occluded` (e.g. sitting
+        behind a modal), so a fast-path match is never fired at a target a
+        real user couldn't actually reach right now.
+        """
         goal_lower = self.user_goal.lower()
-        if len(self.step_history) == 0:
-            if "search" in goal_lower and not any(k in goal_lower for k in ["cart", "sign in", "login"]):
-                match = WebConventionPrior.match_canonical_landmark("search", list(elem_map.values()))
-                if match:
-                    sig = match["signature"]
-                    # Extract search query from goal
-                    query = ""
-                    for prefix in ["search for", "search", "find"]:
-                        if prefix in goal_lower:
-                            idx = goal_lower.find(prefix) + len(prefix)
-                            raw_query = self.user_goal[idx:].strip()
-                            for conj in [" and ", " then ", ","]:
-                                if conj in raw_query.lower():
-                                    raw_query = raw_query[:raw_query.lower().find(conj)].strip()
-                            query = raw_query.strip(" '\"")
-                            break
-                    if query:
-                        return MacroAction(steps=[
-                            MacroStep(action="type", target_id=match["id"], target_signature=sig, value=query),
-                            MacroStep(action="press_key", target_id=match["id"], target_signature=sig, value="Enter"),
-                        ])
+        self._pending_landmark_intent = None
+
+        if "search" in goal_lower and not any(k in goal_lower for k in ["cart", "sign in", "login"]) \
+                and "search" not in self._used_landmark_intents:
+            match = WebConventionPrior.match_canonical_landmark("search", list(elem_map.values()))
+            if match:
+                sig = match["signature"]
+                # Extract search query from goal
+                query = ""
+                for prefix in ["search for", "search", "find"]:
+                    if prefix in goal_lower:
+                        idx = goal_lower.find(prefix) + len(prefix)
+                        raw_query = self.user_goal[idx:].strip()
+                        for conj in [" and ", " then ", ","]:
+                            if conj in raw_query.lower():
+                                raw_query = raw_query[:raw_query.lower().find(conj)].strip()
+                        query = raw_query.strip(" '\"")
+                        break
+                self._pending_landmark_intent = "search"
+                if query:
                     return MacroAction(steps=[
-                        MacroStep(action="click", target_id=match["id"], target_signature=sig)
+                        MacroStep(action="type", target_id=match["id"], target_signature=sig, value=query),
+                        MacroStep(action="press_key", target_id=match["id"], target_signature=sig, value="Enter"),
                     ])
-            elif any(k in goal_lower for k in ["sign up", "create account", "register"]):
-                match = WebConventionPrior.match_canonical_landmark("sign_up", list(elem_map.values()))
-                if match:
-                    sig = match["signature"]
-                    return MacroAction(steps=[
-                        MacroStep(action="click", target_id=match["id"], target_signature=sig)
-                    ])
-            elif "cart" in goal_lower and any(w in goal_lower for w in ["view", "open", "show", "go to"]):
-                match = WebConventionPrior.match_canonical_landmark("cart", list(elem_map.values()))
-                if match:
-                    sig = match["signature"]
-                    return MacroAction(steps=[
-                        MacroStep(action="click", target_id=match["id"], target_signature=sig)
-                    ])
+                return MacroAction(steps=[
+                    MacroStep(action="click", target_id=match["id"], target_signature=sig)
+                ])
+
+        if any(k in goal_lower for k in ["sign up", "create account", "register"]) \
+                and "sign_up" not in self._used_landmark_intents:
+            match = WebConventionPrior.match_canonical_landmark("sign_up", list(elem_map.values()))
+            if match:
+                sig = match["signature"]
+                self._pending_landmark_intent = "sign_up"
+                return MacroAction(steps=[
+                    MacroStep(action="click", target_id=match["id"], target_signature=sig)
+                ])
+
+        if "cart" in goal_lower and any(w in goal_lower for w in ["view", "open", "show", "go to"]) \
+                and "cart" not in self._used_landmark_intents:
+            match = WebConventionPrior.match_canonical_landmark("cart", list(elem_map.values()))
+            if match:
+                sig = match["signature"]
+                self._pending_landmark_intent = "cart"
+                return MacroAction(steps=[
+                    MacroStep(action="click", target_id=match["id"], target_signature=sig)
+                ])
 
         return None
 
@@ -605,7 +764,18 @@ class LightWebAgent:
         return None
 
     async def _run_intent_alignment_critic(self, action: MacroAction) -> Tuple[bool, str]:
-        """Isolated critic evaluating whether consequential actions strictly match user intent."""
+        """Isolated critic evaluating whether consequential actions strictly match user intent.
+
+        FAILS CLOSED, deliberately: this is the one gate standing between an
+        injected/misaligned consequential action (order submit, payment,
+        address change) and actually executing it. A prior version of this
+        function returned (True, "") -- i.e. "aligned" -- whenever the model
+        call errored or its response didn't parse, which meant the critic's
+        entire protection silently vanished exactly when it was least
+        available (a network hiccup, a rate limit, or a page crafted to
+        break its own JSON parsing). Any failure to get a clear "aligned"
+        verdict now returns misaligned=False, routing to the same
+        risk_review HumanCheckpoint a genuine misalignment would."""
         summary = f"Steps: {[s.dict() for s in action.steps]}, Expect: {action.expect}"
         prompt = (
             f"You are a strict security alignment critic for an AI shopping agent.\n"
@@ -625,11 +795,18 @@ class LightWebAgent:
             match = re.search(r"\{.*\}", content, re.DOTALL)
             if match:
                 data = json.loads(match.group(0))
-                verdict = data.get("verdict", "aligned")
-                return (verdict == "aligned", data.get("reason", ""))
+                # Default to "uncertain" (not "aligned") when the model's
+                # JSON is well-formed but simply omits verdict -- same
+                # fail-closed principle as the exception path below.
+                verdict = data.get("verdict", "uncertain")
+                reason = data.get("reason", "")
+                if verdict == "aligned":
+                    return (True, reason)
+                return (False, reason or f"Critic verdict: {verdict}")
+            logger.warning("[IntentCritic] No parseable verdict in critic response -- failing closed (uncertain).")
         except Exception as e:
-            logger.debug(f"[IntentCritic] Fallback evaluation note: {e}")
-        return (True, "")
+            logger.warning(f"[IntentCritic] Critic evaluation failed -- failing closed (uncertain): {e}")
+        return (False, "Critic evaluation failed or was inconclusive -- treating as uncertain, not aligned.")
 
     async def _execute_macro_action(
         self,
@@ -660,6 +837,27 @@ class LightWebAgent:
             if "{{cred:" in val:
                 for cred_key, cred_val in self.credentials.items():
                     val = val.replace(f"{{{{cred:{cred_key}}}}}", cred_val)
+
+            # Occlusion Guard: refuse to click/type into a target the
+            # Perception Engine flagged as covered by something else
+            # (almost always a modal/overlay). This is the actual fix for
+            # the "clicked signup behind the popup" failure -- the
+            # force=True/dispatch_event fallback below exists to route
+            # around stale locators and mid-re-render timing misses, NOT to
+            # punch through a genuinely, correctly blocked element. Without
+            # this guard, a real Playwright actionability failure (the
+            # SAFE, correct outcome for an occluded element) was being
+            # treated as "try harder" instead of "this is actually blocked."
+            if target_el.get("occluded") and step.action in ("click", "type"):
+                logger.warning(
+                    f"[MacroExecutor] Occlusion Guard: target {step.target_id} is covered by "
+                    "another element (likely a modal/overlay). Refusing to force through it."
+                )
+                return False, (
+                    f"Target {step.target_id} is occluded by another element (likely a "
+                    "modal/overlay) -- resolve or engage with the overlay first instead of "
+                    "forcing this action through it."
+                )
 
             # Execute atomic Playwright action
             try:
@@ -768,6 +966,22 @@ class LightWebAgent:
                         await locator.press(normalized_key, timeout=3000)
                     except Exception:
                         await page.keyboard.press(normalized_key)
+                elif step.action == "select_option":
+                    # Declared as a valid MacroStep action but previously
+                    # had no execution branch at all -- the LLM could emit
+                    # it for a shipping-speed/state/quantity dropdown
+                    # (common on real checkout flows) and it would silently
+                    # no-op while the batch still reported success. Try
+                    # matching by visible label first (what an LLM is most
+                    # likely to have read off the page), then by the
+                    # underlying option value.
+                    try:
+                        await locator.select_option(label=val, timeout=3000)
+                    except Exception:
+                        try:
+                            await locator.select_option(value=val, timeout=3000)
+                        except Exception:
+                            await locator.select_option(val, timeout=3000)
                 elif step.action == "scroll":
                     await page.mouse.wheel(0, 500)
                 elif step.action == "wait_for":
@@ -829,6 +1043,27 @@ class LightWebAgent:
         if self.scratchpad_artifacts:
             scratchpad_str = f"\n\n<active_task_scratchpad>\n{json.dumps(self.scratchpad_artifacts, indent=2)}\n</active_task_scratchpad>"
 
+        # One-time steering directive after resuming from a suspended human
+        # checkpoint: tell the planner exactly what just happened and where
+        # the answer lives, instead of letting it re-discover (or worse,
+        # never notice) the still-pending OTP/CAPTCHA/confirmation field.
+        resume_directive = ""
+        if self.resume_checkpoint is not None and self._resume_checkpoint_pending:
+            ck = self.resume_checkpoint
+            resume_directive = (
+                f"\n\n[RESUMED FROM HUMAN CHECKPOINT]: A human was just asked to provide a "
+                f"'{ck.kind}' (they were told: \"{ck.prompt_to_user}\") and has now answered. "
+                "Their answer is available as the credential token '{{cred:checkpoint_answer}}' -- "
+                "do NOT ask for it again and do NOT re-evaluate whether a checkpoint is needed. "
+                "Find the field on THIS page that corresponds to that checkpoint (the OTP/verification "
+                "code input, the CAPTCHA confirmation control, or the payment/risk confirmation control) "
+                "and submit '{{cred:checkpoint_answer}}' into it now as your next action."
+            )
+            # Consumed: only steer the very next planner call this way. If a
+            # different checkpoint shows up later in the same run, normal
+            # detection (re-enabled the moment this flips off) will catch it.
+            self._resume_checkpoint_pending = False
+
         system_prompt = (
             "You are light-web-agent, an autonomous high-speed web navigation agent.\n"
             "Your objective is to accomplish the user's goal with minimal steps and maximum reliability.\n\n"
@@ -867,7 +1102,8 @@ class LightWebAgent:
             f"</web_content_untrusted>\n\n"
             f"Recent Steps Taken:\n{history_str}"
             f"{loop_warning}"
-            f"{scratchpad_str}\n\n"
+            f"{scratchpad_str}"
+            f"{resume_directive}\n\n"
             f"Total steps so far: {len(self.step_history)}\n"
             "Output your next decision in JSON."
         )

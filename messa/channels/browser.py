@@ -84,6 +84,72 @@ async def get_session_pages(session_id: str) -> list[dict[str, Any]]:
     return await browserbase.get_session_pages(session_id)
 
 
+def _coerce_int_user_id(user_id: Any | None) -> int | None:
+    if isinstance(user_id, int):
+        return user_id
+    if isinstance(user_id, str) and user_id.isdigit():
+        return int(user_id)
+    return None
+
+
+async def _finalize_light_web_run(
+    managed: Any,
+    agent: Any,
+    decision: Any,
+    *,
+    int_user_id: int | None,
+    debug_domain_hint: str | None = None,
+) -> dict[str, Any]:
+    """Shared tail for both run_light_web_task and resume_light_web_task:
+    optional debug screenshot, conditional session release (never release
+    while NEEDS_HUMAN -- that's the whole point of suspending instead of
+    tearing down), and the standardized result dict both entry points
+    return. Factored out so the two entry points can't silently drift
+    (e.g. one of them forgetting to release a finished session, or
+    resume's result dict missing a field run's callers already rely on).
+    """
+    from .. import live_activity
+
+    # Optional debug screenshot capture, gated behind an explicit config
+    # value rather than hardcoded to any one machine/person's local
+    # folder (a prior version of this hardcoded a specific developer's
+    # IDE debug directory here -- dead in any real deployment, but
+    # leftover scaffolding that had no business being in the main
+    # task-runner every real user request goes through).
+    debug_dir = getattr(config, "LIGHT_WEB_AGENT_DEBUG_SCREENSHOT_DIR", "") or ""
+    if debug_dir and managed.active_page:
+        from pathlib import Path
+        artifact_dir = Path(debug_dir)
+        try:
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            hint = debug_domain_hint or ""
+            domain_slug = "instacart" if "instacart" in hint else "walmart" if "walmart" in hint else "web"
+            await managed.active_page.screenshot(path=str(artifact_dir / f"{domain_slug}_browserbase_live.png"))
+        except Exception as ss_e:
+            logger.debug(f"[_finalize_light_web_run] screenshot capture skipped: {ss_e}")
+
+    # If completed or failed, release session unless waiting on human
+    if decision.status not in ["NEEDS_HUMAN"]:
+        if int_user_id is not None:
+            try:
+                live_activity.set_closing(int_user_id)
+            except Exception:
+                pass
+        await session_manager.release_session(managed.session_id)
+        if int_user_id is not None:
+            try:
+                live_activity.clear(int_user_id)
+            except Exception:
+                pass
+
+    res = decision.dict()
+    res["session_id"] = managed.session_id
+    res["live_view_url"] = managed.live_view_url
+    res["steps_taken"] = len(agent.step_history)
+    res["step_history"] = agent.step_history
+    return res
+
+
 async def run_light_web_task(
     goal: str,
     *,
@@ -103,11 +169,7 @@ async def run_light_web_task(
     from .browser_session_manager import session_manager
     from .light_web_agent import LightWebAgent
 
-    int_user_id = None
-    if isinstance(user_id, int):
-        int_user_id = user_id
-    elif isinstance(user_id, str) and user_id.isdigit():
-        int_user_id = int(user_id)
+    int_user_id = _coerce_int_user_id(user_id)
 
     # 1. Get or create persistent session
     managed = await session_manager.get_or_create_session(
@@ -139,38 +201,117 @@ async def run_light_web_task(
             user_id=user_id,
         )
         decision = await agent.run()
-
-        # If artifact directory exists, capture screenshot for audit and verification
-        from pathlib import Path
-        artifact_dir = Path("/Users/robocafedesktop/.gemini/antigravity-ide/brain/0d960b0d-a3f3-42ec-8a1f-9bc67641b3d0")
-        if artifact_dir.exists() and managed.active_page:
-            try:
-                domain_slug = "instacart" if "instacart" in (initial_url or "") else "walmart" if "walmart" in (initial_url or "") else "web"
-                await managed.active_page.screenshot(path=str(artifact_dir / f"{domain_slug}_browserbase_live.png"))
-            except Exception as ss_e:
-                logger.debug(f"[run_light_web_task] screenshot capture skipped: {ss_e}")
+        return await _finalize_light_web_run(
+            managed, agent, decision, int_user_id=int_user_id, debug_domain_hint=initial_url,
+        )
 
 
-        # If completed or failed, release session unless waiting on human
-        if decision.status not in ["NEEDS_HUMAN"]:
-            if int_user_id is not None:
-                try:
-                    live_activity.set_closing(int_user_id)
-                except Exception:
-                    pass
-            await session_manager.release_session(managed.session_id)
-            if int_user_id is not None:
-                try:
-                    live_activity.clear(int_user_id)
-                except Exception:
-                    pass
+async def resume_light_web_task(
+    user_id: Any,
+    human_input: str,
+    *,
+    session_id: str | None = None,
+) -> dict[str, Any]:
+    """Resume a light-web-agent task that suspended on a human checkpoint
+    (OTP digits texted back, a CAPTCHA confirmation, a risk-review "YES",
+    etc), using whatever `db.get_pending_light_web_checkpoint` persisted
+    when it suspended (see LightWebAgent._persist_pending_checkpoint).
 
-        res = decision.dict()
-        res["session_id"] = managed.session_id
-        res["live_view_url"] = managed.live_view_url
-        res["steps_taken"] = len(agent.step_history)
-        res["step_history"] = agent.step_history
-        return res
+    The original `run_light_web_task` call's own `async with
+    async_playwright()` block already exited by the time it returned
+    NEEDS_HUMAN -- that's what let the turn actually end instead of
+    blocking a whole asyncio task on a human reply (unlike deepsearch's
+    poll-inside-one-long-task model). So this reconnects with a FRESH
+    Playwright driver over the same remote cloud session's CDP url rather
+    than reusing anything from that exited context.
+    """
+    from playwright.async_api import async_playwright
+    from .. import db, live_activity
+    from .browser_session_manager import session_manager
+    from .light_web_agent import HumanCheckpoint, LightWebAgent
+
+    int_user_id = _coerce_int_user_id(user_id)
+    if int_user_id is None:
+        return {"status": "FAILED", "result_summary": "resume_light_web_task requires a real user_id."}
+
+    task = await db.get_pending_light_web_checkpoint(int_user_id)
+    if not task:
+        return {
+            "status": "FAILED",
+            "result_summary": "No light-web-agent task is currently waiting on a human checkpoint.",
+        }
+
+    artifacts = task.get("artifacts") or {}
+    pending = artifacts.get("pending_checkpoint") or {}
+    call_context = artifacts.get("_call_context") or {}
+    resolved_session_id = session_id or pending.get("session_id")
+
+    managed = session_manager.get_session(resolved_session_id) if resolved_session_id else None
+    if not managed:
+        # The in-memory session is gone (process restarted, or it was
+        # already released/TTL'd out from under this task) -- nothing to
+        # reconnect to. Mark the task failed rather than leaving it stuck
+        # forever in 'waiting_user_input' with no way to ever resume.
+        try:
+            await db.set_active_task_status(task["task_id"], "failed")
+        except Exception:
+            pass
+        return {
+            "status": "FAILED",
+            "result_summary": "The browser session for this task is no longer available (it may have timed out). Please start the task again.",
+        }
+
+    resumed = await session_manager.resume_session(managed.session_id, human_input)
+    if not resumed:
+        return {
+            "status": "FAILED",
+            "result_summary": "Could not resume the suspended browser session.",
+        }
+
+    # Force a fresh CDP reconnect below -- browser_inst/context/active_page
+    # on `managed` are stale Python objects bound to the PREVIOUS
+    # async_playwright() driver process, which already exited. Leaving
+    # them set would make connect_playwright's own "already connected"
+    # fast-path (`if session.browser_inst and session.active_page and not
+    # ...is_closed()`) short-circuit onto dead objects instead of
+    # reconnecting.
+    managed.browser_inst = None
+    managed.context = None
+    managed.active_page = None
+
+    checkpoint = HumanCheckpoint(
+        kind=pending.get("kind", "otp"),
+        prompt_to_user=pending.get("prompt_to_user", ""),
+        trigger_reason="resumed_from_persisted_checkpoint",
+        human_input=human_input,
+    )
+    goal = call_context.get("goal") or ""
+    credentials = dict(call_context.get("credentials") or {})
+    credentials["checkpoint_answer"] = human_input
+    max_steps = call_context.get("max_steps", 15)
+
+    if int_user_id is not None:
+        try:
+            live_activity.start(int_user_id, goal)
+            live_activity.set_session_id(int_user_id, managed.session_id)
+        except Exception as la_e:
+            logger.debug(f"[resume_light_web_task] live_activity start skipped: {la_e}")
+
+    async with async_playwright() as p:
+        await session_manager.connect_playwright(managed, p)
+
+        agent = LightWebAgent(
+            session=managed,
+            user_goal=goal,
+            credentials=credentials,
+            max_steps=max_steps,
+            user_id=user_id,
+            resume_checkpoint=checkpoint,
+        )
+        agent.active_task_id = task.get("task_id")
+        agent.scratchpad_artifacts = artifacts
+        decision = await agent.run()
+        return await _finalize_light_web_run(managed, agent, decision, int_user_id=int_user_id)
 
 
 

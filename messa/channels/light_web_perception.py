@@ -126,6 +126,34 @@ class PerceptionEngine:
                 return rect.width > 0 && rect.height > 0;
             };
 
+            // Occlusion / topmost-hit-test: a modal overlay leaves elements
+            // behind it fully CSS-visible (non-zero size, opacity 1, not
+            // display:none) -- isVisible() alone can't tell "signup button
+            // sitting behind a promo popup" from "signup button a user can
+            // actually click." Real browsers resolve this by hit-testing:
+            // whatever element is topmost AT that point is what a click
+            // actually reaches. document.elementFromPoint replicates that
+            // exact check headlessly. An element is occluded when the
+            // topmost hit at its own center is neither itself nor an
+            // ancestor/descendant of itself (a wrapped icon+label button's
+            // hit target is often a child span, which is fine).
+            const isOccluded = (el) => {
+                try {
+                    const rect = el.getBoundingClientRect();
+                    const cx = rect.left + rect.width / 2;
+                    const cy = rect.top + rect.height / 2;
+                    if (cx < 0 || cy < 0 || cx > window.innerWidth || cy > window.innerHeight) {
+                        return false; // center off-screen -- can't hit-test, don't flag
+                    }
+                    const topEl = document.elementFromPoint(cx, cy);
+                    if (!topEl) return false;
+                    if (topEl === el || el.contains(topEl) || topEl.contains(el)) return false;
+                    return true;
+                } catch (e) {
+                    return false;
+                }
+            };
+
             const interactiveSelectors = 'button, a[href], input, select, textarea, [role="button"], [role="link"], [role="checkbox"], [role="tab"], [role="searchbox"], [role="dialog"] p, [role="dialog"] h1, [role="dialog"] h2, [role="dialog"] h3, .modal p, .modal h3';
             const nodes = document.querySelectorAll(interactiveSelectors);
 
@@ -147,6 +175,7 @@ class PerceptionEngine:
                 const parentText = el.closest('label, div')?.innerText || '';
                 const has_price = /\\$\\d+(\\.\\d{2})?/.test(parentText);
                 const dark_pattern_flag = is_prechecked && has_price;
+                const occluded_flag = isOccluded(el);
 
                 const eid = 'e' + counter++;
                 try {
@@ -175,6 +204,7 @@ class PerceptionEngine:
                     checked: checked,
                     disabled: disabled,
                     dark_pattern: dark_pattern_flag,
+                    occluded: occluded_flag,
                     selector: specificSelector
                 });
 
@@ -200,6 +230,7 @@ class PerceptionEngine:
                     "checked": node.get("checked", False),
                     "disabled": node.get("disabled", False),
                     "dark_pattern": node.get("dark_pattern", False),
+                    "occluded": node.get("occluded", False),
                     "signature": sig,
                     "selector": node.get("selector") or f'[data-messa-id="{eid}"]',
                 })
@@ -233,6 +264,7 @@ class PerceptionEngine:
                             "checked": node.get("checked", False),
                             "disabled": node.get("disabled", False),
                             "dark_pattern": node.get("dark_pattern", False),
+                            "occluded": node.get("occluded", False),
                             "signature": sig,
                             "selector": node.get("selector"),
                         })
@@ -246,10 +278,35 @@ class PerceptionEngine:
         lines = []
         for el in elements:
             dark_flag = " [DARK_PATTERN_FLAG: pre-checked add-on]" if el.get("dark_pattern") else ""
+            # An occluded element is CSS-visible but sits behind something
+            # else (almost always a modal/overlay) -- a real click can't
+            # reach it. Surfacing this explicitly in the prompt text (not
+            # just a hidden field) is what steers the planner toward
+            # resolving the overlay instead of repeatedly trying, and
+            # failing, to act on the element behind it.
+            occluded_flag = " [OCCLUDED: blocked by another element, likely a modal/overlay -- do not target directly]" if el.get("occluded") else ""
             val_str = f" value='{el['value']}'" if el.get("value") else ""
-            lines.append(f"[{el['id']}] {el['role']} \"{el['name']}\"{val_str}{dark_flag}")
+            lines.append(f"[{el['id']}] {el['role']} \"{el['name']}\"{val_str}{dark_flag}{occluded_flag}")
 
         prompt_text = "\n".join(lines)
+
+        # If any interactive element is occluded, an overlay is very likely
+        # active -- prepend an explicit callout so the planner treats
+        # resolving it as the immediate priority rather than reasoning its
+        # way there indirectly from the per-element flags alone.
+        occluded_ids = [el["id"] for el in elements if el.get("occluded")]
+        if occluded_ids:
+            visible_ids = [el["id"] for el in elements if not el.get("occluded")]
+            prompt_text = (
+                f"[ACTIVE OVERLAY DETECTED]: {len(occluded_ids)} element(s) "
+                f"({', '.join(occluded_ids)}) are covered by something else, almost "
+                "certainly a modal, popup, or dialog sitting on top of the page. "
+                "Resolve or engage with that overlay first (close it, or complete "
+                "what it's asking for) using one of the NON-occluded elements below "
+                f"({', '.join(visible_ids) or 'none available'}) before attempting "
+                "anything else -- do not try to click/type into an occluded element.\n\n"
+                + prompt_text
+            )
         return elements, prompt_text
 
 
@@ -267,6 +324,13 @@ class WebConventionPrior:
         roles = config["roles"]
 
         for el in elements:
+            # Never fast-path onto an occluded element -- a modal/overlay
+            # sitting on top of it means a real click can't reach it, no
+            # matter how good the text/role match is. This is the actual
+            # fix for the "signup button behind the popup" failure: the
+            # zero-LLM shortcut used to have no way to know the difference.
+            if el.get("occluded"):
+                continue
             el_name = (el.get("name") or "").lower()
             el_role = (el.get("role") or "").lower()
 

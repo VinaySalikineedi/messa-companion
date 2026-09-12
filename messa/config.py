@@ -609,6 +609,23 @@ STAGEHAND_MODEL_API_KEY = os.environ.get("MESSA_STAGEHAND_MODEL_API_KEY", "").st
 LIGHT_WEB_AGENT_MODEL = os.environ.get("MESSA_LIGHT_WEB_AGENT_MODEL", "google/gemini-2.5-flash").strip()
 LIGHT_WEB_AGENT_CRITIC_MODEL = os.environ.get("MESSA_LIGHT_WEB_AGENT_CRITIC_MODEL", "openai/gpt-4o-mini").strip()
 
+# Optional local directory for light-web-agent debug screenshots (audit/
+# verification during development). Empty (default) disables capture
+# entirely -- deliberately NOT hardcoded to any one machine/person's
+# folder; set this explicitly in .env when debugging a live run.
+LIGHT_WEB_AGENT_DEBUG_SCREENSHOT_DIR = os.environ.get("MESSA_LIGHT_WEB_AGENT_DEBUG_SCREENSHOT_DIR", "").strip()
+
+# Master go-live switch for light-web-agent as a reachable Messa subagent
+# (registry.py gates `build_light_web_agent_subagent(...)` on this, same
+# pattern as GROCERY_AGENT_ENABLED below). Unlike that flag, this defaults
+# OFF: the engine itself is well-tested, but wiring it into real user
+# conversations (routing, checkpoint persistence/resume, TTL handling) is
+# new in this same change, so this is a deliberate opt-in rollout switch,
+# not an already-proven feature getting a kill switch.
+LIGHT_WEB_AGENT_ENABLED = os.environ.get("MESSA_LIGHT_WEB_AGENT_ENABLED", "false").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
 
 # Maximum attempts/retries when encountering or attempting to solve a CAPTCHA.
 # CAPTCHAs are generally hard to pass autonomously, so capping attempts at 2 prevents
