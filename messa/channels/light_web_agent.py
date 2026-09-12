@@ -20,7 +20,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
-from .. import config
+from .. import config, db, live_activity
 from .browser_session_manager import ManagedBrowserSession, session_manager
 from .light_web_perception import (
     PerceptionEngine,
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class MacroStep(BaseModel):
-    action: Literal["click", "type", "press_key", "scroll", "select_option", "wait_for"]
+    action: Literal["click", "type", "press_key", "press", "scroll", "select_option", "wait_for"]
     target_id: str                      # e.g., "e3" or "f1:e2"
     target_signature: str               # sha256(role:name:tag), captured after stabilization
     value: Optional[str] = None         # text or token (e.g., "{{cred:password}}")
@@ -83,6 +83,7 @@ class AgentDecision(BaseModel):
     action: Optional[MacroAction] = None
     checkpoint: Optional[HumanCheckpoint] = None
     result_summary: Optional[str] = None
+    scratchpad_updates: Optional[Dict[str, Any]] = None
 
 
 GLOBAL_WEB_SKILL_CACHE: Dict[str, Dict[str, Any]] = {}
@@ -93,7 +94,7 @@ GLOBAL_WEB_SKILL_CACHE: Dict[str, Dict[str, Any]] = {}
 # ---------------------------------------------------------------------------
 
 class LightWebAgent:
-    """Universal Dynamic Web Navigation Agent."""
+    """Universal Dynamic Web Navigation Agent with Scratchpad, Skills & Live Activity."""
 
     def __init__(
         self,
@@ -103,6 +104,7 @@ class LightWebAgent:
         max_steps: int = 15,
         model_name: Optional[str] = None,
         critic_model_name: Optional[str] = None,
+        user_id: Optional[Any] = None,
     ) -> None:
         self.session = session
         self.user_goal = user_goal
@@ -110,11 +112,79 @@ class LightWebAgent:
         self.max_steps = max_steps
         self.model_name = model_name or getattr(config, "LIGHT_WEB_AGENT_MODEL", "google/gemini-2.5-flash")
         self.critic_model_name = critic_model_name or getattr(config, "LIGHT_WEB_AGENT_CRITIC_MODEL", "openai/gpt-4o-mini")
+        self.user_id = user_id or getattr(session, "user_id", None)
+        self.int_user_id = int(self.user_id) if isinstance(self.user_id, (int, str)) and str(self.user_id).isdigit() else None
 
         self.step_history: List[Dict[str, Any]] = []
         self.action_history_signatures: List[str] = []
         self.is_completed = False
         self.result_summary: Optional[str] = None
+
+        # Scratchpad & Skills state (Postgres-backed with in-memory fallback)
+        self.scratchpad_artifacts: Dict[str, Any] = {}
+        self.domain_skills: List[str] = []
+        self.active_task_id: Optional[str] = None
+
+    async def _init_scratchpad_and_skills(self, domain: str) -> None:
+        """Load persistent active task scratchpad and learned skills from Postgres."""
+        # 1. Active Task Scratchpad lookup
+        if self.int_user_id is not None and getattr(config, "SCRATCHPAD_AND_SKILLS_ENABLED", True):
+            try:
+                task = await db.get_active_task(self.int_user_id)
+                if task is None:
+                    task = await db.start_active_task(self.int_user_id, task_type="light_web_agent")
+                if task:
+                    self.active_task_id = task.get("task_id")
+                    self.scratchpad_artifacts = task.get("artifacts") or {}
+                    logger.info(f"[LightWebAgent] Attached to active task {self.active_task_id} with {len(self.scratchpad_artifacts)} artifacts.")
+            except Exception as e:
+                logger.debug(f"[LightWebAgent] Scratchpad DB lookup fallback: {e}")
+
+        # 2. Skills Playbook lookup
+        if domain and getattr(config, "SCRATCHPAD_AND_SKILLS_ENABLED", True):
+            try:
+                skills = await db.search_skills("light_web_agent", domain)
+                if not skills:
+                    skills = await db.search_skills("deepsearch", domain)
+                self.domain_skills = [s["solution_recipe"] for s in skills if s.get("solution_recipe")]
+                if self.domain_skills:
+                    logger.info(f"[LightWebAgent] Loaded {len(self.domain_skills)} skills for domain '{domain}'.")
+            except Exception as e:
+                logger.debug(f"[LightWebAgent] Skills DB search fallback: {e}")
+
+    async def _update_scratchpad(self, updates: Dict[str, Any]) -> None:
+        """Merge key-value facts into the active task scratchpad."""
+        if not updates:
+            return
+        self.scratchpad_artifacts.update(updates)
+        if self.active_task_id and getattr(config, "SCRATCHPAD_AND_SKILLS_ENABLED", True):
+            try:
+                await db.update_active_task_artifacts(self.active_task_id, updates)
+                logger.info(f"[LightWebAgent] Updated task scratchpad: {list(updates.keys())}")
+            except Exception as e:
+                logger.debug(f"[LightWebAgent] Scratchpad update fallback: {e}")
+
+    async def _persist_skill(self, domain: str, pattern: str, recipe: str) -> None:
+        """Persist learned lesson to cross-user skills playbook."""
+        GLOBAL_WEB_SKILL_CACHE[domain] = {
+            "intent": self.user_goal.lower(),
+            "recipe": recipe,
+            "pattern": pattern,
+            "saved_at": time.time(),
+        }
+        if getattr(config, "SCRATCHPAD_AND_SKILLS_ENABLED", True):
+            try:
+                await db.upsert_skill(
+                    agent_type="light_web_agent",
+                    domain=domain,
+                    problem_pattern=pattern,
+                    solution_recipe=recipe,
+                    source_user_id=self.int_user_id,
+                    source_task_id=self.active_task_id,
+                )
+                logger.info(f"[LightWebAgent] Persisted skill for {domain} to DB playbook: {recipe}")
+            except Exception as e:
+                logger.debug(f"[LightWebAgent] db.upsert_skill fallback: {e}")
 
     def _lookup_skill_cache(self, domain: str, goal: str) -> Optional[MacroAction]:
         """Check if a verified macro-action sequence is cached for this domain & intent."""
@@ -166,12 +236,19 @@ class LightWebAgent:
         # Attach residential network shield to save bandwidth
         await apply_network_shield(page)
 
+        # Initialize scratchpad & domain skills from Messa DB
+        current_url = page.url or ""
+        domain = re.sub(r"^https?://(www\.)?", "", current_url).split("/")[0] if current_url else ""
+        await self._init_scratchpad_and_skills(domain)
+
         for step_idx in range(len(self.step_history), turns):
             self.session.touch()
+            print(f"\n[LightWebAgent Step {step_idx + 1}/{turns}] SENSING DOM...", flush=True)
 
             # 1. Circuit Breakers: Step count & Oscillation Detection
             breaker_decision = self._check_circuit_breakers()
             if breaker_decision:
+                print(f"[LightWebAgent Circuit Breaker] {breaker_decision.result_summary}", flush=True)
                 return breaker_decision
 
             # 2. SENSE: Visual Stabilization & Perception
@@ -180,6 +257,13 @@ class LightWebAgent:
             elem_map = {el["id"]: el for el in elements}
             current_url = page.url or ""
             current_title = await page.title()
+            print(f"[LightWebAgent Page] URL: {current_url} | Title: {current_title} | Elements: {len(elements)}", flush=True)
+
+            if self.int_user_id is not None:
+                try:
+                    live_activity.set_url(self.int_user_id, current_url)
+                except Exception:
+                    pass
 
             # 3. REFLECT & DEFEND: Check for human checkpoints (SMS OTP, CAPTCHA) FIRST
             checkpoint = self._detect_human_checkpoint(current_url, current_title, a11y_text)
@@ -202,7 +286,13 @@ class LightWebAgent:
                     pass
 
             if checkpoint:
+                print(f"[LightWebAgent Human Checkpoint] Triggered: {checkpoint.kind.upper()} -> {checkpoint.prompt_to_user}", flush=True)
                 logger.info(f"[LightWebAgent] Human checkpoint reached: {checkpoint.kind}")
+                if self.int_user_id is not None:
+                    try:
+                        live_activity.set_waiting_for_human(self.int_user_id, checkpoint.prompt_to_user)
+                    except Exception:
+                        pass
                 await session_manager.suspend_session(self.session.session_id, checkpoint.dict())
                 return AgentDecision(
                     status="NEEDS_HUMAN",
@@ -213,6 +303,7 @@ class LightWebAgent:
             # Check for blocking modals (promo, cookie dialogs)
             modal_action = self._detect_and_clear_blocking_modals(elements)
             if modal_action:
+                print("[LightWebAgent Modal Defense] Anomaly/Promo modal detected. Dismissing obstacle...", flush=True)
                 logger.info("[LightWebAgent] Anomaly/Promo modal detected. Dismissing obstacle first.")
                 exec_ok, _ = await self._execute_macro_action(page, modal_action, elem_map)
                 self.step_history.append({"type": "modal_dismiss", "action": modal_action.dict()})
@@ -224,6 +315,7 @@ class LightWebAgent:
                 cached_action = self._lookup_skill_cache(domain, self.user_goal)
                 if cached_action:
                     if all(s.target_id in elem_map for s in cached_action.steps):
+                        print(f"[LightWebAgent Skill Cache] Replaying verified playbook for {domain} (0 LLM cost)...", flush=True)
                         logger.info(f"[LightWebAgent] Replaying verified skill cache for {domain}")
                         exec_ok, err = await self._execute_macro_action(page, cached_action, elem_map)
                         if exec_ok:
@@ -233,44 +325,84 @@ class LightWebAgent:
             # 3.6 DARK PATTERN DEFENSE: Uncheck deceptive pre-checked add-on fees
             dark_action = self._detect_and_uncheck_dark_patterns(elements, elem_map)
             if dark_action:
+                print(f"[LightWebAgent Dark Pattern Defense] Unchecking deceptive fee add-ons...", flush=True)
                 exec_ok, _ = await self._execute_macro_action(page, dark_action, elem_map)
                 self.step_history.append({"type": "dark_pattern_uncheck", "action": dark_action.dict()})
                 continue
 
             # 4. FAST-PATH: Web Convention Prior (Zero-LLM Landmark Match)
-            # If goal is routine navigation (e.g. search, open cart, sign in) and we haven't matched yet
             landmark_action = self._try_landmark_fastpath(elem_map)
             if landmark_action:
+                print(f"[LightWebAgent FastPath] Zero-LLM Landmark match -> {landmark_action.steps[0].action} {landmark_action.steps[0].target_id}", flush=True)
                 logger.info("[LightWebAgent] Executing landmark fast-path action without LLM.")
                 exec_ok, err = await self._execute_macro_action(page, landmark_action, elem_map)
                 if exec_ok:
                     self.step_history.append({"type": "landmark", "action": landmark_action.dict()})
+                    if self.int_user_id is not None:
+                        try:
+                            live_activity.add_step(self.int_user_id, f"Turn {step_idx + 1}: FastPath {landmark_action.steps[0].action} {landmark_action.steps[0].target_id}")
+                        except Exception:
+                            pass
                     continue
 
-            # 5. REASON: LLM Cognitive Decision (Claude 3.5 Sonnet / GPT-4o)
+            # 5. REASON: LLM Cognitive Decision (Claude 3.5 Sonnet / GPT-4o / Gemini)
+            print(f"[LightWebAgent Reason] Consulting model {self.model_name}...", flush=True)
             decision = await self._query_llm_planner(current_url, current_title, a11y_text, elem_map)
+            print(f"[LightWebAgent Decision] Status: {decision.status} | Thought: {decision.thought}", flush=True)
+
+            if self.int_user_id is not None and decision.thought:
+                try:
+                    live_activity.set_description(self.int_user_id, decision.thought[:120])
+                except Exception:
+                    pass
+
+            if decision.scratchpad_updates:
+                await self._update_scratchpad(decision.scratchpad_updates)
 
             if decision.status == "DONE":
                 self.is_completed = True
                 self.result_summary = decision.result_summary
                 domain = re.sub(r"^https?://(www\.)?", "", current_url).split("/")[0]
                 self._write_skill_cache(domain, self.user_goal, self.step_history)
+                # Persist to Messa DB skills playbook
+                await self._persist_skill(
+                    domain=domain,
+                    pattern=f"goal:{self.user_goal[:50]}",
+                    recipe=f"Completed '{self.user_goal}' on {domain} in {len(self.step_history)} steps.",
+                )
+                if self.active_task_id:
+                    try:
+                        await db.set_active_task_status(self.active_task_id, "completed")
+                    except Exception:
+                        pass
+                if self.int_user_id is not None:
+                    try:
+                        live_activity.set_closing(self.int_user_id)
+                    except Exception:
+                        pass
+                print(f"[LightWebAgent Complete] {decision.result_summary}", flush=True)
                 return decision
-
 
             if decision.status in ["FAILED", "NEEDS_HUMAN"] or not decision.action:
                 return decision
 
             # 6. INTENT-ALIGNMENT CRITIC: Validate consequential actions
             if decision.action.is_consequential:
+                print(f"[LightWebAgent Critic] Evaluating consequential action against intent...", flush=True)
                 is_aligned, reason = await self._run_intent_alignment_critic(decision.action)
                 if not is_aligned:
+                    print(f"[LightWebAgent Critic Flag] Blocked injection/misaligned action: {reason}", flush=True)
                     logger.warning(f"[LightWebAgent] Intent critic flagged action: {reason}")
                     risk_checkpoint = HumanCheckpoint(
                         kind="risk_review",
                         prompt_to_user=f"Messa flagged an action requiring confirmation: {reason}. Reply YES to approve.",
                         trigger_reason="critic_misaligned",
                     )
+                    if self.int_user_id is not None:
+                        try:
+                            live_activity.set_waiting_for_human(self.int_user_id, risk_checkpoint.prompt_to_user)
+                        except Exception:
+                            pass
                     await session_manager.suspend_session(self.session.session_id, risk_checkpoint.dict())
                     return AgentDecision(
                         status="BLOCKED_INJECTION",
@@ -279,6 +411,7 @@ class LightWebAgent:
                     )
 
             # 7. ACT: Execute Macro-Action Batch with Staleness Check
+            print(f"[LightWebAgent Act] Executing {len(decision.action.steps)} macro action steps...", flush=True)
             exec_ok, err_msg = await self._execute_macro_action(page, decision.action, elem_map)
             self.step_history.append({
                 "type": "macro_action",
@@ -286,13 +419,31 @@ class LightWebAgent:
                 "success": exec_ok,
                 "error": err_msg,
             })
+            print(f"[LightWebAgent Act Result] Success: {exec_ok} (err: {err_msg})", flush=True)
+
+            if self.int_user_id is not None:
+                try:
+                    action_desc = ", ".join(f"{s.action} {s.target_id}" for s in decision.action.steps) if decision.action else "acted"
+                    live_activity.add_step(self.int_user_id, f"Turn {step_idx + 1}: {action_desc}")
+                except Exception:
+                    pass
 
             # 8. VERIFY: Post-condition assertion check
             await self._wait_for_stabilization(page)
             if decision.action.expect:
                 verified = await self._verify_expectations(page, decision.action.expect)
+                print(f"[LightWebAgent Verify] Expectation {decision.action.expect} -> {verified}", flush=True)
                 if not verified:
                     logger.warning(f"[LightWebAgent] Expectation failed for action: {decision.action.expect}")
+
+        # If loop ended and max_turns was constrained (caller running turn by turn)
+        if len(self.step_history) > 0 and len(self.step_history) < self.max_steps and max_turns is not None:
+            last_step = self.step_history[-1]
+            return AgentDecision(
+                status="OK_REASONED" if last_step.get("type") != "landmark" else "OK_LANDMARK",
+                thought=f"Completed turn {len(self.step_history)} ({last_step.get('type')})",
+                action=MacroAction(**last_step["action"]) if "action" in last_step else None,
+            )
 
         return AgentDecision(
             status="FAILED",
@@ -575,9 +726,19 @@ class LightWebAgent:
 
                 if step.action == "click":
                     try:
+                        try:
+                            await locator.scroll_into_view_if_needed(timeout=2000)
+                        except Exception:
+                            pass
                         await locator.click(timeout=3000)
                     except Exception:
-                        await locator.click(timeout=3000, force=True)
+                        try:
+                            await locator.click(timeout=3000, force=True)
+                        except Exception:
+                            try:
+                                await locator.dispatch_event("click")
+                            except Exception:
+                                pass
                 elif step.action == "type":
                     try:
                         await locator.fill(val, timeout=3000)
@@ -587,11 +748,26 @@ class LightWebAgent:
                             await page.keyboard.type(val)
                         except Exception:
                             await locator.fill(val, timeout=3000)
-                elif step.action == "press_key":
+                elif step.action in ["press_key", "press"]:
+                    raw_key = val or "Enter"
+                    KEY_MAP = {
+                        "enter": "Enter",
+                        "return": "Enter",
+                        "tab": "Tab",
+                        "escape": "Escape",
+                        "esc": "Escape",
+                        "backspace": "Backspace",
+                        "arrowdown": "ArrowDown",
+                        "arrowup": "ArrowUp",
+                        "arrowleft": "ArrowLeft",
+                        "arrowright": "ArrowRight",
+                        "space": " ",
+                    }
+                    normalized_key = KEY_MAP.get(raw_key.lower(), raw_key)
                     try:
-                        await locator.press(val or "Enter", timeout=3000)
+                        await locator.press(normalized_key, timeout=3000)
                     except Exception:
-                        await page.keyboard.press(val or "Enter")
+                        await page.keyboard.press(normalized_key)
                 elif step.action == "scroll":
                     await page.mouse.wheel(0, 500)
                 elif step.action == "wait_for":
@@ -624,16 +800,62 @@ class LightWebAgent:
         elem_map: Dict[str, Any],
     ) -> AgentDecision:
         """Query LLM (Claude 3.5 Sonnet / GPT-4o) for the next batched macro action."""
+        history_lines = []
+        for idx, h in enumerate(self.step_history[-4:], 1):
+            h_type = h.get("type", "action")
+            h_steps = h.get("action", {}).get("steps", [])
+            steps_desc = ", ".join(f"{s.get('action')} on {s.get('target_id')}" for s in h_steps) if h_steps else h_type
+            history_lines.append(f"- Step {len(self.step_history) - len(self.step_history[-4:]) + idx}: {steps_desc} (success={h.get('success', True)})")
+        history_str = "\n".join(history_lines) if history_lines else "None yet."
+
+        loop_warning = ""
+        if len(self.step_history) >= 1:
+            last_step = self.step_history[-1]
+            last_action = last_step.get("action", {}).get("steps", [{}])[0]
+            last_tid = last_action.get("target_id")
+            last_act = last_action.get("action")
+            if last_tid and last_act:
+                loop_warning = (
+                    f"\n\n[SELF-HEALING GUARD]: In your previous turn, you executed '{last_act}' on [{last_tid}]. "
+                    f"If the page/URL did not transition, DO NOT execute '{last_act}' on [{last_tid}] again! "
+                    "You MUST pick an alternative element (such as searching for items directly, clicking a category, or scrolling)."
+                )
+
+        skills_block = ""
+        if self.domain_skills:
+            skills_block = "\n\nLearned Lessons for this site (from Messa Skills Playbook):\n" + "\n".join(f"- {s}" for s in self.domain_skills)
+
+        scratchpad_str = ""
+        if self.scratchpad_artifacts:
+            scratchpad_str = f"\n\n<active_task_scratchpad>\n{json.dumps(self.scratchpad_artifacts, indent=2)}\n</active_task_scratchpad>"
+
         system_prompt = (
             "You are light-web-agent, an autonomous high-speed web navigation agent.\n"
             "Your objective is to accomplish the user's goal with minimal steps and maximum reliability.\n\n"
             "Rules:\n"
             "1. Output ONLY valid JSON matching the AgentDecision schema.\n"
             "2. Emit batched MacroAction steps (up to 4 steps) when filling forms or sequential actions.\n"
-            "3. Use exact element IDs [eX] from the perception tree.\n"
+            "3. Use exact element IDs [eX] from the perception tree in 'target_id'.\n"
             "4. For passwords or sensitive info, use tokens: '{{cred:password}}', '{{cred:email}}'.\n"
             "5. If goal is completely achieved, output status: 'DONE' and a concise result_summary.\n"
-            "6. Flag is_consequential=true for order submits, address changes, payment additions, or account creations."
+            "6. Flag is_consequential=true for order submits, address changes, payment additions, or account creations.\n"
+            "7. SELF-HEALING & NO-LOOP RULE: Review the Recent Steps. If an action has already been performed and the page/URL did not change, DO NOT repeat that exact action! Switch strategies (e.g. search for items directly, scroll down, or click another interactive element toward the goal).\n"
+            "8. SCRATCHPAD MEMORY: You can optionally include 'scratchpad_updates': {'cart_items': [...], 'stage': '...'} to remember key facts across turns.\n"
+            f"{skills_block}\n\n"
+            "Response Schema Format:\n"
+            "{\n"
+            '  "status": "OK_REASONED",\n'
+            '  "thought": "brief explanation of what you are doing and why",\n'
+            '  "scratchpad_updates": {"facts": "..."},\n'
+            '  "action": {\n'
+            '    "steps": [\n'
+            '      {"action": "click|type|press_key|scroll|wait_for", "target_id": "e1", "value": "text or token"}\n'
+            "    ],\n"
+            '    "is_consequential": false\n'
+            "  }\n"
+            "}\n"
+            "When the goal is finished, return:\n"
+            '{"status": "DONE", "thought": "Goal achieved", "result_summary": "Summary of what was done"}'
         )
 
         user_content = (
@@ -643,7 +865,10 @@ class LightWebAgent:
             f"<web_content_untrusted>\n"
             f"{a11y_text}\n"
             f"</web_content_untrusted>\n\n"
-            f"Steps taken so far: {len(self.step_history)}\n"
+            f"Recent Steps Taken:\n{history_str}"
+            f"{loop_warning}"
+            f"{scratchpad_str}\n\n"
+            f"Total steps so far: {len(self.step_history)}\n"
             "Output your next decision in JSON."
         )
 
@@ -669,6 +894,12 @@ class LightWebAgent:
                         data = data[wrapper]
                         break
 
+                # Extract scratchpad updates if model emitted any
+                if "scratchpad_updates" in data and isinstance(data["scratchpad_updates"], dict):
+                    pass
+                else:
+                    data["scratchpad_updates"] = None
+
                 # Normalize status
                 status_raw = str(data.get("status", "OK_REASONED")).upper()
                 valid_statuses = [
@@ -682,13 +913,24 @@ class LightWebAgent:
                 else:
                     data["status"] = "OK_REASONED"
 
+                # If steps are placed at root, wrap into action dict
+                if "steps" in data and "action" not in data:
+                    data["action"] = {"steps": data.pop("steps")}
+                elif "action" in data and isinstance(data["action"], str):
+                    act_type = data.pop("action")
+                    target = data.pop("target_id", data.pop("element_id", "e1"))
+                    val = data.pop("value", None)
+                    data["action"] = {
+                        "steps": [{"action": act_type, "target_id": target, "value": val}]
+                    }
+
                 # Normalize action dictionary if emitted
                 if "action" in data and isinstance(data["action"], dict):
                     action_dict = data["action"]
                     if "action_type" in action_dict and "steps" not in action_dict:
                         action_dict["steps"] = [{
                             "action": action_dict.get("action_type", "click").lower(),
-                            "target_id": action_dict.get("target_id", "e1"),
+                            "target_id": action_dict.get("target_id") or action_dict.get("element_id", "e1"),
                             "target_signature": "",
                             "value": action_dict.get("value"),
                         }]
@@ -697,7 +939,11 @@ class LightWebAgent:
                             if "action_type" in step and "action" not in step:
                                 step["action"] = step.pop("action_type")
                             if "action" in step:
-                                step["action"] = step["action"].lower()
+                                step["action"] = str(step["action"]).lower()
+                            if "element_id" in step and "target_id" not in step:
+                                step["target_id"] = step.pop("element_id")
+                            elif "id" in step and "target_id" not in step:
+                                step["target_id"] = step.pop("id")
                             tid = step.get("target_id")
                             if tid and tid in elem_map and not step.get("target_signature"):
                                 step["target_signature"] = elem_map[tid].get("signature", "")

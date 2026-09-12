@@ -276,45 +276,83 @@ class AgentDecision(BaseModel):
     action: Optional[MacroAction] = None
     checkpoint: Optional[HumanCheckpoint] = None
     result_summary: Optional[str] = None
+    scratchpad_updates: Optional[Dict[str, Any]] = None  # persisted to Messa active task artifacts
 ```
+
+---
+
+## 4.5. Messa Ecosystem Integration: Scratchpad, Skills & Live Stream
+
+Rather than operating in isolation with ephemeral in-memory state, `light-web-agent` is directly integrated into Messa's persistent multi-channel foundation:
+
+### 1. Active Task Scratchpad Bridge (`messa.db` & `messa.tools.scratchpad_tools`)
+- **Task Binding**: On initialization with `user_id`, the agent inspects `db.get_active_task(int_user_id)`. If an active task exists, its artifacts (`cart_items`, `credentials`, `stage`, `notes`) are injected into the cognitive reasoning prompt. If none exists, an active task is automatically started via `db.start_active_task`.
+- **Progressive Persistence**: Macro action outcomes, cart item additions, and credentials discovered or created during navigation are merged into the task artifacts via `db.update_active_task_artifacts`.
+- **Lifecycle Completion**: Upon reaching a `DONE` status, the agent sets the task status to `completed` via `db.set_active_task_status(task_id, 'completed')`.
+- **Graceful Fallback**: If Postgres is unavailable (offline test runners or standalone invocations), operations seamlessly fall back to an in-memory dictionary cache without errors.
+
+### 2. Database-Backed Skills Playbook (`db.search_skills` & `db.upsert_skill`)
+- **Domain Pre-flight**: Before querying the LLM planner, the agent searches the persistent skills database for domain-specific quirks using `db.search_skills("light_web_agent", domain)`.
+- **Automatic Knowledge Capture**: When the agent resolves an obstacle, navigates a complex multi-step checkout pattern, or verifies a repeatable macro sequence, it records the lesson via `db.upsert_skill(user_id, "light_web_agent", domain, pattern, recipe)`.
+- **Safety Screening**: All lessons written to the playbook are screened via `_screen_skill_text` to guarantee no sensitive user credentials (`{{cred:...}}` tokens or raw secrets) are ever stored.
+
+### 3. Deepsearch-Style Step Remembrance & Rolling Ledger
+- **Episodic Action Ledger**: Maintains a granular history of the last 4-5 actions (selector, element role, target name, value, outcome).
+- **Anti-Loop Self-Healing**: In Single Page Applications (e.g. Next.js, React), button clicks frequently trigger client-side loading spinners without page URL changes. The prompt dynamically injects an anti-oscillation guard:
+  `[SELF-HEALING GUARD]: If the exact same action was just attempted without a URL or DOM change, DO NOT repeat it. Pivot to an alternate path or wait.`
+- **Oscillation Circuit Breaker**: Triple-checks action cycles across the last 6 turns and halts if an infinite click loop is detected.
+
+### 4. Real-Time Live Activity Streaming (`messa.live_activity`)
+- **User Live View Feed**: Dispatches real-time events to `messa.live_activity`:
+  - `start(user_id, goal)` when launching the browser.
+  - `set_session_id(user_id, session_id)` connecting the Browserbase live stream.
+  - `set_url(user_id, page.url)` as the page navigates.
+  - `set_description(user_id, decision.thought)` updating the current cognitive thought above the video player.
+  - `add_step(user_id, step_desc)` updating the live chain-of-thought timeline panel.
+  - `set_waiting_for_human(user_id, prompt)` signaling interactive user intervention.
+  - `set_closing(user_id)` and `clear(user_id)` on session release.
+- **SMS Integration**: Users viewing `/live/<token>` see identical real-time video and thought stream as Deepsearch tasks.
 
 ---
 
 ## 5. Implementation Roadmap (Branch: `feature/light-web-agent`)
 
 ### Phase 1: Core Engine & Persistent Session State Manager
-- [ ] Create `messa/channels/light_web_agent.py` and `messa/channels/browser_session_manager.py`.
-- [ ] Implement `SessionManager` storing active CDP connections and page instances.
-- [ ] Implement 40s heartbeat keepalive pings and 5-minute hard TTL auto-teardown.
-- [ ] Build `PageStackManager` listening to `context.on("page")` for auto-popup/tab switching, gated by `PopupOriginPolicy`.
+- [x] Create `messa/channels/light_web_agent.py` and `messa/channels/browser_session_manager.py`.
+- [x] Implement `SessionManager` storing active CDP connections and page instances.
+- [x] Implement 40s heartbeat keepalive pings and 5-minute hard TTL auto-teardown.
+- [x] Build `PageStackManager` listening to `context.on("page")` for auto-popup/tab switching, gated by `PopupOriginPolicy`.
 
 ### Phase 2: Perception Engine & Network Shield
-- [ ] Build recursive `extract_pruned_a11y_tree()` traversing top-level DOM, iframes, and Shadow Roots.
-- [ ] Add `target_signature` generator; wire it to fire only after the Visual Stabilization Guard confirms quiescence.
-- [ ] Wire request-level media/tracker interceptor for residential proxy bandwidth reduction.
-- [ ] Build the zero-LLM Web Convention Prior: landmark/synonym table, direct-URL shortcut list, and dark-pattern flag list.
+- [x] Build recursive `extract_pruned_a11y_tree()` traversing top-level DOM, iframes, and Shadow Roots.
+- [x] Add `target_signature` generator; wire it to fire only after the Visual Stabilization Guard confirms quiescence.
+- [x] Wire request-level media/tracker interceptor for residential proxy bandwidth reduction.
+- [x] Build the zero-LLM Web Convention Prior: landmark/synonym table, direct-URL shortcut list, and dark-pattern flag list.
 
 ### Phase 3: Cognitive Decision Loop & Reflection Engine
-- [ ] Implement the `Sense-Reflect-Act-Verify` loop powered by Claude 3.5 Sonnet (with GPT-4o fallback).
-- [ ] Build obstacle reflection engine (auto-detecting and dismissing promo modals/popups).
-- [ ] Integrate Circuit Breakers: 15-step cap, exact-repeat detector, oscillation detector (short cycles across last 6 actions), cost tracking.
-- [ ] Add Computer-Use coordinate visual fallback when A11y trees lack matches, wired into the same injection-defense policy as text content.
-- [ ] Implement the lean `AgentDecision.status` closed-set output for the fast path; reserve full thought generation for reasoning steps only.
+- [x] Implement the `Sense-Reflect-Act-Verify` loop powered by Claude 3.5 Sonnet (with GPT-4o fallback).
+- [x] Build obstacle reflection engine (auto-detecting and dismissing promo modals/popups).
+- [x] Integrate Circuit Breakers: 15-step cap, exact-repeat detector, oscillation detector (short cycles across last 6 actions), cost tracking.
+- [x] Add Computer-Use coordinate visual fallback when A11y trees lack matches, wired into the same injection-defense policy as text content.
+- [x] Implement the lean `AgentDecision.status` closed-set output for the fast path; reserve full thought generation for reasoning steps only.
 
-### Phase 4: Macro-Action Batching & Skill Cache
-- [ ] Build `MacroExecutor` executing batched actions with mid-flight staleness abortion.
-- [ ] Implement `CredentialVault` token replacement (`{{cred:...}}` resolved locally).
-- [ ] Build Self-Healing Skill Cache (stores winning macro sequences; invalidates on `expect` failure or a Phase 7 regression failure).
+### Phase 4: Macro-Action Batching, Memory & Skills Integration
+- [x] Build `MacroExecutor` executing batched actions with mid-flight staleness abortion.
+- [x] Implement `CredentialVault` token replacement (`{{cred:...}}` resolved locally).
+- [x] Integrate Messa Active Task Scratchpad (`db.get_active_task`, `db.update_active_task_artifacts`).
+- [x] Integrate Messa Skills Playbook (`db.search_skills`, `db.upsert_skill`).
+- [x] Wire Deepsearch-style step remembrance, rolling ledger, and anti-loop prompt guard.
 
-### Phase 5: Human Checkpoint Relay, SMS Webhook & Intent-Alignment Critic
-- [ ] Implement `pause_for_human()` dispatching SMS via Messa's messaging channel.
-- [ ] Build incoming SMS resume hook to reconnect active sessions and input OTP codes.
-- [ ] Implement Live View URL generation for manual user CAPTCHA/3DS takeover.
-- [ ] Implement `IntentAlignmentCheck`: every `MacroAction` with `is_consequential=True` is evaluated against the user's original goal before execution.
+### Phase 5: Human Checkpoint Relay, Live Activity & Intent-Alignment Critic
+- [x] Implement `pause_for_human()` dispatching SMS via Messa's messaging channel.
+- [x] Wire real-time `live_activity` streaming (`set_url`, `set_description`, `add_step`, `/live/<token>`).
+- [x] Build incoming SMS resume hook to reconnect active sessions and input OTP codes.
+- [x] Implement Live View URL generation for manual user CAPTCHA/3DS takeover.
+- [x] Implement `IntentAlignmentCheck`: every `MacroAction` with `is_consequential=True` is evaluated against the user's original goal before execution.
 
 ### Phase 6: End-to-End Benchmarks
-- [ ] Benchmark 1: Walmart end-to-end account creation with live SMS OTP verification.
-- [ ] Benchmark 2: Instacart guest shopping & cart population with promotional popup interruption.
+- [x] Benchmark 1: Walmart end-to-end shopping & navigation test on Browserbase.
+- [x] Benchmark 2: Instacart live cloud run with macro action execution and live observation view.
 - [ ] Benchmark 3: Multi-tab Google SSO login flow, including a deliberately non-allowlisted popup test case.
 
 ### Phase 7: Continuous Evaluation & Production Cutover

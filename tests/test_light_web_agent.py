@@ -342,6 +342,69 @@ async def test_intent_alignment_critic_consequential():
         check("Reason flags the misalignment", "iPhone" in reason)
 
 
+async def test_scratchpad_and_skills_integration():
+    print("\n--- TEST: Scratchpad & Skills Playbook Integration ---")
+    session = ManagedBrowserSession(session_id="test_sess", provider="browserbase", cdp_url="ws://dummy")
+    agent = LightWebAgent(session=session, user_goal="Add 5 grocery items", user_id=999)
+
+    # 1. Mock DB active task & skills
+    mock_task = {"task_id": "task_abc_123", "task_type": "light_web_agent", "artifacts": {"cart_items": ["apples"]}}
+    mock_skills = [{"solution_recipe": "Click search input directly on instacart."}]
+
+    with patch("messa.db.get_active_task", new=AsyncMock(return_value=mock_task)), \
+         patch("messa.db.search_skills", new=AsyncMock(return_value=mock_skills)), \
+         patch("messa.db.update_active_task_artifacts", new=AsyncMock(return_value={"artifacts": {"cart_items": ["apples", "milk"]}})), \
+         patch("messa.db.upsert_skill", new=AsyncMock(return_value={"success_count": 1})):
+
+        await agent._init_scratchpad_and_skills("instacart.com")
+        check("Active task ID resolved", agent.active_task_id == "task_abc_123")
+        check("Scratchpad artifacts loaded", agent.scratchpad_artifacts.get("cart_items") == ["apples"])
+        check("Domain skills loaded", "Click search input directly on instacart." in agent.domain_skills)
+
+        # 2. Update scratchpad
+        await agent._update_scratchpad({"cart_items": ["apples", "milk"]})
+        check("Scratchpad artifacts updated in memory", agent.scratchpad_artifacts.get("cart_items") == ["apples", "milk"])
+
+        # 3. Persist skill
+        await agent._persist_skill("instacart.com", "signup_modal", "Wait 2s for modal animation.")
+        from messa.channels.light_web_agent import GLOBAL_WEB_SKILL_CACHE
+        check("Skill cached in memory", GLOBAL_WEB_SKILL_CACHE.get("instacart.com", {}).get("recipe") == "Wait 2s for modal animation.")
+
+
+def test_live_activity_dispatch():
+    print("\n--- TEST: Deepsearch Live Activity Pipeline ---")
+    from messa import live_activity
+    test_uid = 888777
+
+    # 1. Start live activity
+    live_activity.start(test_uid, "Test live task")
+    check("Live activity started", test_uid in live_activity._state)
+    check("Initial description set", live_activity._state[test_uid]["description"] == "Test live task")
+
+    # 2. Session ID & URL
+    live_activity.set_session_id(test_uid, "sess_bb_123")
+    live_activity.set_url(test_uid, "https://www.instacart.com/store")
+    check("Session ID set", live_activity._state[test_uid]["bb_session_id"] == "sess_bb_123")
+    check("Page URL set", live_activity._state[test_uid]["url"] == "https://www.instacart.com/store")
+
+    # 3. Step logging
+    live_activity.add_step(test_uid, "Turn 1: Clicked searchbox")
+    live_activity.add_step(test_uid, "Turn 2: Typed bananas")
+    check("Steps recorded", len(live_activity._state[test_uid]["steps"]) == 2)
+
+    # 4. Human checkpoint banner
+    live_activity.set_waiting_for_human(test_uid, "Please enter SMS verification code")
+    check("Waiting for human banner active", live_activity._state[test_uid]["waiting_for_human"] == "Please enter SMS verification code")
+    live_activity.clear_waiting_for_human(test_uid)
+    check("Waiting for human cleared", live_activity._state[test_uid]["waiting_for_human"] is None)
+
+    # 5. Clean teardown
+    live_activity.set_closing(test_uid)
+    check("Closing state set", live_activity._state[test_uid]["closing"] is True)
+    live_activity.clear(test_uid)
+    check("Live activity cleared", test_uid not in live_activity._state)
+
+
 async def main():
     print("=== RUNNING LIGHT-WEB-AGENT SUITE ===")
     test_popup_origin_policy()
@@ -353,6 +416,8 @@ async def main():
     test_circuit_breakers()
     test_human_checkpoint_detection()
     await test_intent_alignment_critic_consequential()
+    await test_scratchpad_and_skills_integration()
+    test_live_activity_dispatch()
 
     print("\n=====================================")
     if failures:
@@ -367,3 +432,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
