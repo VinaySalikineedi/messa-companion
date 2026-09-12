@@ -126,13 +126,14 @@ class PerceptionEngine:
                 return rect.width > 0 && rect.height > 0;
             };
 
-            const interactiveSelectors = 'button, a[href], input, select, textarea, [role="button"], [role="link"], [role="checkbox"], [role="tab"], [role="searchbox"]';
+            const interactiveSelectors = 'button, a[href], input, select, textarea, [role="button"], [role="link"], [role="checkbox"], [role="tab"], [role="searchbox"], [role="dialog"] p, [role="dialog"] h1, [role="dialog"] h2, [role="dialog"] h3, .modal p, .modal h3';
             const nodes = document.querySelectorAll(interactiveSelectors);
+
             let counter = 1;
 
             nodes.forEach((el) => {
                 if (!isVisible(el)) return;
-                let text = (el.innerText || el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('title') || el.value || '').trim();
+                let text = (el.innerText || el.getAttribute('aria-label') || el.getAttribute('placeholder') || el.getAttribute('title') || el.closest('label')?.innerText || el.value || '').trim();
                 text = text.replace(/\\s+/g, ' ').slice(0, 80);
                 
                 const role = el.getAttribute('role') || el.tagName.toLowerCase();

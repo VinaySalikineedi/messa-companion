@@ -85,6 +85,9 @@ class AgentDecision(BaseModel):
     result_summary: Optional[str] = None
 
 
+GLOBAL_WEB_SKILL_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
 # ---------------------------------------------------------------------------
 # Core Cognitive Engine: light-web-agent
 # ---------------------------------------------------------------------------
@@ -105,13 +108,53 @@ class LightWebAgent:
         self.user_goal = user_goal
         self.credentials = credentials or {}
         self.max_steps = max_steps
-        self.model_name = model_name or getattr(config, "LIGHT_WEB_AGENT_MODEL", "anthropic/claude-3.5-sonnet")
+        self.model_name = model_name or getattr(config, "LIGHT_WEB_AGENT_MODEL", "google/gemini-2.5-flash")
         self.critic_model_name = critic_model_name or getattr(config, "LIGHT_WEB_AGENT_CRITIC_MODEL", "openai/gpt-4o-mini")
 
         self.step_history: List[Dict[str, Any]] = []
         self.action_history_signatures: List[str] = []
         self.is_completed = False
         self.result_summary: Optional[str] = None
+
+    def _lookup_skill_cache(self, domain: str, goal: str) -> Optional[MacroAction]:
+        """Check if a verified macro-action sequence is cached for this domain & intent."""
+        if domain in GLOBAL_WEB_SKILL_CACHE:
+            entry = GLOBAL_WEB_SKILL_CACHE[domain]
+            steps_data = entry.get("steps", [])
+            if steps_data:
+                steps = [MacroStep(**s) for s in steps_data]
+                return MacroAction(steps=steps)
+        return None
+
+    def _write_skill_cache(self, domain: str, goal: str, history: List[Dict[str, Any]]) -> None:
+        """Cache a successful macro-action sequence for domain reuse."""
+        collected_steps = []
+        for h in history:
+            act = h.get("action")
+            if act and "steps" in act:
+                collected_steps.extend(act["steps"])
+        if collected_steps:
+            GLOBAL_WEB_SKILL_CACHE[domain] = {
+                "intent": goal.lower(),
+                "steps": collected_steps,
+                "saved_at": time.time(),
+            }
+            logger.info(f"[SkillCache] Cached {len(collected_steps)} macro steps for domain: {domain}")
+
+    def _detect_and_uncheck_dark_patterns(
+        self, elements: List[Dict[str, Any]], elem_map: Dict[str, Any]
+    ) -> Optional[MacroAction]:
+        """Detect and uncheck pre-checked deceptive add-ons (e.g. $9.99 protection plan)."""
+        steps = []
+        for el in elements:
+            if el.get("dark_pattern") and el.get("checked"):
+                sig = el.get("signature", "")
+                steps.append(MacroStep(action="click", target_id=el["id"], target_signature=sig))
+        if steps:
+            logger.info(f"[DarkPatternDefense] Unchecking {len(steps)} pre-checked deceptive add-on(s).")
+            return MacroAction(steps=steps)
+        return None
+
 
     async def run(self, max_turns: Optional[int] = None) -> AgentDecision:
         """Run the Sense-Reflect-Act-Verify loop until completion or human checkpoint."""
@@ -175,6 +218,25 @@ class LightWebAgent:
                 self.step_history.append({"type": "modal_dismiss", "action": modal_action.dict()})
                 continue
 
+            # 3.5 SKILL CACHE: Check for existing verified playbook on this domain
+            if len(self.step_history) == 0:
+                domain = re.sub(r"^https?://(www\.)?", "", current_url).split("/")[0]
+                cached_action = self._lookup_skill_cache(domain, self.user_goal)
+                if cached_action:
+                    if all(s.target_id in elem_map for s in cached_action.steps):
+                        logger.info(f"[LightWebAgent] Replaying verified skill cache for {domain}")
+                        exec_ok, err = await self._execute_macro_action(page, cached_action, elem_map)
+                        if exec_ok:
+                            self.step_history.append({"type": "skill_cache", "action": cached_action.dict()})
+                            continue
+
+            # 3.6 DARK PATTERN DEFENSE: Uncheck deceptive pre-checked add-on fees
+            dark_action = self._detect_and_uncheck_dark_patterns(elements, elem_map)
+            if dark_action:
+                exec_ok, _ = await self._execute_macro_action(page, dark_action, elem_map)
+                self.step_history.append({"type": "dark_pattern_uncheck", "action": dark_action.dict()})
+                continue
+
             # 4. FAST-PATH: Web Convention Prior (Zero-LLM Landmark Match)
             # If goal is routine navigation (e.g. search, open cart, sign in) and we haven't matched yet
             landmark_action = self._try_landmark_fastpath(elem_map)
@@ -185,14 +247,16 @@ class LightWebAgent:
                     self.step_history.append({"type": "landmark", "action": landmark_action.dict()})
                     continue
 
-
             # 5. REASON: LLM Cognitive Decision (Claude 3.5 Sonnet / GPT-4o)
             decision = await self._query_llm_planner(current_url, current_title, a11y_text, elem_map)
 
             if decision.status == "DONE":
                 self.is_completed = True
                 self.result_summary = decision.result_summary
+                domain = re.sub(r"^https?://(www\.)?", "", current_url).split("/")[0]
+                self._write_skill_cache(domain, self.user_goal, self.step_history)
                 return decision
+
 
             if decision.status in ["FAILED", "NEEDS_HUMAN"] or not decision.action:
                 return decision
@@ -256,7 +320,7 @@ class LightWebAgent:
                 result_summary=f"Circuit Breaker: Exceeded maximum step limit ({self.max_steps}).",
             )
 
-        # 2. Oscillation detection (e.g. A -> B -> A -> B across last 6 steps)
+        # 2. Oscillation detection (e.g. A -> B -> A -> B across last 4 steps)
         if len(self.action_history_signatures) >= 4:
             recent = self.action_history_signatures[-4:]
             if recent[0] == recent[2] and recent[1] == recent[3]:
@@ -265,6 +329,15 @@ class LightWebAgent:
                     thought="Circuit Breaker: Detected oscillating action cycle (A-B-A-B). Halting.",
                     result_summary="Agent detected an oscillating loop on the website.",
                 )
+
+        # 3. Persistent modal loop trap (reopened >= 3 times)
+        modal_dismiss_count = sum(1 for s in self.step_history if s.get("type") == "modal_dismiss")
+        if modal_dismiss_count >= 3:
+            return AgentDecision(
+                status="FAILED",
+                thought="Circuit Breaker: Detected persistent modal loop trap (modal reopened >= 3 times). Halting.",
+                result_summary="Adversarial modal loop trap detected. Halting to avoid burning turns.",
+            )
         return None
 
     def _try_landmark_fastpath(self, elem_map: Dict[str, Any]) -> Optional[MacroAction]:
@@ -294,6 +367,13 @@ class LightWebAgent:
                     return MacroAction(steps=[
                         MacroStep(action="click", target_id=match["id"], target_signature=sig)
                     ])
+            elif any(k in goal_lower for k in ["sign up", "create account", "register"]):
+                match = WebConventionPrior.match_canonical_landmark("sign_up", list(elem_map.values()))
+                if match:
+                    sig = match["signature"]
+                    return MacroAction(steps=[
+                        MacroStep(action="click", target_id=match["id"], target_signature=sig)
+                    ])
             elif "cart" in goal_lower and any(w in goal_lower for w in ["view", "open", "show", "go to"]):
                 match = WebConventionPrior.match_canonical_landmark("cart", list(elem_map.values()))
                 if match:
@@ -301,6 +381,7 @@ class LightWebAgent:
                     return MacroAction(steps=[
                         MacroStep(action="click", target_id=match["id"], target_signature=sig)
                     ])
+
         return None
 
 
@@ -323,9 +404,12 @@ class LightWebAgent:
                         ])
         return None
 
-    def _detect_human_checkpoint(self, url: str, title: str, a11y_text: str) -> Optional[HumanCheckpoint]:
+    def _detect_human_checkpoint(
+        self, url: str, title: str, a11y_text: str, body_text: str = ""
+    ) -> Optional[HumanCheckpoint]:
         """Detect phone verification (SMS OTP), CAPTCHA, or 3D Secure challenges."""
-        text_lower = a11y_text.lower()
+        combined_text = f"{a11y_text} {body_text}".strip()
+        text_lower = combined_text.lower()
         title_lower = title.lower()
 
         # 1. SMS OTP detection
@@ -339,7 +423,7 @@ class LightWebAgent:
             "6-digit code",
         ]):
             phone_hint = ""
-            phone_match = re.search(r"(\(\d{3}\)\s*\d{3}-\d{4}|\+?\d{1,2}\s*\(?\d{3}\)?\s*\d{3}-\d{4})", a11y_text)
+            phone_match = re.search(r"(\(\d{3}\)\s*\d{3}-\d{4}|\+?\d{1,2}\s*\(?\d{3}\)?\s*\d{3}-\d{4})", combined_text)
             if phone_match:
                 phone_hint = f" to {phone_match.group(1)}"
             return HumanCheckpoint(
@@ -347,6 +431,7 @@ class LightWebAgent:
                 prompt_to_user=f"Verification code sent{phone_hint}. Please reply with the 6-digit code to continue.",
                 trigger_reason="sms_otp_prompt",
             )
+
 
         # 2. CAPTCHA detection
         if any(w in title_lower or w in text_lower for w in [

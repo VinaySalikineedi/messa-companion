@@ -328,8 +328,18 @@ class BrowserSessionManager:
         # Stop keepalive & TTL watchdog
         if session.keepalive_task and not session.keepalive_task.done():
             session.keepalive_task.cancel()
+            try:
+                await session.keepalive_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
         if session.ttl_task and not session.ttl_task.done():
             session.ttl_task.cancel()
+            try:
+                await session.ttl_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
 
         session.status = "ACTIVE"
         session.touch()
