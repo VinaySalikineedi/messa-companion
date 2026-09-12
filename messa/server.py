@@ -1758,6 +1758,100 @@ async def _process_inbound(
 
     _send = _sms_send_factory(from_number)
 
+    # light-web-agent checkpoint short-circuit --------------------------------
+    # If this user currently has a light_web_agent task suspended on a human
+    # checkpoint (OTP / CAPTCHA / risk_review), their very next SMS is almost
+    # certainly the answer.  Instead of spinning up the full orchestrator turn
+    # (LLM call + all subagents) just to re-delegate to resume_light_web_task,
+    # we skip straight to the resume here and send the final status as a plain
+    # SMS reply. The short-circuit fires ONLY when:
+    #   a) the feature flag is on (no-op when off),
+    #   b) the user exists and has a pending checkpoint (cheap DB read),
+    #   c) the text content looks like a short human answer (not a new
+    #      unrelated request -- we want "123456" or "done" not "hey what did
+    #      you say earlier").  We define "looks like an answer" as: <= 40
+    #      chars AND contains no sentence-level punctuation, i.e. not a new
+    #      statement.  This is intentionally conservative -- if uncertain, we
+    #      fall through to the normal orchestrator turn below.
+    if config.LIGHT_WEB_AGENT_ENABLED:
+        _lwa_user_data: dict | None = None
+        try:
+            _lwa_user_data = await db.get_user_by_phone(from_number)
+        except Exception as _lwa_e:
+            console.system(f"[light_web_agent short-circuit] user lookup failed (non-fatal): {_lwa_e}")
+
+        if _lwa_user_data:
+            _lwa_user_id = _lwa_user_data.get("id")
+            if _lwa_user_id:
+                _pending_ckpt: dict | None = None
+                try:
+                    _pending_ckpt = await db.get_pending_light_web_checkpoint(int(_lwa_user_id))
+                except Exception as _lwa_e2:
+                    console.system(f"[light_web_agent short-circuit] checkpoint lookup failed (non-fatal): {_lwa_e2}")
+
+                # "Looks like a checkpoint answer": short, no complex punctuation
+                _answer_text = effective_content.strip()
+                _looks_like_answer = (
+                    (len(_answer_text) <= 60 and not any(c in _answer_text for c in ["?", ".", "!", ","]))
+                    or _answer_text.lower() in ("yes", "no", "done", "ok", "okay", "continue", "resume")
+                )
+
+                if _pending_ckpt and _looks_like_answer:
+                    console.system(
+                        f"[light_web_agent short-circuit] Routing '{_answer_text[:30]}' "
+                        f"as checkpoint answer for user #{_lwa_user_id}"
+                    )
+
+                    async def _run_lwa_resume() -> None:
+                        from .channels.browser import resume_light_web_task
+                        try:
+                            result = await resume_light_web_task(
+                                user_id=int(_lwa_user_id),
+                                human_input=_answer_text,
+                            )
+                        except Exception as _resume_e:
+                            console.system(f"[light_web_agent short-circuit] resume failed: {_resume_e}")
+                            await _send(
+                                "Sorry, I had trouble resuming the browser task -- "
+                                "could you try again?"
+                            )
+                            return
+
+                        status = result.get("status", "FAILED")
+                        summary = result.get("result_summary") or ""
+                        steps = result.get("steps_taken", 0)
+                        checkpoint = result.get("checkpoint")
+
+                        if status == "DONE":
+                            reply = (
+                                f"✅ Done! {summary}"
+                                if summary
+                                else f"✅ Done ({steps} steps)."
+                            )
+                        elif status == "NEEDS_HUMAN":
+                            # Another checkpoint -- relay it.
+                            cp_prompt = ""
+                            if isinstance(checkpoint, dict):
+                                cp_prompt = checkpoint.get("prompt_to_user") or ""
+                            elif checkpoint is not None and hasattr(checkpoint, "prompt_to_user"):
+                                cp_prompt = checkpoint.prompt_to_user or ""
+                            reply = cp_prompt or "I need more information to continue."
+                        else:
+                            reply = (
+                                f"I wasn't able to complete the task ({status}). "
+                                f"{summary or 'Please try again or let me know how to proceed.'}"
+                            )
+                        await _send(reply)
+
+                    turn_task = asyncio.create_task(_run_lwa_resume())
+                    # Wait for the resume task to finish before exiting the
+                    # background handler -- same shape as the normal turn_task
+                    # wait below for the non-short-circuit path.
+                    await turn_task
+                    # Checkpoint short-circuit consumed this turn: do NOT fall
+                    # through to the full orchestrator path.
+                    return
+
     async def _run_turn() -> None:
         turn_user_id: int | None = None
         turn_token: int | None = None

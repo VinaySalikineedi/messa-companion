@@ -297,23 +297,34 @@ class BrowserSessionManager:
 
         session.keepalive_task = asyncio.create_task(keepalive_worker())
 
-        # Start 5-minute Hard TTL watchdog
+        # TTL watchdog: honour the checkpoint's own timeout_seconds when set
+        # (HumanCheckpoint.timeout_seconds from light_web_agent.py -- an SMS
+        # OTP checkpoint is 5 min by default, a risk_review may be longer).
+        # Falls back to the manager-level default_ttl_seconds if the checkpoint
+        # dict carries no timeout_seconds key, preserving the pre-existing
+        # behaviour for callers that don't set one.
+        checkpoint_timeout = checkpoint.get("timeout_seconds")
+        ttl = int(checkpoint_timeout) if checkpoint_timeout else self.default_ttl_seconds
+
         if session.ttl_task and not session.ttl_task.done():
             session.ttl_task.cancel()
 
         async def ttl_watchdog() -> None:
             try:
-                await asyncio.sleep(self.default_ttl_seconds)
+                await asyncio.sleep(ttl)
                 if session.status == "SUSPENDED_WAITING_INPUT":
                     logger.warning(
-                        f"[SessionManager] Session {session_id} exceeded TTL ({self.default_ttl_seconds}s). Auto-terminating."
+                        f"[SessionManager] Session {session_id} exceeded checkpoint TTL ({ttl}s). Auto-terminating."
                     )
                     await self.release_session(session_id)
             except asyncio.CancelledError:
                 pass
 
         session.ttl_task = asyncio.create_task(ttl_watchdog())
-        logger.info(f"[SessionManager] Suspended session {session_id} for checkpoint: {checkpoint.get('kind')}")
+        logger.info(
+            f"[SessionManager] Suspended session {session_id} for checkpoint: "
+            f"{checkpoint.get('kind')} (TTL={ttl}s)"
+        )
 
     async def resume_session(
         self,

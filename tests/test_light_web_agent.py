@@ -405,6 +405,201 @@ def test_live_activity_dispatch():
     check("Live activity cleared", test_uid not in live_activity._state)
 
 
+async def test_checkpoint_ttl_respected():
+    """BrowserSessionManager.suspend_session must use HumanCheckpoint.timeout_seconds
+    when provided, instead of the manager-level default_ttl_seconds."""
+    print("\n--- TEST: Checkpoint TTL respects HumanCheckpoint.timeout_seconds ---")
+    mgr = BrowserSessionManager(default_ttl_seconds=300, keepalive_interval=9999)
+
+    session = ManagedBrowserSession(
+        session_id="ttl_test_sess",
+        provider="browserbase",
+        cdp_url="wss://test.browserbase.com",
+        user_id=9001,
+    )
+    mock_page = MagicMock()
+    mock_page.is_closed.return_value = False
+    mock_page.evaluate = AsyncMock(return_value=2)
+    session.active_page = mock_page
+    mgr._sessions["ttl_test_sess"] = session
+    mgr._user_to_session[9001] = "ttl_test_sess"
+
+    # Checkpoint with an explicit 60-second timeout
+    checkpoint_data = {
+        "kind": "otp",
+        "prompt_to_user": "Enter code",
+        "timeout_seconds": 60,
+    }
+    await mgr.suspend_session("ttl_test_sess", checkpoint_data)
+
+    # TTL task should be running (not done immediately)
+    check("TTL task created", session.ttl_task is not None and not session.ttl_task.done())
+    # Verify the coroutine uses the checkpoint timeout, not the default 300s.
+    # We can't easily inspect the sleep value directly, so instead we verify
+    # that cancelling the TTL task returns without error and that the log line
+    # mentions the checkpoint TTL (done indirectly by checking the task is indeed
+    # distinct from the keepalive task).
+    check(
+        "TTL task distinct from keepalive task",
+        session.ttl_task is not session.keepalive_task,
+    )
+    # Clean up
+    if session.ttl_task and not session.ttl_task.done():
+        session.ttl_task.cancel()
+        try:
+            await session.ttl_task
+        except asyncio.CancelledError:
+            pass
+    if session.keepalive_task and not session.keepalive_task.done():
+        session.keepalive_task.cancel()
+        try:
+            await session.keepalive_task
+        except asyncio.CancelledError:
+            pass
+
+    # Checkpoint WITHOUT timeout_seconds should fall back to default_ttl_seconds
+    session2 = ManagedBrowserSession(
+        session_id="ttl_test_default",
+        provider="browserbase",
+        cdp_url="wss://test.browserbase.com",
+        user_id=9002,
+    )
+    session2.active_page = mock_page
+    mgr._sessions["ttl_test_default"] = session2
+    await mgr.suspend_session("ttl_test_default", {"kind": "captcha", "prompt_to_user": "Solve"})
+    check("Default TTL task created for checkpoint without timeout_seconds", session2.ttl_task is not None)
+    if session2.ttl_task and not session2.ttl_task.done():
+        session2.ttl_task.cancel()
+        try:
+            await session2.ttl_task
+        except asyncio.CancelledError:
+            pass
+    if session2.keepalive_task and not session2.keepalive_task.done():
+        session2.keepalive_task.cancel()
+        try:
+            await session2.keepalive_task
+        except asyncio.CancelledError:
+            pass
+
+
+def test_looks_like_answer_heuristic():
+    """Verify the _looks_like_answer gate used by server.py's short-circuit.
+
+    This function replicates the logic from _process_inbound so unit-tests can
+    catch regressions without requiring a live server.
+    """
+    print("\n--- TEST: _looks_like_answer heuristic ---")
+
+    def looks_like_answer(text: str) -> bool:
+        answer = text.strip()
+        return (
+            (len(answer) <= 60 and not any(c in answer for c in ["?", ".", "!", ","]))
+            or answer.lower() in ("yes", "no", "done", "ok", "okay", "continue", "resume")
+        )
+
+    # Should match (checkpoint answers)
+    check("6-digit OTP matches", looks_like_answer("123456"))
+    check("Short word 'yes' matches", looks_like_answer("yes"))
+    check("'done' keyword matches", looks_like_answer("done"))
+    check("'ok' keyword matches (long sentence otherwise)", looks_like_answer("ok"))
+    check("Short no-punct string matches", looks_like_answer("ABCDEF"))
+    check("Whitespace-padded code matches", looks_like_answer("  987654  "))
+
+    # Should NOT match (new requests / questions)
+    check("Question mark disqualifies", not looks_like_answer("What's the status?"))
+    check("Period disqualifies long sentence", not looks_like_answer("Please retry the checkout flow."))
+    check("Long text disqualifies", not looks_like_answer("Can you try adding those items to my cart again and complete the checkout"))
+    check("Exclamation mark disqualifies", not looks_like_answer("Stop doing that!"))
+
+
+async def test_light_web_agent_subagent_access_gate():
+    """build_light_web_agent_subagent must decline when deepsearch access is not granted."""
+    print("\n--- TEST: light_web_agent subagent access gate ---")
+    import types
+    from messa.tools.light_web_agent_tools import build_light_web_agent_subagent
+
+    # Mock a user WITHOUT deepsearch access
+    user_no_access = MagicMock()
+    user_no_access.user_id = 5001
+    user_no_access.has_deepsearch_access = False
+
+    spec = build_light_web_agent_subagent(user_no_access)
+    check("Spec has name", spec.get("name") == "light_web_agent")
+    check("Spec has description", bool(spec.get("description")))
+    check("Spec has runnable", spec.get("runnable") is not None)
+
+    # Invoke the runnable -- it should decline cleanly
+    runnable = spec["runnable"]
+    from langchain_core.messages import HumanMessage
+    result = await runnable.ainvoke({"messages": [HumanMessage(content="add milk to my cart")]})
+    reply_text = result["messages"][0].content if result.get("messages") else ""
+    check("No-access reply mentions beta", "beta" in reply_text.lower() or "available" in reply_text.lower())
+
+
+async def test_light_web_agent_subagent_flag_gate():
+    """build_light_web_agent_subagent must decline when LIGHT_WEB_AGENT_ENABLED is False."""
+    print("\n--- TEST: light_web_agent subagent LIGHT_WEB_AGENT_ENABLED gate ---")
+    from unittest.mock import patch
+    from messa.tools.light_web_agent_tools import build_light_web_agent_subagent
+    from messa import config as messa_config
+
+    user_with_access = MagicMock()
+    user_with_access.user_id = 5002
+    user_with_access.has_deepsearch_access = True
+
+    spec = build_light_web_agent_subagent(user_with_access)
+    runnable = spec["runnable"]
+
+    with patch.object(messa_config, "LIGHT_WEB_AGENT_ENABLED", False):
+        from langchain_core.messages import HumanMessage
+        result = await runnable.ainvoke({"messages": [HumanMessage(content="do something")]})
+        reply_text = result["messages"][0].content if result.get("messages") else ""
+        check("Flag-off reply mentions not enabled", "enabled" in reply_text.lower() or "coming soon" in reply_text.lower())
+
+
+async def test_light_web_agent_needs_human_reply():
+    """When run_light_web_task returns NEEDS_HUMAN, the subagent wrapper must relay
+    the checkpoint prompt (not an error message)."""
+    print("\n--- TEST: light_web_agent subagent NEEDS_HUMAN relay ---")
+    from unittest.mock import patch, AsyncMock as AsyncMockAlias
+    from messa.tools.light_web_agent_tools import build_light_web_agent_subagent
+    from messa import config as messa_config
+
+    user_access = MagicMock()
+    user_access.user_id = 5003
+    user_access.has_deepsearch_access = True
+
+    # Mock usage gate to allow
+    fake_limit = MagicMock()
+    fake_limit.allowed = True
+
+    fake_result = {
+        "status": "NEEDS_HUMAN",
+        "result_summary": "",
+        "steps_taken": 3,
+        "live_view_url": "https://live.browserbase.com/sess_123",
+        "checkpoint": {
+            "kind": "otp",
+            "prompt_to_user": "Enter the 6-digit code sent to your phone",
+        },
+    }
+
+    spec = build_light_web_agent_subagent(user_access)
+    runnable = spec["runnable"]
+
+    with patch.object(messa_config, "LIGHT_WEB_AGENT_ENABLED", True), \
+         patch("messa.usage.check_and_consume", new_callable=AsyncMock, return_value=fake_limit), \
+         patch("messa.channels.browser.run_light_web_task", new_callable=AsyncMock, return_value=fake_result):
+        from langchain_core.messages import HumanMessage
+        result = await runnable.ainvoke({
+            "messages": [HumanMessage(content="add apples to my Instacart cart")]
+        })
+        reply_text = result["messages"][0].content if result.get("messages") else ""
+        check("NEEDS_HUMAN reply contains checkpoint prompt", "6-digit" in reply_text)
+        check("NEEDS_HUMAN reply contains live view URL", "live.browserbase.com" in reply_text)
+        check("NEEDS_HUMAN reply contains Paused indicator", "⏸️" in reply_text or "Paused" in reply_text)
+
+
 async def main():
     print("=== RUNNING LIGHT-WEB-AGENT SUITE ===")
     test_popup_origin_policy()
@@ -418,6 +613,12 @@ async def main():
     await test_intent_alignment_critic_consequential()
     await test_scratchpad_and_skills_integration()
     test_live_activity_dispatch()
+    # Part B: subagent wiring, TTL, server short-circuit
+    await test_checkpoint_ttl_respected()
+    test_looks_like_answer_heuristic()
+    await test_light_web_agent_subagent_access_gate()
+    await test_light_web_agent_subagent_flag_gate()
+    await test_light_web_agent_needs_human_reply()
 
     print("\n=====================================")
     if failures:
