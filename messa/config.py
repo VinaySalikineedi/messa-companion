@@ -634,7 +634,7 @@ LIGHT_WEB_AGENT_ENABLED = os.environ.get("MESSA_LIGHT_WEB_AGENT_ENABLED", "false
 # above -- defaults OFF. Pairing and driving a REAL physical device the user
 # owns is a materially higher-stakes rollout than a cloud browser session,
 # so this stays a deliberate opt-in even after the engine itself is tested.
-ANDROID_PHONE_AGENT_ENABLED = os.environ.get("MESSA_ANDROID_PHONE_AGENT_ENABLED", "false").strip().lower() in (
+ANDROID_PHONE_AGENT_ENABLED = os.environ.get("MESSA_ANDROID_PHONE_AGENT_ENABLED", "true").strip().lower() in (
     "1", "true", "yes", "on",
 )
 
@@ -684,7 +684,7 @@ ANDROID_PHONE_CHECKPOINT_TIMEOUT_SECONDS = int(
 # this doesn't change any of that engine's own risk profile, but it's a
 # brand-new network-facing endpoint (an actual WebSocket auth surface) and
 # deserves its own deliberate opt-in independent of the phone agent itself.
-MESSA_COMPANION_BRIDGE_ENABLED = os.environ.get("MESSA_COMPANION_BRIDGE_ENABLED", "false").strip().lower() in (
+MESSA_COMPANION_BRIDGE_ENABLED = os.environ.get("MESSA_COMPANION_BRIDGE_ENABLED", "true").strip().lower() in (
     "1", "true", "yes", "on",
 )
 
