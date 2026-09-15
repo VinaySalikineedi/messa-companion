@@ -143,6 +143,11 @@ def render_skills_showcase_page(skills: list[dict], app_filter: str | None = Non
 <div class="wrap">
   <h1>Community phone skills</h1>
   <p class="subtitle">Automation recipes other Messa users have published from their own Open-Source Phone tasks -- how to do a specific thing in a specific app, shared so Messa can do it faster next time for everyone.</p>
+  <div style="margin-bottom: 28px;">
+    <a href="/download/companion.apk" style="display: inline-flex; align-items: center; gap: 8px; background: #2563eb; color: #ffffff; text-decoration: none; padding: 11px 20px; border-radius: 8px; font-size: 14px; font-weight: 600; box-shadow: 0 2px 8px rgba(37,99,235,0.3);">
+      <span>📱</span> Download Messa Companion APK
+    </a>
+  </div>
   {filter_note}
   {cards_html}
   <footer>Published via Messa's Open-Source Phone (Bring Your Own Phone) feature.</footer>

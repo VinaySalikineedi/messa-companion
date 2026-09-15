@@ -46,7 +46,7 @@ from zoneinfo import ZoneInfo
 import httpx
 import websockets
 from fastapi import BackgroundTasks, FastAPI, Header, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from . import asset_consolidation, background, briefings, call_activity, call_control, cli, companion_bridge, config, console, db, email_triage, live_activity, media_understanding, meeting_dossiers, memory, pdf_reader, phone_activity, region_gate, turn_control, waitlist
 from .agents.registry import build_orchestrator
@@ -157,6 +157,23 @@ async def skills_showcase_page_route(app: str | None = None) -> HTMLResponse:
     app_package = app
     skills = await db.list_public_device_skills(app_package=app_package)
     return HTMLResponse(render_skills_showcase_page(skills, app_filter=app_package))
+
+
+@app.get("/download/companion.apk")
+@app.get("/download/apk")
+async def download_companion_apk_route():
+    """Serves local companion APK if present, or redirects to the latest GitHub release."""
+    local_apk = Path(__file__).resolve().parent.parent / "companion-apk" / "app" / "build" / "outputs" / "apk" / "debug" / "app-debug.apk"
+    if local_apk.exists():
+        return FileResponse(
+            path=str(local_apk),
+            media_type="application/vnd.android.package-archive",
+            filename="messa-companion.apk",
+        )
+    return RedirectResponse(
+        url="https://github.com/VinaySalikineedi/agent-browser/releases/download/companion-latest/app-debug.apk",
+        status_code=307,
+    )
 
 
 @app.get("/og-image.png")

@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Adaptive icon (API 26+ only, matching this app's minSdk 26 -- no
+<!-- Adaptive icon (API 26+ only, matching this app's minSdk 26 - no
      legacy per-density PNG mipmaps are needed since every supported
      Android version understands this format). -->
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
