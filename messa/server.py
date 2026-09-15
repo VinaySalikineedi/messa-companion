@@ -48,7 +48,7 @@ import websockets
 from fastapi import BackgroundTasks, FastAPI, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
-from . import asset_consolidation, background, briefings, call_activity, call_control, cli, config, console, db, email_triage, live_activity, media_understanding, meeting_dossiers, memory, pdf_reader, phone_activity, region_gate, turn_control, waitlist
+from . import asset_consolidation, background, briefings, call_activity, call_control, cli, companion_bridge, config, console, db, email_triage, live_activity, media_understanding, meeting_dossiers, memory, pdf_reader, phone_activity, region_gate, turn_control, waitlist
 from .agents.registry import build_orchestrator
 from .approval import AutoApproveGate, DenyApprovalGate
 from .call_live_view_page import render_call_live_view_page
@@ -925,25 +925,21 @@ async def phone_live_view_frame(token: str) -> Response:
     return Response(content=png_bytes, media_type="image/png")
 
 
-@app.post("/live/{token}/phone/abort")
-async def phone_live_view_abort(token: str) -> JSONResponse:
-    """The live-view page's "Pause / Abort" break-glass button
-    (open-source-phone.md section 5): presses the Android Home key
-    directly against the device FIRST (best-effort, independent of
-    whether a live task is even still running -- a device can be stuck
-    'busy' with no live task to show for it after a crash), THEN cancels
-    the in-process asyncio.Task via phone_activity.cancel so
-    AndroidPhoneAgent.run() stops at its very next await point (its own
-    CancelledError handler in devices/android.py releases the device
-    queue lock and records the 'aborted' end state), and finally releases
-    the device here too so a device that had no live task to cancel isn't
-    left stuck 'busy' either way."""
-    if not config.ANDROID_PHONE_AGENT_ENABLED:
-        return JSONResponse({"error": "not found"}, status_code=404)
-    user = await db.get_user_by_live_token(token)
-    if user is None:
-        return JSONResponse({"error": "not found"}, status_code=404)
-    user_id = user["id"]
+async def _press_home_and_abort_phone_task(user_id: int) -> bool:
+    """Shared break-glass abort: presses the Android Home key directly
+    against the device FIRST (best-effort, independent of whether a live
+    task is even still running -- a device can be stuck 'busy' with no
+    live task to show for it after a crash), THEN cancels the in-process
+    asyncio.Task via phone_activity.cancel so AndroidPhoneAgent.run()
+    stops at its very next await point (its own CancelledError handler in
+    devices/android.py releases the device queue lock and records the
+    'aborted' end state), and finally releases the device here too so a
+    device that had no live task to cancel isn't left stuck 'busy' either
+    way. Two callers: the live-view page's HTTP "Pause / Abort" button
+    (open-source-phone.md section 5) and the Companion APK's own
+    touch-killswitch overlay (section 3.4) signaling "touch_abort" over
+    its `/device/ws` connection -- same physical action, just two
+    different triggers for it, so the logic lives in exactly one place."""
     entry = phone_activity.get(user_id)
     device_id = entry.get("device_id")
 
@@ -954,7 +950,7 @@ async def phone_live_view_abort(token: str) -> JSONResponse:
             try:
                 await asyncio.to_thread(managed.u2_device.press, "home")
             except Exception as e:  # noqa: BLE001 - best-effort; the abort must proceed either way
-                console.system(f"[phone_live_view_abort] home-key press failed for device {device_id}: {e}")
+                console.system(f"[phone_abort] home-key press failed for device {device_id}: {e}")
 
     cancelled = phone_activity.cancel(user_id)
     if device_id:
@@ -964,7 +960,140 @@ async def phone_live_view_abort(token: str) -> JSONResponse:
         except Exception:
             pass
     phone_activity.set_status(user_id, "aborted")
+    return cancelled
+
+
+@app.post("/live/{token}/phone/abort")
+async def phone_live_view_abort(token: str) -> JSONResponse:
+    """The live-view page's "Pause / Abort" break-glass button
+    (open-source-phone.md section 5) -- see _press_home_and_abort_phone_task
+    for the actual mechanics, shared with the Companion APK's touch
+    killswitch below."""
+    if not config.ANDROID_PHONE_AGENT_ENABLED:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    user = await db.get_user_by_live_token(token)
+    if user is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    cancelled = await _press_home_and_abort_phone_task(user["id"])
     return JSONResponse({"ok": True, "cancelled": cancelled})
+
+
+@app.websocket("/device/ws")
+async def companion_device_ws(websocket: WebSocket) -> None:
+    """The Messa Companion APK's outbound reverse-tunnel connection
+    (open-source-phone.md section 2/3, messa/companion_bridge.py). The
+    phone always dials OUT here -- this route never reaches back into the
+    phone -- which is precisely what lets this work through any router/
+    NAT/CGNAT and on Hugging Face Spaces' HTTP/WebSocket-only egress.
+
+    Two paths after auth, both ending the same way (promote to a live
+    CompanionDeviceBridge and block until it closes):
+      - An already-paired device's secret hash resolves straight to its
+        user_devices row -- just reconnect the bridge.
+      - An unrecognized secret starts the pairing flow: a 6-digit code is
+        sent down this same socket, and this coroutine waits (bounded by
+        the pairing TTL) for messa/companion_bridge.py's bind_pairing_code
+        to resolve it -- called from the SMS short-circuit in
+        _process_inbound below the moment the user texts that code back
+        from their registered number.
+    """
+    if not config.MESSA_COMPANION_BRIDGE_ENABLED:
+        await websocket.close(code=4404)
+        return
+
+    auth_header = websocket.headers.get("authorization") or ""
+    if not auth_header.lower().startswith("bearer "):
+        await websocket.close(code=4401)
+        return
+    device_secret = auth_header[len("Bearer "):].strip()
+    if not device_secret:
+        await websocket.close(code=4401)
+        return
+    device_name = (websocket.headers.get("x-device-name") or "Android Phone").strip() or "Android Phone"
+
+    await websocket.accept()
+
+    async def _on_touch_abort(device_id: int) -> None:
+        """Wired to the phone's touch-killswitch overlay (open-source-
+        phone.md section 3.4) -- resolves device_id back to its owning
+        user_id and runs the exact same home-press + task-cancel path the
+        live-view page's HTTP abort button uses (see
+        _press_home_and_abort_phone_task)."""
+        device_row = await db.get_device_by_id(device_id)
+        if not device_row:
+            return
+        await _press_home_and_abort_phone_task(device_row["user_id"])
+
+    async def _run_as_bridge(device_id: int) -> None:
+        try:
+            await db.update_device_status(device_id, "connected")
+        except Exception as e:  # noqa: BLE001 - a status-column hiccup must not drop the bridge
+            console.system(f"companion_device_ws: status update failed (non-fatal): {e}")
+        bridge = await companion_bridge.start_device_bridge(
+            device_id, websocket, on_touch_abort=_on_touch_abort,
+        )
+        try:
+            # Purely cosmetic for the APK's own UI (it has nothing else to
+            # tell "paired but idle" apart from "actively bridging ADB
+            # traffic" -- the bridge itself works identically either way,
+            # this is not relied on for anything functional).
+            await websocket.send_json({"type": "bridge_active"})
+        except Exception:  # noqa: BLE001 - purely cosmetic, must never break the bridge
+            pass
+        try:
+            await bridge.wait_closed()
+        finally:
+            try:
+                await db.update_device_status(device_id, "offline")
+            except Exception:  # noqa: BLE001
+                pass
+
+    existing_device = await companion_bridge.MANAGER.authenticate_device_secret(device_secret)
+    if existing_device is not None:
+        await _run_as_bridge(existing_device["id"])
+        return
+
+    # Not yet paired -- run the pairing wait on this same connection.
+    pending = companion_bridge.MANAGER.start_pairing(websocket, device_secret, device_name)
+    bound_device: dict | None = None
+    try:
+        await companion_bridge.send_pairing_prompt(websocket, pending)
+        try:
+            bound_device = await asyncio.wait_for(
+                pending.bound_future,
+                timeout=config.COMPANION_PAIRING_CODE_TTL_SECONDS + 30,
+            )
+        except asyncio.TimeoutError:
+            bound_device = None
+    except WebSocketDisconnect:
+        companion_bridge.MANAGER.cancel_pairing_for_socket(websocket)
+        return
+    except Exception as e:  # noqa: BLE001 - a pairing hiccup must not crash the server
+        console.system(f"companion_device_ws: pairing wait failed: {e}")
+        companion_bridge.MANAGER.cancel_pairing_for_socket(websocket)
+        try:
+            await websocket.close(code=4500)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    finally:
+        if pending.ping_task is not None:
+            pending.ping_task.cancel()
+
+    if bound_device is None:
+        # Expired without ever being claimed by a matching SMS, or the
+        # socket dropped mid-wait -- cancel_pairing_for_socket already ran
+        # in the disconnect branch above; a plain timeout still needs the
+        # entry cleared here since _prune_expired only runs lazily on the
+        # next start_pairing/bind_pairing_code call otherwise.
+        companion_bridge.MANAGER.cancel_pairing_for_socket(websocket)
+        try:
+            await websocket.close(code=4408)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    await _run_as_bridge(bound_device["id"])
 
 
 @app.post("/webhook/vapi")
@@ -2088,6 +2217,60 @@ async def _process_inbound(
                     turn_task = asyncio.create_task(_run_android_resume())
                     await turn_task
                     return
+
+    # Messa Companion APK pairing short-circuit --------------------------------
+    # A companion_ws device shows a 6-digit code ("PAIR 918-243",
+    # open-source-phone.md section 3.2) on first launch and waits for the
+    # user to text it back from their registered number -- this single SMS
+    # is the ONLY way a device_secret_hash ever gets bound to a
+    # user_devices row (messa/companion_bridge.py's bind_pairing_code).
+    # Matched by a strict "PAIR ###-###" shape rather than the "looks like
+    # a short answer" heuristics the two short-circuits above use: unlike
+    # an OTP/checkpoint answer, there's no pending-per-user state to check
+    # FIRST here (the code itself is the only identifier a pairing message
+    # carries), so a loose heuristic would risk silently swallowing an
+    # unrelated short SMS ("done", "no").
+    if config.MESSA_COMPANION_BRIDGE_ENABLED:
+        _pair_match = re.match(
+            r"^\s*PAIR[\s:.-]*(\d{3})[\s-]?(\d{3})\s*$", effective_content, re.IGNORECASE,
+        )
+        if _pair_match:
+            _pair_code = f"{_pair_match.group(1)}-{_pair_match.group(2)}"
+            console.system(f"[companion_bridge short-circuit] pairing attempt from {from_number}")
+
+            async def _run_companion_pairing() -> None:
+                _pair_user_data: dict | None = None
+                try:
+                    _pair_user_data = await db.get_user_by_phone(from_number)
+                except Exception as _pair_e:
+                    console.system(f"[companion_bridge short-circuit] user lookup failed (non-fatal): {_pair_e}")
+
+                if not _pair_user_data or not _pair_user_data.get("id"):
+                    await _send(
+                        "I couldn't find your Messa account for this number, so I can't pair that "
+                        "phone yet -- text me to get started first, then try pairing again."
+                    )
+                    return
+
+                device = await companion_bridge.MANAGER.bind_pairing_code(
+                    _pair_code, from_number, user_id=int(_pair_user_data["id"]),
+                )
+                if device is None:
+                    _ttl_minutes = max(1, config.COMPANION_PAIRING_CODE_TTL_SECONDS // 60)
+                    await _send(
+                        "That pairing code didn't work -- it may have expired "
+                        f"(codes last about {_ttl_minutes} minute{'s' if _ttl_minutes != 1 else ''}) or "
+                        "already been used. Open Messa Bridge on your phone again for a fresh code."
+                    )
+                    return
+
+                await _send(
+                    f"Your phone \"{device.get('device_name') or 'device'}\" is now paired with Messa!"
+                )
+
+            turn_task = asyncio.create_task(_run_companion_pairing())
+            await turn_task
+            return
 
     async def _run_turn() -> None:
         turn_user_id: int | None = None

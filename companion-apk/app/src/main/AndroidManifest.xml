@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Messa Companion APK manifest (open-source-phone.md section 2/3/4).
+
+    Deliberately requests ZERO listening/server permissions: this app
+    never opens a port and is never reachable from the network (section
+    3.1 "Zero inbound ports on the phone") -- every permission below
+    exists only to (a) dial OUT over a WebSocket, (b) stay alive as a
+    foreground service against Android's battery/Doze restrictions
+    (section 4, roadblock #3/#5), and (c) show the touch killswitch
+    overlay (section 3.4).
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- Touch killswitch overlay (section 3.4) -- a transparent full-screen
+         overlay that detects a genuine user touch while Messa is driving
+         the phone and immediately signals abort. SYSTEM_ALERT_WINDOW is
+         the one permission here that needs an explicit user grant via
+         Settings (requested from MainActivity, never silently assumed). -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:theme="@style/Theme.MessaCompanion"
+        android:usesCleartextTraffic="false">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+            Roadblock #5 (open-source-phone.md section 4): Android 14+
+            (API 34) requires every foreground service to declare a
+            concrete foregroundServiceType. "connectedDevice" is the
+            closest first-class fit (this service's entire purpose is
+            bridging a connection to the device's own local ADB daemon);
+            FOREGROUND_SERVICE_CONNECTED_DEVICE above is its matching
+            permission.
+        -->
+        <service
+            android:name=".BridgeForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="connectedDevice" />
+
+    </application>
+
+</manifest>
