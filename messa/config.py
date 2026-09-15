@@ -627,6 +627,53 @@ LIGHT_WEB_AGENT_ENABLED = os.environ.get("MESSA_LIGHT_WEB_AGENT_ENABLED", "false
 )
 
 
+# ---- Open-Source Phone / Bring Your Own Phone (BYOP) (open-source-phone.md,
+# messa/devices/android.py, feature/open-source-phone) ----
+
+# Master go-live switch, same idiom/reasoning as LIGHT_WEB_AGENT_ENABLED just
+# above -- defaults OFF. Pairing and driving a REAL physical device the user
+# owns is a materially higher-stakes rollout than a cloud browser session,
+# so this stays a deliberate opt-in even after the engine itself is tested.
+ANDROID_PHONE_AGENT_ENABLED = os.environ.get("MESSA_ANDROID_PHONE_AGENT_ENABLED", "false").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+ANDROID_PHONE_AGENT_MODEL = os.environ.get("MESSA_ANDROID_PHONE_AGENT_MODEL", "google/gemini-2.5-flash").strip()
+
+# How many OTHER requests may queue behind whatever's currently running on
+# one physical phone (open-source-phone.md section 4 -- a phone can only
+# run one foreground app at a time). Deliberately small: this is meant to
+# smooth "mom's using it, I'll wait 2 minutes," not let unrelated requests
+# pile up indefinitely against one device.
+ANDROID_PHONE_MAX_QUEUE_DEPTH = int(os.environ.get("MESSA_ANDROID_PHONE_MAX_QUEUE_DEPTH", "5"))
+
+# Family-sharing category allowlist (open-source-phone.md section 4). A
+# category not in this list can never be granted to an authorized contact
+# in the first place (messa/tools/android_phone_tools.py validates
+# against this before calling db.authorize_device_contact) -- deliberately
+# enforced in code, not just left to whatever string the phone owner
+# happens to type, so "allow mom to use my phone for everything" can't
+# accidentally grant banking/messaging access via a typo'd category name.
+ANDROID_PHONE_ALLOWED_CATEGORIES = frozenset({
+    "food_delivery", "rides", "smart_home", "streaming", "maps",
+})
+# Never authorizable for a non-owner, regardless of what's asked for --
+# listed explicitly (rather than just "not in ALLOWED_CATEGORIES") so the
+# refusal message can name exactly why, matching this repo's convention of
+# explaining refusals rather than silently no-oping.
+ANDROID_PHONE_BLOCKED_CATEGORIES = frozenset({
+    "banking", "messages", "whatsapp", "photos", "phone_settings",
+})
+
+# Default suspended-checkpoint timeout for a phone task waiting on a human
+# reply (a milestone confirmation, an unexpected-dialog question) -- longer
+# than light-web-agent's OTP default since a phone task's confirmations are
+# often "should I actually place this order," not a fast-expiring SMS code.
+ANDROID_PHONE_CHECKPOINT_TIMEOUT_SECONDS = int(
+    os.environ.get("MESSA_ANDROID_PHONE_CHECKPOINT_TIMEOUT_SECONDS", "600")
+)
+
+
 # Maximum attempts/retries when encountering or attempting to solve a CAPTCHA.
 # CAPTCHAs are generally hard to pass autonomously, so capping attempts at 2 prevents
 # burning expensive remote browser minutes and agent turn budget.

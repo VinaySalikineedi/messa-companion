@@ -68,6 +68,16 @@ class PlanLimits:
     # below for why this is handled there instead of the required-fields
     # tuple.
     call_minutes: int | None = 0
+    # Open-Source Phone / BYOP (open-source-phone.md section 7): the
+    # HARD CAP on real UI steps (taps/types/swipes) one phone-automation
+    # task may take, and its wall-clock timeout. Same "None = unlimited,
+    # 0 = not on this plan, defaults to 0 for an old override JSON"
+    # convention as call_minutes just above -- a genuinely new physical-
+    # device feature has to earn its way onto a plan explicitly, not
+    # silently inherit a real cap from a JSON payload written before this
+    # field existed.
+    phone_automation_steps: int | None = 0
+    phone_task_timeout_seconds: int | None = 0
 
 
 @dataclass(frozen=True)
@@ -97,28 +107,28 @@ PLANS: dict[str, Plan] = {
         id="basic", name="Basic", price_cents=0,
         limits=PlanLimits(
             outbound_emails=10, browse_actions=5, number_of_texts=25, max_connected_apps=2,
-            call_minutes=0,
+            call_minutes=0, phone_automation_steps=10, phone_task_timeout_seconds=180,
         ),
     ),
     "pro": Plan(
         id="pro", name="Pro", price_cents=1200,
         limits=PlanLimits(
             outbound_emails=50, browse_actions=25, number_of_texts=150, max_connected_apps=6,
-            call_minutes=0,
+            call_minutes=0, phone_automation_steps=60, phone_task_timeout_seconds=900,
         ),
     ),
     "plus": Plan(
         id="plus", name="Plus", price_cents=2900,
         limits=PlanLimits(
             outbound_emails=200, browse_actions=75, number_of_texts=500, max_connected_apps=15,
-            call_minutes=20,
+            call_minutes=20, phone_automation_steps=120, phone_task_timeout_seconds=1200,
         ),
     ),
     "business": Plan(
         id="business", name="Business", price_cents=7900,
         limits=PlanLimits(
             outbound_emails=1000, browse_actions=300, number_of_texts=2000, max_connected_apps=None,
-            call_minutes=40,
+            call_minutes=40, phone_automation_steps=None, phone_task_timeout_seconds=None,
         ),
     ),
 }
@@ -149,6 +159,8 @@ def _parse_limits(raw: dict) -> PlanLimits:
     # plan yet," i.e. 0 -- the same value basic/pro carry in PLANS itself
     # -- not "unlimited."
     limits_dict["call_minutes"] = raw.get("call_minutes", 0)
+    limits_dict["phone_automation_steps"] = raw.get("phone_automation_steps", 0)
+    limits_dict["phone_task_timeout_seconds"] = raw.get("phone_task_timeout_seconds", 0)
     return PlanLimits(**limits_dict)
 
 

@@ -73,6 +73,7 @@ from ..tools.executive_tools import _format_contact_line, build_executive_subage
 from ..tools.integration_tools import app_category_for_toolkit, build_integration_subagent
 from ..tools.grocery_tools import build_grocery_subagent
 from ..tools.light_web_agent_tools import build_light_web_agent_subagent
+from ..tools.android_phone_tools import build_android_phone_subagent
 from ..tools.personal_inbox_tools import build_personal_inbox_subagent, build_personal_inbox_tools
 from ..tools.routines_tools import build_routines_subagent, build_routines_tools
 from ..tools.scratchpad_tools import build_scratchpad_tools, scratchpad_prompt_block
@@ -1206,6 +1207,22 @@ def _build_system_prompt(
         else ""
     )
 
+    android_phone_agent_mention = (
+        ", android_phone_agent (pairs with and drives the user's OWN physical Android phone -- "
+        "ordering food, booking rides, or using any app exactly the way the user themselves would)"
+        if config.ANDROID_PHONE_AGENT_ENABLED
+        else ""
+    )
+    android_phone_agent_routing_note = (
+        "  - the user's OWN physical phone: delegate to android_phone_agent whenever the request "
+        "is about pairing, controlling, or authorizing access to the user's REAL Android device -- "
+        "'connect my phone', 'order me a burrito on DoorDash', 'let mom use my phone for rides', "
+        "'what's my phone doing'. This is DIFFERENT from light_web_agent/deepsearch (a cloud "
+        "browser Messa controls, not the user's own hardware) -- never confuse the two.\n"
+        if config.ANDROID_PHONE_AGENT_ENABLED
+        else ""
+    )
+
     return (
         "You are Messa -- a task-oriented personal life manager reachable by text, email, and "
         "(soon) WhatsApp, not a chatbot. Your job is taking real things off the user's plate "
@@ -1248,6 +1265,7 @@ def _build_system_prompt(
         "integrations_agent (1,400+ third-party connected apps, e.g. Slack, Notion, GitHub, Google Calendar)"
         f"{grocery_mention}"
         f"{light_web_agent_mention}"
+        f"{android_phone_agent_mention}"
         f"{admin_agent_mention}."
         f"{parallel_delegation_note}\n\n"
         "Routing -- email, calendar, and tasks each have a NATIVE Messa tool and, once "
@@ -1285,6 +1303,7 @@ def _build_system_prompt(
         "connected-app equivalent exists.\n"
         f"{grocery_routing_note}"
         f"{light_web_agent_routing_note}"
+        f"{android_phone_agent_routing_note}"
         "Switching or disconnecting a connected app: there's NO settings/integrations page for "
         "the user to do this themselves -- never say there is. Do it directly: to switch accounts, call "
         "request_email_connection/connect_integration_app with switch_account=True (disconnects "
@@ -1577,6 +1596,11 @@ async def build_orchestrator(
     if config.LIGHT_WEB_AGENT_ENABLED:
         subagents.append(
             build_light_web_agent_subagent(user, approval_gate)
+        )
+
+    if config.ANDROID_PHONE_AGENT_ENABLED:
+        subagents.append(
+            build_android_phone_subagent(user, _subagent_model_for("android_phone_agent"), approval_gate)
         )
 
     # Admin-only, and only ever added here -- a non-admin's subagents list

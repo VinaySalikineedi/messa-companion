@@ -48,7 +48,7 @@ import websockets
 from fastapi import BackgroundTasks, FastAPI, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
-from . import asset_consolidation, background, briefings, call_activity, call_control, cli, config, console, db, email_triage, live_activity, media_understanding, meeting_dossiers, memory, pdf_reader, region_gate, turn_control, waitlist
+from . import asset_consolidation, background, briefings, call_activity, call_control, cli, config, console, db, email_triage, live_activity, media_understanding, meeting_dossiers, memory, pdf_reader, phone_activity, region_gate, turn_control, waitlist
 from .agents.registry import build_orchestrator
 from .approval import AutoApproveGate, DenyApprovalGate
 from .call_live_view_page import render_call_live_view_page
@@ -57,7 +57,9 @@ from .channels.sendblue import SendblueError
 from .channels.vapi import VapiError
 from .landing_page import render_landing_page
 from .live_view_page import render_live_view_page
+from .phone_live_view_page import render_phone_live_view_page
 from .privacy_page import render_privacy_page
+from .skills_showcase_page import render_skills_showcase_page
 from .tools import call_tools, email_tools, integration_tools
 from .tools.routines_tools import ONE_SHOT_SENTINEL, compute_next_run
 
@@ -130,6 +132,31 @@ async def privacy_page() -> HTMLResponse:
     are the only per-deployment values, same pattern as landing_page.py's
     phone number/domain."""
     return HTMLResponse(render_privacy_page())
+
+
+@app.get("/skills")
+async def skills_showcase_page_route(app: str | None = None) -> HTMLResponse:
+    """The public Open-Source Phone community skill showcase (open-source-
+    phone.md section 6, messa.ai/skills) -- lists every device_skills row a
+    user has explicitly published (via android_phone_tools.py's
+    publish_phone_skill tool, never anything private). `?app=<package>`
+    filters to one Android app's package, matching db.
+    list_public_device_skills' own optional filter. Always 200s, even with
+    the feature flag off or the table not yet migrated -- db.
+    list_public_device_skills already returns [] for a missing table
+    rather than raising, and render_skills_showcase_page shows a clean
+    "no skills published yet" state for an empty list, so there's nothing
+    here that needs its own flag check to render safely.
+
+    Route parameter is deliberately named `app` (matching the public
+    `?app=<package>` query string, e.g. open-source-phone.md's own
+    examples) -- FastAPI resolves it from the request query, not this
+    module's global `app = FastAPI()` instance; the name only shadows that
+    global inside this one function body, which never needs to reference
+    it, so this is safe, if a little easy to misread at a glance."""
+    app_package = app
+    skills = await db.list_public_device_skills(app_package=app_package)
+    return HTMLResponse(render_skills_showcase_page(skills, app_filter=app_package))
 
 
 @app.get("/og-image.png")
@@ -832,6 +859,112 @@ async def call_live_view_audio(websocket: WebSocket) -> None:
             await websocket.close()
         except Exception:  # noqa: BLE001
             pass
+
+
+@app.get("/live/{token}/phone")
+async def phone_live_view_page_route(token: str) -> HTMLResponse:
+    """The public page a phone task's live-monitoring link points at (see
+    messa/tools/android_phone_tools.py's run_phone_task, which texts this
+    link when a task starts). Always returns 200 with the page shell
+    regardless of whether the token is valid -- same reasoning as
+    live_view_page/call_live_view_page above."""
+    return HTMLResponse(render_phone_live_view_page(token))
+
+
+@app.get("/live/{token}/phone/status")
+async def phone_live_view_status(token: str) -> JSONResponse:
+    """Polled by the page above every ~1.5s. 404 means "no such link" (or
+    the feature flag is off); 200 with active=false means "valid link,
+    nothing tracked for this user right now". See phone_activity.py's
+    has_entry docstring for what counts as 'active' here -- a running
+    task, a paused NEEDS_HUMAN checkpoint, or a just-finished task's
+    terminal status that hasn't been cleared yet."""
+    if not config.ANDROID_PHONE_AGENT_ENABLED:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    user = await db.get_user_by_live_token(token)
+    if user is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    user_id = user["id"]
+    if not phone_activity.has_entry(user_id):
+        return JSONResponse({"active": False})
+    entry = phone_activity.get(user_id)
+    return JSONResponse({
+        "active": True,
+        "status": entry.get("status"),
+        "goal": entry.get("goal"),
+        "thought": entry.get("thought"),
+        "steps_taken": entry.get("steps_taken"),
+        "waiting_prompt": entry.get("waiting_prompt"),
+    })
+
+
+@app.get("/live/{token}/phone/frame")
+async def phone_live_view_frame(token: str) -> Response:
+    """Polled by the page's <img> tag, pulling a FRESH screenshot straight
+    off the device on every single call (AndroidDeviceManager.
+    take_screenshot) rather than replaying a cached one -- deliberately
+    on-demand, not a background streaming loop, since nothing else in this
+    feature needs frames while no one is looking at the page. 404 for
+    anything not currently trackable (bad token, no device_id known yet,
+    device not actually connected, or the screenshot call itself fails) --
+    the page's own <img onerror> handles that as "screen not available
+    yet" rather than a broken image icon."""
+    if not config.ANDROID_PHONE_AGENT_ENABLED:
+        return Response(status_code=404)
+    user = await db.get_user_by_live_token(token)
+    if user is None:
+        return Response(status_code=404)
+    entry = phone_activity.get(user["id"])
+    device_id = entry.get("device_id")
+    if not device_id:
+        return Response(status_code=404)
+    from .devices.android import device_manager
+    png_bytes = await device_manager.take_screenshot(device_id)
+    if not png_bytes:
+        return Response(status_code=404)
+    return Response(content=png_bytes, media_type="image/png")
+
+
+@app.post("/live/{token}/phone/abort")
+async def phone_live_view_abort(token: str) -> JSONResponse:
+    """The live-view page's "Pause / Abort" break-glass button
+    (open-source-phone.md section 5): presses the Android Home key
+    directly against the device FIRST (best-effort, independent of
+    whether a live task is even still running -- a device can be stuck
+    'busy' with no live task to show for it after a crash), THEN cancels
+    the in-process asyncio.Task via phone_activity.cancel so
+    AndroidPhoneAgent.run() stops at its very next await point (its own
+    CancelledError handler in devices/android.py releases the device
+    queue lock and records the 'aborted' end state), and finally releases
+    the device here too so a device that had no live task to cancel isn't
+    left stuck 'busy' either way."""
+    if not config.ANDROID_PHONE_AGENT_ENABLED:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    user = await db.get_user_by_live_token(token)
+    if user is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    user_id = user["id"]
+    entry = phone_activity.get(user_id)
+    device_id = entry.get("device_id")
+
+    from .devices.android import device_manager
+    if device_id:
+        managed = device_manager.get_managed(device_id)
+        if managed is not None and managed.u2_device is not None:
+            try:
+                await asyncio.to_thread(managed.u2_device.press, "home")
+            except Exception as e:  # noqa: BLE001 - best-effort; the abort must proceed either way
+                console.system(f"[phone_live_view_abort] home-key press failed for device {device_id}: {e}")
+
+    cancelled = phone_activity.cancel(user_id)
+    if device_id:
+        device_manager.release(device_id)
+        try:
+            await db.update_device_status(device_id, "connected")
+        except Exception:
+            pass
+    phone_activity.set_status(user_id, "aborted")
+    return JSONResponse({"ok": True, "cancelled": cancelled})
 
 
 @app.post("/webhook/vapi")
@@ -1866,6 +1999,94 @@ async def _process_inbound(
                     await turn_task
                     # Checkpoint short-circuit consumed this turn: do NOT fall
                     # through to the full orchestrator path.
+                    return
+
+    # android_phone_agent checkpoint short-circuit -----------------------------
+    # Sibling of the light_web_agent short-circuit just above -- same
+    # reasoning, same "looks like an answer" heuristic, same "skip the full
+    # orchestrator turn and resume directly" shape -- for a phone task
+    # suspended on a PhoneCheckpoint (a milestone confirmation before a real
+    # order goes through, an unexpected dialog, a need-help ask) instead of
+    # an OTP/CAPTCHA/risk_review one. Also relays the checkpoint's milestone
+    # screenshot (if one was captured) as an MMS attachment, same mechanism
+    # stagehand_tools.py's _send_screenshot / the light-web-agent path use
+    # (db.create_document_share -> /files/{token} -> sendblue media_url).
+    if config.ANDROID_PHONE_AGENT_ENABLED:
+        _android_user_data: dict | None = None
+        try:
+            _android_user_data = await db.get_user_by_phone(from_number)
+        except Exception as _android_e:
+            console.system(f"[android_phone_agent short-circuit] user lookup failed (non-fatal): {_android_e}")
+
+        if _android_user_data:
+            _android_user_id = _android_user_data.get("id")
+            if _android_user_id:
+                _android_pending: dict | None = None
+                try:
+                    _android_pending = await db.get_pending_android_checkpoint(int(_android_user_id))
+                except Exception as _android_e2:
+                    console.system(
+                        f"[android_phone_agent short-circuit] checkpoint lookup failed (non-fatal): {_android_e2}"
+                    )
+
+                _android_answer_text = effective_content.strip()
+                _android_looks_like_answer = (
+                    (len(_android_answer_text) <= 60 and not any(c in _android_answer_text for c in ["?", ".", "!", ","]))
+                    or _android_answer_text.lower() in ("yes", "no", "done", "ok", "okay", "continue", "resume", "cancel")
+                )
+
+                if _android_pending and _android_looks_like_answer:
+                    console.system(
+                        f"[android_phone_agent short-circuit] Routing '{_android_answer_text[:30]}' "
+                        f"as checkpoint answer for user #{_android_user_id}"
+                    )
+
+                    async def _run_android_resume() -> None:
+                        from .devices.android import resume_android_phone_task
+                        try:
+                            result = await resume_android_phone_task(
+                                user_id=int(_android_user_id), human_input=_android_answer_text,
+                            )
+                        except Exception as _resume_e:
+                            console.system(f"[android_phone_agent short-circuit] resume failed: {_resume_e}")
+                            await _send("Sorry, I had trouble resuming that phone task -- could you try again?")
+                            return
+
+                        status = result.get("status", "FAILED")
+                        summary = result.get("result_summary") or ""
+                        steps = result.get("steps_taken", 0)
+                        checkpoint = result.get("checkpoint")
+
+                        if status == "DONE":
+                            reply = f"Done! {summary}" if summary else f"Done ({steps} steps)."
+                        elif status == "NEEDS_HUMAN":
+                            cp_prompt = ""
+                            cp_token = None
+                            if isinstance(checkpoint, dict):
+                                cp_prompt = checkpoint.get("prompt_to_user") or ""
+                                cp_token = checkpoint.get("screenshot_share_token")
+                            elif checkpoint is not None:
+                                cp_prompt = getattr(checkpoint, "prompt_to_user", "") or ""
+                                cp_token = getattr(checkpoint, "screenshot_share_token", None)
+                            reply = cp_prompt or "I need more information to continue."
+                            if cp_token:
+                                try:
+                                    await sendblue.send_message(
+                                        from_number, reply,
+                                        media_url=f"{config.LIVE_VIEW_BASE_URL}/files/{cp_token}",
+                                    )
+                                    return
+                                except Exception as _mms_e:
+                                    console.system(f"[android_phone_agent short-circuit] MMS send failed: {_mms_e}")
+                        else:
+                            reply = (
+                                f"I wasn't able to finish that ({status}). "
+                                f"{summary or 'Please try again or let me know how to proceed.'}"
+                            )
+                        await _send(reply)
+
+                    turn_task = asyncio.create_task(_run_android_resume())
+                    await turn_task
                     return
 
     async def _run_turn() -> None:

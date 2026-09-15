@@ -5821,3 +5821,325 @@ async def list_grocery_orders(user_id: int, limit: int = 5) -> list[dict[str, An
             user_id, limit,
         )
         return [dict(r) for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Open-Source Phone / Bring Your Own Phone (BYOP) -- migrations/
+# 043_android_phone_agent.sql, messa/devices/android.py,
+# tools/android_phone_tools.py, open-source-phone.md.
+#
+# Mid-task pause/resume (a milestone confirmation, a device that went
+# offline mid-task, an unfamiliar screen needing human help) deliberately
+# does NOT get a new table here -- it reuses active_tasks (migration 033)
+# exactly the way light_web_agent.py's own checkpoint suspend/resume
+# already does (task_type='android_phone_agent' instead of
+# 'light_web_agent'; get_pending_android_checkpoint below is the sibling of
+# get_pending_light_web_checkpoint above). Two independent engines, same
+# proven mechanism, no new schema needed for it.
+# ---------------------------------------------------------------------------
+
+async def pair_user_device(
+    user_id: int, device_name: str, tunnel_host: str, tunnel_port: int,
+) -> dict[str, Any] | None:
+    """Pairs (or RE-pairs) a phone -- INSERT ... ON CONFLICT (user_id,
+    device_name) DO UPDATE so re-running this after a Wi-Fi reconnect
+    changed the phone's address (open-source-phone.md section 3's own
+    'IP / Port Changed' diagnostic) just refreshes the same row's
+    tunnel_host/tunnel_port/status rather than creating a second device the
+    user never asked for. Always sets status back to 'paired' -- callers
+    that actually verify a live connection right after (messa/devices/
+    android.py's AndroidDeviceManager.pair_device) bump it to 'connected'
+    themselves via update_device_status."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_devices"):
+            return None
+        row = await conn.fetchrow(
+            """
+            INSERT INTO user_devices (user_id, device_name, tunnel_host, tunnel_port, status)
+            VALUES ($1, $2, $3, $4, 'paired')
+            ON CONFLICT (user_id, device_name) DO UPDATE SET
+                tunnel_host = EXCLUDED.tunnel_host,
+                tunnel_port = EXCLUDED.tunnel_port,
+                status = 'paired',
+                updated_at = NOW()
+            RETURNING *
+            """,
+            user_id, device_name, tunnel_host, tunnel_port,
+        )
+        return dict(row) if row else None
+
+
+async def get_user_device(user_id: int, device_name: str | None = None) -> dict[str, Any] | None:
+    """device_name=None returns the user's most recently updated device --
+    the common case, since most users pair exactly one phone; callers that
+    need to disambiguate ('which of my 2 phones') pass an explicit name."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_devices"):
+            return None
+        if device_name:
+            row = await conn.fetchrow(
+                "SELECT * FROM user_devices WHERE user_id = $1 AND device_name = $2",
+                user_id, device_name,
+            )
+        else:
+            row = await conn.fetchrow(
+                "SELECT * FROM user_devices WHERE user_id = $1 AND status != 'revoked' "
+                "ORDER BY updated_at DESC LIMIT 1",
+                user_id,
+            )
+        return dict(row) if row else None
+
+
+async def get_device_by_id(device_id: int) -> dict[str, Any] | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_devices"):
+            return None
+        row = await conn.fetchrow("SELECT * FROM user_devices WHERE id = $1", device_id)
+        return dict(row) if row else None
+
+
+async def list_user_devices(user_id: int) -> list[dict[str, Any]]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_devices"):
+            return []
+        rows = await conn.fetch(
+            "SELECT * FROM user_devices WHERE user_id = $1 AND status != 'revoked' ORDER BY updated_at DESC",
+            user_id,
+        )
+        return _rows(rows)
+
+
+async def update_device_status(device_id: int, status: str, touch_last_seen: bool = True) -> None:
+    """status in {'paired', 'connected', 'busy', 'offline', 'revoked'}."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_devices"):
+            return
+        if touch_last_seen:
+            await conn.execute(
+                "UPDATE user_devices SET status = $2, last_seen_at = NOW(), updated_at = NOW() WHERE id = $1",
+                device_id, status,
+            )
+        else:
+            await conn.execute(
+                "UPDATE user_devices SET status = $2, updated_at = NOW() WHERE id = $1",
+                device_id, status,
+            )
+
+
+async def revoke_user_device(user_id: int, device_name: str) -> bool:
+    """Explicit user control ('stop using my phone' / 'unpair'). Marks the
+    row revoked rather than deleting it -- keeps device_authorizations'
+    foreign key and any historical task rows intact, and get_user_device/
+    list_user_devices both already filter status != 'revoked' so a
+    revoked device simply stops being found by name."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_devices"):
+            return False
+        result = await conn.execute(
+            "UPDATE user_devices SET status = 'revoked', updated_at = NOW() "
+            "WHERE user_id = $1 AND device_name = $2 AND status != 'revoked'",
+            user_id, device_name,
+        )
+        return result.endswith(" 1")
+
+
+# ---- Family sharing (device_authorizations) ----
+
+async def authorize_device_contact(
+    device_id: int, authorized_contact: str, allowed_categories: list[str],
+) -> dict[str, Any] | None:
+    """The device owner names a family member (email or E.164 phone) who
+    may queue tasks against their phone, scoped to allowed_categories.
+    INSERT ... ON CONFLICT DO UPDATE so re-authorizing the same contact
+    with a new category list replaces it rather than erroring or
+    duplicating."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "device_authorizations"):
+            return None
+        row = await conn.fetchrow(
+            """
+            INSERT INTO device_authorizations (device_id, authorized_contact, allowed_categories)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (device_id, authorized_contact) DO UPDATE SET
+                allowed_categories = EXCLUDED.allowed_categories
+            RETURNING *
+            """,
+            device_id, authorized_contact.strip().lower(), allowed_categories,
+        )
+        return dict(row) if row else None
+
+
+async def get_device_authorization(device_id: int, contact: str) -> dict[str, Any] | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "device_authorizations"):
+            return None
+        row = await conn.fetchrow(
+            "SELECT * FROM device_authorizations WHERE device_id = $1 AND authorized_contact = $2",
+            device_id, contact.strip().lower(),
+        )
+        return dict(row) if row else None
+
+
+async def list_device_authorizations(device_id: int) -> list[dict[str, Any]]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "device_authorizations"):
+            return []
+        rows = await conn.fetch(
+            "SELECT * FROM device_authorizations WHERE device_id = $1 ORDER BY created_at", device_id,
+        )
+        return _rows(rows)
+
+
+async def revoke_device_authorization(device_id: int, contact: str) -> bool:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "device_authorizations"):
+            return False
+        result = await conn.execute(
+            "DELETE FROM device_authorizations WHERE device_id = $1 AND authorized_contact = $2",
+            device_id, contact.strip().lower(),
+        )
+        return result.endswith(" 1")
+
+
+async def find_devices_authorized_for_contact(contact: str) -> list[dict[str, Any]]:
+    """'Which phone(s) can I use' -- joins user_devices so the caller gets
+    the device row (tunnel address, owner, status) directly, not just the
+    authorization row. Excludes revoked devices."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "device_authorizations") or not await _has_table(conn, "user_devices"):
+            return []
+        rows = await conn.fetch(
+            """
+            SELECT d.*, a.allowed_categories, a.authorized_contact
+            FROM device_authorizations a
+            JOIN user_devices d ON d.id = a.device_id
+            WHERE a.authorized_contact = $1 AND d.status != 'revoked'
+            ORDER BY a.created_at DESC
+            """,
+            contact.strip().lower(),
+        )
+        return _rows(rows)
+
+
+# ---- Community skill registry (device_skills) -- explicit publish only ----
+
+async def publish_device_skill(
+    author_user_id: int,
+    skill_slug: str,
+    app_name: str,
+    app_package: str,
+    recipe_json: str,
+    *,
+    author_handle: str | None = None,
+    description: str | None = None,
+    is_public: bool = True,
+) -> dict[str, Any] | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "device_skills"):
+            return None
+        row = await conn.fetchrow(
+            """
+            INSERT INTO device_skills
+                (author_user_id, author_handle, skill_slug, app_name, app_package,
+                 description, recipe_json, is_public)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (author_user_id, skill_slug) DO UPDATE SET
+                author_handle = EXCLUDED.author_handle,
+                app_name = EXCLUDED.app_name,
+                app_package = EXCLUDED.app_package,
+                description = EXCLUDED.description,
+                recipe_json = EXCLUDED.recipe_json,
+                is_public = EXCLUDED.is_public,
+                updated_at = NOW()
+            RETURNING *
+            """,
+            author_user_id, author_handle, skill_slug, app_name, app_package,
+            description, recipe_json, is_public,
+        )
+        return dict(row) if row else None
+
+
+async def get_device_skill(author_user_id: int, skill_slug: str) -> dict[str, Any] | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "device_skills"):
+            return None
+        row = await conn.fetchrow(
+            "SELECT * FROM device_skills WHERE author_user_id = $1 AND skill_slug = $2",
+            author_user_id, skill_slug,
+        )
+        return dict(row) if row else None
+
+
+async def list_public_device_skills(app_package: str | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    """Powers the public showcase page (messa.ai/skills) -- only is_public
+    rows, ranked by success_count so the most reliable recipes surface
+    first within an app."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "device_skills"):
+            return []
+        if app_package:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM device_skills
+                WHERE is_public = TRUE AND app_package = $1
+                ORDER BY success_count DESC, created_at DESC LIMIT $2
+                """,
+                app_package, limit,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT * FROM device_skills
+                WHERE is_public = TRUE
+                ORDER BY success_count DESC, created_at DESC LIMIT $1
+                """,
+                limit,
+            )
+        return _rows(rows)
+
+
+async def record_device_skill_outcome(skill_id: int, success: bool) -> None:
+    """Bumps the showcase page's success/failure counters every time a
+    replay of this published skill actually runs -- never called just from
+    someone viewing the showcase page."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "device_skills"):
+            return
+        column = "success_count" if success else "failure_count"
+        await conn.execute(
+            f"UPDATE device_skills SET {column} = {column} + 1, updated_at = NOW() WHERE id = $1",
+            skill_id,
+        )
+
+
+# ---- Mid-task pause/resume (reuses active_tasks -- see header comment) ----
+
+async def get_pending_android_checkpoint(user_id: int) -> dict[str, Any] | None:
+    """Sibling of get_pending_light_web_checkpoint above, same shape and
+    same reasoning: does this user currently have an android_phone_agent
+    active task suspended on a human checkpoint (a milestone confirmation,
+    an unfamiliar screen, a device that went offline mid-task)? Wraps
+    get_active_task rather than a bespoke query -- see that function's own
+    docstring for why this is intentionally NOT a new table."""
+    task = await get_active_task(user_id)
+    if not task or task.get("task_type") != "android_phone_agent":
+        return None
+    artifacts = task.get("artifacts") or {}
+    if not artifacts.get("pending_checkpoint"):
+        return None
+    return task

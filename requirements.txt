@@ -82,3 +82,17 @@ beautifulsoup4>=4.12.0
 # reportlab/pypdf above needing to keep working unmodified there).
 mem0ai>=2.0.20
 psycopg[binary,pool]>=3.2.0
+
+# Open-Source Phone / BYOP (messa/devices/android.py, open-source-phone.md)
+# -- pairs and drives a user's own Android phone over ADB wireless
+# debugging. adbutils bundles its OWN real `adb` binary (adbutils.adb_path())
+# rather than requiring the Android SDK platform-tools to be separately
+# installed on the host/Docker image -- messa/devices/android.py shells out
+# to that bundled binary ONLY for `adb pair host:port code` (the wireless-
+# debugging pairing handshake isn't implemented by adbutils' own pure-Python
+# client, only by the real adb binary); everything after pairing (connect,
+# shell, forward) goes through adbutils' pure-Python AdbClient. uiautomator2
+# is the actual on-device UI automation driver (dump_hierarchy/click/
+# send_keys/screenshot) once paired.
+adbutils>=2.12.0
+uiautomator2>=3.7.0
