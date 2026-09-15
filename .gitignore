@@ -16,3 +16,5 @@ error.txt
 scratch/
 *.pptx
 Pitch-deck/
+android-app/
+*.apk

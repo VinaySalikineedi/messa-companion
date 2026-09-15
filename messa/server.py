@@ -187,7 +187,7 @@ async def download_companion_apk_route():
                 filename="messa-companion.apk",
             )
     return RedirectResponse(
-        url="https://github.com/VinaySalikineedi/agent-browser/releases/download/companion-latest/app-debug.apk",
+        url="https://github.com/VinaySalikineedi/messa-companion/releases/download/v0.1.0/messa-companion.apk",
         status_code=307,
     )
 
