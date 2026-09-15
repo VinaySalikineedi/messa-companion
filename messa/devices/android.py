@@ -199,7 +199,11 @@ class DeviceQueueTicket:
         self.position = position
 
     async def __aenter__(self) -> ManagedDevice:
-        await self._managed.lock.acquire()
+        try:
+            await self._managed.lock.acquire()
+        except BaseException:
+            self._managed.queue_depth = max(0, self._managed.queue_depth - 1)
+            raise
         self._managed.status = "busy"
         self._managed.touch()
         return self._managed
@@ -404,8 +408,13 @@ def extract_pruned_hierarchy(xml_str: str, max_elements: int = 120) -> tuple[Lis
     prompt_lines: List[str] = []
     try:
         root = ET.fromstring(xml_str)
-    except ET.ParseError as e:
-        return [], f"[Could not parse screen hierarchy: {e}]"
+    except ET.ParseError:
+        try:
+            # Fix unescaped ampersands commonly found in raw Android app hierarchy dumps (e.g. H&M, AT&T)
+            fixed_xml = re.sub(r"&(?!amp;|lt;|gt;|quot;|apos;)", "&amp;", xml_str or "")
+            root = ET.fromstring(fixed_xml)
+        except ET.ParseError as e:
+            return [], f"[Could not parse screen hierarchy: {e}]"
 
     idx = 0
     for node in root.iter("node"):
@@ -1079,34 +1088,40 @@ async def resume_android_phone_task(user_id: Any, human_input: str) -> Dict[str,
     agent.active_task_id = task.get("task_id")
     agent.scratchpad_artifacts = artifacts
 
+    try:
+        ticket = await device_manager.acquire(device_id)
+    except Exception as e:
+        return {"status": "FAILED", "result_summary": str(e)}
+
     # Same phone_activity register/finally-unregister bracket as
     # run_android_phone_task above (see that function's own comment) --
     # a resumed task is just as cancellable via the live-view page's
     # Pause/Abort button as a fresh one.
     phone_activity.register(int_user_id, device_id, call_context.get("goal") or "")
     try:
-        try:
-            decision = await agent.run()
-        except asyncio.CancelledError:
-            phone_activity.set_status(int_user_id, "aborted")
-            device_manager.release(device_id)
+        async with ticket:
             try:
-                await db.update_device_status(device_id, "connected")
-            except Exception:
-                pass
-            raise
+                decision = await agent.run()
+            except asyncio.CancelledError:
+                phone_activity.set_status(int_user_id, "aborted")
+                device_manager.release(device_id)
+                try:
+                    await db.update_device_status(device_id, "connected")
+                except Exception:
+                    pass
+                raise
 
-        if decision.status != "NEEDS_HUMAN":
-            device_manager.release(device_id)
-            try:
-                await db.update_device_status(device_id, "connected")
-            except Exception:
-                pass
-            phone_activity.set_status(int_user_id, "done" if decision.status == "DONE" else "failed")
+            if decision.status != "NEEDS_HUMAN":
+                device_manager.release(device_id)
+                try:
+                    await db.update_device_status(device_id, "connected")
+                except Exception:
+                    pass
+                phone_activity.set_status(int_user_id, "done" if decision.status == "DONE" else "failed")
 
-        result = decision.dict()
-        result["steps_taken"] = len(agent.step_history)
-        result["device_id"] = device_id
-        return result
+            result = decision.dict()
+            result["steps_taken"] = len(agent.step_history)
+            result["device_id"] = device_id
+            return result
     finally:
         phone_activity.unregister(int_user_id)

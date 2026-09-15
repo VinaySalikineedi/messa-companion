@@ -70,6 +70,7 @@ TESTS=(
   tests/test_kernel_and_browser_provider.py
   tests/test_light_web_agent.py
   tests/test_android_phone_agent.py
+  tests/test_android_phone_adversarial.py
 )
 
 PASSED=()

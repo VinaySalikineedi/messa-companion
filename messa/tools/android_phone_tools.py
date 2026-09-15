@@ -214,10 +214,38 @@ def build_android_phone_tools(
         from ..devices.android import device_manager, run_android_phone_task
 
         device = await db.get_user_device(uid, device_name)
+        is_shared_device = False
+        if not device:
+            # Family sharing lookup (open-source-phone.md section 4): if the caller
+            # has no phone of their own, check if an authorized family device exists
+            # for their email or phone number.
+            for contact in (user.email, user.phone_number):
+                if contact:
+                    authorized = await db.find_devices_authorized_for_contact(contact)
+                    if authorized:
+                        if device_name:
+                            matched = [d for d in authorized if d.get("device_name", "").lower() == device_name.lower()]
+                            device = matched[0] if matched else None
+                        else:
+                            device = authorized[0]
+                        if device:
+                            is_shared_device = True
+                            break
+
         if not device:
             return "You don't have a phone paired yet. Text me \"connect <ip:port> <code>\" from Wireless Debugging to pair one."
         if device["status"] == "revoked":
             return "That phone was unpaired. Please pair it again first."
+
+        if is_shared_device:
+            cat = _guess_category(goal)
+            allowed_cats = set(device.get("allowed_categories") or [])
+            if cat and cat not in allowed_cats:
+                return (
+                    f"You're authorized to use \"{device.get('device_name', 'this phone')}\" for "
+                    f"{', '.join(sorted(allowed_cats))}, but not for {cat.replace('_', ' ')}. "
+                    "Please ask the owner to expand your permissions."
+                )
 
         plan = plans.get_plan(user.plan_id)
         max_steps = plan.limits.phone_automation_steps
@@ -336,13 +364,10 @@ def build_android_phone_tools(
 
 _PII_PATTERNS = [
     re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"),   # emails
-    re.compile(r"\b\+?1?\d{10,13}\b"),                                # bare-digit phone-ish numbers
-    # Formatted phone numbers (555-123-4567, (555) 123-4567, 555.123.4567,
-    # +1 555 123 4567) -- the bare-digit pattern above only ever matches an
-    # unbroken run of digits, so a hyphenated/parenthesized number (the
-    # common real-world form someone would actually type into a recipe's
-    # notes) slipped through it entirely until this was added.
-    re.compile(r"\b\+?1?[-.\s]?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b"),
+    re.compile(r"\b\+?\d{10,14}\b"),                                  # bare-digit phone-ish numbers (10-14 digits)
+    # Formatted phone numbers (US and international formats: +1 (555) 123-4567, 555-123-4567,
+    # +44 20 7946 0958, +91 98765-43210, etc.)
+    re.compile(r"\b\+?\d{1,3}[-.\s]?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4}\b"),
 ]
 
 
