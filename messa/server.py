@@ -55,6 +55,7 @@ from .call_live_view_page import render_call_live_view_page
 from .channels import browser, browserbase, sendblue, vapi
 from .channels.sendblue import SendblueError
 from .channels.vapi import VapiError
+from .downloads_page import render_downloads_page
 from .landing_page import render_landing_page
 from .live_view_page import render_live_view_page
 from .phone_live_view_page import render_phone_live_view_page
@@ -159,8 +160,17 @@ async def skills_showcase_page_route(app: str | None = None) -> HTMLResponse:
     return HTMLResponse(render_skills_showcase_page(skills, app_filter=app_package))
 
 
+@app.get("/downloads")
+@app.get("/download")
+async def downloads_page_route() -> HTMLResponse:
+    """The public downloads page at textmessa.com/downloads."""
+    return HTMLResponse(render_downloads_page())
+
+
 @app.get("/download/companion.apk")
 @app.get("/download/apk")
+@app.get("/downloads/companion.apk")
+@app.get("/downloads/messa-companion.apk")
 async def download_companion_apk_route():
     """Serves local companion APK if present, or redirects to the latest GitHub release."""
     local_apk = Path(__file__).resolve().parent.parent / "companion-apk" / "app" / "build" / "outputs" / "apk" / "debug" / "app-debug.apk"
