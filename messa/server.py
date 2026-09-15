@@ -173,13 +173,19 @@ async def downloads_page_route() -> HTMLResponse:
 @app.get("/downloads/messa-companion.apk")
 async def download_companion_apk_route():
     """Serves local companion APK if present, or redirects to the latest GitHub release."""
-    local_apk = Path(__file__).resolve().parent.parent / "companion-apk" / "app" / "build" / "outputs" / "apk" / "debug" / "app-debug.apk"
-    if local_apk.exists():
-        return FileResponse(
-            path=str(local_apk),
-            media_type="application/vnd.android.package-archive",
-            filename="messa-companion.apk",
-        )
+    repo_root = Path(__file__).resolve().parent.parent
+    candidates = [
+        repo_root / "android-app" / "app-debug.apk",
+        repo_root / "android-app" / "messa-companion.apk",
+        repo_root / "companion-apk" / "app" / "build" / "outputs" / "apk" / "debug" / "app-debug.apk",
+    ]
+    for p in candidates:
+        if p.exists():
+            return FileResponse(
+                path=str(p),
+                media_type="application/vnd.android.package-archive",
+                filename="messa-companion.apk",
+            )
     return RedirectResponse(
         url="https://github.com/VinaySalikineedi/agent-browser/releases/download/companion-latest/app-debug.apk",
         status_code=307,
