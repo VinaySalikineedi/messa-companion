@@ -4,7 +4,7 @@
 
     Deliberately requests ZERO listening/server permissions: this app
     never opens a port and is never reachable from the network (section
-    3.1 "Zero inbound ports on the phone") -- every permission below
+    3.1 "Zero inbound ports on the phone") - every permission below
     exists only to (a) dial OUT over a WebSocket, (b) stay alive as a
     foreground service against Android's battery/Doze restrictions
     (section 4, roadblock #3/#5), and (c) show the touch killswitch
@@ -18,7 +18,7 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
-    <!-- Touch killswitch overlay (section 3.4) -- a transparent full-screen
+    <!-- Touch killswitch overlay (section 3.4): a transparent full-screen
          overlay that detects a genuine user touch while Messa is driving
          the phone and immediately signals abort. SYSTEM_ALERT_WINDOW is
          the one permission here that needs an explicit user grant via
