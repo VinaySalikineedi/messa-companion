@@ -5949,6 +5949,71 @@ async def revoke_user_device(user_id: int, device_name: str) -> bool:
         return result.endswith(" 1")
 
 
+# ---- Companion APK bridge (bridge_kind='companion_ws', migration 044) ----
+#
+# A companion_ws device is paired differently from a direct_lan one: there's
+# no tunnel_host/tunnel_port to record (see migration 044's header for why),
+# instead the APK's own device_secret gets hashed and stored so a later
+# `/device/ws` connection can look the row back up from the bearer token it
+# presents. Kept as its own small section (mirroring the file's existing
+# "Family sharing" / "Community skill registry" divisions below) rather than
+# folded into pair_user_device, since the two pairing flows share nothing
+# but the destination table.
+
+async def bind_companion_device_secret(
+    user_id: int, device_name: str, device_secret_hash: str,
+) -> dict[str, Any] | None:
+    """Pairs (or re-pairs) a Messa Companion APK device. Same INSERT ...
+    ON CONFLICT (user_id, device_name) DO UPDATE shape as pair_user_device
+    -- re-running this (e.g. the APK re-registers after a reinstall, which
+    rotates the device secret) just refreshes the same row's
+    device_secret_hash/status rather than creating a second device.
+    tunnel_host/tunnel_port are explicitly cleared to NULL: a companion_ws
+    row has no LAN address, and if this device_name previously existed as
+    a direct_lan pairing, switching bridge_kind must not leave a stale
+    address behind that nothing will ever read but could still confuse a
+    future migration/debugging session."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_devices"):
+            return None
+        row = await conn.fetchrow(
+            """
+            INSERT INTO user_devices
+                (user_id, device_name, bridge_kind, device_secret_hash, tunnel_host, tunnel_port, status)
+            VALUES ($1, $2, 'companion_ws', $3, NULL, NULL, 'paired')
+            ON CONFLICT (user_id, device_name) DO UPDATE SET
+                bridge_kind = 'companion_ws',
+                device_secret_hash = EXCLUDED.device_secret_hash,
+                tunnel_host = NULL,
+                tunnel_port = NULL,
+                status = 'paired',
+                updated_at = NOW()
+            RETURNING *
+            """,
+            user_id, device_name, device_secret_hash,
+        )
+        return dict(row) if row else None
+
+
+async def get_device_by_secret_hash(device_secret_hash: str) -> dict[str, Any] | None:
+    """The `/device/ws` auth lookup: the APK presents its raw secret as a
+    bearer token, the route hashes it (never storing/logging the raw
+    value -- see migration 044) and looks up the owning device+user here.
+    Excludes revoked devices so an unpaired/revoked phone's still-valid
+    secret can't reopen a bridge for a device the user explicitly kicked
+    off their account."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if not await _has_table(conn, "user_devices"):
+            return None
+        row = await conn.fetchrow(
+            "SELECT * FROM user_devices WHERE device_secret_hash = $1 AND status != 'revoked'",
+            device_secret_hash,
+        )
+        return dict(row) if row else None
+
+
 # ---- Family sharing (device_authorizations) ----
 
 async def authorize_device_contact(

@@ -297,13 +297,52 @@ class AndroidDeviceManager:
             await asyncio.sleep(0.5)
         return None
 
-    async def connect_device(self, device_id: int, host: str, connect_port: int) -> Any:
+    async def connect_device(self, device_row: dict) -> Any:
         """Connects (or reuses an existing live connection) and returns a
-        uiautomator2.Device. connect_port is the device's ONGOING
-        wireless-debugging port (distinct from the one-time pairing port
-        used above) -- Android shows both in Developer Options, and they
-        are usually different numbers."""
+        uiautomator2.Device. Routes to one of two transports depending on
+        device_row['bridge_kind'] (migration 044, feature/messa-
+        companion-apk):
+
+          - 'direct_lan' (default, and every device_row from before this
+            column existed): dials the device's own ONGOING wireless-
+            debugging tunnel_host:tunnel_port directly -- the one-time
+            pairing port is a different number, handled by pair_device
+            above, never this.
+          - 'companion_ws': the phone has no LAN address to dial at all
+            (that's the whole reason this bridge exists -- see messa/
+            companion_bridge.py's own module docstring). Instead this
+            looks up the live CompanionDeviceBridge the phone's own
+            outbound `/device/ws` connection opened for this device_id,
+            and connects to ITS local loopback port instead. If no live
+            bridge exists (the Companion app isn't currently connected),
+            this fails fast with a translated, user-facing message rather
+            than hanging on a 127.0.0.1 port nothing is listening on.
+
+        Either way, from here down this is a completely ordinary ADB TCP
+        connect -- adbutils/uiautomator2 have no idea which transport got
+        them there, which is the entire point of a pure byte-pipe bridge."""
         import uiautomator2 as u2
+
+        device_id = device_row["id"]
+        bridge_kind = device_row.get("bridge_kind") or "direct_lan"
+
+        if bridge_kind == "companion_ws":
+            from .. import companion_bridge
+
+            bridge = companion_bridge.MANAGER.get_bridge(device_id)
+            if bridge is None or bridge.local_port is None:
+                raise ConnectionError(
+                    "This phone's Messa Companion app isn't currently connected -- "
+                    "make sure the app is open with a network connection, then try again."
+                )
+            host, connect_port = "127.0.0.1", bridge.local_port
+        else:
+            host = device_row.get("tunnel_host")
+            connect_port = device_row.get("tunnel_port")
+            if not host or not connect_port:
+                raise ConnectionError(
+                    "This phone has no known address to connect to -- try re-pairing it."
+                )
 
         managed = self._devices.get(device_id)
         if managed is None or managed.tunnel_host != host or managed.tunnel_port != connect_port:
@@ -969,9 +1008,7 @@ async def run_android_phone_task(
         phone_activity.register(int_user_id, device_id, goal)
     try:
         try:
-            u2_device = await device_manager.connect_device(
-                device_id, device_row["tunnel_host"], device_row["tunnel_port"],
-            )
+            u2_device = await device_manager.connect_device(device_row)
         except ConnectionError as e:
             if int_user_id is not None:
                 phone_activity.set_status(int_user_id, "failed")
@@ -1059,9 +1096,7 @@ async def resume_android_phone_task(user_id: Any, human_input: str) -> Dict[str,
         return {"status": "FAILED", "result_summary": "That phone is no longer paired."}
 
     try:
-        u2_device = await device_manager.connect_device(
-            device_id, device_row["tunnel_host"], device_row["tunnel_port"],
-        )
+        u2_device = await device_manager.connect_device(device_row)
     except ConnectionError as e:
         return {"status": "FAILED", "result_summary": str(e)}
 

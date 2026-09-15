@@ -674,6 +674,58 @@ ANDROID_PHONE_CHECKPOINT_TIMEOUT_SECONDS = int(
 )
 
 
+# ---- Messa Companion APK bridge (open-source-phone.md section 2/3,
+# messa/companion_bridge.py, feature/messa-companion-apk) ----
+#
+# Second transport for a paired device (bridge_kind='companion_ws',
+# migration 044), alongside the direct-LAN path above: the phone's own
+# Companion APK dials OUT to `/device/ws` instead of Messa dialing in, so
+# these all default OFF the same way ANDROID_PHONE_AGENT_ENABLED does --
+# this doesn't change any of that engine's own risk profile, but it's a
+# brand-new network-facing endpoint (an actual WebSocket auth surface) and
+# deserves its own deliberate opt-in independent of the phone agent itself.
+MESSA_COMPANION_BRIDGE_ENABLED = os.environ.get("MESSA_COMPANION_BRIDGE_ENABLED", "false").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+# How long a 6-digit pairing code shown on the APK stays valid, waiting for
+# the user to text it in (open-source-phone.md section 3.2 -- "PAIR
+# 918-243", valid 3 minutes). Kept short: it's only ever meant to bridge
+# the few seconds between "app just launched" and "user sent the text,"
+# not a durable credential.
+COMPANION_PAIRING_CODE_TTL_SECONDS = int(
+    os.environ.get("MESSA_COMPANION_PAIRING_CODE_TTL_SECONDS", "180")
+)
+
+# Anti-bruteforce cap on wrong pairing-code attempts from a single sending
+# phone number before it's locked out for the rest of that code's TTL --
+# a 6-digit code has only 10^6 possibilities, so without a cap an attacker
+# who can send SMS as a spoofed/guessed number could brute-force a
+# still-open pairing window.
+COMPANION_PAIRING_MAX_ATTEMPTS = int(
+    os.environ.get("MESSA_COMPANION_PAIRING_MAX_ATTEMPTS", "3")
+)
+
+# Both sides of the bridge (the APK and messa/server.py's `/device/ws`
+# handler) exchange a ping/pong at this interval to keep the socket alive
+# through Cloudflare/Hugging Face's own idle-WebSocket timeout, which
+# open-source-phone.md section 4 documents as 30-60 seconds -- 25s leaves
+# comfortable margin under the shortest of those.
+COMPANION_BRIDGE_HEARTBEAT_SECONDS = int(
+    os.environ.get("MESSA_COMPANION_BRIDGE_HEARTBEAT_SECONDS", "25")
+)
+
+# If neither a pong nor any data frame has been seen from the APK in this
+# long, treat the connection as dead and tear it down (releases the local
+# loopback socket, marks the device 'offline') rather than leaving a
+# half-open bridge that adbutils would otherwise hang against. Comfortably
+# longer than 2x the heartbeat interval so one missed beat under a slow
+# network doesn't flap the connection.
+COMPANION_BRIDGE_STALE_TIMEOUT_SECONDS = int(
+    os.environ.get("MESSA_COMPANION_BRIDGE_STALE_TIMEOUT_SECONDS", "90")
+)
+
+
 # Maximum attempts/retries when encountering or attempting to solve a CAPTCHA.
 # CAPTCHAs are generally hard to pass autonomously, so capping attempts at 2 prevents
 # burning expensive remote browser minutes and agent turn budget.

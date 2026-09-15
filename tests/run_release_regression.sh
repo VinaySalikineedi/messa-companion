@@ -71,6 +71,7 @@ TESTS=(
   tests/test_light_web_agent.py
   tests/test_android_phone_agent.py
   tests/test_android_phone_adversarial.py
+  tests/test_android_companion_bridge.py
 )
 
 PASSED=()
