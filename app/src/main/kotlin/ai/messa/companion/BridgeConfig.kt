@@ -15,7 +15,7 @@ import android.content.SharedPreferences
 object BridgeConfig {
     private const val PREFS_NAME = "messa_companion_config"
     private const val KEY_SERVER_WS_URL = "server_ws_url"
-    const val DEFAULT_WS_URL = "wss://messa.ai/device/ws"
+    const val DEFAULT_WS_URL = "wss://vin999-aimessage.hf.space/device/ws"
 
     private fun prefs(context: Context): SharedPreferences =
         context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
