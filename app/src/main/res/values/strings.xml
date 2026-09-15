@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Messa Bridge</string>
+    <string name="notification_channel_name">Messa Bridge</string>
+    <string name="notification_title_connecting">Messa Bridge starting…</string>
+    <string name="notification_title_connected">Messa Bridge connected</string>
+    <string name="notification_title_pairing">Messa Bridge -- pairing required</string>
+    <string name="notification_action_stop">Emergency Stop</string>
+    <string name="status_idle">Not connected</string>
+    <string name="status_connecting">Connecting to Messa…</string>
+    <string name="status_pairing">Text this code from your Messa number:</string>
+    <string name="status_connected">Connected -- Messa can now use this phone</string>
+    <string name="status_error">Connection problem -- see details below</string>
+</resources>
