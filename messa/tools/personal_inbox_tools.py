@@ -207,8 +207,47 @@ def build_personal_inbox_tools(
         # awaited -- see commitments.py's own docstring for why this can
         # never add latency to (or fail) the send itself.
         commitments.maybe_record_commitment(user.user_id, to, body, sender_timezone=user.timezone)
+        # Clear pending draft in task scratchpad if one was staged
+        try:
+            task = await db.get_active_task(user.user_id)
+            if task and (task.get("artifacts") or {}).get("pending_email_draft"):
+                artifacts = dict(task.get("artifacts") or {})
+                artifacts.pop("pending_email_draft", None)
+                await db.update_active_task_artifacts(task["task_id"], artifacts)
+        except Exception:
+            pass
         attached_note = f" (attached {attachment_path.rsplit('/', 1)[-1]})" if attachment_path else ""
         return f"Sent from {local_part}@{config.TEXTMESSA_EMAIL_DOMAIN} to {to}{attached_note}."
+
+    @tool
+    async def stage_email_draft(to: str, subject: str, body: str, goal: str | None = None) -> str:
+        """Stage an email draft for the user's review before sending. Generates
+        a formatted .txt file with a share URL for zero-bloat SMS/iMessage review
+        and saves it into the active task scratchpad so it is never lost across turns.
+        Call this when drafting high-stakes emails, cold outreach, or when the
+        user explicitly asks to review or see a draft first."""
+        from ..email_governor import stage_draft_as_text_file
+        draft_info = await stage_draft_as_text_file(user.user_id, to, subject, body)
+        task = await db.get_active_task(user.user_id)
+        if task is None:
+            task = await db.start_active_task(user.user_id, task_type="email_outreach")
+        if task:
+            await db.update_active_task_artifacts(task["task_id"], {
+                "pending_email_draft": {
+                    "to": to,
+                    "subject": subject,
+                    "body": body,
+                    "media_url": draft_info["media_url"],
+                    "file_path": draft_info["file_path"],
+                    "goal": goal or "",
+                }
+            })
+        return (
+            f"Draft staged successfully as {draft_info['filename']}! "
+            f"Preview URL: {draft_info['media_url']}. "
+            "To send to user for review, use send_draft_over_text or relay the link. "
+            "Once user approves ('send as is'), call send_email."
+        )
 
     @tool
     async def reply_to_email(
@@ -336,6 +375,7 @@ def build_personal_inbox_tools(
 
     raw_tools: list[BaseTool] = [
         get_my_messa_email, send_email, reply_to_email, get_thread_history, search_my_emails,
+        stage_email_draft,
     ]
     # outbound_emails is one logical usage-limits feature spanning three
     # physical send paths (see plans.py's own comment on the field) -- this
