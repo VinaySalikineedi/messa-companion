@@ -61,15 +61,14 @@ _ERROR_GUIDANCE: list[tuple[re.Pattern, str, str]] = [
     (
         re.compile(r"failed to authenticate|auth.*fail|incorrect.*pin|pairing.*fail", re.I),
         "pairing_code_expired",
-        "The 6-digit pairing code expired. On your phone, go to Settings > Developer Options > "
-        "Wireless debugging > Pair device with pairing code, and text me the new 6 digits.",
+        "The pairing code expired or was not recognized. Please open the Messa Companion app "
+        "and text me the 6-digit code shown on screen.",
     ),
     (
         re.compile(r"connection refused|econnrefused", re.I),
-        "wireless_debugging_disabled",
-        "It looks like Wireless Debugging turned off (Android disables this automatically when "
-        "reconnecting to Wi-Fi). Go to Settings > Developer Options > Wireless Debugging and toggle "
-        "it back on, then text me \"reconnect\".",
+        "bridge_connection_refused",
+        "The local bridge connection was refused. Please ensure the Messa Companion app is "
+        "open and shows 'Connected', then try your command again.",
     ),
     (
         re.compile(r"timed out|timeout|no route to host|network is unreachable", re.I),
@@ -78,23 +77,23 @@ _ERROR_GUIDANCE: list[tuple[re.Pattern, str, str]] = [
         "and shows 'Connected', then try your command again.",
     ),
     (
-        re.compile(r"device.*offline|not found|no such device", re.I),
+        re.compile(r"device.*offline|not found|no such device|not online", re.I),
         "device_offline",
-        "Your phone looks offline or the pairing expired. Please re-pair: text me "
-        "\"connect <ip:port> <code>\" with the fresh values from Developer Options > Wireless Debugging.",
+        "Your phone's connection is offline. Please make sure the Messa Companion app is open "
+        "and shows 'Connected', then try your command again.",
     ),
     (
         re.compile(r"hierarchy.*empty|hierarchyempty", re.I),
         "screen_locked_or_blank",
         "I can't read your screen right now -- it may be locked or off. Please unlock your phone "
-        "with your PIN or fingerprint so I can continue.",
+        "so I can continue.",
     ),
 ]
 
 _DEFAULT_ERROR_GUIDANCE = (
     "unknown_device_error",
-    "I ran into a problem talking to your phone. Please make sure it's unlocked, on Wi-Fi, and "
-    "Wireless Debugging is still on, then text me \"reconnect\".",
+    "I ran into a problem communicating with your phone. Please make sure the phone is unlocked "
+    "and the Messa Companion app shows 'Connected', then try your command again.",
 )
 
 

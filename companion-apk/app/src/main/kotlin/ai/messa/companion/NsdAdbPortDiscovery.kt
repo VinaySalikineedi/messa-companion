@@ -5,21 +5,17 @@ import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.util.Log
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import java.net.InetSocketAddress
+import java.net.Socket
 
 /**
- * Roadblock #1 (open-source-phone.md section 4): Android's wireless-
- * debugging local ADB port changes every time Wi-Fi reconnects, so a
- * hardcoded/user-typed port goes stale constantly. Rather than asking the
- * user to hunt for it in Developer Options, this uses Android's own
- * [NsdManager] to resolve the `_adb-tls-connect._tcp` mDNS service the
- * OS's own wireless-debugging daemon already advertises on the loopback
- * interface -- the exact same mechanism Android Studio's "auto-connect"
- * relies on internally.
- *
- * This is the ONLY thing on the phone side that ever needs to know the
- * local ADB port; once discovered, [AdbLocalSocketRelay] just opens a
- * plain TCP socket to `127.0.0.1:<port>` like any other ADB client would.
+ * Roadblock #1 (open-source-phone.md section 4): Resolves the local ADB
+ * daemon port. Fast-probes standard ADB port 5555 (and common ports 5556-5585)
+ * on loopback first (taking ~2ms), then falls back to Android's [NsdManager]
+ * mDNS service resolution if neither responds.
  */
 class NsdAdbPortDiscovery(context: Context) {
 
@@ -28,12 +24,39 @@ class NsdAdbPortDiscovery(context: Context) {
 
     /**
      * Resolves the current local wireless-debugging connect port, or null
-     * if nothing answers within [timeoutMs] (e.g. wireless debugging is
-     * off, or this Android version/OEM doesn't advertise the service --
-     * callers fall back to asking the user to enable Developer Options >
-     * Wireless debugging and try again).
+     * if nothing answers within [timeoutMs].
      */
-    suspend fun discoverAdbPort(timeoutMs: Long = 8_000L): Int? {
+    suspend fun discoverAdbPort(timeoutMs: Long = 6_000L): Int? = withContext(Dispatchers.IO) {
+        // 1. Fast probe standard ADB daemon port 5555 (takes ~2ms on loopback)
+        if (isPortListening(5555, 100)) {
+            Log.i(TAG, "Standard ADB port 5555 is open on loopback")
+            return@withContext 5555
+        }
+
+        // 2. Fast probe common alternate loopback ADB ports
+        for (candidate in 5556..5585) {
+            if (isPortListening(candidate, 50)) {
+                Log.i(TAG, "Found listening ADB loopback port: $candidate")
+                return@withContext candidate
+            }
+        }
+
+        // 3. Fall back to mDNS discovery
+        discoverViaMdns(timeoutMs)
+    }
+
+    private fun isPortListening(port: Int, timeoutMs: Int): Boolean {
+        return try {
+            Socket().use { s ->
+                s.connect(InetSocketAddress("127.0.0.1", port), timeoutMs)
+                true
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private suspend fun discoverViaMdns(timeoutMs: Long): Int? {
         val result = CompletableDeferred<Int?>()
 
         val listener = object : NsdManager.DiscoveryListener {
@@ -46,11 +69,7 @@ class NsdAdbPortDiscovery(context: Context) {
                 resolveService(service, result)
             }
 
-            override fun onServiceLost(service: NsdServiceInfo) {
-                // Not actionable here -- AdbLocalSocketRelay's own connect
-                // attempt is what actually surfaces a now-stale port, via
-                // its usual translated connection-error path.
-            }
+            override fun onServiceLost(service: NsdServiceInfo) {}
 
             override fun onDiscoveryStopped(serviceType: String) {}
 
@@ -80,9 +99,6 @@ class NsdAdbPortDiscovery(context: Context) {
             }
 
             override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
-                // The wireless-debugging daemon only ever advertises this
-                // on the loopback interface -- the port is what matters,
-                // the host is always 127.0.0.1 from this same device.
                 if (!result.isCompleted) {
                     result.complete(serviceInfo.port)
                 }

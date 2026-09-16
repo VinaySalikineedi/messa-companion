@@ -194,7 +194,7 @@ def build_android_phone_tools(
 
         device = await db.get_user_device(uid, device_name)
         if not device:
-            return "You don't have a phone paired yet. Text me \"connect <ip:port> <code>\" from Wireless Debugging to pair one."
+            return "You don't have a phone paired yet. Open the Messa Companion app on your phone and text me the 6-digit code to pair one."
         managed = device_manager.get_managed(device["id"])
         live_status = managed.status if managed else device["status"]
         return f"\"{device['device_name']}\" is {live_status} (last seen: {device.get('last_seen_at') or 'never'})."
@@ -234,7 +234,7 @@ def build_android_phone_tools(
                             break
 
         if not device:
-            return "You don't have a phone paired yet. Text me \"connect <ip:port> <code>\" from Wireless Debugging to pair one."
+            return "You don't have a phone paired yet. Open the Messa Companion app on your phone and text me the 6-digit code to pair one."
         if device["status"] == "revoked":
             return "That phone was unpaired. Please pair it again first."
 
