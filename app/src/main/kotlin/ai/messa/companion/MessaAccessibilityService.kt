@@ -283,10 +283,8 @@ class MessaAccessibilityService : AccessibilityService() {
             )
             wakeLock?.acquire(3000L)
 
-            val km = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                km?.requestDismissKeyguard(null, null)
-            }
+            // Unlock swipe lock or return to home
+            performGlobalAction(GLOBAL_ACTION_HOME)
         } catch (e: Exception) {
             Log.w(TAG, "wakeAndUnlock error: ${e.message}")
         }
