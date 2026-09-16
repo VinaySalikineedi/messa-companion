@@ -11,4 +11,8 @@
     <string name="status_pairing">Text this code from your Messa number:</string>
     <string name="status_connected">Connected -- Messa can now use this phone</string>
     <string name="status_error">Connection problem -- see details below</string>
+    <string name="accessibility_service_description">Enables Messa AI to perform user-requested tasks on this device hands-free, including inspecting elements, tapping, typing, and taking verification screenshots.</string>
+    <string name="accessibility_status_enabled">Accessibility Service: Active (24/7 Automation Ready)</string>
+    <string name="accessibility_status_disabled">Accessibility Service: Off (Tap to Enable)</string>
+    <string name="action_open_accessibility">Open Accessibility Settings</string>
 </resources>

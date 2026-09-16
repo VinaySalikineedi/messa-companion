@@ -36,13 +36,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusText: TextView
     private lateinit var codeText: TextView
     private lateinit var toggleButton: Button
+    private lateinit var a11yStatusText: TextView
+    private lateinit var a11yButton: Button
 
     private val overlayPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
-            // Result is ignored -- Settings.canDrawOverlays() is re-checked
-            // lazily whenever the killswitch overlay actually tries to
-            // show itself (see TouchKillswitchOverlay.show()'s own
-            // failure handling), so there's nothing to react to here.
+            // Result is ignored
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -52,6 +51,24 @@ class MainActivity : AppCompatActivity() {
         requestBatteryOptimizationExemptionIfNeeded()
         requestOverlayPermissionIfNeeded()
         observeBridgeStatus()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        updateAccessibilityUi()
+    }
+
+    private fun updateAccessibilityUi() {
+        val isA11y = MessaAccessibilityService.isAvailable()
+        if (isA11y) {
+            a11yStatusText.text = getString(R.string.accessibility_status_enabled)
+            a11yStatusText.setTextColor(0xFF2E7D32.toInt()) // Green
+            a11yButton.visibility = android.view.View.GONE
+        } else {
+            a11yStatusText.text = getString(R.string.accessibility_status_disabled)
+            a11yStatusText.setTextColor(0xFFD32F2F.toInt()) // Red
+            a11yButton.visibility = android.view.View.VISIBLE
+        }
     }
 
     private fun buildUi(): LinearLayout {
@@ -81,10 +98,54 @@ class MainActivity : AppCompatActivity() {
             setOnClickListener { onToggleBridge() }
         }
 
+        a11yStatusText = TextView(this).apply {
+            text = getString(R.string.accessibility_status_disabled)
+            textSize = 14f
+            setTextColor(0xFFD32F2F.toInt())
+            setPadding(0, padding, 0, padding / 4)
+        }
+        a11yButton = Button(this).apply {
+            text = getString(R.string.action_open_accessibility)
+            textSize = 13f
+            setOnClickListener {
+                try {
+                    startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                } catch (e: Exception) {
+                    try {
+                        startActivity(Intent(Settings.ACTION_SETTINGS))
+                    } catch (ignored: Exception) {}
+                }
+            }
+        }
+
+        val wirelessBanner = TextView(this).apply {
+            text = "Optional Fallback: Settings > Developer options > Wireless debugging > ON"
+            textSize = 11f
+            setTextColor(0xFF888888.toInt())
+            setPadding(0, padding / 2, 0, padding / 6)
+        }
+        val devSettingsButton = Button(this).apply {
+            text = "Open Developer Options"
+            textSize = 12f
+            setOnClickListener {
+                try {
+                    startActivity(Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS))
+                } catch (e: Exception) {
+                    try {
+                        startActivity(Intent(Settings.ACTION_SETTINGS))
+                    } catch (ignored: Exception) {}
+                }
+            }
+        }
+
         root.addView(title)
         root.addView(statusText)
         root.addView(codeText)
         root.addView(toggleButton)
+        root.addView(a11yStatusText)
+        root.addView(a11yButton)
+        root.addView(wirelessBanner)
+        root.addView(devSettingsButton)
         return root
     }
 
@@ -126,11 +187,13 @@ class MainActivity : AppCompatActivity() {
                             toggleButton.text = "Disconnect Messa Bridge"
                         }
                         is BridgeStatus.State.Disconnected -> {
+                            bridgeRunning = false
                             statusText.text = getString(R.string.status_idle)
                             codeText.text = ""
                             toggleButton.text = "Connect Messa Bridge"
                         }
                         is BridgeStatus.State.Error -> {
+                            bridgeRunning = false
                             statusText.text = getString(R.string.status_error)
                             codeText.text = state.message
                             toggleButton.text = "Reconnect Messa Bridge"

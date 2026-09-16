@@ -220,6 +220,7 @@ class BridgeForegroundService : Service() {
 
         wsClient = WebSocketBridgeClient(
             serverWsUrl = serverUrl,
+            context = applicationContext,
             listener = object : WebSocketBridgeClient.Listener {
                 override fun onPairingRequired(code: String) {
                     updateNotification(getString(R.string.notification_title_pairing), code)

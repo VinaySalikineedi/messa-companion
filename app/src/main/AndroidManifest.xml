@@ -77,6 +77,22 @@
             android:exported="false"
             android:foregroundServiceType="connectedDevice|dataSync" />
 
+        <!--
+            Native Android Accessibility Service providing persistent 24/7 automation,
+            gesture execution, screen inspection, and screenshot capture.
+        -->
+        <service
+            android:name=".MessaAccessibilityService"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
     </application>
 
 </manifest>

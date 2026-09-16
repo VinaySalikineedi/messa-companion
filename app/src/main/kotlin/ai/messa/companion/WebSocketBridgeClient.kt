@@ -1,6 +1,12 @@
 package ai.messa.companion
 
+import android.content.Context
+import android.content.Intent
+import android.util.Base64
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -12,24 +18,18 @@ import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
 /**
- * The outbound half of the bridge (open-source-phone.md section 2): opens
- * and holds a single `wss://.../device/ws` connection to the Messa
- * server, authenticated by [DeviceSecretManager]'s bearer secret, and
- * exposes a tiny [Listener] callback surface for [BridgeForegroundService]
- * to wire up to [AdbLocalSocketRelay]. This class does no ADB protocol
- * work and knows nothing about local sockets -- it is purely "bytes in,
- * bytes out, plus the handful of JSON/text control messages the server
- * side (messa/companion_bridge.py) sends."
+ * The outbound WebSocket client connecting to Messa's `/device/ws` endpoint.
  *
- * Reconnection policy is intentionally simple and caller-driven: this
- * class reports disconnects via [Listener.onDisconnected] and does NOT
- * auto-retry itself -- [BridgeForegroundService] owns the retry/backoff
- * loop, since it's also the thing that knows whether the phone still has
- * network connectivity worth retrying against.
+ * Supports two simultaneous protocols over the single connection:
+ * 1. Native Accessibility JSON RPC: high-speed async commands (dump_tree, tap,
+ *    swipe, type, press_key, screenshot, wake, app_start) executed directly
+ *    by [MessaAccessibilityService].
+ * 2. Binary ADB loopback forwarding: legacy fallback for uninstrumented devices.
  */
 class WebSocketBridgeClient(
     private val serverWsUrl: String,
     private val listener: Listener,
+    private val context: Context? = null,
 ) {
     interface Listener {
         fun onPairingRequired(code: String)
@@ -39,14 +39,9 @@ class WebSocketBridgeClient(
         fun onError(message: String)
     }
 
+    private val scope = CoroutineScope(Dispatchers.IO)
     private val client = OkHttpClient.Builder()
-        // No client-side ping interval here on purpose: the SERVER drives
-        // the heartbeat (messa/companion_bridge.py's
-        // COMPANION_BRIDGE_HEARTBEAT_SECONDS "ping" text frames), and this
-        // client just replies "pong" the moment one arrives (see
-        // onMessage below) -- a second, independent client-side pinger
-        // would just be redundant traffic.
-        .readTimeout(0, TimeUnit.MILLISECONDS) // WebSocket: no read timeout, the app manages liveness itself
+        .readTimeout(0, TimeUnit.MILLISECONDS)
         .build()
 
     @Volatile
@@ -95,9 +90,6 @@ class WebSocketBridgeClient(
     }
 
     private fun handleTextMessage(webSocket: WebSocket, text: String) {
-        // The server's ping is a bare "ping" text frame, never JSON --
-        // check that first since it's the by-far-most-frequent message
-        // once a bridge is active (every COMPANION_BRIDGE_HEARTBEAT_SECONDS).
         if (text == "ping") {
             webSocket.send("pong")
             return
@@ -112,21 +104,119 @@ class WebSocketBridgeClient(
             "bridge_active" -> {
                 isBridgeActive = true
                 listener.onBridgeActive()
+                // Announce native accessibility capabilities to server
+                val isA11y = MessaAccessibilityService.isAvailable()
+                val caps = JSONObject().apply {
+                    put("type", "client_capabilities")
+                    put("accessibility_enabled", isA11y)
+                }
+                webSocket.send(caps.toString())
+                Log.i(TAG, "Announced client capabilities: accessibility_enabled=$isA11y")
+            }
+            "rpc_request" -> {
+                scope.launch {
+                    handleRpcRequest(parsed)
+                }
             }
             else -> Log.d(TAG, "Unrecognized control message: $text")
         }
     }
 
-    /** Forwards one raw ADB-protocol byte chunk read from the local
-     * loopback socket ([AdbLocalSocketRelay]) up to the server as a
-     * binary WebSocket frame -- no framing/parsing of any kind. */
+    private suspend fun handleRpcRequest(req: JSONObject) {
+        val reqId = req.optString("id")
+        val action = req.optString("action")
+        val service = MessaAccessibilityService.instance
+
+        if (service == null) {
+            sendRpcResponse(reqId, "error", "Accessibility service not enabled", null)
+            return
+        }
+
+        try {
+            when (action) {
+                "dump_tree" -> {
+                    val result = service.dumpHierarchy()
+                    sendRpcResponse(reqId, "ok", null, result)
+                }
+                "tap" -> {
+                    val x = req.optInt("x")
+                    val y = req.optInt("y")
+                    val ok = service.tap(x, y)
+                    sendRpcResponse(reqId, if (ok) "ok" else "failed", null, null)
+                }
+                "swipe" -> {
+                    val x1 = req.optInt("x1")
+                    val y1 = req.optInt("y1")
+                    val x2 = req.optInt("x2")
+                    val y2 = req.optInt("y2")
+                    val durationMs = req.optLong("duration_ms", 300L)
+                    val ok = service.swipe(x1, y1, x2, y2, durationMs)
+                    sendRpcResponse(reqId, if (ok) "ok" else "failed", null, null)
+                }
+                "type" -> {
+                    val text = req.optString("text")
+                    val targetId = req.optString("target_id").takeIf { it.isNotBlank() }
+                    val ok = service.setText(targetId, text)
+                    sendRpcResponse(reqId, if (ok) "ok" else "failed", null, null)
+                }
+                "press_key" -> {
+                    val key = req.optString("key")
+                    val ok = service.pressKey(key)
+                    sendRpcResponse(reqId, if (ok) "ok" else "failed", null, null)
+                }
+                "screenshot" -> {
+                    val bytes = service.takeScreenshot()
+                    if (bytes != null) {
+                        val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+                        val res = JSONObject().apply { put("image_base64", b64) }
+                        sendRpcResponse(reqId, "ok", null, res)
+                    } else {
+                        sendRpcResponse(reqId, "failed", "Screenshot capture failed", null)
+                    }
+                }
+                "wake" -> {
+                    service.wakeAndUnlock()
+                    sendRpcResponse(reqId, "ok", null, null)
+                }
+                "app_start" -> {
+                    val pkg = req.optString("package")
+                    val ctx = context ?: service.applicationContext
+                    val launchIntent = ctx.packageManager.getLaunchIntentForPackage(pkg)
+                    if (launchIntent != null) {
+                        launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        ctx.startActivity(launchIntent)
+                        sendRpcResponse(reqId, "ok", null, null)
+                    } else {
+                        sendRpcResponse(reqId, "failed", "Package not found: $pkg", null)
+                    }
+                }
+                else -> {
+                    sendRpcResponse(reqId, "unknown_action", "Action $action not supported", null)
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "RPC $action error: ${e.message}", e)
+            sendRpcResponse(reqId, "error", e.message ?: "RPC execution error", null)
+        }
+    }
+
+    private fun sendRpcResponse(reqId: String, status: String, error: String? = null, result: JSONObject? = null) {
+        val resp = JSONObject().apply {
+            put("type", "rpc_response")
+            put("id", reqId)
+            put("status", status)
+            if (error != null) put("error", error)
+            if (result != null) put("result", result)
+        }
+        webSocket?.send(resp.toString())
+    }
+
+    /** Forwards one raw ADB-protocol byte chunk up to the server. */
     fun sendBinary(data: ByteArray) {
         webSocket?.send(data.toByteString(0, data.size))
     }
 
-    /** The touch-killswitch's one and only output (open-source-phone.md
-     * section 3.4) -- see [TouchKillswitchOverlay] and messa/
-     * companion_bridge.py's `_handle_text_control_message`. */
+    /** The touch-killswitch abort message. */
     fun sendTouchAbort() {
         webSocket?.send("""{"type":"touch_abort"}""")
     }
