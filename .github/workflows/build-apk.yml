@@ -43,12 +43,22 @@ jobs:
       - name: Build Debug APK
         run: |
           chmod +x ./gradlew
-          ./gradlew assembleDebug --no-daemon --stacktrace
+          ./gradlew assembleDebug --no-daemon --stacktrace 2>&1 | tee /tmp/build_output.log
           cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/messa-companion.apk
+
+      - name: Publish Failure Log
+        if: failure()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-failure
+          name: "Build Failure"
+          body_path: /tmp/build_output.log
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish Release Asset
         uses: softprops/action-gh-release@v2
-        if: github.ref == 'refs/heads/main'
+        if: success() && github.ref == 'refs/heads/main'
         with:
           tag_name: v0.1.0
           name: "Messa Bridge v0.1.0"
