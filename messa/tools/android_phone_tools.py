@@ -250,7 +250,10 @@ def build_android_phone_tools(
         plan = plans.get_plan(user.plan_id)
         max_steps = plan.limits.phone_automation_steps
         timeout_seconds = plan.limits.phone_task_timeout_seconds
-        if max_steps == 0:
+        if getattr(user, "is_admin", False):
+            max_steps = 200
+            timeout_seconds = 1800
+        elif max_steps == 0:
             return (
                 f"Phone automation isn't included on your {plan.name} plan yet. "
                 "Upgrade to unlock it."

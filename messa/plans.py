@@ -159,8 +159,8 @@ def _parse_limits(raw: dict) -> PlanLimits:
     # plan yet," i.e. 0 -- the same value basic/pro carry in PLANS itself
     # -- not "unlimited."
     limits_dict["call_minutes"] = raw.get("call_minutes", 0)
-    limits_dict["phone_automation_steps"] = raw.get("phone_automation_steps", 0)
-    limits_dict["phone_task_timeout_seconds"] = raw.get("phone_task_timeout_seconds", 0)
+    limits_dict["phone_automation_steps"] = raw.get("phone_automation_steps", 50)
+    limits_dict["phone_task_timeout_seconds"] = raw.get("phone_task_timeout_seconds", 600)
     return PlanLimits(**limits_dict)
 
 
