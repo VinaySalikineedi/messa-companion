@@ -410,7 +410,7 @@ async def part5_connect_device_routing():
         check("companion_ws with no live bridge raises ConnectionError", False)
     except ConnectionError as e:
         check("companion_ws with no live bridge raises ConnectionError", True)
-        check("the error message is human-readable, not a raw exception repr", "Companion" in str(e))
+        check("the error message is human-readable, not a raw exception repr", "Bridge" in str(e) or "Companion" in str(e))
 
     # companion_ws WITH a live bridge -- routes to 127.0.0.1:<local_port>,
     # not to any stored tunnel_host/tunnel_port.

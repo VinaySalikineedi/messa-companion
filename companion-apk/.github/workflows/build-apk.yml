@@ -1,4 +1,4 @@
-name: Build & Release Messa Companion APK
+name: Build & Release Messa Bridge APK
 
 on:
   push:
@@ -50,8 +50,8 @@ jobs:
         if: github.ref == 'refs/heads/main'
         with:
           tag_name: v0.1.0
-          name: "Messa Companion v0.1.0"
-          body: "Direct download for Messa Companion Android APK."
+          name: "Messa Bridge v0.1.0"
+          body: "Direct download for Messa Bridge Android APK."
           files: app/build/outputs/apk/debug/app-debug.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

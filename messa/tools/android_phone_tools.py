@@ -59,7 +59,7 @@ ANDROID_PHONE_SYSTEM_PROMPT = (
     "tool call.\n\n"
     "CONVERSATIONAL SELF-HEALING: if a tool reports a connectivity problem (expired pairing code, "
     "wireless debugging off, screen locked), relay that guidance to the user plainly -- don't just say "
-    "'it failed.' Devices connect via the Messa Companion app reverse tunnel. Never ask for "
+    "'it failed.' Devices connect via the Messa Bridge app reverse tunnel. Never ask for "
     "Tailscale, WireGuard, or third-party VPNs."
 )
 
@@ -194,18 +194,39 @@ def build_android_phone_tools(
 
         device = await db.get_user_device(uid, device_name)
         if not device:
-            return "You don't have a phone paired yet. Open the Messa Companion app on your phone and text me the 6-digit code to pair one."
+            for contact in (user.phone_number, user.email):
+                if contact:
+                    authorized = await db.find_devices_authorized_for_contact(contact)
+                    if authorized:
+                        if device_name:
+                            matched = [d for d in authorized if d.get("device_name", "").lower() == device_name.lower()]
+                            device = matched[0] if matched else None
+                        else:
+                            device = authorized[0]
+                        if device:
+                            break
+        if not device:
+            return "You don't have a phone paired yet. Open the Messa Bridge app on your phone and text me the 6-digit code to pair one."
         managed = device_manager.get_managed(device["id"])
         live_status = managed.status if managed else device["status"]
         return f"\"{device['device_name']}\" is {live_status} (last seen: {device.get('last_seen_at') or 'never'})."
 
     @tool
     async def list_my_phones() -> str:
-        """Lists every phone the user has paired."""
+        """Lists every phone the user has paired or has authorized family access to."""
         devices = await db.list_user_devices(uid)
-        if not devices:
+        lines = [f"- {d['device_name']}: {d['status']}" for d in devices]
+        seen_ids = {d["id"] for d in devices}
+        for contact in (user.phone_number, user.email):
+            if contact:
+                authorized = await db.find_devices_authorized_for_contact(contact)
+                for d in authorized:
+                    if d["id"] not in seen_ids:
+                        seen_ids.add(d["id"])
+                        lines.append(f"- {d['device_name']} (shared by {d.get('owner_name') or 'family'}): {d['status']}")
+        if not lines:
             return "No phones paired yet."
-        return "\n".join(f"- {d['device_name']}: {d['status']}" for d in devices)
+        return "\n".join(lines)
 
     @tool
     async def run_phone_task(goal: str, device_name: str | None = None) -> str:
@@ -220,7 +241,7 @@ def build_android_phone_tools(
             # Family sharing lookup (open-source-phone.md section 4): if the caller
             # has no phone of their own, check if an authorized family device exists
             # for their email or phone number.
-            for contact in (user.email, user.phone_number):
+            for contact in (user.phone_number, user.email):
                 if contact:
                     authorized = await db.find_devices_authorized_for_contact(contact)
                     if authorized:
@@ -234,7 +255,7 @@ def build_android_phone_tools(
                             break
 
         if not device:
-            return "You don't have a phone paired yet. Open the Messa Companion app on your phone and text me the 6-digit code to pair one."
+            return "You don't have a phone paired yet. Open the Messa Bridge app on your phone and text me the 6-digit code to pair one."
         if device["status"] == "revoked":
             return "That phone was unpaired. Please pair it again first."
 

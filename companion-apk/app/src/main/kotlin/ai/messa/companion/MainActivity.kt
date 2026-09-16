@@ -77,7 +77,7 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, padding / 2, 0, padding / 2)
         }
         toggleButton = Button(this).apply {
-            text = getString(R.string.app_name)
+            text = "Connect Messa Bridge"
             setOnClickListener { onToggleBridge() }
         }
 
@@ -109,29 +109,35 @@ class MainActivity : AppCompatActivity() {
                             bridgeRunning = false
                             statusText.text = getString(R.string.status_idle)
                             codeText.text = ""
+                            toggleButton.text = "Connect Messa Bridge"
                         }
                         is BridgeStatus.State.PairingRequired -> {
                             bridgeRunning = true
                             statusText.text = getString(R.string.status_pairing)
                             codeText.text = "PAIR ${state.code}"
+                            toggleButton.text = "Disconnect Messa Bridge"
                         }
                         is BridgeStatus.State.Connected -> {
                             bridgeRunning = true
                             statusText.text = getString(R.string.status_connected)
                             codeText.text = ""
+                            toggleButton.text = "Disconnect Messa Bridge"
                         }
                         is BridgeStatus.State.Disconnected -> {
                             statusText.text = getString(R.string.status_idle)
                             codeText.text = ""
+                            toggleButton.text = "Connect Messa Bridge"
                         }
                         is BridgeStatus.State.Error -> {
                             statusText.text = getString(R.string.status_error)
                             codeText.text = state.message
+                            toggleButton.text = "Reconnect Messa Bridge"
                         }
                         is BridgeStatus.State.Stopped -> {
                             bridgeRunning = false
                             statusText.text = getString(R.string.status_idle)
                             codeText.text = ""
+                            toggleButton.text = "Connect Messa Bridge"
                         }
                     }
                 }

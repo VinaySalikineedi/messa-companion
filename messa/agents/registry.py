@@ -1667,11 +1667,40 @@ async def build_orchestrator(
                 dev_names = ", ".join(f"\"{d.get('device_name') or 'Android phone'}\"" for d in active_devs)
                 orchestrator_system_prompt += (
                     f"\n\nConnected Physical Android Device: {dev_names}. "
-                    "The user's physical Android phone is ALREADY PAIRED and CONNECTED via the Messa Companion app. "
+                    "The user's physical Android phone is ALREADY PAIRED and CONNECTED via the Messa Bridge app. "
                     "Zero setup, no VPN, and no Tailscale needed. "
                     "Whenever the user asks to control their phone, open apps (like YouTube, Uber, DoorDash), search, tap, or retry/continue mobile tasks, "
                     "immediately delegate to android_phone_agent. Never ask them to connect Tailscale, provide IP addresses, or pair again.\n"
                 )
+            else:
+                # Also check shared family devices authorized for this contact
+                shared_devs = []
+                for contact in (user.phone_number, user.email):
+                    if contact:
+                        found = await db.find_devices_authorized_for_contact(contact)
+                        for d in found:
+                            if d.get("status") in ("connected", "busy") and d.get("status") != "revoked":
+                                shared_devs.append(d)
+                if shared_devs:
+                    seen_ids = set()
+                    unique_shared = []
+                    for d in shared_devs:
+                        if d["id"] not in seen_ids:
+                            seen_ids.add(d["id"])
+                            unique_shared.append(d)
+                    dev_desc = ", ".join(
+                        f"\"{d.get('device_name') or 'Android phone'}\" (Shared family phone owned by {d.get('owner_name') or 'family member'})"
+                        for d in unique_shared
+                    )
+                    cats = ", ".join(sorted({c for d in unique_shared for c in d.get("allowed_categories", [])}))
+                    orchestrator_system_prompt += (
+                        f"\n\nConnected Physical Android Device (Family Shared): {dev_desc}. "
+                        f"The user has authorized family access to this phone for categories: {cats or 'food_delivery, rides, streaming, maps'}. "
+                        "The device is ALREADY PAIRED and CONNECTED via the Messa Bridge app. "
+                        "Zero setup, no VPN, and no Tailscale needed. "
+                        "Whenever the user asks to control the phone, open apps (like Uber Eats, YouTube, DoorDash), search, tap, or order, "
+                        "immediately delegate to android_phone_agent. Never ask them to pair, provide IP addresses, or connect Tailscale.\n"
+                    )
         except Exception as e:  # noqa: BLE001
             console.system(f"failed to inject device context (non-fatal): {e}")
     if config.SCRATCHPAD_AND_SKILLS_ENABLED:

@@ -17,8 +17,8 @@ def render_downloads_page() -> str:
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Download Messa Companion for Android | textmessa.com</title>
-<meta name="description" content="Download the open-source Messa Companion APK for Android. Automate your phone over SMS text with zero VPN subscriptions.">
+<title>Download Messa Bridge for Android | textmessa.com</title>
+<meta name="description" content="Download the open-source Messa Bridge APK for Android. Automate your phone over SMS text with zero VPN subscriptions.">
 <style>
   * { box-sizing: border-box; }
   body {
@@ -88,7 +88,7 @@ def render_downloads_page() -> str:
 <body>
 <div class="wrap">
   <div class="badge">🤖 Open-Source Phone • BYOP</div>
-  <h1>Messa Companion for Android</h1>
+  <h1>Messa Bridge for Android</h1>
   <p class="subtitle">Control and automate your personal Android phone directly over SMS text with zero third-party VPN subscriptions.</p>
 
   <div class="download-box">
@@ -118,7 +118,7 @@ def render_downloads_page() -> str:
       <div class="step-num">3</div>
       <div class="step-body">
         <h3>Text the Pairing Code</h3>
-        <p>Open Messa Companion. It auto-discovers your phone's local debugging port and displays a 6-digit code:</p>
+        <p>Open Messa Bridge. It auto-discovers your phone's local debugging port and displays a 6-digit code:</p>
         <div class="code-pill">PAIR 123-456</div>
         <p style="margin-top: 6px;">Send that exact text to your Messa number from your personal phone. You're immediately connected!</p>
       </div>

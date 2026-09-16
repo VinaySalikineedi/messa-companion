@@ -6016,15 +6016,34 @@ async def get_device_by_secret_hash(device_secret_hash: str) -> dict[str, Any] |
 
 # ---- Family sharing (device_authorizations) ----
 
+def _normalize_authorized_contact(contact: str) -> str:
+    """Normalizes an email or phone number for device authorization storage.
+    Emails are lowercased and stripped. Phone numbers are converted to E.164
+    format (e.g. +12569108600) with default US code if given as 10 digits."""
+    c = (contact or "").strip().lower()
+    if not c or "@" in c:
+        return c
+    digits = "".join(ch for ch in c if ch.isdigit())
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    if c.startswith("+") and digits:
+        return f"+{digits}"
+    return c
+
+
 async def authorize_device_contact(
     device_id: int, authorized_contact: str, allowed_categories: list[str],
 ) -> dict[str, Any] | None:
     """The device owner names a family member (email or E.164 phone) who
     may queue tasks against their phone, scoped to allowed_categories.
+    Normalizes phone numbers to standard E.164 format.
     INSERT ... ON CONFLICT DO UPDATE so re-authorizing the same contact
     with a new category list replaces it rather than erroring or
     duplicating."""
     pool = await get_pool()
+    norm_contact = _normalize_authorized_contact(authorized_contact)
     async with pool.acquire() as conn:
         if not await _has_table(conn, "device_authorizations"):
             return None
@@ -6036,19 +6055,24 @@ async def authorize_device_contact(
                 allowed_categories = EXCLUDED.allowed_categories
             RETURNING *
             """,
-            device_id, authorized_contact.strip().lower(), allowed_categories,
+            device_id, norm_contact, allowed_categories,
         )
         return dict(row) if row else None
 
 
 async def get_device_authorization(device_id: int, contact: str) -> dict[str, Any] | None:
     pool = await get_pool()
+    raw_contact = (contact or "").strip().lower()
+    norm_contact = _normalize_authorized_contact(raw_contact)
     async with pool.acquire() as conn:
         if not await _has_table(conn, "device_authorizations"):
             return None
         row = await conn.fetchrow(
-            "SELECT * FROM device_authorizations WHERE device_id = $1 AND authorized_contact = $2",
-            device_id, contact.strip().lower(),
+            """
+            SELECT * FROM device_authorizations 
+            WHERE device_id = $1 AND (authorized_contact = $2 OR authorized_contact = $3)
+            """,
+            device_id, raw_contact, norm_contact,
         )
         return dict(row) if row else None
 
@@ -6066,34 +6090,71 @@ async def list_device_authorizations(device_id: int) -> list[dict[str, Any]]:
 
 async def revoke_device_authorization(device_id: int, contact: str) -> bool:
     pool = await get_pool()
+    raw_contact = (contact or "").strip().lower()
+    norm_contact = _normalize_authorized_contact(raw_contact)
     async with pool.acquire() as conn:
         if not await _has_table(conn, "device_authorizations"):
             return False
         result = await conn.execute(
-            "DELETE FROM device_authorizations WHERE device_id = $1 AND authorized_contact = $2",
-            device_id, contact.strip().lower(),
+            """
+            DELETE FROM device_authorizations 
+            WHERE device_id = $1 AND (authorized_contact = $2 OR authorized_contact = $3)
+            """,
+            device_id, raw_contact, norm_contact,
         )
         return result.endswith(" 1")
 
 
 async def find_devices_authorized_for_contact(contact: str) -> list[dict[str, Any]]:
-    """'Which phone(s) can I use' -- joins user_devices so the caller gets
+    """'Which phone(s) can I use' -- joins user_devices and users so the caller gets
     the device row (tunnel address, owner, status) directly, not just the
-    authorization row. Excludes revoked devices."""
+    authorization row. Excludes revoked devices. Matches both exact contact,
+    normalized E.164, and the last 10 national digits so US and international
+    formats match reliably."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         if not await _has_table(conn, "device_authorizations") or not await _has_table(conn, "user_devices"):
             return []
-        rows = await conn.fetch(
-            """
-            SELECT d.*, a.allowed_categories, a.authorized_contact
-            FROM device_authorizations a
-            JOIN user_devices d ON d.id = a.device_id
-            WHERE a.authorized_contact = $1 AND d.status != 'revoked'
-            ORDER BY a.created_at DESC
-            """,
-            contact.strip().lower(),
-        )
+        raw_contact = (contact or "").strip().lower()
+        if not raw_contact:
+            return []
+        norm_contact = _normalize_authorized_contact(raw_contact)
+        digits = "".join(ch for ch in raw_contact if ch.isdigit())
+        suffix10 = digits[-10:] if len(digits) >= 10 else None
+
+        if suffix10:
+            rows = await conn.fetch(
+                """
+                SELECT d.*, a.allowed_categories, a.authorized_contact,
+                       u.name AS owner_name, u.phone_number AS owner_phone
+                FROM device_authorizations a
+                JOIN user_devices d ON d.id = a.device_id
+                JOIN users u ON u.id = d.user_id
+                WHERE (a.authorized_contact = $1
+                   OR a.authorized_contact = $2
+                   OR RIGHT(REGEXP_REPLACE(a.authorized_contact, '[^0-9]', '', 'g'), 10) = $3)
+                  AND d.status != 'revoked'
+                ORDER BY a.created_at DESC
+                """,
+                raw_contact,
+                norm_contact,
+                suffix10,
+            )
+        else:
+            rows = await conn.fetch(
+                """
+                SELECT d.*, a.allowed_categories, a.authorized_contact,
+                       u.name AS owner_name, u.phone_number AS owner_phone
+                FROM device_authorizations a
+                JOIN user_devices d ON d.id = a.device_id
+                JOIN users u ON u.id = d.user_id
+                WHERE (a.authorized_contact = $1 OR a.authorized_contact = $2)
+                  AND d.status != 'revoked'
+                ORDER BY a.created_at DESC
+                """,
+                raw_contact,
+                norm_contact,
+            )
         return _rows(rows)
 
 

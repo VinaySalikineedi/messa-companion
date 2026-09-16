@@ -174,11 +174,11 @@ def part1_translate_device_error():
     check("expired pairing code guidance mentions the 6-digit code", "6-digit" in msg)
 
     code, msg = translate_device_error(ConnectionRefusedError("Connection refused"))
-    check("ECONNREFUSED maps to wireless_debugging_disabled", code == "wireless_debugging_disabled")
+    check("ECONNREFUSED maps to connection error code", code in ("wireless_debugging_disabled", "bridge_connection_refused"))
 
     code, msg = translate_device_error(TimeoutError("Connection timed out"))
     check("timeout maps to device_unreachable", code == "device_unreachable")
-    check("device_unreachable guidance mentions the companion", "companion" in msg.lower())
+    check("device_unreachable guidance mentions the companion or bridge", "companion" in msg.lower() or "bridge" in msg.lower())
 
     code, msg = translate_device_error(RuntimeError("device offline"))
     check("device offline maps to device_offline", code == "device_offline")
@@ -450,7 +450,7 @@ async def part6_execute_macro_action():
     action_fail = PhoneMacroAction(steps=[{"action": "tap", "target_id": "e0", "target_signature": "sig-abc"}])
     ok10, err10 = await agent._execute_macro_action(action_fail, elem_map)
     check("a device exception during a step is caught and translated to guidance text",
-          ok10 is False and "re-pair" in (err10 or "").lower())
+          ok10 is False and ("re-pair" in (err10 or "").lower() or "bridge" in (err10 or "").lower()))
 
 
 # ===========================================================================

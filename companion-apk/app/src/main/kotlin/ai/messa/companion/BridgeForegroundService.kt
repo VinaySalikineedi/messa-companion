@@ -5,16 +5,26 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * The persistent foreground service that IS the bridge, end to end
@@ -24,12 +34,9 @@ import kotlinx.coroutines.launch
  * straight between them -- neither side is ever parsed, this class is
  * pure plumbing plus lifecycle/retry management.
  *
- * `START_STICKY` + a persistent foreground notification is roadblock #3's
- * answer (section 4): without this, Android's battery optimization/Doze
- * would suspend the process's networking within minutes of the screen
- * turning off, silently dropping the bridge. `REQUEST_IGNORE_BATTERY_
- * OPTIMIZATIONS` is requested once from [MainActivity] for the same
- * reason, before this service ever starts.
+ * `START_STICKY` + a persistent foreground notification + `PowerManager.PARTIAL_WAKE_LOCK`
+ * and `WifiManager.WifiLock` prevents Android Doze from suspending the process's networking
+ * when the screen turns off, maintaining 24/7 responsiveness to incoming SMS commands.
  */
 class BridgeForegroundService : Service() {
 
@@ -40,21 +47,90 @@ class BridgeForegroundService : Service() {
     private lateinit var nsdDiscovery: NsdAdbPortDiscovery
     private lateinit var killswitchOverlay: TouchKillswitchOverlay
 
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+    private val reconnectChannel = Channel<Unit>(Channel.CONFLATED)
+
     private var retryDelayMs = INITIAL_RETRY_DELAY_MS
+
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val action = intent?.action
+            if (action == Intent.ACTION_SCREEN_ON || action == Intent.ACTION_USER_PRESENT) {
+                Log.d(TAG, "Screen active event ($action) -> triggering immediate bridge reconnect")
+                triggerImmediateReconnect()
+            }
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
         deviceSecretManager = DeviceSecretManager(applicationContext)
         nsdDiscovery = NsdAdbPortDiscovery(applicationContext)
         killswitchOverlay = TouchKillswitchOverlay(applicationContext) {
-            // A genuine touch always sends touch_abort immediately AND
-            // hides the overlay itself -- see this class's own doc for
-            // why an overlay bug must never be able to trap the user
-            // behind an invisible, unresponsive layer.
             wsClient?.sendTouchAbort()
             killswitchOverlay.hide()
         }
         createNotificationChannel()
+
+        // Acquire WakeLock to keep CPU executing during sleep
+        try {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
+            wakeLock = powerManager?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "MessaBridge:WakeLock")?.apply {
+                setReferenceCounted(false)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not create WakeLock: ${e.message}")
+        }
+
+        // Acquire WifiLock to keep Wi-Fi radio alive during screen-off
+        try {
+            val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            wifiLock = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                wifiManager?.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "MessaBridge:WifiLock")
+            } else {
+                @Suppress("DEPRECATION")
+                wifiManager?.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "MessaBridge:WifiLock")
+            }?.apply {
+                setReferenceCounted(false)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not create WifiLock: ${e.message}")
+        }
+
+        // Register screen-on receiver
+        try {
+            val filter = IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_USER_PRESENT)
+            }
+            registerReceiver(screenReceiver, filter)
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not register screenReceiver: ${e.message}")
+        }
+
+        // Register network callback for immediate reconnect when network restores
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            if (cm != null) {
+                val callback = object : ConnectivityManager.NetworkCallback() {
+                    override fun onAvailable(network: Network) {
+                        Log.d(TAG, "Network became available -> triggering immediate reconnect")
+                        triggerImmediateReconnect()
+                    }
+                }
+                networkCallback = callback
+                cm.registerDefaultNetworkCallback(callback)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not register network callback: ${e.message}")
+        }
+    }
+
+    fun triggerImmediateReconnect() {
+        retryDelayMs = INITIAL_RETRY_DELAY_MS
+        reconnectChannel.trySend(Unit)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -70,14 +146,17 @@ class BridgeForegroundService : Service() {
             return START_NOT_STICKY
         }
         startBridge()
-        // START_STICKY: if the OS kills this process under memory pressure,
-        // it's restarted (with a null Intent) and startBridge() runs again
-        // -- the WebSocket/local-ADB connections themselves are never
-        // durable across a process death, only this restart behavior is.
         return START_STICKY
     }
 
     private fun startBridge() {
+        try {
+            if (wakeLock?.isHeld != true) wakeLock?.acquire()
+            if (wifiLock?.isHeld != true) wifiLock?.acquire()
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not acquire WakeLock/WifiLock: ${e.message}")
+        }
+        triggerImmediateReconnect()
         scope.launch {
             connectLoop()
         }
@@ -93,11 +172,10 @@ class BridgeForegroundService : Service() {
             if (connected) {
                 retryDelayMs = INITIAL_RETRY_DELAY_MS
             }
-            // connectOnce only returns after the connection has ended one
-            // way or another (disconnected, error, or a local ADB relay
-            // failure) -- back off before trying again so a persistent
-            // outage (no network, server down) doesn't spin this loop.
-            delay(retryDelayMs)
+            // Wait for either the retry delay or an immediate trigger (screen turned on, network available)
+            withTimeoutOrNull(retryDelayMs) {
+                reconnectChannel.receive()
+            }
             retryDelayMs = (retryDelayMs * 2).coerceAtMost(MAX_RETRY_DELAY_MS)
         }
     }
@@ -200,6 +278,12 @@ class BridgeForegroundService : Service() {
     }
 
     private fun stopBridge() {
+        try {
+            if (wakeLock?.isHeld == true) wakeLock?.release()
+            if (wifiLock?.isHeld == true) wifiLock?.release()
+        } catch (e: Exception) {
+            Log.w(TAG, "Error releasing locks: ${e.message}")
+        }
         wsClient?.disconnect()
         adbRelay?.close()
         killswitchOverlay.hide()
@@ -208,6 +292,13 @@ class BridgeForegroundService : Service() {
 
     override fun onDestroy() {
         stopBridge()
+        try {
+            unregisterReceiver(screenReceiver)
+        } catch (_: Exception) {}
+        try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+            networkCallback?.let { cm?.unregisterNetworkCallback(it) }
+        } catch (_: Exception) {}
         scope.coroutineContext[Job]?.cancel()
         super.onDestroy()
     }

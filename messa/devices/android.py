@@ -90,25 +90,25 @@ _ERROR_GUIDANCE: list[tuple[re.Pattern, str, str]] = [
     (
         re.compile(r"failed to authenticate|auth.*fail|incorrect.*pin|pairing.*fail", re.I),
         "pairing_code_expired",
-        "The pairing code expired or was not recognized. Please open the Messa Companion app "
+        "The pairing code expired or was not recognized. Please open the Messa Bridge app "
         "and text me the 6-digit code shown on screen.",
     ),
     (
         re.compile(r"connection refused|econnrefused", re.I),
         "bridge_connection_refused",
-        "The local bridge connection was refused. Please ensure the Messa Companion app is "
+        "The local bridge connection was refused. Please ensure the Messa Bridge app is "
         "open and shows 'Connected', then try your command again.",
     ),
     (
         re.compile(r"timed out|timeout|no route to host|network is unreachable", re.I),
         "device_unreachable",
-        "I can't reach your phone right now. Please make sure the Messa Companion app is open "
+        "I can't reach your phone right now. Please make sure the Messa Bridge app is open "
         "and shows 'Connected', then try your command again.",
     ),
     (
         re.compile(r"device.*offline|not found|no such device|not online", re.I),
         "device_offline",
-        "Your phone's connection is offline. Please make sure the Messa Companion app is open "
+        "Your phone's connection is offline. Please make sure the Messa Bridge app is open "
         "and shows 'Connected', then try your command again.",
     ),
     (
@@ -122,7 +122,7 @@ _ERROR_GUIDANCE: list[tuple[re.Pattern, str, str]] = [
 _DEFAULT_ERROR_GUIDANCE = (
     "unknown_device_error",
     "I ran into a problem communicating with your phone. Please make sure the phone is unlocked "
-    "and the Messa Companion app shows 'Connected', then try your command again.",
+    "and the Messa Bridge app shows 'Connected', then try your command again.",
 )
 
 
@@ -358,7 +358,7 @@ class AndroidDeviceManager:
             bridge = companion_bridge.MANAGER.get_bridge(device_id)
             if bridge is None or bridge.local_port is None:
                 raise ConnectionError(
-                    "This phone's Messa Companion app isn't currently connected -- "
+                    "This phone's Messa Bridge app isn't currently connected -- "
                     "make sure the app is open with a network connection, then try again."
                 )
             host, connect_port = "127.0.0.1", bridge.local_port
@@ -420,7 +420,7 @@ class AndroidDeviceManager:
                     self._devices[device_id] = managed
                 elif row and row.get("bridge_kind") == "companion_ws":
                     raise ConnectionError(
-                        "This phone's Messa Companion app isn't currently connected -- "
+                        "This phone's Messa Bridge app isn't currently connected -- "
                         "make sure the app is open with a network connection, then try again."
                     )
                 else:
@@ -447,6 +447,19 @@ class AndroidDeviceManager:
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         return buf.getvalue()
+
+    @staticmethod
+    def wake_device(u2_device: Any) -> None:
+        """Ensures the phone display is powered on and unlocked/keyguard dismissed."""
+        try:
+            # KEYCODE_WAKEUP (224): turns on display if asleep
+            u2_device.shell("input keyevent 224")
+            # Dismiss keyguard
+            u2_device.shell("wm dismiss-keyguard")
+            # Upward swipe to dismiss lock screen if necessary
+            u2_device.shell("input swipe 500 1500 500 500 200")
+        except Exception as e:
+            logger.debug(f"[wake_device] non-fatal: {e}")
 
     def release(self, device_id: int) -> None:
         """Drops the live connection handle (NOT the paired row in
@@ -1058,17 +1071,23 @@ async def run_android_phone_task(
                 phone_activity.set_status(int_user_id, "failed")
             return {"status": "FAILED", "result_summary": str(e)}
 
-        agent = AndroidPhoneAgent(
-            u2_device=u2_device,
-            device_row=device_row,
-            user_goal=goal,
-            credentials=credentials,
-            max_steps=max_steps or 10,
-            timeout_seconds=timeout_seconds or 180,
-            user_id=user_id,
-            target_package=target_package,
-        )
         try:
+            # Proactively wake screen and dismiss keyguard if sleeping
+            try:
+                await asyncio.to_thread(device_manager.wake_device, u2_device)
+            except Exception as e:
+                logger.debug(f"[run_android_phone_task] wake_device error (non-fatal): {e}")
+
+            agent = AndroidPhoneAgent(
+                u2_device=u2_device,
+                device_row=device_row,
+                user_goal=goal,
+                credentials=credentials,
+                max_steps=max_steps or 10,
+                timeout_seconds=timeout_seconds or 180,
+                user_id=user_id,
+                target_package=target_package,
+            )
             decision = await agent.run()
         except asyncio.CancelledError:
             # The live-view page's break-glass Pause/Abort button
