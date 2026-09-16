@@ -1659,6 +1659,21 @@ async def build_orchestrator(
     )
     orchestrator_system_prompt += _pending_meeting_note_paragraph(pending_meeting_note)
     orchestrator_system_prompt += _active_project_capsules_paragraph(active_project_capsules)
+    if config.ANDROID_PHONE_AGENT_ENABLED:
+        try:
+            devs = await db.list_user_devices(user.user_id)
+            active_devs = [d for d in devs if d.get("status") in ("connected", "busy") and d.get("status") != "revoked"]
+            if active_devs:
+                dev_names = ", ".join(f"\"{d.get('device_name') or 'Android phone'}\"" for d in active_devs)
+                orchestrator_system_prompt += (
+                    f"\n\nConnected Physical Android Device: {dev_names}. "
+                    "The user's physical Android phone is ALREADY PAIRED and CONNECTED via the Messa Companion app. "
+                    "Zero setup, no VPN, and no Tailscale needed. "
+                    "Whenever the user asks to control their phone, open apps (like YouTube, Uber, DoorDash), search, tap, or retry/continue mobile tasks, "
+                    "immediately delegate to android_phone_agent. Never ask them to connect Tailscale, provide IP addresses, or pair again.\n"
+                )
+        except Exception as e:  # noqa: BLE001
+            console.system(f"failed to inject device context (non-fatal): {e}")
     if config.SCRATCHPAD_AND_SKILLS_ENABLED:
         orchestrator_tools = orchestrator_tools + build_scratchpad_tools(user, "messa_orchestrator", approval_gate)
         orchestrator_system_prompt = orchestrator_system_prompt + await scratchpad_prompt_block(user, "messa_orchestrator")

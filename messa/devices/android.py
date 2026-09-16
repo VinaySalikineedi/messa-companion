@@ -74,10 +74,8 @@ _ERROR_GUIDANCE: list[tuple[re.Pattern, str, str]] = [
     (
         re.compile(r"timed out|timeout|no route to host|network is unreachable", re.I),
         "device_unreachable",
-        "I can't reach your phone right now. Your phone's local port may have changed after "
-        "reconnecting to Wi-Fi -- check Developer Options > Wireless Debugging and text me the new "
-        "port shown there (e.g. \"port 41235\"). If you're using a Tailscale/WireGuard tunnel, make "
-        "sure it's still connected too.",
+        "I can't reach your phone right now. Please make sure the Messa Companion app is open "
+        "and shows 'Connected', then try your command again.",
     ),
     (
         re.compile(r"device.*offline|not found|no such device", re.I),

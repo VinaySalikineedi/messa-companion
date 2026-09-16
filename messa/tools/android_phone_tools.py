@@ -59,7 +59,8 @@ ANDROID_PHONE_SYSTEM_PROMPT = (
     "tool call.\n\n"
     "CONVERSATIONAL SELF-HEALING: if a tool reports a connectivity problem (expired pairing code, "
     "wireless debugging off, screen locked), relay that guidance to the user plainly -- don't just say "
-    "'it failed.'"
+    "'it failed.' Devices connect via the Messa Companion app reverse tunnel. Never ask for "
+    "Tailscale, WireGuard, or third-party VPNs."
 )
 
 

@@ -178,7 +178,7 @@ def part1_translate_device_error():
 
     code, msg = translate_device_error(TimeoutError("Connection timed out"))
     check("timeout maps to device_unreachable", code == "device_unreachable")
-    check("device_unreachable guidance mentions the port", "port" in msg.lower())
+    check("device_unreachable guidance mentions the companion", "companion" in msg.lower())
 
     code, msg = translate_device_error(RuntimeError("device offline"))
     check("device offline maps to device_offline", code == "device_offline")
