@@ -521,6 +521,14 @@ class CompanionDeviceBridge:
         if self._server is not None:
             self._server.close()
         MANAGER.pop_bridge(self.device_id, self)
+        try:
+            from .devices.android import device_manager
+            managed = device_manager.get_managed(self.device_id)
+            if managed and managed.tunnel_port == self.local_port:
+                managed.status = "offline"
+                managed.u2_device = None
+        except Exception:
+            pass
 
     async def wait_closed(self) -> None:
         await self._closed_event.wait()
@@ -548,6 +556,18 @@ async def start_device_bridge(
     bridge = CompanionDeviceBridge(device_id, websocket, on_touch_abort=on_touch_abort)
     await bridge.start()
     MANAGER.register_bridge(device_id, bridge)
+
+    try:
+        from .devices.android import device_manager, ManagedDevice
+        managed = device_manager.get_managed(device_id)
+        if managed is None or managed.tunnel_port != bridge.local_port:
+            managed = ManagedDevice(device_id, "127.0.0.1", bridge.local_port)
+            device_manager._devices[device_id] = managed
+        managed.status = "connected"
+        managed.touch()
+    except Exception as e:
+        logger.debug("Failed to sync managed device state: %s", e)
+
     return bridge
 
 

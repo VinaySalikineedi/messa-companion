@@ -378,7 +378,25 @@ class AndroidDeviceManager:
         to try again later instead of queuing indefinitely."""
         managed = self._devices.get(device_id)
         if managed is None:
-            raise ConnectionError("This device isn't connected yet.")
+            from .. import companion_bridge
+            bridge = companion_bridge.MANAGER.get_bridge(device_id)
+            if bridge is not None and bridge.local_port is not None:
+                managed = ManagedDevice(device_id, "127.0.0.1", bridge.local_port)
+                managed.status = "connected"
+                self._devices[device_id] = managed
+            else:
+                row = await db.get_device_by_id(device_id)
+                if row and row.get("tunnel_host") and row.get("tunnel_port"):
+                    managed = ManagedDevice(device_id, row["tunnel_host"], row["tunnel_port"])
+                    managed.status = "connected"
+                    self._devices[device_id] = managed
+                elif row and row.get("bridge_kind") == "companion_ws":
+                    raise ConnectionError(
+                        "This phone's Messa Companion app isn't currently connected -- "
+                        "make sure the app is open with a network connection, then try again."
+                    )
+                else:
+                    raise ConnectionError("This device isn't connected yet.")
         max_depth = getattr(config, "ANDROID_PHONE_MAX_QUEUE_DEPTH", 5)
         if managed.queue_depth >= max_depth:
             raise QueueFullError(
