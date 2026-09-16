@@ -36,9 +36,12 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
+import shutil
 import time
 import xml.etree.ElementTree as ET
+from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
@@ -46,6 +49,32 @@ from pydantic import BaseModel, Field
 from .. import config, db, phone_activity
 
 logger = logging.getLogger(__name__)
+
+
+def _ensure_adb_keys() -> None:
+    """Ensures ADB client uses the persistent/bundled key pair so devices
+    don't prompt 'Allow USB debugging?' repeatedly across server restarts."""
+    try:
+        android_dir = Path.home() / ".android"
+        android_dir.mkdir(parents=True, exist_ok=True)
+        assets_dir = Path(__file__).resolve().parent.parent / "assets"
+        bundled_key = assets_dir / "adbkey"
+        bundled_pub = assets_dir / "adbkey.pub"
+        target_key = android_dir / "adbkey"
+        target_pub = android_dir / "adbkey.pub"
+
+        if bundled_key.exists():
+            if not target_key.exists() or target_key.stat().st_size == 0:
+                shutil.copy(bundled_key, target_key)
+                os.chmod(target_key, 0o600)
+            if not target_pub.exists() or target_pub.stat().st_size == 0:
+                shutil.copy(bundled_pub, target_pub)
+                os.chmod(target_pub, 0o644)
+    except Exception as e:
+        logger.debug(f"[AndroidDeviceManager] _ensure_adb_keys non-fatal error: {e}")
+
+
+_ensure_adb_keys()
 
 
 # ---------------------------------------------------------------------------
