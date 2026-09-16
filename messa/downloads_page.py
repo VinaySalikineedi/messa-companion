@@ -92,10 +92,10 @@ def render_downloads_page() -> str:
   <p class="subtitle">Control and automate your personal Android phone directly over SMS text with zero third-party VPN subscriptions.</p>
 
   <div class="download-box">
-    <a href="/download/companion.apk" class="btn-download">
+    <a href="https://github.com/VinaySalikineedi/messa-companion/releases/download/v0.1.0/messa-companion.apk" class="btn-download">
       <span>📱</span> Download APK (v0.1.0)
     </a>
-    <div class="download-meta">Requires Android 8.0+ (Oreo) or later • Standalone Debug Build</div>
+    <div class="download-meta">Direct download from GitHub Releases • Android 8.0+</div>
   </div>
 
   <h2>Quick Setup (Under 1 Minute)</h2>
