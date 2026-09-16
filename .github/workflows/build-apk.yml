@@ -1,0 +1,57 @@
+name: Build & Release Messa Companion APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build & Release Android APK
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Install Gradle 8.7
+        run: |
+          curl -fsSL https://services.gradle.org/distributions/gradle-8.7-bin.zip -o gradle.zip
+          unzip -q gradle.zip
+          echo "${PWD}/gradle-8.7/bin" >> $GITHUB_PATH
+
+      - name: Accept Android SDK Licenses & Verify SDK
+        run: |
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          echo "ANDROID_HOME=${ANDROID_HOME}" >> $GITHUB_ENV
+          if [ -d "${ANDROID_HOME}/cmdline-tools/latest/bin" ]; then
+            yes | "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --licenses || true
+          fi
+
+      - name: Generate Gradle Wrapper
+        run: |
+          gradle wrapper --gradle-version 8.7
+
+      - name: Build Debug APK
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Publish Release Asset
+        uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/main'
+        with:
+          tag_name: v0.1.0
+          name: "Messa Companion v0.1.0"
+          body: "Direct download for Messa Companion Android APK."
+          files: app/build/outputs/apk/debug/app-debug.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

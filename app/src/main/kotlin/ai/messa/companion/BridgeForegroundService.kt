@@ -135,26 +135,43 @@ class BridgeForegroundService : Service() {
                     becameActive = true
                     updateNotification(getString(R.string.notification_title_connected))
                     BridgeStatus.post(BridgeStatus.State.Connected)
+                    scope.launch {
+                        ensureAdbConnected()
+                    }
                 }
+
+                private val pendingChunks = ArrayList<ByteArray>()
+                @Volatile private var isConnectingAdb = false
 
                 override fun onBinaryMessage(data: ByteArray) {
                     val relay = adbRelay ?: return
-                    if (!relay.isConnected()) {
-                        // First bytes for a new task -- (re)discover the
-                        // current local ADB port (roadblock #1: it changes
-                        // on every Wi-Fi reconnect), connect fresh, and
-                        // arm the touch killswitch for the duration of
-                        // this task (section 3.4).
-                        killswitchOverlay.show()
-                        scope.launch {
-                            val port = nsdDiscovery.discoverAdbPort()
-                            if (port != null) {
-                                relay.connect(port)
-                                relay.writeToLocal(data)
+                    if (relay.isConnected()) {
+                        relay.writeToLocal(data)
+                        return
+                    }
+                    synchronized(pendingChunks) {
+                        if (relay.isConnected()) {
+                            relay.writeToLocal(data)
+                            return
+                        }
+                        pendingChunks.add(data)
+                        if (!isConnectingAdb) {
+                            isConnectingAdb = true
+                            killswitchOverlay.show()
+                            scope.launch {
+                                try {
+                                    ensureAdbConnected()
+                                    synchronized(pendingChunks) {
+                                        for (chunk in pendingChunks) {
+                                            relay.writeToLocal(chunk)
+                                        }
+                                        pendingChunks.clear()
+                                    }
+                                } finally {
+                                    isConnectingAdb = false
+                                }
                             }
                         }
-                    } else {
-                        relay.writeToLocal(data)
                     }
                 }
 
@@ -173,6 +190,13 @@ class BridgeForegroundService : Service() {
         doneSignal.await()
         adbRelay?.close()
         return becameActive
+    }
+
+    private suspend fun ensureAdbConnected(): Boolean {
+        val relay = adbRelay ?: return false
+        if (relay.isConnected()) return true
+        val port = nsdDiscovery.discoverAdbPort() ?: return false
+        return relay.connect(port)
     }
 
     private fun stopBridge() {
