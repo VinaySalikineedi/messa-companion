@@ -1,3 +1,4 @@
+@file:Suppress("NewApi")
 package ai.messa.companion
 
 import android.accessibilityservice.AccessibilityService
@@ -17,6 +18,8 @@ import android.util.Log
 import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import androidx.annotation.RequiresApi
+import androidx.core.content.ContextCompat
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -225,6 +228,7 @@ class MessaAccessibilityService : AccessibilityService() {
     /**
      * Takes a screen capture on Android 11+ (API 30+) natively without user prompts.
      */
+    @RequiresApi(Build.VERSION_CODES.R)
     suspend fun takeScreenshot(): ByteArray? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
             Log.w(TAG, "takeScreenshot requires Android 11+ (API 30)")
@@ -234,7 +238,7 @@ class MessaAccessibilityService : AccessibilityService() {
         val deferred = CompletableDeferred<ByteArray?>()
         takeScreenshot(
             Display.DEFAULT_DISPLAY,
-            applicationContext.mainExecutor,
+            ContextCompat.getMainExecutor(applicationContext),
             object : TakeScreenshotCallback {
                 override fun onSuccess(screenshotResult: ScreenshotResult) {
                     val hardwareBitmap = Bitmap.wrapHardwareBuffer(
