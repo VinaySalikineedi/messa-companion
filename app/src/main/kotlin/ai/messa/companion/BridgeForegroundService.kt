@@ -133,20 +133,35 @@ class BridgeForegroundService : Service() {
         reconnectChannel.trySend(Unit)
     }
 
+    private var connectJob: Job? = null
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val notification = buildNotification(getString(R.string.notification_title_connecting))
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+            val serviceType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            } else {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            }
+            startForeground(NOTIFICATION_ID, notification, serviceType)
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
         if (intent?.action == ACTION_STOP) {
+            BridgeWatchdogReceiver.cancel(applicationContext)
             stopBridge()
             stopSelf()
             return START_NOT_STICKY
         }
         startBridge()
+        BridgeWatchdogReceiver.schedule(applicationContext)
         return START_STICKY
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        Log.d(TAG, "onTaskRemoved called -> scheduling immediate watchdog revival")
+        BridgeWatchdogReceiver.schedule(applicationContext, 1000L)
     }
 
     private fun startBridge() {
@@ -157,8 +172,10 @@ class BridgeForegroundService : Service() {
             Log.w(TAG, "Could not acquire WakeLock/WifiLock: ${e.message}")
         }
         triggerImmediateReconnect()
-        scope.launch {
-            connectLoop()
+        if (connectJob == null || connectJob?.isActive != true) {
+            connectJob = scope.launch {
+                connectLoop()
+            }
         }
     }
 
@@ -222,6 +239,7 @@ class BridgeForegroundService : Service() {
                 @Volatile private var isConnectingAdb = false
 
                 override fun onBinaryMessage(data: ByteArray) {
+                    wakeScreenBriefly()
                     val relay = adbRelay ?: return
                     if (relay.isConnected()) {
                         relay.writeToLocal(data)
@@ -270,6 +288,20 @@ class BridgeForegroundService : Service() {
         return becameActive
     }
 
+    private fun wakeScreenBriefly() {
+        try {
+            val powerManager = getSystemService(Context.POWER_SERVICE) as? PowerManager
+            @Suppress("DEPRECATION")
+            val screenLock = powerManager?.newWakeLock(
+                PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP or PowerManager.ON_AFTER_RELEASE,
+                "MessaBridge:CommandWake"
+            )
+            screenLock?.acquire(3000L)
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not acquire screen wake lock: ${e.message}")
+        }
+    }
+
     private suspend fun ensureAdbConnected(): Boolean {
         val relay = adbRelay ?: return false
         if (relay.isConnected()) return true
@@ -278,6 +310,8 @@ class BridgeForegroundService : Service() {
     }
 
     private fun stopBridge() {
+        connectJob?.cancel()
+        connectJob = null
         try {
             if (wakeLock?.isHeld == true) wakeLock?.release()
             if (wifiLock?.isHeld == true) wifiLock?.release()
@@ -335,7 +369,9 @@ class BridgeForegroundService : Service() {
     }
 
     companion object {
+        private const val TAG = "BridgeFGS"
         const val ACTION_STOP = "ai.messa.companion.action.STOP"
+        const val ACTION_KEEP_ALIVE = "ai.messa.companion.action.KEEP_ALIVE"
         private const val CHANNEL_ID = "messa_bridge_channel"
         private const val NOTIFICATION_ID = 1001
         private const val INITIAL_RETRY_DELAY_MS = 2_000L

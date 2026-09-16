@@ -22,6 +22,7 @@ class BootReceiver : BroadcastReceiver() {
             } else {
                 context.startService(serviceIntent)
             }
+            BridgeWatchdogReceiver.schedule(context)
         }
     }
 }

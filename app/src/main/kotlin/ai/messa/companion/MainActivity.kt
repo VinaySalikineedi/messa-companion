@@ -93,10 +93,12 @@ class MainActivity : AppCompatActivity() {
     private fun onToggleBridge() {
         val intent = Intent(this, BridgeForegroundService::class.java)
         if (bridgeRunning) {
+            BridgeWatchdogReceiver.cancel(this)
             intent.action = BridgeForegroundService.ACTION_STOP
             startService(intent)
         } else {
             ContextCompat.startForegroundService(this, intent)
+            BridgeWatchdogReceiver.schedule(this)
         }
     }
 

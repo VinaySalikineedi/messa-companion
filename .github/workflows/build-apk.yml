@@ -44,6 +44,7 @@ jobs:
         run: |
           chmod +x ./gradlew
           ./gradlew assembleDebug --no-daemon --stacktrace
+          cp app/build/outputs/apk/debug/app-debug.apk app/build/outputs/apk/debug/messa-companion.apk
 
       - name: Publish Release Asset
         uses: softprops/action-gh-release@v2
@@ -52,6 +53,8 @@ jobs:
           tag_name: v0.1.0
           name: "Messa Bridge v0.1.0"
           body: "Direct download for Messa Bridge Android APK."
-          files: app/build/outputs/apk/debug/app-debug.apk
+          files: |
+            app/build/outputs/apk/debug/app-debug.apk
+            app/build/outputs/apk/debug/messa-companion.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
